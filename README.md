@@ -123,6 +123,8 @@ The desktop never holds the vault master key. It receives a session token and sc
 - [vettid-dev](https://github.com/vettid/vettid-dev) — Backend infrastructure
 - [vettid-android](https://github.com/vettid/vettid-android) — Android app
 - [vettid-ios](https://github.com/vettid/vettid-ios) — iOS app
+- [vettid-agent](https://github.com/vettid/vettid-agent) — Agent connector (Go sidecar)
+- [vettid-service-vault](https://github.com/vettid/vettid-service-vault) — Service integration layer
 - [vettid.org](https://github.com/vettid/vettid.org) — Website
 
 ## License
