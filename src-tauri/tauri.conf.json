@@ -1,0 +1,33 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicedoc/tauri/v2/crates/tauri-config-schema/schema.json",
+  "productName": "VettID Desktop",
+  "version": "0.1.0",
+  "identifier": "com.vettid.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "VettID Desktop",
+        "width": 900,
+        "height": 700,
+        "resizable": true,
+        "center": true,
+        "minWidth": 600,
+        "minHeight": 500
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' https://api.vettid.dev wss://*.nats.io; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    }
+  }
+}

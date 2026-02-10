@@ -1,0 +1,23 @@
+# Rust
+/src-tauri/target/
+**/*.rs.bk
+
+# Node/Frontend
+node_modules/
+dist/
+
+# Tauri
+/src-tauri/gen/schemas/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+*.pem
+
+# IDE
+.vscode/
+.idea/
