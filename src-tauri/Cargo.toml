@@ -3,7 +3,7 @@ name = "vettid-desktop"
 version = "0.1.0"
 edition = "2021"
 description = "VettID Desktop Client"
-license = "UNLICENSED"
+license = "AGPL-3.0-or-later"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
