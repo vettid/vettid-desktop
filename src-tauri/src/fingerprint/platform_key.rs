@@ -8,8 +8,15 @@
 //! Requires at least 3 of 5 machine attributes to be non-empty to prevent
 //! weak fingerprints in minimal environments (containers, early-boot, etc.).
 
+#[cfg(target_os = "linux")]
 use super::platform_linux::{
     collect_machine_attributes, compute_machine_fingerprint, FingerprintError, MachineAttributes,
+};
+
+#[cfg(target_os = "macos")]
+use super::platform_macos::{
+    collect_machine_attributes_macos as collect_machine_attributes, compute_machine_fingerprint,
+    FingerprintError, MachineAttributes,
 };
 
 /// Minimum number of non-empty machine attributes required for key derivation.

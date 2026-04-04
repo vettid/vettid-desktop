@@ -27,7 +27,7 @@
   },
   "plugins": {
     "shell": {
-      "open": true
+      "open": "^https://(vett\\.id|api\\.vettid\\.dev|vettid\\.org)/.*"
     }
   }
 }

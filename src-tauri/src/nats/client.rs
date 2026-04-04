@@ -74,6 +74,61 @@ impl NatsClient {
         Ok(())
     }
 
+    /// Connect to NATS using JWT + seed credentials (same format as mobile
+    /// peer connection invitations).
+    ///
+    /// This is the standard NATS authentication method used when accepting
+    /// connection invitations — matching the mobile app pattern.
+    pub async fn connect_with_credentials(
+        &mut self,
+        url: &str,
+        jwt: &str,
+        seed: &str,
+        owner_guid: &str,
+    ) -> Result<(), NatsError> {
+        let jwt_owned = jwt.to_string();
+        let seed_owned = seed.to_string();
+
+        let client = async_nats::ConnectOptions::new()
+            .credentials(&format!(
+                "-----BEGIN NATS USER JWT-----\n{}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\n{}\n------END USER NKEY SEED------",
+                jwt_owned, seed_owned
+            ))
+            .map_err(|e| NatsError::ConnectionFailed(format!("invalid credentials: {}", e)))?
+            .connect(url)
+            .await
+            .map_err(|e| NatsError::ConnectionFailed(e.to_string()))?;
+
+        self.client = Some(client);
+        self.owner_guid = owner_guid.to_string();
+        log::info!("Connected to NATS at {} with JWT credentials", url);
+        Ok(())
+    }
+
+    /// Publish a message to a specific subject.
+    pub async fn publish_to(&self, subject: &str, payload: &[u8]) -> Result<(), NatsError> {
+        let client = self.client.as_ref().ok_or(NatsError::NotConnected)?;
+        client
+            .publish(subject.to_string(), payload.to_vec().into())
+            .await
+            .map_err(|e| NatsError::PublishFailed(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Subscribe to a specific subject.
+    pub async fn subscribe_to(&self, subject: &str) -> Result<Subscriber, NatsError> {
+        let client = self.client.as_ref().ok_or(NatsError::NotConnected)?;
+        client
+            .subscribe(subject.to_string())
+            .await
+            .map_err(|e| NatsError::SubscribeFailed(e.to_string()))
+    }
+
+    /// Get the owner GUID.
+    pub fn owner_guid(&self) -> &str {
+        &self.owner_guid
+    }
+
     /// Publish a registration payload to the owner's device topic.
     ///
     /// Topic: `MessageSpace.{owner_guid}.forOwner.device`
@@ -169,6 +224,8 @@ impl NatsClient {
         }
         self.owner_guid.clear();
         self.connection_id = None;
-        self.sequence.store(0, Ordering::SeqCst);
+        // Use a random starting sequence on reconnect to avoid replay confusion
+        let random_start = rand::random::<u32>() as u64;
+        self.sequence.store(random_start, Ordering::SeqCst);
     }
 }

@@ -3,32 +3,55 @@ use serde::Deserialize;
 use crate::registration::flow::RegistrationError;
 
 // ---------------------------------------------------------------------------
-// Shortlink payload returned by the VettID API
+// Invitation payload — matches mobile peer connection invitation format
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ShortlinkPayload {
-    pub messagespace_uri: String,
-    pub invite_token: String,
-    pub invitation_id: String,
-    pub vault_public_key: String,
-    pub owner_guid: String,
-    pub connection_type: Option<String>,
+pub struct InvitationPayload {
+    /// NATS server URI
+    pub nats_endpoint: String,
+
+    /// NATS JWT for authentication (from invitation credentials)
+    pub jwt: String,
+
+    /// NATS seed for signing (from invitation credentials)
+    pub seed: String,
+
+    /// Connection ID assigned by the vault
+    pub connection_id: String,
+
+    /// Vault owner's OwnerSpace identifier
+    pub owner_space: String,
+
+    /// Vault owner's MessageSpace topic
+    pub message_space: String,
+
+    /// When the invitation expires (ISO 8601)
+    pub expires_at: String,
+
+    /// Display label (inviter's name)
+    #[serde(default)]
+    pub label: String,
+
+    /// Inviter's profile data
+    #[serde(default)]
+    pub inviter_profile: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------
-// Shortlink resolution
+// Resolve an invite code to an invitation payload
 // ---------------------------------------------------------------------------
 
-/// Resolve a VettID shortlink URL to a [`ShortlinkPayload`].
+/// Resolve a VettID invite code to an [`InvitationPayload`].
 ///
-/// Performs an HTTP GET with `Accept: application/json` and parses the
-/// response body. Handles common error status codes with human-readable
-/// error messages.
-pub async fn resolve_shortlink(url: &str) -> Result<ShortlinkPayload, RegistrationError> {
+/// The invite code is resolved via the same broker/shortlink service used by
+/// mobile peer connections. Returns NATS credentials (JWT+seed), connection_id,
+/// and space identifiers needed to connect and accept the invitation.
+pub async fn resolve_invite_code(code: &str) -> Result<InvitationPayload, RegistrationError> {
+    let url = format!("https://vett.id/{}", code);
     let client = reqwest::Client::new();
     let response = client
-        .get(url)
+        .get(&url)
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
@@ -38,12 +61,12 @@ pub async fn resolve_shortlink(url: &str) -> Result<ShortlinkPayload, Registrati
         200 => {}
         404 => {
             return Err(RegistrationError::ShortlinkFailed(
-                "shortlink expired or already used".to_string(),
+                "invite code expired or already used".to_string(),
             ));
         }
         429 => {
             return Err(RegistrationError::ShortlinkFailed(
-                "rate limited".to_string(),
+                "rate limited — try again shortly".to_string(),
             ));
         }
         status => {
@@ -54,30 +77,45 @@ pub async fn resolve_shortlink(url: &str) -> Result<ShortlinkPayload, Registrati
         }
     }
 
-    let payload: ShortlinkPayload = response
+    let payload: InvitationPayload = response
         .json()
         .await
-        .map_err(|e| RegistrationError::ShortlinkFailed(format!("failed to parse JSON: {}", e)))?;
+        .map_err(|e| RegistrationError::ShortlinkFailed(format!("failed to parse invitation: {}", e)))?;
 
-    // Validate that all required fields are non-empty.
-    validate_non_empty(&payload)?;
+    validate_invitation(&payload)?;
+    check_expiry(&payload)?;
 
     Ok(payload)
 }
 
-fn validate_non_empty(payload: &ShortlinkPayload) -> Result<(), RegistrationError> {
+fn check_expiry(payload: &InvitationPayload) -> Result<(), RegistrationError> {
+    if payload.expires_at.is_empty() {
+        return Ok(()); // No expiry set
+    }
+    if let Ok(expires) = chrono::DateTime::parse_from_rfc3339(&payload.expires_at) {
+        if expires < chrono::Utc::now() {
+            return Err(RegistrationError::ShortlinkFailed(
+                "invitation has expired".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_invitation(payload: &InvitationPayload) -> Result<(), RegistrationError> {
     let checks: &[(&str, &str)] = &[
-        ("messagespace_uri", &payload.messagespace_uri),
-        ("invite_token", &payload.invite_token),
-        ("invitation_id", &payload.invitation_id),
-        ("vault_public_key", &payload.vault_public_key),
-        ("owner_guid", &payload.owner_guid),
+        ("nats_endpoint", &payload.nats_endpoint),
+        ("jwt", &payload.jwt),
+        ("seed", &payload.seed),
+        ("connection_id", &payload.connection_id),
+        ("owner_space", &payload.owner_space),
+        ("message_space", &payload.message_space),
     ];
 
     for (name, value) in checks {
         if value.trim().is_empty() {
             return Err(RegistrationError::ShortlinkFailed(format!(
-                "shortlink payload field '{}' is empty",
+                "invitation field '{}' is empty",
                 name,
             )));
         }
@@ -90,29 +128,29 @@ fn validate_non_empty(payload: &ShortlinkPayload) -> Result<(), RegistrationErro
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_validate_non_empty_success() {
-        let payload = ShortlinkPayload {
-            messagespace_uri: "nats://example.com".to_string(),
-            invite_token: "tok-123".to_string(),
-            invitation_id: "inv-456".to_string(),
-            vault_public_key: "abcdef".to_string(),
-            owner_guid: "owner-789".to_string(),
-            connection_type: None,
-        };
-        assert!(validate_non_empty(&payload).is_ok());
+    fn test_payload() -> InvitationPayload {
+        InvitationPayload {
+            nats_endpoint: "tls://nats.vettid.dev:443".to_string(),
+            jwt: "eyJ...".to_string(),
+            seed: "SUAB...".to_string(),
+            connection_id: "conn-abc123".to_string(),
+            owner_space: "OwnerSpace.user-guid".to_string(),
+            message_space: "MessageSpace.user-guid.forOwner.>".to_string(),
+            expires_at: "2026-04-04T00:00:00Z".to_string(),
+            label: "John Doe".to_string(),
+            inviter_profile: serde_json::json!({}),
+        }
     }
 
     #[test]
-    fn test_validate_non_empty_failure() {
-        let payload = ShortlinkPayload {
-            messagespace_uri: "nats://example.com".to_string(),
-            invite_token: "".to_string(),
-            invitation_id: "inv-456".to_string(),
-            vault_public_key: "abcdef".to_string(),
-            owner_guid: "owner-789".to_string(),
-            connection_type: None,
-        };
-        assert!(validate_non_empty(&payload).is_err());
+    fn test_validate_success() {
+        assert!(validate_invitation(&test_payload()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_empty_jwt_fails() {
+        let mut p = test_payload();
+        p.jwt = String::new();
+        assert!(validate_invitation(&p).is_err());
     }
 }

@@ -5,16 +5,10 @@ use std::path::PathBuf;
 use tokio::time::{timeout, Duration};
 use zeroize::Zeroize;
 
-use crate::crypto::keys::{compute_shared_secret, generate_x25519_keypair};
-use crate::crypto::encrypt;
+use crate::crypto::keys::{compute_shared_secret, generate_x25519_keypair, generate_random_bytes};
 use crate::crypto::CryptoError;
 use crate::nats::client::{NatsClient, NatsError};
-use crate::nats::messages::{
-    self, ConnectionApproval, ConnectionDenial, ConnectionRequest, DeviceRegistration,
-    DeviceSessionInfo, MSG_DEVICE_CONNECTION_APPROVED, MSG_DEVICE_CONNECTION_DENIED,
-    MSG_DEVICE_CONNECTION_REQUEST,
-};
-use crate::registration::shortlink::resolve_shortlink;
+use crate::registration::shortlink::resolve_invite_code;
 
 // ---------------------------------------------------------------------------
 // Registration errors
@@ -22,7 +16,7 @@ use crate::registration::shortlink::resolve_shortlink;
 
 #[derive(Debug, Clone)]
 pub enum RegistrationError {
-    /// The shortlink could not be resolved.
+    /// The invite code could not be resolved.
     ShortlinkFailed(String),
     /// Failed to connect to NATS.
     NatsConnectionFailed(String),
@@ -30,7 +24,7 @@ pub enum RegistrationError {
     NatsOperationFailed(String),
     /// Cryptographic operation failed.
     CryptoFailed(String),
-    /// The registration request was denied by the vault owner.
+    /// The connection request was denied by the vault owner.
     Denied(String),
     /// Timed out waiting for approval.
     Timeout,
@@ -41,27 +35,13 @@ pub enum RegistrationError {
 impl fmt::Display for RegistrationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RegistrationError::ShortlinkFailed(msg) => {
-                write!(f, "shortlink resolution failed: {}", msg)
-            }
-            RegistrationError::NatsConnectionFailed(msg) => {
-                write!(f, "NATS connection failed: {}", msg)
-            }
-            RegistrationError::NatsOperationFailed(msg) => {
-                write!(f, "NATS operation failed: {}", msg)
-            }
-            RegistrationError::CryptoFailed(msg) => {
-                write!(f, "cryptographic operation failed: {}", msg)
-            }
-            RegistrationError::Denied(reason) => {
-                write!(f, "registration denied: {}", reason)
-            }
-            RegistrationError::Timeout => {
-                write!(f, "timed out waiting for approval")
-            }
-            RegistrationError::Internal(msg) => {
-                write!(f, "internal error: {}", msg)
-            }
+            Self::ShortlinkFailed(msg) => write!(f, "invite resolution failed: {}", msg),
+            Self::NatsConnectionFailed(msg) => write!(f, "NATS connection failed: {}", msg),
+            Self::NatsOperationFailed(msg) => write!(f, "NATS operation failed: {}", msg),
+            Self::CryptoFailed(msg) => write!(f, "cryptographic operation failed: {}", msg),
+            Self::Denied(reason) => write!(f, "connection denied: {}", reason),
+            Self::Timeout => write!(f, "timed out waiting for approval"),
+            Self::Internal(msg) => write!(f, "internal error: {}", msg),
         }
     }
 }
@@ -71,15 +51,15 @@ impl std::error::Error for RegistrationError {}
 impl From<NatsError> for RegistrationError {
     fn from(err: NatsError) -> Self {
         match err {
-            NatsError::ConnectionFailed(msg) => RegistrationError::NatsConnectionFailed(msg),
-            other => RegistrationError::NatsOperationFailed(other.to_string()),
+            NatsError::ConnectionFailed(msg) => Self::NatsConnectionFailed(msg),
+            other => Self::NatsOperationFailed(other.to_string()),
         }
     }
 }
 
 impl From<CryptoError> for RegistrationError {
     fn from(err: CryptoError) -> Self {
-        RegistrationError::CryptoFailed(err.to_string())
+        Self::CryptoFailed(err.to_string())
     }
 }
 
@@ -90,24 +70,25 @@ impl From<CryptoError> for RegistrationError {
 #[derive(Debug, Clone, Serialize)]
 pub enum RegistrationState {
     Idle,
-    ResolvingShortlink,
+    ResolvingInvite,
     ConnectingNats,
-    SendingRequest,
+    StoringCredentials,
     WaitingApproval,
+    KeyExchange,
     Approved,
     Denied(String),
     Failed(String),
 }
 
 // ---------------------------------------------------------------------------
-// Registration flow
+// Registration flow — uses P2P connection pattern
 // ---------------------------------------------------------------------------
 
-/// Maximum time to wait for an approval/denial response (5 minutes).
+/// Maximum time to wait for approval + key exchange (5 minutes).
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// The ECIES domain separator used during device registration.
-const ECIES_DOMAIN: &str = "vettid-device-v1";
+/// HKDF domain for connection key derivation (matches peer connections).
+const CONNECTION_DOMAIN: &str = "vettid-connection-v1";
 
 pub struct RegistrationFlow {
     state: RegistrationState,
@@ -116,8 +97,6 @@ pub struct RegistrationFlow {
 }
 
 impl RegistrationFlow {
-    /// Create a new registration flow that will persist credentials under
-    /// `config_dir`.
     pub fn new(config_dir: PathBuf) -> Self {
         Self {
             state: RegistrationState::Idle,
@@ -126,180 +105,196 @@ impl RegistrationFlow {
         }
     }
 
-    /// Return a reference to the current state.
     pub fn state(&self) -> &RegistrationState {
         &self.state
     }
 
-    /// Execute the full registration flow end-to-end.
+    /// Execute the full registration flow using the same pattern as peer-to-peer
+    /// connections in the mobile apps.
     ///
     /// # Phases
     ///
-    /// 1. Resolve the shortlink to obtain NATS URI, invite token, etc.
-    /// 2. Connect to NATS using the invite token.
-    /// 3. Generate an X25519 keypair, collect device fingerprint, build the
-    ///    [`ConnectionRequest`], ECIES-encrypt it with the vault public key
-    ///    using the domain `"vettid-device-v1"`, and publish.
-    /// 4. Subscribe to the invitation topic and wait up to 5 minutes for a
-    ///    response.
-    /// 5. On approval, derive the connection key from the shared secret,
-    ///    decrypt the approval payload, and save credentials to disk.
-    pub async fn run(&mut self, shortlink_code: &str) -> Result<(), RegistrationError> {
-        // -- Phase 1: Resolve shortlink ------------------------------------
-        self.set_state(RegistrationState::ResolvingShortlink);
-        let shortlink_url = format!("https://vett.id/{}", shortlink_code);
-        let payload = resolve_shortlink(&shortlink_url).await?;
+    /// 1. Resolve invite code → get NATS credentials (JWT+seed), connection_id,
+    ///    owner_space, message_space (same format as mobile invitations)
+    /// 2. Connect to NATS using JWT+seed credentials (same as a peer accepting
+    ///    an invitation)
+    /// 3. Generate X25519 keypair, publish `connection.store-credentials` to the
+    ///    vault via OwnerSpace (same handler mobile apps use)
+    /// 4. Wait for vault to forward approval request to phone, phone user approves
+    /// 5. Receive key exchange message with vault's X25519 public key
+    /// 6. Compute shared secret, derive connection key, save encrypted credentials
+    pub async fn run(&mut self, invite_code: &str, passphrase: &str) -> Result<(), RegistrationError> {
+        // -- Phase 1: Resolve invite code -------------------------------------
+        self.set_state(RegistrationState::ResolvingInvite);
+        let invitation = resolve_invite_code(invite_code).await?;
         log::info!(
-            "Shortlink resolved: invitation_id={}, owner_guid={}",
-            payload.invitation_id,
-            payload.owner_guid,
+            "Invite resolved: connection_id={}, owner_space={}",
+            invitation.connection_id,
+            invitation.owner_space,
         );
 
-        // -- Phase 2: Connect to NATS --------------------------------------
+        // -- Phase 2: Connect to NATS with invitation credentials -------------
         self.set_state(RegistrationState::ConnectingNats);
         self.nats_client
-            .connect(
-                &payload.messagespace_uri,
-                &payload.invite_token,
-                &payload.owner_guid,
+            .connect_with_credentials(
+                &invitation.nats_endpoint,
+                &invitation.jwt,
+                &invitation.seed,
+                &invitation.owner_space,
             )
             .await?;
-        log::info!("NATS connected");
+        log::info!("NATS connected with invitation credentials");
 
-        // -- Phase 3: Build & publish registration request -----------------
-        self.set_state(RegistrationState::SendingRequest);
+        // -- Phase 3: Store credentials (accept the invitation) ---------------
+        self.set_state(RegistrationState::StoringCredentials);
 
-        // Generate ephemeral X25519 keypair.
+        // Generate X25519 keypair for this device connection.
         let (device_secret, device_public) = generate_x25519_keypair();
 
-        // Collect device registration metadata.
-        let registration = collect_device_registration();
+        // Collect device metadata to send as peer_profile.
+        let device_profile = collect_device_profile();
 
-        let request = ConnectionRequest {
-            invitation_id: payload.invitation_id.clone(),
-            device_public_key: device_public.as_bytes().to_vec(),
-            registration,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-        };
+        // Build store-credentials request (same format as mobile apps).
+        let store_request = serde_json::json!({
+            "connection_id": invitation.connection_id,
+            "peer_guid": format!("desktop-{}", hex::encode(generate_random_bytes(8))),
+            "label": hostname().unwrap_or_else(|| "Desktop".to_string()),
+            "nats_credentials": format!(
+                "-----BEGIN NATS USER JWT-----\n{}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\n{}\n------END USER NKEY SEED------",
+                invitation.jwt, invitation.seed,
+            ),
+            "peer_owner_space_id": invitation.owner_space,
+            "peer_message_space_id": invitation.message_space,
+            "peer_profile": device_profile,
+            "e2e_public_key": hex::encode(device_public.as_bytes()),
+            "connection_type": "device",
+        });
 
-        let request_json = serde_json::to_vec(&request)
+        // Build a vault event message matching the mobile OwnerSpaceClient pattern.
+        let request_id = hex::encode(generate_random_bytes(16));
+        let vault_message = serde_json::json!({
+            "id": request_id,
+            "type": "connection.store-credentials",
+            "payload": store_request,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+
+        let message_bytes = serde_json::to_vec(&vault_message)
             .map_err(|e| RegistrationError::Internal(format!("serialize request: {}", e)))?;
 
-        // Decode vault public key from hex.
-        let vault_pk_bytes = hex::decode(&payload.vault_public_key).map_err(|e| {
-            RegistrationError::CryptoFailed(format!("invalid vault public key hex: {}", e))
-        })?;
-
-        // ECIES-encrypt the request payload with the vault's public key.
-        // We derive a one-time shared secret and use HKDF with the domain
-        // separator to produce the symmetric key.
-        let encrypted = ecies_encrypt_for_vault(
-            &vault_pk_bytes,
-            &device_secret,
-            &device_public,
-            &request_json,
-        )?;
-
-        // Wrap in an envelope and publish.
-        let seq = self.nats_client.next_sequence();
-        let envelope_bytes = messages::encode_envelope(
-            MSG_DEVICE_CONNECTION_REQUEST,
-            "ephemeral",
-            &encrypted,
-            seq,
-        )
-        .map_err(|e| RegistrationError::Internal(format!("encode envelope: {}", e)))?;
-
+        // Publish to vault's MessageSpace (desktop devices use MessageSpace, not OwnerSpace).
+        let vault_topic = format!(
+            "MessageSpace.{}.forOwner.connection.store-credentials",
+            invitation.owner_space,
+        );
         self.nats_client
-            .publish_registration(&envelope_bytes)
+            .publish_to(&vault_topic, &message_bytes)
             .await?;
-        log::info!("Registration request published");
+        log::info!("Store-credentials request published to vault");
 
-        // -- Phase 4: Wait for approval ------------------------------------
+        // -- Phase 4: Wait for approval + key exchange ------------------------
         self.set_state(RegistrationState::WaitingApproval);
 
-        let mut subscription = self
-            .nats_client
-            .subscribe_invitation(&payload.invitation_id)
-            .await?;
+        // Subscribe to device-specific response topics on MessageSpace.
+        let response_subject = format!(
+            "MessageSpace.{}.forOwner.device.>",
+            invitation.owner_space,
+        );
+        let mut subscription = self.nats_client.subscribe_to(&response_subject).await?;
 
-        let response_msg = timeout(APPROVAL_TIMEOUT, subscription.next())
+        // Also subscribe to the store-credentials response on MessageSpace.
+        let store_response_subject = format!(
+            "MessageSpace.{}.forOwner.connection.store-credentials.response",
+            invitation.owner_space,
+        );
+        let mut store_sub = self.nats_client.subscribe_to(&store_response_subject).await?;
+
+        // Wait for store-credentials response first.
+        let store_response = timeout(Duration::from_secs(30), store_sub.next())
             .await
             .map_err(|_| RegistrationError::Timeout)?
-            .ok_or_else(|| {
-                RegistrationError::Internal("subscription closed unexpectedly".to_string())
-            })?;
+            .ok_or_else(|| RegistrationError::Internal("store-credentials subscription closed".to_string()))?;
 
-        let envelope = messages::decode_envelope(&response_msg.payload).map_err(|e| {
-            RegistrationError::Internal(format!("decode response envelope: {}", e))
-        })?;
+        let store_result: serde_json::Value = serde_json::from_slice(&store_response.payload)
+            .map_err(|e| RegistrationError::Internal(format!("parse store response: {}", e)))?;
 
-        match envelope.msg_type.as_str() {
-            MSG_DEVICE_CONNECTION_APPROVED => {
-                // -- Phase 5: Decrypt approval, persist credentials --------
-                let vault_public =
-                    x25519_dalek::PublicKey::from(<[u8; 32]>::try_from(vault_pk_bytes.as_slice())
-                        .map_err(|_| {
-                            RegistrationError::CryptoFailed(
-                                "vault public key is not 32 bytes".to_string(),
-                            )
-                        })?);
-                let mut shared_secret = compute_shared_secret(&device_secret, &vault_public);
-
-                // Derive connection key via HKDF.
-                let connection_key =
-                    derive_connection_key(&shared_secret, ECIES_DOMAIN.as_bytes())?;
-                shared_secret.zeroize();
-
-                // Extract ciphertext from the envelope payload.
-                let ciphertext = extract_payload_bytes(&envelope.payload)?;
-
-                // Decrypt the approval payload.
-                let approval_json = encrypt::decrypt(&connection_key, &ciphertext)?;
-
-                let approval: ConnectionApproval = serde_json::from_slice(&approval_json)
-                    .map_err(|e| {
-                        RegistrationError::Internal(format!("parse approval: {}", e))
-                    })?;
-
-                log::info!(
-                    "Registration approved: connection_id={}, session_id={}",
-                    approval.connection_id,
-                    approval.session.session_id,
-                );
-
-                // Persist credentials.
-                save_credentials(
-                    &self.config_dir,
-                    &approval.connection_id,
-                    &approval.key_id,
-                    &connection_key,
-                    &approval.session,
-                )?;
-
-                self.nats_client
-                    .set_connection_id(approval.connection_id.clone());
-
-                self.set_state(RegistrationState::Approved);
-                Ok(())
-            }
-            MSG_DEVICE_CONNECTION_DENIED => {
-                let denial: ConnectionDenial =
-                    serde_json::from_value(envelope.payload).map_err(|e| {
-                        RegistrationError::Internal(format!("parse denial: {}", e))
-                    })?;
-                self.set_state(RegistrationState::Denied(denial.reason.clone()));
-                Err(RegistrationError::Denied(denial.reason))
-            }
-            other => {
-                let msg = format!("unexpected message type during registration: {}", other);
-                self.set_state(RegistrationState::Failed(msg.clone()));
-                Err(RegistrationError::Internal(msg))
-            }
+        let success = store_result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !success {
+            let error = store_result.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+            return Err(RegistrationError::Denied(error.to_string()));
         }
+
+        log::info!("Store-credentials accepted, waiting for key exchange...");
+        self.set_state(RegistrationState::KeyExchange);
+
+        // Wait for key exchange message from vault (vault sends its public key).
+        let key_exchange_msg = timeout(APPROVAL_TIMEOUT, async {
+            while let Some(msg) = subscription.next().await {
+                if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                    // Look for key-exchange or activated message
+                    if parsed.get("e2e_public_key").and_then(|v| v.as_str()).is_some() {
+                        return Ok(parsed.clone());
+                    }
+                }
+            }
+            Err(RegistrationError::Internal("subscription ended without key exchange".to_string()))
+        })
+        .await
+        .map_err(|_| RegistrationError::Timeout)??;
+
+        // -- Phase 5: Compute shared secret + save credentials ----------------
+        let vault_public_hex = key_exchange_msg
+            .get("e2e_public_key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RegistrationError::CryptoFailed("no e2e_public_key in key exchange".to_string()))?;
+
+        let vault_pk_bytes = hex::decode(vault_public_hex)
+            .map_err(|e| RegistrationError::CryptoFailed(format!("invalid vault public key hex: {}", e)))?;
+
+        if vault_pk_bytes.len() != 32 {
+            return Err(RegistrationError::CryptoFailed("vault public key is not 32 bytes".to_string()));
+        }
+
+        let vault_public = x25519_dalek::PublicKey::from(
+            <[u8; 32]>::try_from(vault_pk_bytes.as_slice()).unwrap(),
+        );
+
+        // Compute shared secret via X25519 ECDH (same as peer connections).
+        let mut shared_secret = compute_shared_secret(&device_secret, &vault_public);
+
+        // Derive connection key via HKDF-SHA256 with connection_id as salt.
+        let mut connection_key = derive_connection_key(
+            &shared_secret,
+            invitation.connection_id.as_bytes(),
+            CONNECTION_DOMAIN.as_bytes(),
+        )?;
+        shared_secret.zeroize();
+
+        // Save encrypted credentials via the credential store.
+        save_credentials(
+            &self.config_dir,
+            passphrase,
+            &invitation.connection_id,
+            &hex::encode(device_public.as_bytes()),
+            &connection_key,
+            device_public.as_bytes(),
+            &vault_pk_bytes,
+            &invitation.owner_space,
+            &invitation.nats_endpoint,
+            &invitation.jwt,
+            &invitation.seed,
+            &invitation.label,
+        )?;
+
+        // SECURITY: Zeroize connection key after saving
+        connection_key.zeroize();
+
+        self.nats_client.set_connection_id(invitation.connection_id.clone());
+        self.set_state(RegistrationState::Approved);
+        log::info!("Registration complete via P2P connection pattern");
+        Ok(())
     }
 
-    /// Update state and emit a log line.
     fn set_state(&mut self, state: RegistrationState) {
         log::info!("Registration state -> {:?}", state);
         self.state = state;
@@ -310,151 +305,97 @@ impl RegistrationFlow {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Collect device metadata for the registration request.
-fn collect_device_registration() -> DeviceRegistration {
-    DeviceRegistration {
-        device_type: "desktop".to_string(),
-        ip_address: String::new(), // filled by server
-        hostname: hostname().unwrap_or_default(),
-        platform: std::env::consts::OS.to_string(),
-        binary_fingerprint: String::new(), // TODO: compute from binary hash
-        machine_fingerprint: String::new(), // TODO: use fingerprint module
-        app_version: env!("CARGO_PKG_VERSION").to_string(),
-        os_version: os_version(),
-    }
+/// Collect device metadata as a profile object (sent as peer_profile in
+/// store-credentials, matching how mobile apps send peer profiles).
+fn collect_device_profile() -> serde_json::Value {
+    serde_json::json!({
+        "_system_first_name": hostname().unwrap_or_else(|| "Desktop".to_string()),
+        "_system_last_name": "Device",
+        "device_type": "desktop",
+        "hostname": hostname().unwrap_or_default(),
+        "platform": format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+        "app_version": env!("CARGO_PKG_VERSION"),
+        "os_version": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+    })
 }
 
 fn hostname() -> Option<String> {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .ok()
-}
-
-fn os_version() -> String {
-    format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)
-}
-
-/// ECIES encrypt: compute ECDH shared secret between the device's ephemeral
-/// private key and the vault's public key, derive a symmetric key via HKDF
-/// with the domain separator, and XChaCha20-Poly1305 encrypt the plaintext.
-///
-/// The output is: `device_public_key (32 bytes) || ciphertext`.
-fn ecies_encrypt_for_vault(
-    vault_pk_bytes: &[u8],
-    device_secret: &x25519_dalek::StaticSecret,
-    device_public: &x25519_dalek::PublicKey,
-    plaintext: &[u8],
-) -> Result<Vec<u8>, RegistrationError> {
-    if vault_pk_bytes.len() != 32 {
-        return Err(RegistrationError::CryptoFailed(
-            "vault public key is not 32 bytes".to_string(),
-        ));
-    }
-
-    let vault_public = x25519_dalek::PublicKey::from(
-        <[u8; 32]>::try_from(vault_pk_bytes).unwrap(),
-    );
-
-    let mut shared_secret = compute_shared_secret(device_secret, &vault_public);
-    let sym_key = derive_connection_key(&shared_secret, ECIES_DOMAIN.as_bytes())?;
-    shared_secret.zeroize();
-
-    let ciphertext = encrypt::encrypt(&sym_key, plaintext)?;
-
-    // Prepend the ephemeral device public key so the vault can recompute the
-    // shared secret.
-    let mut result = Vec::with_capacity(32 + ciphertext.len());
-    result.extend_from_slice(device_public.as_bytes());
-    result.extend_from_slice(&ciphertext);
-
-    Ok(result)
+    hostname::get().ok().map(|h| h.to_string_lossy().to_string())
 }
 
 /// Derive a 32-byte symmetric key from a shared secret using HKDF-SHA256.
+/// Uses connection_id as salt for binding to this specific connection.
 fn derive_connection_key(
     shared_secret: &[u8; 32],
+    salt: &[u8],
     info: &[u8],
 ) -> Result<[u8; 32], RegistrationError> {
     use hkdf::Hkdf;
     use sha2::Sha256;
 
-    let hk = Hkdf::<Sha256>::new(None, shared_secret);
+    let hk = Hkdf::<Sha256>::new(Some(salt), shared_secret);
     let mut okm = [0u8; 32];
     hk.expand(info, &mut okm)
         .map_err(|e| RegistrationError::CryptoFailed(format!("HKDF expand failed: {}", e)))?;
     Ok(okm)
 }
 
-/// Extract raw bytes from an envelope payload (JSON array of numbers).
-fn extract_payload_bytes(value: &serde_json::Value) -> Result<Vec<u8>, RegistrationError> {
-    match value {
-        serde_json::Value::Array(arr) => {
-            let mut bytes = Vec::with_capacity(arr.len());
-            for v in arr {
-                let b = v
-                    .as_u64()
-                    .ok_or_else(|| {
-                        RegistrationError::Internal("payload byte is not a number".to_string())
-                    })?;
-                if b > 255 {
-                    return Err(RegistrationError::Internal(
-                        "payload byte exceeds u8 range".to_string(),
-                    ));
-                }
-                bytes.push(b as u8);
-            }
-            Ok(bytes)
-        }
-        serde_json::Value::String(s) => {
-            // Also support base64-encoded payloads.
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD
-                .decode(s)
-                .map_err(|e| {
-                    RegistrationError::Internal(format!("base64 decode failed: {}", e))
-                })
-        }
-        _ => Err(RegistrationError::Internal(
-            "unexpected payload format".to_string(),
-        )),
-    }
-}
-
-/// Persist connection credentials to the config directory.
+/// Persist connection credentials using the encrypted credential store.
+/// Uses Argon2id + XChaCha20-Poly1305 with passphrase + platform key binding.
 fn save_credentials(
     config_dir: &PathBuf,
+    passphrase: &str,
     connection_id: &str,
     key_id: &str,
     connection_key: &[u8; 32],
-    session: &DeviceSessionInfo,
+    device_public_key: &[u8],
+    vault_public_key: &[u8],
+    owner_guid: &str,
+    nats_endpoint: &str,
+    jwt: &str,
+    seed: &str,
+    owner_name: &str,
 ) -> Result<(), RegistrationError> {
+    use crate::credential::store::{self, ConnectionCredentials};
+    use crate::fingerprint::platform_key;
+
     std::fs::create_dir_all(config_dir).map_err(|e| {
         RegistrationError::Internal(format!("create config dir: {}", e))
     })?;
 
-    let creds = serde_json::json!({
-        "connection_id": connection_id,
-        "key_id": key_id,
-        "connection_key": hex::encode(connection_key),
-        "session": {
-            "session_id": session.session_id,
-            "status": session.status,
-            "expires_at": session.expires_at,
-            "ttl_hours": session.ttl_hours,
-            "capabilities": session.capabilities,
-            "requires_phone": session.requires_phone,
-        }
-    });
+    let nats_creds_string = format!(
+        "-----BEGIN NATS USER JWT-----\n{}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\n{}\n------END USER NKEY SEED------",
+        jwt, seed,
+    );
 
-    let creds_path = config_dir.join("credentials.json");
-    let json_bytes = serde_json::to_vec_pretty(&creds).map_err(|e| {
-        RegistrationError::Internal(format!("serialize credentials: {}", e))
-    })?;
+    let creds = ConnectionCredentials {
+        connection_id: connection_id.to_string(),
+        connection_key: connection_key.to_vec(),
+        key_id: key_id.to_string(),
+        device_private_key: Vec::new(), // Private key not stored — ephemeral
+        device_public_key: device_public_key.to_vec(),
+        vault_public_key: vault_public_key.to_vec(),
+        message_space_token: nats_creds_string,
+        message_space_url: nats_endpoint.to_string(),
+        owner_guid: owner_guid.to_string(),
+        owner_name: owner_name.to_string(),
+        session_id: String::new(),
+    };
 
-    std::fs::write(&creds_path, &json_bytes).map_err(|e| {
-        RegistrationError::Internal(format!("write credentials file: {}", e))
-    })?;
+    // Derive platform key for machine binding
+    let platform_key = platform_key::derive_platform_key()
+        .map_err(|e| RegistrationError::Internal(format!("platform key: {}", e)))?;
 
-    log::info!("Credentials saved to {:?}", creds_path);
+    // Save via encrypted credential store (Argon2id + XChaCha20-Poly1305, mode 0600)
+    store::save(config_dir, &creds, passphrase.as_bytes(), &platform_key)
+        .map_err(|e| RegistrationError::Internal(format!("save credentials: {}", e)))?;
+
+    // Clean up any leftover plaintext credentials from previous versions
+    let plaintext_path = config_dir.join("credentials.json");
+    if plaintext_path.exists() {
+        let _ = std::fs::remove_file(&plaintext_path);
+    }
+
+    log::info!("Credentials saved (encrypted) to {:?}", config_dir);
     Ok(())
 }

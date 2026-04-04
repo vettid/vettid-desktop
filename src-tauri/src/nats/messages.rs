@@ -89,6 +89,30 @@ pub struct ConnectionDenial {
 }
 
 // ---------------------------------------------------------------------------
+// Device operation request/response (post-registration)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceOpRequest {
+    pub request_id: String,
+    pub operation: String,
+    pub connection_id: String,
+    pub params: serde_json::Value,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeviceOpResponse {
+    pub request_id: String,
+    pub operation: String,
+    pub success: bool,
+    pub data: Option<serde_json::Value>,
+    pub error: Option<String>,
+    #[serde(default)]
+    pub pending_phone_approval: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Encode / decode helpers
 // ---------------------------------------------------------------------------
 
