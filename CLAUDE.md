@@ -20,6 +20,15 @@ npm run check        # svelte-check type checking
 # Full Tauri app
 cargo tauri dev      # Dev mode (frontend + backend)
 cargo tauri build    # Production binary
+
+# With WebRTC calls (audio in/out via libopus + cpal)
+brew install opus pkg-config cmake     # one-time system deps
+cargo tauri build --features webrtc    # adds ~5min on first compile
+
+# Local install (drag-to-Applications + ad-hoc sign + quarantine strip)
+./scripts/install-local.sh             # release, signaling-only
+./scripts/install-local.sh --calls     # release, with WebRTC media
+./scripts/install-local.sh --debug     # debug build (faster compile)
 ```
 
 ## Testing

@@ -21,7 +21,7 @@
 //!    paces the RTP send rate via the supplied frame duration.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -29,6 +29,7 @@ use cpal::{SampleFormat, SampleRate};
 use tokio::sync::mpsc;
 use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+use webrtc::track::track_remote::TrackRemote;
 
 /// 48 kHz × 20 ms = 960 samples per Opus frame at 48 kHz mono.
 const OPUS_SAMPLE_RATE: u32 = 48_000;
@@ -236,5 +237,212 @@ fn spawn_encoder_task(
         }
 
         log::debug!("Audio encoder task ended");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Playback (peer audio → speakers)
+// ---------------------------------------------------------------------------
+
+/// Returned by [`start_playback`]. Drop it to stop the cpal output stream
+/// and join the audio thread.
+pub struct PlaybackHandle {
+    shutdown: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for PlaybackHandle {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Pull RTP packets from `track`, decode Opus, and play through the default
+/// output device.
+///
+/// Symmetric to [`start_capture`]: a Tokio task reads/decodes, an OS thread
+/// owns the (!Send) cpal output stream, and an mpsc bridges them. The
+/// playback shared buffer is a Mutex<VecDeque<f32>> rather than another
+/// mpsc because the cpal output callback needs random-access drain to
+/// match its requested frame size.
+pub fn start_playback(
+    track: Arc<TrackRemote>,
+) -> Result<PlaybackHandle, String> {
+    use std::collections::VecDeque;
+
+    let buffer: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
+        OPUS_SAMPLE_RATE as usize, // ~1s of buffered audio
+    )));
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    spawn_decoder_task(track, buffer.clone(), shutdown.clone());
+
+    let buffer_for_thread = buffer.clone();
+    let shutdown_for_thread = shutdown.clone();
+    let thread = std::thread::Builder::new()
+        .name("vettid-audio-playback".to_string())
+        .spawn(move || run_playback_thread(buffer_for_thread, shutdown_for_thread))
+        .map_err(|e| format!("spawn playback thread: {}", e))?;
+
+    Ok(PlaybackHandle {
+        shutdown,
+        thread: Some(thread),
+    })
+}
+
+fn run_playback_thread(
+    buffer: Arc<Mutex<std::collections::VecDeque<f32>>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let host = cpal::default_host();
+    let device = match host.default_output_device() {
+        Some(d) => d,
+        None => {
+            log::error!("Audio playback: no default output device");
+            return;
+        }
+    };
+
+    log::info!(
+        "Audio playback device: {}",
+        device.name().unwrap_or_else(|_| "<unknown>".to_string()),
+    );
+
+    let stream_config = cpal::StreamConfig {
+        channels: 1,
+        sample_rate: SampleRate(OPUS_SAMPLE_RATE),
+        buffer_size: cpal::BufferSize::Default,
+    };
+    let supported = match device.default_output_config() {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("Audio playback: query output config failed: {}", e);
+            return;
+        }
+    };
+
+    let err_cb = |err| log::warn!("cpal output stream error: {}", err);
+
+    let buffer_for_cb = buffer.clone();
+    let stream_result = match supported.sample_format() {
+        SampleFormat::F32 => device.build_output_stream(
+            &stream_config,
+            move |out: &mut [f32], _| fill_output(out, &buffer_for_cb, |s| s),
+            err_cb,
+            None,
+        ),
+        SampleFormat::I16 => device.build_output_stream(
+            &stream_config,
+            move |out: &mut [i16], _| {
+                fill_output(out, &buffer_for_cb, |s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+            },
+            err_cb,
+            None,
+        ),
+        SampleFormat::U16 => device.build_output_stream(
+            &stream_config,
+            move |out: &mut [u16], _| {
+                fill_output(out, &buffer_for_cb, |s| {
+                    ((s.clamp(-1.0, 1.0) * 32767.0) + 32768.0) as u16
+                });
+            },
+            err_cb,
+            None,
+        ),
+        other => {
+            log::error!("Audio playback: unsupported sample format {:?}", other);
+            return;
+        }
+    };
+
+    let stream = match stream_result {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Audio playback: build_output_stream failed: {}", e);
+            return;
+        }
+    };
+
+    if let Err(e) = stream.play() {
+        log::error!("Audio playback: stream.play failed: {}", e);
+        return;
+    }
+    log::info!("Audio playback started");
+
+    while !shutdown.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    drop(stream);
+    log::info!("Audio playback stopped");
+}
+
+/// Drain up to `out.len()` samples from the shared buffer; any shortfall is
+/// padded with silence so the audio device keeps clocking.
+fn fill_output<S: Copy + Default>(
+    out: &mut [S],
+    buffer: &Arc<Mutex<std::collections::VecDeque<f32>>>,
+    convert: impl Fn(f32) -> S,
+) {
+    let mut buf = buffer.lock().unwrap_or_else(|p| p.into_inner());
+    for slot in out.iter_mut() {
+        *slot = match buf.pop_front() {
+            Some(s) => convert(s),
+            None => S::default(),
+        };
+    }
+}
+
+fn spawn_decoder_task(
+    track: Arc<TrackRemote>,
+    buffer: Arc<Mutex<std::collections::VecDeque<f32>>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let mut decoder = match opus::Decoder::new(OPUS_SAMPLE_RATE, opus::Channels::Mono) {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!("Failed to init Opus decoder: {}", e);
+                return;
+            }
+        };
+
+        // 120ms (6 × 20ms) is the largest Opus frame size at 48 kHz; size for
+        // that to avoid mid-call reallocs.
+        let mut decoded = vec![0f32; OPUS_FRAME_SAMPLES * 6];
+
+        while !shutdown.load(Ordering::SeqCst) {
+            let (rtp_packet, _attrs) = match track.read_rtp().await {
+                Ok(p) => p,
+                Err(e) => {
+                    log::debug!("read_rtp ended: {}", e);
+                    break;
+                }
+            };
+            let payload = rtp_packet.payload;
+            if payload.is_empty() {
+                continue;
+            }
+            let n = match decoder.decode_float(&payload, &mut decoded, false) {
+                Ok(n) => n,
+                Err(e) => {
+                    log::warn!("Opus decode failed: {}", e);
+                    continue;
+                }
+            };
+            // Push into the shared buffer; cap at ~500ms so we don't grow
+            // unboundedly if playback stalls.
+            let mut buf = buffer.lock().unwrap_or_else(|p| p.into_inner());
+            if buf.len() > OPUS_SAMPLE_RATE as usize / 2 {
+                let drop_count = buf.len() - OPUS_SAMPLE_RATE as usize / 2;
+                buf.drain(..drop_count);
+            }
+            buf.extend(decoded[..n].iter().copied());
+        }
+
+        log::debug!("Audio decoder task ended");
     });
 }

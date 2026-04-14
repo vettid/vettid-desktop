@@ -11,10 +11,11 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTPCodecType};
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+use webrtc::track::track_remote::TrackRemote;
 
-use super::audio::{self, CaptureHandle};
+use super::audio::{self, CaptureHandle, PlaybackHandle};
 
 /// Outbound event from a call session — published to the peer's vault by the
 /// signaling layer.
@@ -72,6 +73,11 @@ pub struct CallSession {
     /// Microphone capture handle. Kept alive for the call's lifetime; drops
     /// when the session drops, which stops the cpal stream.
     _audio_capture: Mutex<Option<CaptureHandle>>,
+    /// Speaker playback handle for the peer's audio track. Created lazily
+    /// inside `on_track` when the peer's audio arrives. Wrapped in `Mutex`
+    /// because the on_track callback runs on the webrtc-rs runtime and
+    /// needs to mutate this field.
+    _audio_playback: Arc<Mutex<Option<PlaybackHandle>>>,
 }
 
 impl CallSession {
@@ -154,16 +160,42 @@ impl CallSession {
             }
         };
 
+        // Inbound audio: when the peer's audio track arrives, kick off a
+        // playback pipeline (decode Opus → cpal output device). One callback
+        // can fire per received track; we only handle the first audio one,
+        // since this app is single-stream.
+        let playback_slot: Arc<Mutex<Option<PlaybackHandle>>> = Arc::new(Mutex::new(None));
+        let playback_for_cb = playback_slot.clone();
+        pc.on_track(Box::new(move |track: Arc<TrackRemote>, _, _| {
+            let playback_for_cb = playback_for_cb.clone();
+            Box::pin(async move {
+                if track.kind() != RTPCodecType::Audio {
+                    return;
+                }
+                let mut slot = playback_for_cb.lock().await;
+                if slot.is_some() {
+                    return;
+                }
+                match audio::start_playback(track) {
+                    Ok(handle) => {
+                        *slot = Some(handle);
+                    }
+                    Err(e) => {
+                        log::error!("Audio playback init failed: {}", e);
+                    }
+                }
+            })
+        }));
+
         // TODO: install RTP frame cryptor for E2EE matching Android's
         //       `CallFrameCryptor` (X25519-derived shared secret + AES-128-GCM).
-        // TODO: handle inbound audio track via pc.on_track — feed remote
-        //       Opus packets into a decoder + cpal output stream.
 
         Ok(Self {
             pc,
             call_id,
             peer_guid,
             _audio_capture: Mutex::new(capture),
+            _audio_playback: playback_slot,
         })
     }
 
