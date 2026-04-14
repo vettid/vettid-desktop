@@ -7,6 +7,8 @@ pub mod session;
 pub mod commands;
 pub mod state;
 pub mod tray;
+#[cfg(feature = "webrtc")]
+pub mod webrtc;
 
 use commands::{auth, calls, vault, session as session_cmd};
 use state::AppState;
