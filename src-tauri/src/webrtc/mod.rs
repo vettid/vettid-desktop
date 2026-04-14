@@ -30,6 +30,7 @@
 #![cfg(feature = "webrtc")]
 
 pub mod audio;
+pub mod cryptor;
 pub mod session;
 
 pub use session::CallSession;
