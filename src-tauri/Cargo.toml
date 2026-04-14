@@ -44,6 +44,12 @@ base64 = "0.22"
 # --features webrtc` to enable.
 webrtc = { version = "0.17", optional = true }
 async-trait = { version = "0.1", optional = true }
+# Audio capture (microphone) for the WebRTC audio track. cpal handles the
+# OS-specific audio backends (CoreAudio on macOS, ALSA/PulseAudio on Linux);
+# opus + bytes encode the captured PCM into RTP-friendly Opus frames.
+cpal = { version = "0.15", optional = true }
+opus = { version = "0.3", optional = true }
+bytes = { version = "1", optional = true }
 
 # Logging
 log = "0.4"
@@ -66,4 +72,4 @@ custom-protocol = ["tauri/custom-protocol"]
 # Enable real WebRTC media. Without this, call signaling still works but no
 # audio/video flows — useful for testing the call UX without paying the
 # webrtc-rs compile cost (~5–10 min on a clean build).
-webrtc = ["dep:webrtc", "dep:async-trait"]
+webrtc = ["dep:webrtc", "dep:async-trait", "dep:cpal", "dep:opus", "dep:bytes"]

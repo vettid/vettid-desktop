@@ -1,9 +1,9 @@
 //! A single WebRTC peer-connection wrapping the lifecycle of one call.
 
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
-use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_OPUS};
 use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -11,6 +11,10 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+
+use super::audio::{self, CaptureHandle};
 
 /// Outbound event from a call session — published to the peer's vault by the
 /// signaling layer.
@@ -65,6 +69,9 @@ pub struct CallSession {
     pc: Arc<RTCPeerConnection>,
     pub call_id: String,
     pub peer_guid: String,
+    /// Microphone capture handle. Kept alive for the call's lifetime; drops
+    /// when the session drops, which stops the cpal stream.
+    _audio_capture: Mutex<Option<CaptureHandle>>,
 }
 
 impl CallSession {
@@ -121,11 +128,43 @@ impl CallSession {
             })
         }));
 
-        // TODO: add audio track (cpal capture → TrackLocalStaticSample).
+        // Add an outbound audio track. Created BEFORE create_offer so the
+        // generated SDP includes the media description (m=audio …).
+        let audio_track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_OPUS.to_owned(),
+                clock_rate: 48_000,
+                channels: 1,
+                ..Default::default()
+            },
+            "vettid-audio".to_owned(),
+            "vettid-audio-stream".to_owned(),
+        ));
+        pc.add_track(audio_track.clone()).await?;
+
+        // Start microphone capture. If this fails (no mic, permission
+        // denied, unsupported format), log it and continue with a silent
+        // call rather than aborting — the user can still hear the peer
+        // even if their own mic isn't working.
+        let capture = match audio::start_capture(audio_track) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                log::error!("Audio capture failed, call will be silent outbound: {}", e);
+                None
+            }
+        };
+
         // TODO: install RTP frame cryptor for E2EE matching Android's
         //       `CallFrameCryptor` (X25519-derived shared secret + AES-128-GCM).
+        // TODO: handle inbound audio track via pc.on_track — feed remote
+        //       Opus packets into a decoder + cpal output stream.
 
-        Ok(Self { pc, call_id, peer_guid })
+        Ok(Self {
+            pc,
+            call_id,
+            peer_guid,
+            _audio_capture: Mutex::new(capture),
+        })
     }
 
     /// Generate an SDP offer to send to the callee.
