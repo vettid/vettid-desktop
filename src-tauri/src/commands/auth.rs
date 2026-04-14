@@ -37,15 +37,10 @@ pub async fn register(
     state: State<'_, AppState>,
     request: RegisterRequest,
 ) -> Result<RegisterResponse, String> {
+    use crate::credential::store;
     use crate::registration::flow::RegistrationFlow;
-    use std::path::PathBuf;
 
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
-                .join(".config")
-        })
-        .join("vettid-desktop");
+    let config_dir = store::default_config_dir();
 
     // Ensure config directory exists
     std::fs::create_dir_all(&config_dir)
@@ -118,14 +113,8 @@ pub async fn register(
 #[tauri::command]
 pub async fn unlock(state: State<'_, AppState>, passphrase: String) -> Result<bool, String> {
     use crate::credential::store;
-    use std::path::PathBuf;
 
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
-                .join(".config")
-        })
-        .join("vettid-desktop");
+    let config_dir = store::default_config_dir();
 
     let (creds, _re_encrypted) = store::load_with_tolerance(&config_dir, &passphrase)
         .map_err(|e| format!("Failed to unlock: {}", e))?;
@@ -197,15 +186,7 @@ pub async fn get_status(state: State<'_, AppState>) -> Result<AuthStatus, String
     // Also check on disk if not yet known
     let is_registered = if !is_registered {
         use crate::credential::store;
-        use std::path::PathBuf;
-
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
-                .join(".config")
-        })
-            .join("vettid-desktop");
-        store::exists(&config_dir)
+        store::exists(&store::default_config_dir())
     } else {
         is_registered
     };

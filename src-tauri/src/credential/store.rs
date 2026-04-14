@@ -41,8 +41,8 @@ const STORE_VERSION: i32 = 1;
 /// Credential file name within the config directory.
 const CREDENTIAL_FILE: &str = "connection.enc";
 
-/// Default config directory relative to the user's home.
-const DEFAULT_CONFIG_DIR: &str = ".config/vettid-desktop";
+/// Subdirectory name appended to the OS config dir.
+const CONFIG_SUBDIR: &str = "vettid-desktop";
 
 /// Salt size for Argon2id (16 bytes).
 const ARGON2_SALT_SIZE: usize = 16;
@@ -171,11 +171,14 @@ pub struct EncryptedStore {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Returns the default config directory path (`~/.config/vettid-desktop`).
+/// Returns the OS-appropriate config directory path for credentials.
+///
+/// - Linux: `$XDG_CONFIG_HOME/vettid-desktop` (typically `~/.config/vettid-desktop`)
+/// - macOS: `~/Library/Application Support/vettid-desktop`
 pub fn default_config_dir() -> PathBuf {
-    dirs::home_dir()
+    dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(DEFAULT_CONFIG_DIR)
+        .join(CONFIG_SUBDIR)
 }
 
 /// Encrypt credentials and write them to `connection.enc` in `config_dir`.

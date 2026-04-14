@@ -6,6 +6,7 @@ pub mod registration;
 pub mod session;
 pub mod commands;
 pub mod state;
+pub mod tray;
 
 use commands::{auth, vault, session as session_cmd};
 use state::AppState;
@@ -14,7 +15,22 @@ use state::AppState;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState::new())
+        .setup(|app| {
+            tray::install(app.handle())?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Closing the main window only hides it — the listener and tray
+            // keep running. The user quits via the tray menu (or Cmd+Q on macOS).
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             // Auth commands
             auth::register,

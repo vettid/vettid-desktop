@@ -1,6 +1,7 @@
 <script lang="ts">
     import { sessionStore } from '../stores/session';
     import { initVaultListeners } from '../stores/vault';
+    import { selectedConnectionStore } from '../stores/navigation';
     import PendingApproval from '../components/PendingApproval.svelte';
 
     // Feature views
@@ -11,6 +12,8 @@
     import VotingView from './vault/VotingView.svelte';
     import WalletView from './vault/WalletView.svelte';
     import DevicesView from './vault/DevicesView.svelte';
+    import ConnectionDetail from './vault/ConnectionDetail.svelte';
+    import Conversation from './vault/Conversation.svelte';
 
     type TabId = 'connections' | 'messages' | 'secrets' | 'feed' | 'voting' | 'wallets' | 'devices';
 
@@ -25,7 +28,17 @@
     ];
 
     let session = $derived($sessionStore);
-    let activeTab = $state<TabId>('connections');
+    let activeTab = $state<TabId>('feed');
+    let selectedConnection = $derived($selectedConnectionStore);
+
+    // When a connection is open, this toggles between the Conversation
+    // (default) and the read-only ConnectionDetail (profile/manage).
+    let detailMode = $state<'conversation' | 'profile'>('conversation');
+
+    // Reset to conversation view whenever a different connection is opened.
+    $effect(() => {
+        if (selectedConnection) detailMode = 'conversation';
+    });
 
     // Pending approval overlay
     let pendingApproval = $state<{ operation: string; requestId: string } | null>(null);
@@ -68,9 +81,18 @@
             {/each}
         </div>
 
-        <!-- Tab content -->
+        <!-- Tab content. When a connection is selected, ConnectionDetail
+             takes over the panel regardless of which tab is active — the
+             back arrow returns to the previous tab. -->
         <div class="tab-content" role="tabpanel">
-            {#if activeTab === 'connections'}
+            {#if selectedConnection && detailMode === 'profile'}
+                <ConnectionDetail connection={selectedConnection} />
+            {:else if selectedConnection}
+                <Conversation
+                    connection={selectedConnection}
+                    onShowProfile={() => detailMode = 'profile'}
+                />
+            {:else if activeTab === 'connections'}
                 <ConnectionsList />
             {:else if activeTab === 'messages'}
                 <MessagingView />

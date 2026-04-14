@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSCameraUsageDescription</key>
+	<string>VettID uses your camera for video calls with your connections.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>VettID uses your microphone for voice and video calls with your connections.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>VettID uses screen recording to share your screen during calls.</string>
+	<key>NSUserNotificationUsageDescription</key>
+	<string>VettID notifies you about new messages, calls, and connection activity.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>VettID does not use Apple Events.</string>
+	<key>LSUIElement</key>
+	<false/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 VettID. All rights reserved.</string>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+</dict>
+</plist>

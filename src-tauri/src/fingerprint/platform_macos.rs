@@ -15,16 +15,18 @@ pub use super::platform_linux::{
 ///
 /// Sources:
 /// - hostname: gethostname (same as Linux)
-/// - machine_id: IOPlatformUUID via ioreg
+/// - machine_id: IOPlatformUUID via ioreg (per-install identifier)
 /// - cpu: sysctl machdep.cpu.brand_string
-/// - disk_serial: diskutil info disk0 (system disk)
+/// - disk_serial: IOPlatformSerialNumber via ioreg (Apple Silicon doesn't expose a
+///   per-disk serial through diskutil — the system serial number serves the same
+///   purpose: a stable hardware-bound identifier distinct from IOPlatformUUID)
 /// - mac_address: first non-loopback interface via ifconfig
 pub fn collect_machine_attributes_macos() -> Result<MachineAttributes, FingerprintError> {
     Ok(MachineAttributes {
         hostname: collect_hostname(),
-        machine_id: collect_machine_uuid(),
+        machine_id: collect_ioreg_property("IOPlatformUUID"),
         cpu: collect_cpu_brand(),
-        disk_serial: collect_disk_serial(),
+        disk_serial: collect_ioreg_property("IOPlatformSerialNumber"),
         mac_address: collect_mac_address(),
     })
 }
@@ -37,9 +39,12 @@ fn collect_hostname() -> String {
         .unwrap_or_default()
 }
 
-/// IOPlatformUUID — the macOS equivalent of /etc/machine-id.
-/// Reads from: ioreg -rd1 -c IOPlatformExpertDevice | grep IOPlatformUUID
-fn collect_machine_uuid() -> String {
+/// Read a string property from IOPlatformExpertDevice via `ioreg`.
+///
+/// Used for both `IOPlatformUUID` (per-install identifier, stable across reboots)
+/// and `IOPlatformSerialNumber` (factory hardware serial, stable across OS reinstalls).
+/// The output format is one property per line: `"KeyName" = "Value"`.
+fn collect_ioreg_property(key: &str) -> String {
     let output = match Command::new("ioreg")
         .args(["-rd1", "-c", "IOPlatformExpertDevice"])
         .output()
@@ -50,10 +55,10 @@ fn collect_machine_uuid() -> String {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
-        if line.contains("IOPlatformUUID") {
-            // Format: "IOPlatformUUID" = "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
-            if let Some(uuid) = line.split('"').nth(3) {
-                return uuid.trim().to_string();
+        if line.contains(key) {
+            // Format: `"KeyName" = "Value"` — split on `"` and take the 4th field
+            if let Some(value) = line.split('"').nth(3) {
+                return value.trim().to_string();
             }
         }
     }
@@ -61,6 +66,9 @@ fn collect_machine_uuid() -> String {
 }
 
 /// CPU brand string via sysctl.
+///
+/// On Apple Silicon `machdep.cpu.brand_string` is missing under Rosetta-translated
+/// processes but present natively. Falls back to `hw.model` if absent.
 fn collect_cpu_brand() -> String {
     let output = match Command::new("sysctl")
         .args(["-n", "machdep.cpu.brand_string"])
@@ -70,30 +78,15 @@ fn collect_cpu_brand() -> String {
         Err(_) => return String::new(),
     };
 
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-/// Disk serial from the system disk (disk0).
-/// Uses: diskutil info disk0 | grep "Serial Number"
-fn collect_disk_serial() -> String {
-    let output = match Command::new("diskutil")
-        .args(["info", "disk0"])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return String::new(),
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("Device / Media Name:") || trimmed.starts_with("Media Name:") {
-            if let Some((_key, value)) = trimmed.split_once(':') {
-                return value.trim().to_string();
-            }
-        }
+    let primary = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !primary.is_empty() {
+        return primary;
     }
-    String::new()
+
+    match Command::new("sysctl").args(["-n", "hw.model"]).output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Err(_) => String::new(),
+    }
 }
 
 /// First non-loopback MAC address via ifconfig.
@@ -143,10 +136,23 @@ mod tests {
 
     #[test]
     fn test_collect_machine_uuid() {
-        let uuid = collect_machine_uuid();
+        let uuid = collect_ioreg_property("IOPlatformUUID");
         // Should be a UUID format: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
         if !uuid.is_empty() {
             assert!(uuid.contains('-'), "UUID should contain dashes: {}", uuid);
+        }
+    }
+
+    #[test]
+    fn test_collect_serial_number() {
+        let serial = collect_ioreg_property("IOPlatformSerialNumber");
+        // Apple hardware serials are typically 10–12 alphanumeric chars
+        if !serial.is_empty() {
+            assert!(
+                serial.len() >= 8 && serial.chars().all(|c| c.is_ascii_alphanumeric()),
+                "serial should be 8+ alphanumeric chars: {:?}",
+                serial,
+            );
         }
     }
 

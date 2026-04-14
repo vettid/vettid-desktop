@@ -12,10 +12,16 @@ The desktop client is a **functional prototype** built with Tauri v2 (Rust backe
 - **Session management**: State machine with time-bounded tokens, phone delegation
 - **Operation mapping**: 30+ vault operations mapped (independent + phone-required)
 - **Background listener**: Incoming message routing (device_op_response, session_update, feed_event, new_message)
+- **Cross-platform fingerprint scaffolding**: `platform_linux.rs` (production) + `platform_macos.rs` (scaffolded — IOPlatformUUID, sysctl CPU brand, diskutil, ifconfig MAC). `platform_key.rs` already cfg-dispatches by target OS.
 
 ### What's Scaffolded (Empty UI)
 - ConnectionsList, MessagingView, FeedView, WalletView, VotingView, SecretsView, DevicesView
 - These Svelte views exist as containers but lack logic and data binding
+
+### Target Platforms
+- **Linux** (primary dev target — x86_64 and aarch64; AppImage + .deb)
+- **macOS** (parallel target — Apple Silicon `aarch64` only; .app + .dmg, Developer ID signed and notarized. Intel Macs are out of scope: Apple stopped selling them in 2023, and a 2026 launch with no existing Intel users doesn't justify the build/bundle overhead. Adding `x86_64` later is a one-line CI change if needed.)
+- Windows is out of scope for this plan
 
 ### Architecture Model
 The desktop operates as a **"device connection"** — it does NOT own a vault. It delegates operations through the user's phone/vault:
@@ -41,6 +47,42 @@ The Android app (vettid-android) is the reference implementation. Key features t
 | Clickable links in messages | Done | Phase 3 |
 | Notification deep-linking | Done | Phase 7 |
 | Foreground service (background) | Done | Phase 7 (system tray) |
+
+---
+
+## Cross-Platform Strategy
+
+The desktop is built once with Tauri v2 and deployed to both Linux and macOS. The vast majority of code is platform-agnostic; platform-specific concerns are isolated to a handful of modules.
+
+### Where the OSes diverge
+
+| Concern | Linux approach | macOS approach |
+|---|---|---|
+| Machine fingerprint (5 attrs) | `/etc/machine-id`, `/proc/cpuinfo`, `lsblk`, `/sys/class/net` | `ioreg` IOPlatformUUID, `sysctl machdep.cpu.brand_string`, `diskutil info disk0`, `ifconfig` |
+| HMAC domain label | `vettid-desktop-platform-v1` (shared — same label across OSes; fingerprints are inherently OS-bound through their inputs) | same |
+| Credential store path | `$XDG_DATA_HOME/vettid` or `~/.local/share/vettid` (via `dirs::data_dir()`) | `~/Library/Application Support/com.vettid.desktop` (via `dirs::data_dir()`) |
+| System tray icon | Standard PNG | Template icon (black + alpha) so macOS recolors it for light/dark menu bar |
+| Notifications | `notify-rust` / freedesktop spec, no permission prompt | Requires `NSUserNotificationUsageDescription` in Info.plist; first send triggers permission prompt |
+| Window chrome | Standard decorations | Native traffic-light buttons; consider `titleBarStyle: "overlay"` for unified look |
+| Single-instance | `tauri-plugin-single-instance` | same plugin; macOS also reactivates on Dock click via `RunEvent::Reopen` |
+| Camera/mic permissions (Phase 6) | None at OS level | Requires `NSCameraUsageDescription`, `NSMicrophoneUsageDescription` in Info.plist + first-use prompt |
+| Screen sharing (Phase 6) | PipeWire (Wayland) / X11 | Requires `NSScreenCaptureUsageDescription`; user must grant in System Settings → Privacy & Security → Screen Recording |
+| Auto-launch on login | `.desktop` file in `~/.config/autostart` | `LaunchAgents` plist or `tauri-plugin-autostart` |
+| Distribution format | AppImage (portable) + .deb (Debian/Ubuntu) | .dmg with .app inside, signed + notarized |
+
+### Code organization principle
+
+- **Default-to-shared**: place logic in cross-platform modules; only branch on `cfg(target_os = …)` when behavior actually differs.
+- **Platform modules stay thin**: each `platform_<os>.rs` exposes the same shared types (`MachineAttributes`, `FingerprintError`) and a `collect_*` function. Higher-level code (`platform_key.rs`) dispatches via `cfg`.
+- **No conditional imports in business logic**: views, stores, and command handlers must compile identically on both platforms.
+
+### CI matrix
+
+CI should build and test on:
+- `ubuntu-latest` (Linux x86_64)
+- `macos-latest` (Apple Silicon aarch64 — single-arch build, no `lipo` step)
+
+Run `cargo test`, `npm run check`, and `cargo tauri build` on each runner. Bundle artifacts get attached to GitHub Releases.
 
 ---
 
@@ -160,9 +202,11 @@ The Android app (vettid-android) is the reference implementation. Key features t
 
 #### 3.6 Desktop Notifications
 - Show OS notification for incoming messages when app is not focused
-- Use Tauri's notification API: `tauri::api::notification`
+- Use the `tauri-plugin-notification` v2 plugin (replaces the v1 `tauri::api::notification` path)
 - Include sender name and message preview
 - Click notification → focus app and navigate to conversation
+- **macOS**: first call triggers permission prompt; check + request via plugin API on app start. Add `NSUserNotificationUsageDescription` (or rely on the bundle identifier — modern macOS uses identifier-bound permission). Confirm notifications work both when app is in Dock and when only in menu bar.
+- **Linux**: uses freedesktop notification spec via `notify-rust` under the hood; no permission prompt. Verify on both GNOME and KDE.
 
 **Key files to modify:**
 - `src/lib/views/` — New ConversationView component
@@ -265,6 +309,13 @@ This is the largest phase and may require a Rust WebRTC library or Tauri plugin.
 - Desktop advantage: share screen/window during video calls
 - Use WebRTC's `getDisplayMedia` equivalent
 - Add share button to active call controls
+- **macOS**: requires explicit Screen Recording permission (System Settings → Privacy & Security → Screen Recording). First attempt fails silently if the user hasn't granted; show an in-app guide that opens the relevant pane via `x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture`. Prefer ScreenCaptureKit (macOS 12.3+) over deprecated CGDisplayStream when the chosen WebRTC stack supports it.
+- **Linux**: differs by display server. Wayland requires PipeWire + xdg-desktop-portal screen-cast; X11 uses `XCompositeNameWindowPixmap`. Detect at runtime via `XDG_SESSION_TYPE`.
+
+#### 6.6 Camera & Microphone Permissions
+- **macOS**: bundle Info.plist must declare `NSCameraUsageDescription` and `NSMicrophoneUsageDescription` (set via `tauri.conf.json` bundle config). First access triggers OS prompt; denial requires the user to flip the toggle in System Settings.
+- **Linux**: PulseAudio/PipeWire handles mic with no OS prompt. Camera access via `/dev/video*` is governed by group membership (`video` group) — handle the `EACCES` case with a clear error message.
+- Add a pre-call permission check that surfaces missing permissions before initiating the call rather than mid-handshake.
 
 **Key files to create:**
 - `src-tauri/src/webrtc/` — WebRTC client module
@@ -276,11 +327,19 @@ This is the largest phase and may require a Rust WebRTC library or Tauri plugin.
 ### Phase 7: Notifications & Background
 **Goal**: Reliable notifications even when app window isn't focused.
 
-#### 7.1 System Tray
-- Run in system tray when window is closed
+#### 7.1 System Tray / Menu Bar
+- Run in system tray (Linux) / menu bar (macOS) when window is closed
 - Maintain NATS connection in background
 - Tray icon with context menu: Open, Status, Quit
-- Reference: Tauri v2 system tray API
+- Reference: Tauri v2 `TrayIconBuilder` API
+- **macOS specifics**:
+  - Use a *template image* (black + transparency, no color) so macOS auto-tints for light/dark menu bar
+  - Hide the Dock icon when only running from menu bar by setting `LSUIElement = true` in Info.plist (or making it a runtime toggle in Settings)
+  - Handle `RunEvent::Reopen` (Dock click after window close) to restore the window
+  - `Cmd+W` should close the window without quitting the app; `Cmd+Q` quits
+- **Linux specifics**:
+  - On GNOME, `StatusNotifierItem` requires the AppIndicator extension; document the requirement or fall back to legacy XEmbed
+  - On KDE / Wayland, native support is fine
 
 #### 7.2 Desktop Notifications
 - OS-native notifications via Tauri notification API
@@ -294,6 +353,8 @@ This is the largest phase and may require a Rust WebRTC library or Tauri plugin.
 #### 7.4 Badge Count
 - Show unread count on system tray icon
 - Clear on app focus or when user reads messages
+- **macOS**: also set the Dock badge via `app.set_dock_badge()` (or the `tauri::AppHandle` equivalent) — this is the canonical Mac UX for unread counts and is more visible than the menu bar icon
+- **Linux**: tray icon overlay only (Dock badges aren't a universal concept)
 
 **Key files to modify:**
 - `src-tauri/src/lib.rs` — System tray setup
@@ -330,11 +391,90 @@ This is the largest phase and may require a Rust WebRTC library or Tauri plugin.
 
 ---
 
+### Phase 9: macOS Build, Packaging & Distribution
+**Goal**: Ship a signed, notarized, Apple Silicon `.dmg` that installs cleanly on Macs running macOS 12+ (`aarch64` only — see Target Platforms above for the Intel decision).
+
+This phase runs *in parallel* with the feature phases, not at the end. Get a basic dev build running on macOS as soon as Phase 1 is in flight; come back to signing/notarization once the app is feature-complete enough to share with testers.
+
+#### 9.1 Bring-up: dev build on macOS
+- Verify `cargo tauri dev` runs end-to-end on Apple Silicon
+- Validate the `platform_macos.rs` fingerprint produces ≥3 attributes on a real Mac (fix the `disk_serial` collector — currently parses "Media Name" instead of the actual serial; should match on `"Volume UUID"` or `"Disk / Partition UUID"` line from `diskutil info disk0`)
+- Validate the credential store path under `~/Library/Application Support/com.vettid.desktop/`
+- Confirm NATS connection survives Sleep/Wake transitions (Power Nap wake delivers a different network state than Linux suspend/resume)
+
+#### 9.2 Bundle configuration
+Update `tauri.conf.json` `bundle` section:
+- `targets`: `["app", "dmg"]` for macOS, `["appimage", "deb"]` for Linux
+- `macOS.minimumSystemVersion`: `"12.0"` (covers ScreenCaptureKit + reasonable adoption)
+- `macOS.frameworks`: any required system frameworks (likely none for Phases 1–5; AVFoundation for Phase 6)
+- `macOS.entitlements`: path to `entitlements.plist` (see 9.4)
+- `macOS.signingIdentity`: `"Developer ID Application: <Team Name> (<Team ID>)"` — read from CI secret, not committed
+- `icon`: include `.icns` alongside the existing `.png`/`.ico` set; generate from a 1024×1024 master via `iconutil`
+- Bundle identifier already correct: `com.vettid.desktop`
+
+#### 9.3 Info.plist additions
+Tauri generates the Info.plist at build time. Required keys (declared via `bundle.macOS.infoPlist`):
+- `NSCameraUsageDescription` — "VettID uses your camera for video calls."
+- `NSMicrophoneUsageDescription` — "VettID uses your microphone for voice and video calls."
+- `NSScreenCaptureUsageDescription` — "VettID uses screen recording for sharing your screen during calls."
+- `LSMinimumSystemVersion` — `"12.0"`
+- `LSUIElement` — `false` for v1; consider `true` toggle in Settings for "menu-bar-only mode"
+- `NSAppTransportSecurity` — only relax if absolutely required; default is fine since vault traffic is over WSS
+
+#### 9.4 Entitlements
+Create `src-tauri/entitlements.plist`:
+- `com.apple.security.app-sandbox`: `false` initially (sandboxing will require careful work around the credential store, IOKit access for fingerprinting, and screen-capture). Plan to enable in a follow-up phase.
+- Hardened Runtime entitlements (required for notarization):
+  - `com.apple.security.cs.allow-jit`: `true` (WebKit JIT)
+  - `com.apple.security.cs.allow-unsigned-executable-memory`: `true` (Tauri webview)
+  - `com.apple.security.device.audio-input`: `true`
+  - `com.apple.security.device.camera`: `true`
+  - `com.apple.security.network.client`: `true`
+
+#### 9.5 Single-arch build (Apple Silicon)
+- Build for `aarch64-apple-darwin` only: `cargo tauri build --target aarch64-apple-darwin`
+- No `lipo` step, no x86_64 toolchain needed in CI
+- If Intel demand emerges, switch the target to `universal-apple-darwin` (Tauri handles `lipo` internally) and re-cut the release
+
+#### 9.6 Code signing
+- Apple Developer Program enrollment required (~$99/yr) — out of scope for this plan but a prerequisite for distribution
+- Developer ID Application certificate installed in CI keychain (or use Keychain Access locally)
+- Sign with `--options runtime` for Hardened Runtime
+- Tauri does this automatically when `signingIdentity` is set in config
+
+#### 9.7 Notarization
+- Submit signed `.dmg` to Apple's notary service via `notarytool` (replaces deprecated `altool`)
+- Requires App Store Connect API key (separate from Developer ID cert)
+- Staple ticket back to the .dmg with `xcrun stapler staple`
+- Verify with `spctl -a -t open --context context:primary-signature -v <path>`
+- CI: store API key, key ID, and issuer ID as encrypted secrets
+
+#### 9.8 Auto-update (optional, defer to v1.1)
+- `tauri-plugin-updater` with signed update artifacts
+- Hosting: GitHub Releases or self-hosted endpoint
+- macOS signature verification is mandatory per Apple's requirements
+
+#### 9.9 Distribution
+- v0: GitHub Releases — direct .dmg download, users manually re-download for updates
+- v1: signed updater feed pointing at GitHub Releases
+- v2 (deferred): Mac App Store (requires sandboxing — major rework around fingerprinting and credential storage)
+
+**Key files to create/modify:**
+- `src-tauri/tauri.conf.json` — bundle.macOS section, target list, icon list
+- `src-tauri/entitlements.plist` (new)
+- `src-tauri/icons/icon.icns` (new — generate from existing icon set)
+- `.github/workflows/release.yml` (new) — matrix build for Linux + macOS, signing, notarization
+- `src-tauri/src/fingerprint/platform_macos.rs` — fix `collect_disk_serial`
+
+---
+
 ## Priority & Ship Order
 
 **Recommended order**: Phase 1 → 2 → 3 → 7 → 4 → 5 → 6 → 8
 
 Phases 1-3 + 7 produce a **useful daily-driver**: real-time events, connections, messaging with notifications — covering 80% of daily use cases. Wallet and calling can follow.
+
+**Phase 9 (macOS packaging) runs in parallel.** Sub-phase 9.1 (dev bring-up + fingerprint fix) should happen alongside Phase 1 — there's no value in writing the rest of the app if it doesn't run on macOS at all. Sub-phases 9.2–9.7 (signing/notarization) can wait until just before the first external release.
 
 ## Key Reference Files (Android)
 

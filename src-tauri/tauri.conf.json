@@ -18,11 +18,37 @@
         "resizable": true,
         "center": true,
         "minWidth": 600,
-        "minHeight": 500
+        "minHeight": 500,
+        "titleBarStyle": "Visible"
       }
     ],
     "security": {
       "csp": "default-src 'self'; connect-src 'self' https://api.vettid.dev wss://*.nats.io; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg", "appimage", "deb"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/256x256.png",
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "SocialNetworking",
+    "shortDescription": "VettID Desktop",
+    "longDescription": "VettID desktop client — encrypted vault access, messaging, and calling delegated through your VettID phone.",
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "entitlements": "entitlements.plist"
+    },
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libayatana-appindicator3-1"]
+      }
     }
   },
   "plugins": {
