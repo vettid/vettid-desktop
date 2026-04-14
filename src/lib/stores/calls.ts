@@ -39,6 +39,14 @@ interface CallEventPayload {
     reason?: string;
 }
 
+/**
+ * Most recent SDP offer received with `call.incoming`. Held outside the
+ * call store so the accept handler can hand it to `answer_call` — the
+ * Rust side needs the full SDP to drive the WebRTC `setRemoteDescription`
+ * step before generating an answer.
+ */
+let pendingRemoteOffer: string | null = null;
+
 // ---------------------------------------------------------------------------
 // Stores
 // ---------------------------------------------------------------------------
@@ -58,6 +66,28 @@ export function initCallListener(): void {
     if (initialized) return;
     initialized = true;
 
+    // WebRTC peer-connection state changes (only fires when --features
+    // webrtc is compiled in). Promotes us from `connecting` to `active` once
+    // ICE establishes, and back to `ended` on disconnect/failure.
+    listen<{ call_id: string; state: string }>('vault:call-state', (event) => {
+        const { call_id, state } = event.payload;
+        currentCallStore.update((c) => {
+            if (!c || c.callId !== call_id) return c;
+            switch (state) {
+                case 'active':
+                    return { ...c, state: 'active', activeSince: Date.now() };
+                case 'connecting':
+                    return { ...c, state: 'connecting' };
+                case 'failed':
+                case 'disconnected':
+                case 'ended':
+                    return { ...c, state: 'ended', error: state === 'failed' ? 'connection failed' : undefined };
+                default:
+                    return c;
+            }
+        });
+    });
+
     listen<{ subject: string; payload_b64: string }>('vault:call-event', (event) => {
         const subject = event.payload?.subject ?? '';
         const action = subject.split('.forApp.call.')[1] ?? '';
@@ -67,6 +97,7 @@ export function initCallListener(): void {
         switch (action) {
             case 'incoming': {
                 if (!payload.call_id) return;
+                pendingRemoteOffer = payload.sdp_offer ?? null;
                 currentCallStore.set({
                     callId: payload.call_id,
                     peerGuid: payload.caller_id ?? '',
@@ -83,14 +114,19 @@ export function initCallListener(): void {
                     if (!c || c.callId !== payload.call_id) return c;
                     return { ...c, state: 'connecting' };
                 });
-                // Once a real WebRTC stack is wired, this is where we'd
-                // setRemoteDescription with payload.sdp_answer and let ICE
-                // complete to push us into `active`.
+                // Hand the remote SDP answer to the WebRTC layer (the
+                // Rust side no-ops if the webrtc feature isn't compiled
+                // in, so this stays safe in signaling-only builds).
+                if (payload.sdp_answer) {
+                    invoke('apply_remote_answer', { sdp: payload.sdp_answer })
+                        .catch((e) => console.warn('apply_remote_answer failed:', e));
+                }
                 break;
             }
             case 'ended':
             case 'declined':
             case 'cancelled': {
+                pendingRemoteOffer = null;
                 currentCallStore.update((c) => {
                     if (!c || (payload.call_id && c.callId !== payload.call_id)) return c;
                     return { ...c, state: 'ended', error: payload.reason };
@@ -104,8 +140,12 @@ export function initCallListener(): void {
                 break;
             }
             case 'candidate': {
-                // ICE candidate from peer — would feed RTCPeerConnection
-                // .addIceCandidate once WebRTC is wired.
+                // Forward the remote ICE candidate to the active session.
+                // Backend no-ops without the webrtc feature.
+                if (payload.candidate) {
+                    invoke('apply_remote_ice', { candidate: payload.candidate })
+                        .catch((e) => console.warn('apply_remote_ice failed:', e));
+                }
                 break;
             }
             default:
@@ -157,20 +197,26 @@ export async function acceptCall(call: ActiveCall): Promise<void> {
     currentCallStore.update((c) =>
         c && c.callId === call.callId ? { ...c, state: 'connecting' } : c,
     );
+    const sdpOffer = pendingRemoteOffer;
+    pendingRemoteOffer = null;
     try {
         await invoke('answer_call', {
             callId: call.callId,
             peerGuid: call.peerGuid,
-            sdpAnswer: null, // populated once WebRTC is wired
+            sdpOffer,         // backend uses this to drive setRemoteDescription
+            sdpAnswer: null,  // backend generates the answer when webrtc is on
         });
-        // Move straight to active for now — without media, "active" simply
-        // means "both ends agreed to the call." Real activation will wait
-        // for ICE completion.
-        currentCallStore.update((c) =>
-            c && c.callId === call.callId
-                ? { ...c, state: 'active', activeSince: Date.now() }
-                : c,
-        );
+        // In WebRTC mode the `vault:call-state` listener will promote us to
+        // `active` once ICE establishes. In signaling-only mode, that event
+        // never fires — flip to `active` after a brief delay so the UX still
+        // works for testing.
+        if (!sdpOffer) {
+            currentCallStore.update((c) =>
+                c && c.callId === call.callId
+                    ? { ...c, state: 'active', activeSince: Date.now() }
+                    : c,
+            );
+        }
     } catch (e) {
         currentCallStore.update((c) =>
             c && c.callId === call.callId

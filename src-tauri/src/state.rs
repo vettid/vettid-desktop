@@ -7,6 +7,9 @@ use crate::nats::client::NatsClient;
 use crate::session::delegation::DelegationManager;
 use crate::session::manager::SessionManager;
 
+#[cfg(feature = "webrtc")]
+use crate::webrtc::CallSession;
+
 // ---------------------------------------------------------------------------
 // Central application state — managed by Tauri
 // ---------------------------------------------------------------------------
@@ -36,6 +39,12 @@ pub struct AppState {
     /// Pending operation response channels, keyed by request_id.
     /// The background listener resolves these when a matching response arrives.
     pub pending_responses: Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>>,
+
+    /// Currently active WebRTC call session, if any. Only one call at a time
+    /// — multi-call (call-waiting) would warrant a HashMap keyed by call_id,
+    /// but the Android app is single-call and we follow that model.
+    #[cfg(feature = "webrtc")]
+    pub active_call: Arc<Mutex<Option<Arc<CallSession>>>>,
 }
 
 impl AppState {
@@ -49,6 +58,8 @@ impl AppState {
             is_registered: Arc::new(RwLock::new(false)),
             is_unlocked: Arc::new(RwLock::new(false)),
             pending_responses: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "webrtc")]
+            active_call: Arc::new(Mutex::new(None)),
         }
     }
 }

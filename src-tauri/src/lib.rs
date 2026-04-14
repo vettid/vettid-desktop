@@ -79,6 +79,8 @@ pub fn run() {
             calls::decline_call,
             calls::end_call,
             calls::send_ice_candidate,
+            calls::apply_remote_answer,
+            calls::apply_remote_ice,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
