@@ -88,8 +88,14 @@ Run `cargo test`, `npm run check`, and `cargo tauri build` on each runner. Bundl
 
 ## Implementation Phases
 
-### Phase 1: Core Communication & Real-time Updates
+### Phase 1: Core Communication & Real-time Updates ✅ (1.3 deferred)
 **Goal**: Desktop receives real-time events like the Android app.
+
+**Status**: 1.1, 1.2, 1.4 shipped. Listener multiplexes the device-response
+channel and `OwnerSpace.{guid}.forApp.>` via `tokio::select`, routing 12
+event categories by subject. Auto-reconnect with unlimited retries; state
+events surface as `vault:nats-state`. JetStream consumer (1.3) deferred —
+basic pub/sub with timeouts works for the delegated operations we have.
 
 **Why first**: Everything else depends on reliable real-time communication.
 
@@ -128,8 +134,14 @@ Run `cargo test`, `npm run check`, and `cargo tauri build` on each runner. Bundl
 
 ---
 
-### Phase 2: Feed & Connections UI
+### Phase 2: Feed & Connections UI ✅ (2.4 partial)
 **Goal**: Working feed and connection management matching Android's connection-centric design.
+
+**Status**: Connection-centric `FeedView` ships peer cards sorted by last
+activity at top, standalone events below. New `ConnectionDetail` view shows
+profile, fields, manage section. Real-time updates via `vault:connection-event`
+re-list. Revoke wired through `revoke_connection` Tauri command (phone-required).
+2.4 still needs the create-new-connection shortlink flow.
 
 #### 2.1 Connection List
 - Wire `connection.list` vault operation to ConnectionsList view
@@ -169,8 +181,14 @@ Run `cargo test`, `npm run check`, and `cargo tauri build` on each runner. Bundl
 
 ---
 
-### Phase 3: Messaging
+### Phase 3: Messaging ✅ (3.5 deferred)
 **Goal**: Full conversation experience.
+
+**Status**: New `Conversation.svelte` with Android color scheme (gold-on-black
+sent, black-on-gold received), auto-scroll, Enter to send. URL linkifier opens
+via `tauri-plugin-shell`. Status-based receipt badges (✓/✓✓) updated client-side
+when `mark_message_read` succeeds. Rich BTC payment-request rendering deferred.
+OS notification on incoming message gated on window focus.
 
 #### 3.1 Conversation View
 - Message list with bubble UI
@@ -216,8 +234,13 @@ Run `cargo test`, `npm run check`, and `cargo tauri build` on each runner. Bundl
 
 ---
 
-### Phase 4: Profile & Personal Data
+### Phase 4: Profile & Personal Data ✅
 **Goal**: View and manage identity.
+
+**Status**: New `ProfileView` shows identity card, contact fields, public
+identifiers, dynamic per-section personal-data cards. Editing wires through
+`update_profile` (phone-required) with a phone-approval banner while pending.
+Refreshes on `vault:profile-update` push events.
 
 #### 4.1 Profile View
 - Display published profile: name, email, phone, wallet addresses, public keys
@@ -244,8 +267,14 @@ Run `cargo test`, `npm run check`, and `cargo tauri build` on each runner. Bundl
 
 ---
 
-### Phase 5: Wallet
+### Phase 5: Wallet ✅ (no QR yet)
 **Goal**: Bitcoin wallet management from desktop.
+
+**Status**: `WalletView` rewritten with mode switcher (Activity / Send /
+Receive / Create). Send pulls fee estimates and prompts for phone approval;
+Create asks the enclave to generate keys (phone-required); Receive shows the
+current address with copy-to-clipboard. QR code rendering for receive
+deferred — copy-button is sufficient for v0.
 
 #### 5.1 Wallet List
 - Display wallets with balances (independent operation)
@@ -276,8 +305,20 @@ Run `cargo test`, `npm run check`, and `cargo tauri build` on each runner. Bundl
 
 ---
 
-### Phase 6: Voice/Video Calling
+### Phase 6: Voice/Video Calling 🟡 (signaling only)
 **Goal**: WebRTC calls from desktop.
+
+**Status**: 6.2 (signaling) and 6.3 (UI scaffolding) shipped. Five Tauri
+commands publish to `OwnerSpace.{target}.forVault.call.*` matching Android's
+wire format. Frontend `calls.ts` store dispatches incoming/answered/ended
+events from `vault:call-event`. `CallOverlay.svelte` is a global modal
+showing ringing / dialing / connecting / active states with Accept / Decline /
+End-call. The Conversation header has voice + video buttons.
+
+**Still needed for real calls**: 6.1 (WebRTC stack — `webrtc-rs` is the
+likely pick), 6.4 (E2EE frame encryption), 6.5 (screen sharing), 6.6
+(camera/mic permission flows). The overlay shows a "media not yet
+implemented" notice so users aren't surprised.
 
 This is the largest phase and may require a Rust WebRTC library or Tauri plugin.
 
@@ -324,8 +365,14 @@ This is the largest phase and may require a Rust WebRTC library or Tauri plugin.
 
 ---
 
-### Phase 7: Notifications & Background
+### Phase 7: Notifications & Background ✅ (Dock badge deferred)
 **Goal**: Reliable notifications even when app window isn't focused.
+
+**Status**: System tray with Show / Hide / Quit menu, left-click toggles
+window, close button hides instead of quitting so background NATS push
+events keep flowing. `tauri-plugin-notification` fires OS notifications on
+incoming messages only when the window is unfocused. Dock badge unread
+count and notification deep-linking deferred.
 
 #### 7.1 System Tray / Menu Bar
 - Run in system tray (Linux) / menu bar (macOS) when window is closed
@@ -363,8 +410,13 @@ This is the largest phase and may require a Rust WebRTC library or Tauri plugin.
 
 ---
 
-### Phase 8: Settings & Security
+### Phase 8: Settings & Security ✅ (passphrase change deferred)
 **Goal**: Full settings management.
+
+**Status**: Settings has Appearance (light/dark/auto theme with localStorage
+persistence), Security (lock now button), Network (live NATS state + last
+error). Change-passphrase flow deferred — needs re-encrypt + new
+credential file write that stays atomic.
 
 #### 8.1 Theme
 - Light/dark/auto theme switching
@@ -391,8 +443,14 @@ This is the largest phase and may require a Rust WebRTC library or Tauri plugin.
 
 ---
 
-### Phase 9: macOS Build, Packaging & Distribution
+### Phase 9: macOS Build, Packaging & Distribution ✅ (signing/notarization need cert)
 **Goal**: Ship a signed, notarized, Apple Silicon `.dmg` that installs cleanly on Macs running macOS 12+ (`aarch64` only — see Target Platforms above for the Intel decision).
+
+**Status**: 9.1–9.5 done. `aarch64-apple-darwin` `.app` builds clean with
+1024×1024 master `.icns`, Info.plist privacy strings, entitlements file,
+and Tauri v2 capabilities. 9.6 (code signing) and 9.7 (notarization) are
+config-ready — just need an Apple Developer cert plugged into
+`tauri.conf.json bundle.macOS.signingIdentity` and a notary API key for CI.
 
 This phase runs *in parallel* with the feature phases, not at the end. Get a basic dev build running on macOS as soon as Phase 1 is in flight; come back to signing/notarization once the app is feature-complete enough to share with testers.
 

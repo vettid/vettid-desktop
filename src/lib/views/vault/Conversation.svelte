@@ -5,6 +5,7 @@
     import type { Connection, Message, VaultOpResponse } from '../../types';
     import { clearSelectedConnection, selectedConnectionStore } from '../../stores/navigation';
     import { markConversationRead } from '../../stores/vault';
+    import { placeCall, type CallType } from '../../stores/calls';
 
     interface Props {
         connection: Connection;
@@ -156,6 +157,17 @@
             && msg.sender_id !== connection.peer_guid;
     }
 
+    async function startCall(type: CallType) {
+        try {
+            const peerName = `${connection.peer_profile?.first_name ?? ''} ${connection.peer_profile?.last_name ?? ''}`.trim()
+                || connection.label
+                || 'Peer';
+            await placeCall(connection.peer_guid, peerName, type);
+        } catch (e) {
+            error = `Call failed: ${e}`;
+        }
+    }
+
     // Reload when the connection prop changes.
     $effect(() => {
         // Take a stable reference so the effect re-fires on connection change.
@@ -187,6 +199,8 @@
             <span class="name">{peerName(connection)}</span>
             <span class="profile-hint">view profile</span>
         </button>
+        <button class="call-btn" onclick={() => startCall('audio')} aria-label="Voice call" title="Voice call">📞</button>
+        <button class="call-btn" onclick={() => startCall('video')} aria-label="Video call" title="Video call">🎥</button>
         <span class="status-dot {connection.status}" aria-label={connection.status}></span>
     </header>
 
@@ -265,6 +279,17 @@
     }
     .name { font-weight: 500; }
     .profile-hint { font-size: 0.7em; color: var(--text-secondary); }
+
+    .call-btn {
+        background: none;
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 4px 10px;
+        cursor: pointer;
+        color: inherit;
+        font-size: 1.05em;
+    }
+    .call-btn:hover { background: rgba(255,193,37,0.1); border-color: var(--accent, #ffc125); }
 
     .status-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--text-secondary); }
     .status-dot.active { background: #4caf50; }

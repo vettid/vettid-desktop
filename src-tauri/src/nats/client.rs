@@ -234,6 +234,30 @@ impl NatsClient {
             .map_err(|e| NatsError::SubscribeFailed(e.to_string()))
     }
 
+    /// Publish a payload to another user's vault.
+    ///
+    /// Topic: `OwnerSpace.{target_guid}.forVault.{operation}` — used for
+    /// peer-to-peer signaling routed through the target's vault (call setup,
+    /// connection invitations, etc.). Mirrors Android's
+    /// `OwnerSpaceClient.sendToTargetVault`.
+    ///
+    /// Payload is sent as-is — callers are responsible for any framing
+    /// (the call signaling layer wraps in a VaultMessage envelope).
+    pub async fn publish_to_target_vault(
+        &self,
+        target_guid: &str,
+        operation: &str,
+        payload: &[u8],
+    ) -> Result<(), NatsError> {
+        let client = self.client.as_ref().ok_or(NatsError::NotConnected)?;
+        let subject = format!("OwnerSpace.{}.forVault.{}", target_guid, operation);
+        client
+            .publish(subject, payload.to_vec().into())
+            .await
+            .map_err(|e| NatsError::PublishFailed(e.to_string()))?;
+        Ok(())
+    }
+
     /// Publish an already-encoded envelope to the owner's device topic.
     pub async fn publish_message(&self, envelope_bytes: &[u8]) -> Result<(), NatsError> {
         let client = self.client.as_ref().ok_or(NatsError::NotConnected)?;

@@ -3,11 +3,13 @@
   import { sessionStore, type SessionState } from './lib/stores/session';
   import { natsStore, initNatsListener } from './lib/stores/nats';
   import { themeStore } from './lib/stores/theme';
+  import { initCallListener } from './lib/stores/calls';
   import Pairing from './lib/views/Pairing.svelte';
   import Session from './lib/views/Session.svelte';
   import Vault from './lib/views/Vault.svelte';
   import Settings from './lib/views/Settings.svelte';
   import StatusBar from './lib/components/StatusBar.svelte';
+  import CallOverlay from './lib/components/CallOverlay.svelte';
 
   let currentView = $state<'pairing' | 'session' | 'vault' | 'settings'>('pairing');
   let sessionState: SessionState = $derived($sessionStore);
@@ -16,6 +18,7 @@
   // when its subscribe handler fires on import.
   onMount(() => {
     initNatsListener();
+    initCallListener();
     // Touch the theme store so the subscriber fires once with the persisted
     // value (handles the cold-start case where the document hadn't been
     // populated yet).
@@ -87,6 +90,9 @@
       <Settings />
     {/if}
   </main>
+
+  <!-- Global call overlay — present in any view -->
+  <CallOverlay />
 </div>
 
 <style>

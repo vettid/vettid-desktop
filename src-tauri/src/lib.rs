@@ -8,7 +8,7 @@ pub mod commands;
 pub mod state;
 pub mod tray;
 
-use commands::{auth, vault, session as session_cmd};
+use commands::{auth, calls, vault, session as session_cmd};
 use state::AppState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -71,6 +71,12 @@ pub fn run() {
             // Session commands
             session_cmd::get_session_status,
             session_cmd::get_session_timer,
+            // Call signaling
+            calls::initiate_call,
+            calls::answer_call,
+            calls::decline_call,
+            calls::end_call,
+            calls::send_ice_candidate,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
