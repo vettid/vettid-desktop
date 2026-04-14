@@ -52,17 +52,34 @@
         return JSON.stringify(value);
     }
 
+    let revoking = $state(false);
+    let revokeMessage = $state('');
+
     /**
-     * Revoke this connection. This is a phone-required operation — the
-     * desktop only initiates the request; final approval happens on the user's
-     * phone. The pending state is tracked by the delegation manager.
+     * Revoke this connection. Phone-required — the desktop only initiates;
+     * the user approves on their phone. The push event from the vault will
+     * refresh the list once the revocation lands.
      */
     async function revoke() {
         const ok = confirm(`Revoke connection with ${peerName(detail)}? This requires phone approval.`);
         if (!ok) return;
-        // TODO: wire to a `revoke_connection` Tauri command once it lands in
-        // commands/vault.rs (phone-required operation).
-        alert('Revoke flow not yet implemented in backend');
+        revoking = true;
+        revokeMessage = '';
+        try {
+            const resp: VaultOpResponse = await invoke('revoke_connection', {
+                connectionId: detail.connection_id,
+            });
+            if (resp.success) {
+                revokeMessage = 'Connection revoked.';
+            } else if (resp.pending_approval) {
+                revokeMessage = 'Waiting for phone approval…';
+            } else {
+                revokeMessage = resp.error ?? 'Revoke failed';
+            }
+        } catch (e) {
+            revokeMessage = String(e);
+        }
+        revoking = false;
     }
 </script>
 
@@ -128,10 +145,13 @@
             <!-- Manage -->
             <section class="card">
                 <h4>Manage</h4>
-                <button class="danger" onclick={revoke} disabled={detail.status !== 'active'}>
-                    Revoke connection
+                <button class="danger" onclick={revoke} disabled={detail.status !== 'active' || revoking}>
+                    {revoking ? 'Submitting…' : 'Revoke connection'}
                 </button>
                 <p class="hint">Requires approval from your phone.</p>
+                {#if revokeMessage}
+                    <p class="revoke-msg">{revokeMessage}</p>
+                {/if}
             </section>
         </div>
     {/if}
@@ -201,4 +221,5 @@
     }
     .danger:disabled { opacity: 0.4; cursor: not-allowed; }
     .hint { font-size: 0.8em; color: var(--text-secondary); margin: 8px 0 0; }
+    .revoke-msg { margin: 8px 0 0; font-size: 0.85em; color: var(--text-primary); }
 </style>

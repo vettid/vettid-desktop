@@ -1,8 +1,12 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { sessionStore } from '../stores/session';
+  import { themeStore, setTheme, type Theme } from '../stores/theme';
+  import { natsStore } from '../stores/nats';
 
   let session = $derived($sessionStore);
+  let theme = $derived($themeStore);
+  let nats = $derived($natsStore);
 
   let deviceInfo = $state<{
     hostname: string;
@@ -12,6 +16,8 @@
   } | null>(null);
 
   let loading = $state(true);
+  let locking = $state(false);
+  let lockMessage = $state('');
 
   async function loadDeviceInfo() {
     try {
@@ -32,6 +38,21 @@
     } finally {
       loading = false;
     }
+  }
+
+  async function lockApp() {
+    if (locking) return;
+    const ok = confirm('Lock the app? You will need to enter your passphrase to unlock.');
+    if (!ok) return;
+    locking = true;
+    lockMessage = '';
+    try {
+      await invoke('lock');
+      lockMessage = 'Locked.';
+    } catch (e) {
+      lockMessage = `Lock failed: ${e}`;
+    }
+    locking = false;
   }
 
   $effect(() => {
@@ -111,6 +132,57 @@
       </div>
     </div>
   {/if}
+
+  <div class="section">
+    <h2>Appearance</h2>
+    <div class="card">
+      <div class="row">
+        <span class="label">Theme</span>
+        <div class="theme-options">
+          {#each ['light', 'dark', 'auto'] as opt}
+            <button
+              class="theme-btn"
+              class:active={theme === opt}
+              onclick={() => setTheme(opt as Theme)}
+            >{opt}</button>
+          {/each}
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Security</h2>
+    <div class="card">
+      <div class="row">
+        <span class="label">Lock vault</span>
+        <button class="lock-btn" onclick={lockApp} disabled={locking || session.state === 'inactive'}>
+          {locking ? 'Locking…' : 'Lock now'}
+        </button>
+      </div>
+      {#if lockMessage}
+        <div class="lock-msg">{lockMessage}</div>
+      {/if}
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Network</h2>
+    <div class="card">
+      <div class="row">
+        <span class="label">NATS state</span>
+        <span class="value" class:reachable={nats.connected} class:unreachable={!nats.connected}>
+          {nats.rawState ?? 'unknown'}
+        </span>
+      </div>
+      {#if nats.error}
+        <div class="row">
+          <span class="label">Last error</span>
+          <span class="value">{nats.error}</span>
+        </div>
+      {/if}
+    </div>
+  </div>
 
   <div class="section">
     <h2>About</h2>
@@ -198,4 +270,30 @@
     color: var(--text-muted);
     padding: 20px;
   }
+
+  .theme-options { display: flex; gap: 6px; }
+  .theme-btn {
+    background: transparent;
+    color: inherit;
+    border: 1px solid var(--border, rgba(255,255,255,0.15));
+    border-radius: 4px;
+    padding: 4px 12px;
+    cursor: pointer;
+    font: inherit;
+    text-transform: capitalize;
+    font-size: 0.85rem;
+  }
+  .theme-btn.active { background: var(--accent, #ffc125); color: #000; border-color: var(--accent, #ffc125); }
+
+  .lock-btn {
+    background: rgba(198, 40, 40, 0.15);
+    color: #ef5350;
+    border: 1px solid rgba(198, 40, 40, 0.4);
+    padding: 6px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font: inherit;
+  }
+  .lock-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .lock-msg { padding: 8px 0 0; font-size: 0.85rem; color: var(--text-muted); }
 </style>

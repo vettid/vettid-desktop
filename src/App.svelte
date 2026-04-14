@@ -1,6 +1,8 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { sessionStore, type SessionState } from './lib/stores/session';
-  import { natsStore } from './lib/stores/nats';
+  import { natsStore, initNatsListener } from './lib/stores/nats';
+  import { themeStore } from './lib/stores/theme';
   import Pairing from './lib/views/Pairing.svelte';
   import Session from './lib/views/Session.svelte';
   import Vault from './lib/views/Vault.svelte';
@@ -9,6 +11,17 @@
 
   let currentView = $state<'pairing' | 'session' | 'vault' | 'settings'>('pairing');
   let sessionState: SessionState = $derived($sessionStore);
+
+  // Subscribe to NATS state events on mount; the theme store self-applies
+  // when its subscribe handler fires on import.
+  onMount(() => {
+    initNatsListener();
+    // Touch the theme store so the subscriber fires once with the persisted
+    // value (handles the cold-start case where the document hadn't been
+    // populated yet).
+    const unsub = themeStore.subscribe(() => {});
+    unsub();
+  });
 
   // Auto-navigate based on session state
   $effect(() => {

@@ -47,6 +47,32 @@
         loading = false;
         scrollToBottom();
         markConversationRead(connection.connection_id);
+        sendReadReceiptsForUnread();
+    }
+
+    /**
+     * Fire `message.read-receipt` for every received message we haven't yet
+     * marked read. The vault de-dupes by (connection_id, message_id), so it's
+     * safe to be permissive — better than missing one and leaving the peer
+     * staring at a single check forever.
+     */
+    async function sendReadReceiptsForUnread() {
+        const unread = messages.filter((m) =>
+            !isSent(m) && m.status !== 'read',
+        );
+        for (const msg of unread) {
+            try {
+                await invoke('mark_message_read', {
+                    connectionId: connection.connection_id,
+                    messageId: msg.id,
+                });
+                msg.status = 'read';
+            } catch (e) {
+                console.warn('Failed to send read receipt:', e);
+            }
+        }
+        // Trigger reactivity since we mutated objects in place.
+        messages = [...messages];
     }
 
     async function sendMessage() {

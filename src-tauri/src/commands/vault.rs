@@ -198,6 +198,78 @@ pub async fn get_profile(state: State<'_, AppState>) -> Result<VaultOpResponse, 
     Ok(VaultOpResponse::from_op(result))
 }
 
+/// Update fields in the user's published profile (phone-required).
+///
+/// `fields` is a JSON object whose keys are field IDs and whose values are
+/// `{ display_name, value, visibility }` triples — same shape Android sends to
+/// `profile.update`. The vault validates the schema and the phone confirms.
+#[tauri::command]
+pub async fn update_profile(
+    state: State<'_, AppState>,
+    fields: serde_json::Value,
+) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(
+        &state,
+        "profile.update",
+        serde_json::json!({ "fields": fields }),
+    )
+    .await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+/// Update a personal-data section (phone-required).
+///
+/// `section` identifies the category (e.g., `"medical"`, `"financial"`) and
+/// `entries` is an array of `{ field_id, value, visibility }` items.
+#[tauri::command]
+pub async fn update_personal_data(
+    state: State<'_, AppState>,
+    section: String,
+    entries: serde_json::Value,
+) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(
+        &state,
+        "personal-data.update",
+        serde_json::json!({ "section": section, "entries": entries }),
+    )
+    .await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+/// Revoke a connection (phone-required — irreversible).
+#[tauri::command]
+pub async fn revoke_connection(
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(
+        &state,
+        "connection.revoke",
+        serde_json::json!({ "connection_id": connection_id }),
+    )
+    .await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+/// Send a read receipt for a single message (independent — no phone needed).
+#[tauri::command]
+pub async fn mark_message_read(
+    state: State<'_, AppState>,
+    connection_id: String,
+    message_id: String,
+) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(
+        &state,
+        "message.read-receipt",
+        serde_json::json!({
+            "connection_id": connection_id,
+            "message_id": message_id,
+        }),
+    )
+    .await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
 /// Send a message.
 #[tauri::command]
 pub async fn send_message(

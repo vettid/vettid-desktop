@@ -64,6 +64,10 @@ pub fn run() {
             vault::delete_wallet,
             vault::set_wallet_visibility,
             vault::request_payment,
+            vault::update_profile,
+            vault::update_personal_data,
+            vault::revoke_connection,
+            vault::mark_message_read,
             // Session commands
             session_cmd::get_session_status,
             session_cmd::get_session_timer,

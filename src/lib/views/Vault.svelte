@@ -14,14 +14,24 @@
     import DevicesView from './vault/DevicesView.svelte';
     import ConnectionDetail from './vault/ConnectionDetail.svelte';
     import Conversation from './vault/Conversation.svelte';
+    import ProfileView from './vault/ProfileView.svelte';
 
-    type TabId = 'connections' | 'messages' | 'secrets' | 'feed' | 'voting' | 'wallets' | 'devices';
+    type TabId =
+        | 'feed'
+        | 'connections'
+        | 'messages'
+        | 'profile'
+        | 'secrets'
+        | 'voting'
+        | 'wallets'
+        | 'devices';
 
     const tabs: { id: TabId; label: string }[] = [
+        { id: 'feed', label: 'Feed' },
         { id: 'connections', label: 'Connections' },
         { id: 'messages', label: 'Messages' },
+        { id: 'profile', label: 'Profile' },
         { id: 'secrets', label: 'Secrets' },
-        { id: 'feed', label: 'Feed' },
         { id: 'voting', label: 'Voting' },
         { id: 'wallets', label: 'Wallets' },
         { id: 'devices', label: 'Devices' },
@@ -100,6 +110,8 @@
                 <SecretsView />
             {:else if activeTab === 'feed'}
                 <FeedView />
+            {:else if activeTab === 'profile'}
+                <ProfileView />
             {:else if activeTab === 'voting'}
                 <VotingView />
             {:else if activeTab === 'wallets'}
