@@ -37,58 +37,55 @@ use crate::registration::flow::RegistrationError;
 /// HKDF info string — MUST match vault-manager/device_pairing.go `DomainDeviceSession`.
 const DOMAIN_DEVICE_SESSION: &str = "vettid-device-session-v1";
 
-/// Default NATS endpoint if `VETTID_NATS_URL` is not set.
-const DEFAULT_NATS_URL: &str = "tls://nats.vettid.dev:443";
+/// Where to reach the bootstrap endpoint that mints per-pair NATS creds.
+/// Override at runtime via the `VETTID_BOOTSTRAP_URL` env var for testing.
+const DEFAULT_BOOTSTRAP_URL: &str = "https://api.vettid.dev/pair/device/bootstrap";
 
 /// How long we wait for the user to scan the QR on their phone.
 const ACTIVATION_TIMEOUT_SECS: u64 = 300;
 
-// ---------------------------------------------------------------------------
-// Environment-sourced config
-// ---------------------------------------------------------------------------
-
-/// Guest NATS creds baked into the binary at compile time. The build pipeline
-/// (scripts/fetch-guest-creds.sh) fetches values from SSM and exports them as
-/// env vars before `cargo build`; `option_env!` reads them into the binary.
-///
-/// End users never set these — the shipped binary contains them. For local
-/// development, run `scripts/fetch-guest-creds.sh` once before building.
-///
-/// These creds are intentionally public — the guest account can only read the
-/// INVITATIONS JetStream, and invite codes are 8-char random values valid for
-/// 2 minutes, so a leaked binary doesn't expose any existing data.
-const BAKED_GUEST_JWT: Option<&str> = option_env!("VETTID_GUEST_JWT");
-const BAKED_GUEST_SEED: Option<&str> = option_env!("VETTID_GUEST_SEED");
-const BAKED_NATS_URL: Option<&str> = option_env!("VETTID_NATS_URL");
-
-#[derive(Debug)]
-struct GuestConfig {
-    nats_url: String,
+/// Response from POST /pair/device/bootstrap.
+#[derive(Debug, Deserialize)]
+struct BootstrapResponse {
+    nats_endpoint: String,
     jwt: String,
     seed: String,
+    #[serde(default)]
+    _expires_in: i64,
 }
 
-impl GuestConfig {
-    fn baked() -> Result<Self, RegistrationError> {
-        let jwt = BAKED_GUEST_JWT
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| RegistrationError::Internal(
-                "no guest NATS creds baked into this build — rebuild with scripts/fetch-guest-creds.sh".to_string(),
-            ))?;
-        let seed = BAKED_GUEST_SEED
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| RegistrationError::Internal(
-                "no guest NATS seed baked into this build".to_string(),
-            ))?;
-        let nats_url = BAKED_NATS_URL
-            .filter(|s| !s.is_empty())
-            .unwrap_or(DEFAULT_NATS_URL);
-        Ok(Self {
-            nats_url: nats_url.to_string(),
-            jwt: jwt.to_string(),
-            seed: seed.to_string(),
-        })
+/// Call the bootstrap endpoint to obtain short-lived NATS creds scoped to
+/// this specific invite code. No long-lived credential is stored in the
+/// desktop binary — every pairing mints a fresh keypair server-side.
+async fn fetch_bootstrap_creds(code: &str) -> Result<BootstrapResponse, RegistrationError> {
+    let url = std::env::var("VETTID_BOOTSTRAP_URL")
+        .unwrap_or_else(|_| DEFAULT_BOOTSTRAP_URL.to_string());
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| RegistrationError::InviteResolutionFailed(format!("http client: {}", e)))?;
+
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({ "code": code }))
+        .send()
+        .await
+        .map_err(|e| RegistrationError::InviteResolutionFailed(format!("bootstrap request: {}", e)))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(RegistrationError::InviteResolutionFailed(format!(
+            "bootstrap endpoint returned {}: {}",
+            status, body
+        )));
     }
+
+    response
+        .json::<BootstrapResponse>()
+        .await
+        .map_err(|e| RegistrationError::InviteResolutionFailed(format!("parse bootstrap response: {}", e)))
 }
 
 // ---------------------------------------------------------------------------
@@ -142,14 +139,21 @@ struct SessionActivatedPayload {
 // Public entry points
 // ---------------------------------------------------------------------------
 
-/// Stage 1: resolve an invite code via the guest NATS account.
-/// Returns the scoped-credential NatsClient (connected) and the parsed payload.
+/// Stage 1: resolve an invite code.
+///
+/// Mints short-lived NATS creds via the bootstrap endpoint, connects as that
+/// user, reads `invite.<code>` from JetStream, then tears down the guest
+/// connection. Returns the scoped peer credentials the vault attached to the
+/// invitation, plus the ephemeral crypto state for stage 2.
 pub async fn resolve_invite(
     invite_code: &str,
 ) -> Result<(InviteSession, PairingRuntime), RegistrationError> {
-    let guest = GuestConfig::baked()?;
+    let guest = fetch_bootstrap_creds(invite_code).await?;
 
-    log::info!("Resolving invite code via guest account on {}", guest.nats_url);
+    log::info!(
+        "Resolving invite code on {} with fresh per-pair guest creds",
+        guest.nats_endpoint
+    );
 
     // Ephemeral guest connection purely for JetStream read.
     let guest_client = async_nats::ConnectOptions::with_credentials(&format!(
@@ -157,7 +161,7 @@ pub async fn resolve_invite(
         guest.jwt, guest.seed,
     ))
     .map_err(|e| RegistrationError::InviteResolutionFailed(format!("guest creds: {}", e)))?
-    .connect(&guest.nats_url)
+    .connect(&guest.nats_endpoint)
     .await
     .map_err(|e| RegistrationError::NatsConnectionFailed(format!("guest connect: {}", e)))?;
 
@@ -218,7 +222,7 @@ pub async fn resolve_invite(
     let session = InviteSession {
         connection_id: payload.connection_id,
         owner_space: payload.owner_space,
-        nats_url: guest.nats_url,
+        nats_url: guest.nats_endpoint,
         scoped_jwt: payload.jwt,
         scoped_seed: payload.seed,
         approval_token,

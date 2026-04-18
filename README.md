@@ -23,22 +23,24 @@ VettID Desktop extends your VettID vault to desktop environments. Sessions are t
 - Node.js 18+
 - Tauri v2 system dependencies ([see Tauri prerequisites](https://v2.tauri.app/start/prerequisites/))
 
-### Guest NATS creds (built-in, no user setup)
+### Pairing bootstrap (no creds shipped in the binary)
 
-<a id="guest-creds"></a>
-Pairing reads the vault-published invitation from the `INVITATIONS` JetStream using a pre-provisioned guest NATS account (see `vettid-dev/docs/DESKTOP-CONNECTION-FLOW.md` §"Invite delivery"). The guest creds are **baked into the binary at compile time** via `option_env!` — end users never configure anything, they just install and run.
+Pairing reads the vault-published invitation from the `INVITATIONS` JetStream using NATS credentials that are **minted server-side per pairing attempt** — no long-lived credential is distributed with the desktop binary.
 
-The build pipeline / developer runs this once before building:
+Flow:
 
-```bash
-./scripts/fetch-guest-creds.sh     # reads from SSM, writes .cargo-env
-set -a && source .cargo-env && set +a
-cargo tauri build                  # creds get baked in
-```
+1. User types the 8-char invite code into the desktop.
+2. Desktop POSTs `{ "code": "..." }` to `https://api.vettid.dev/pair/device/bootstrap` (override via `VETTID_BOOTSTRAP_URL` for dev/staging).
+3. Lambda returns a freshly-generated NATS user JWT + seed, scoped to INVITATIONS stream JetStream ops, with a 60-second TTL.
+4. Desktop connects to NATS with those creds, pulls `invite.<code>`, disconnects. The creds expire by themselves seconds later.
 
-CI pipelines do the same: fetch from SSM → source into env → build.
+Security properties:
 
-The guest account is provisioned by `vettid-dev/cdk/scripts/init-nats-operator.ts`. Its JWT is read-only on the `INVITATIONS` stream only — it cannot impersonate a user or read any other topic. Invite codes are single-use and valid for 2 minutes, so a baked-in (effectively public) guest JWT in shipped binaries does not expose any existing data. Rotation is handled by re-running the script and re-releasing.
+- Reverse-engineering the binary gives you nothing — there are no static creds in it.
+- A captured bootstrap response is useless in 60 s and only authorizes INVITATIONS stream reads (no user spaces).
+- Each pairing is auditable at the Lambda boundary (source IP + code prefix are logged; the full code is never logged).
+
+See `vettid-dev/docs/DESKTOP-CONNECTION-FLOW.md` §"Invite delivery" for the full protocol.
 
 ## Project Structure
 

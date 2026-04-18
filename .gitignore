@@ -22,5 +22,3 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Guest NATS creds fetched by scripts/fetch-guest-creds.sh
-.cargo-env
