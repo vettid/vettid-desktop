@@ -47,9 +47,20 @@ const ACTIVATION_TIMEOUT_SECS: u64 = 300;
 // Environment-sourced config
 // ---------------------------------------------------------------------------
 
-/// Guest NATS account creds + endpoint, loaded from env at runtime.
-/// Populated at install or first launch — see
-/// `vettid-desktop/README.md#guest-creds`.
+/// Guest NATS creds baked into the binary at compile time. The build pipeline
+/// (scripts/fetch-guest-creds.sh) fetches values from SSM and exports them as
+/// env vars before `cargo build`; `option_env!` reads them into the binary.
+///
+/// End users never set these — the shipped binary contains them. For local
+/// development, run `scripts/fetch-guest-creds.sh` once before building.
+///
+/// These creds are intentionally public — the guest account can only read the
+/// INVITATIONS JetStream, and invite codes are 8-char random values valid for
+/// 2 minutes, so a leaked binary doesn't expose any existing data.
+const BAKED_GUEST_JWT: Option<&str> = option_env!("VETTID_GUEST_JWT");
+const BAKED_GUEST_SEED: Option<&str> = option_env!("VETTID_GUEST_SEED");
+const BAKED_NATS_URL: Option<&str> = option_env!("VETTID_NATS_URL");
+
 #[derive(Debug)]
 struct GuestConfig {
     nats_url: String,
@@ -58,20 +69,25 @@ struct GuestConfig {
 }
 
 impl GuestConfig {
-    fn from_env() -> Result<Self, RegistrationError> {
-        let nats_url = std::env::var("VETTID_NATS_URL")
-            .unwrap_or_else(|_| DEFAULT_NATS_URL.to_string());
-        let jwt = std::env::var("VETTID_GUEST_JWT").map_err(|_| {
-            RegistrationError::Internal(
-                "VETTID_GUEST_JWT env var not set — desktop cannot resolve invites".to_string(),
-            )
-        })?;
-        let seed = std::env::var("VETTID_GUEST_SEED").map_err(|_| {
-            RegistrationError::Internal(
-                "VETTID_GUEST_SEED env var not set — desktop cannot resolve invites".to_string(),
-            )
-        })?;
-        Ok(Self { nats_url, jwt, seed })
+    fn baked() -> Result<Self, RegistrationError> {
+        let jwt = BAKED_GUEST_JWT
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| RegistrationError::Internal(
+                "no guest NATS creds baked into this build — rebuild with scripts/fetch-guest-creds.sh".to_string(),
+            ))?;
+        let seed = BAKED_GUEST_SEED
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| RegistrationError::Internal(
+                "no guest NATS seed baked into this build".to_string(),
+            ))?;
+        let nats_url = BAKED_NATS_URL
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_NATS_URL);
+        Ok(Self {
+            nats_url: nats_url.to_string(),
+            jwt: jwt.to_string(),
+            seed: seed.to_string(),
+        })
     }
 }
 
@@ -131,7 +147,7 @@ struct SessionActivatedPayload {
 pub async fn resolve_invite(
     invite_code: &str,
 ) -> Result<(InviteSession, PairingRuntime), RegistrationError> {
-    let guest = GuestConfig::from_env()?;
+    let guest = GuestConfig::baked()?;
 
     log::info!("Resolving invite code via guest account on {}", guest.nats_url);
 
