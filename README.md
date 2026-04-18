@@ -23,6 +23,19 @@ VettID Desktop extends your VettID vault to desktop environments. Sessions are t
 - Node.js 18+
 - Tauri v2 system dependencies ([see Tauri prerequisites](https://v2.tauri.app/start/prerequisites/))
 
+### Guest NATS creds
+
+<a id="guest-creds"></a>
+Pairing reads the vault-published invitation from the NATS `INVITATIONS` JetStream using a pre-provisioned guest account (see `vettid-dev/docs/DESKTOP-CONNECTION-FLOW.md` §"Invite delivery"). Before running or packaging the desktop, export:
+
+```bash
+export VETTID_NATS_URL="tls://nats.vettid.dev:443"
+export VETTID_GUEST_JWT="$(aws ssm get-parameter --name /vettid/nats/guest-user-jwt --with-decryption --query Parameter.Value --output text)"
+export VETTID_GUEST_SEED="$(aws ssm get-parameter --name /vettid/nats/guest-user-seed --with-decryption --query Parameter.Value --output text)"
+```
+
+The guest account is provisioned by `vettid-dev/cdk/scripts/init-nats-operator.ts`. Its JWT permits read-only access to the INVITATIONS stream only — it cannot impersonate a user or read any other topic. Invite codes are single-use and valid for 2 minutes, so a leaked guest JWT does not expose any existing data.
+
 ## Project Structure
 
 ```

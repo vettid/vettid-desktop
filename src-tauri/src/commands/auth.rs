@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::state::AppState;
 
@@ -12,7 +12,9 @@ pub struct AuthStatus {
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
-    pub shortlink_code: String,
+    /// 8-char code the user typed in from the phone app.
+    pub invite_code: String,
+    /// Passphrase for encrypting the on-disk credential store.
     pub passphrase: String,
 }
 
@@ -20,88 +22,142 @@ pub struct RegisterRequest {
 pub struct RegisterResponse {
     pub success: bool,
     pub error: Option<String>,
-    pub device_name: Option<String>,
+    pub connection_id: Option<String>,
     pub session_id: Option<String>,
+    pub expires_at: Option<i64>,
 }
 
-/// Register this desktop with a vault via invite code.
+/// Event emitted to the frontend with the QR payload the user should scan
+/// with their phone. Occurs after stage-1 completes, before the phone scan.
+#[derive(Debug, Clone, Serialize)]
+pub struct PairingQrEvent {
+    pub connection_id: String,
+    pub qr_payload: String,
+}
+
+/// Pair this desktop with a vault via an 8-char invite code typed by the user.
 ///
-/// Uses the same connection pattern as peer-to-peer connections:
-/// 1. Resolve invite code → get NATS credentials, connection info
-/// 2. Connect to NATS with invitation JWT+seed
-/// 3. Store credentials (like a peer accepting an invitation)
-/// 4. Wait for key exchange and activation
-/// 5. Save encrypted credentials with passphrase + platform key
+/// Two-stage flow (see vettid-dev/docs/DESKTOP-CONNECTION-FLOW.md):
+///   1. Resolve invite via the embedded guest NATS account → scoped creds +
+///      connection_id.
+///   2. Publish device.request-session, emit `pairing:qr-ready` so the UI can
+///      render the QR the user scans on their phone.
+///   3. Receive device.session.activated with the vault's pubkey; derive the
+///      session_key via HKDF; save encrypted credentials to disk.
 #[tauri::command]
 pub async fn register(
+    app: AppHandle,
     state: State<'_, AppState>,
     request: RegisterRequest,
 ) -> Result<RegisterResponse, String> {
     use crate::credential::store;
-    use crate::registration::flow::RegistrationFlow;
+    use crate::registration::pairing;
 
     let config_dir = store::default_config_dir();
-
-    // Ensure config directory exists
     std::fs::create_dir_all(&config_dir)
         .map_err(|e| format!("Failed to create config dir: {}", e))?;
 
-    let mut flow = RegistrationFlow::new(config_dir.clone());
-
-    match flow.run(&request.shortlink_code, &request.passphrase).await {
-        Ok(()) => {
-            // Mark as registered
-            *state.is_registered.write().await = true;
-
-            // Load and populate credentials into shared state
-            match crate::credential::store::load_with_tolerance(&config_dir, &request.passphrase) {
-                Ok((creds, _)) => {
-                    // Decode connection key from hex
-                    if let Ok(key_bytes) = hex::decode(&creds.connection_key) {
-                        if key_bytes.len() == 32 {
-                            let mut key = [0u8; 32];
-                            key.copy_from_slice(&key_bytes);
-                            *state.connection_key.write().await = Some(key);
-                        }
-                    }
-
-                    // Activate session if session_id is present
-                    if !creds.session_id.is_empty() {
-                        // Session will be activated when we receive session info from vault
-                    }
-
-                    let device_name = creds.owner_name.clone();
-                    *state.credentials.write().await = Some(creds);
-                    *state.is_unlocked.write().await = true;
-
-                    Ok(RegisterResponse {
-                        success: true,
-                        error: None,
-                        device_name: Some(
-                            hostname::get()
-                                .ok()
-                                .map(|h| h.to_string_lossy().to_string())
-                                .unwrap_or_else(|| device_name),
-                        ),
-                        session_id: None,
-                    })
-                }
-                Err(_) => Ok(RegisterResponse {
-                    success: true,
-                    error: None,
-                    device_name: hostname::get()
-                        .ok()
-                        .map(|h| h.to_string_lossy().to_string()),
-                    session_id: None,
-                }),
-            }
-        }
-        Err(e) => Ok(RegisterResponse {
+    let invite_code = request.invite_code.trim().to_string();
+    if invite_code.len() != 8 {
+        return Ok(RegisterResponse {
             success: false,
-            error: Some(e.to_string()),
-            device_name: None,
+            error: Some("Invite code must be 8 characters".to_string()),
+            connection_id: None,
             session_id: None,
-        }),
+            expires_at: None,
+        });
+    }
+
+    // Stage 1 — resolve invite via guest account
+    let (session, runtime) = match pairing::resolve_invite(&invite_code).await {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(RegisterResponse {
+                success: false,
+                error: Some(e.to_string()),
+                connection_id: None,
+                session_id: None,
+                expires_at: None,
+            });
+        }
+    };
+
+    // Emit the QR payload so the UI can render it while we await approval.
+    let _ = app.emit(
+        "pairing:qr-ready",
+        PairingQrEvent {
+            connection_id: session.connection_id.clone(),
+            qr_payload: session.qr_payload.clone(),
+        },
+    );
+
+    let fingerprint = collect_device_fingerprint();
+
+    // Stage 2 — wait for activation, derive session_key, save credentials.
+    let outcome = match pairing::complete_pairing(
+        session,
+        runtime,
+        fingerprint,
+        &config_dir,
+        &request.passphrase,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            return Ok(RegisterResponse {
+                success: false,
+                error: Some(e.to_string()),
+                connection_id: None,
+                session_id: None,
+                expires_at: None,
+            });
+        }
+    };
+
+    *state.is_registered.write().await = true;
+    if let Ok((creds, _)) = store::load_with_tolerance(&config_dir, &request.passphrase) {
+        if creds.connection_key.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&creds.connection_key);
+            *state.connection_key.write().await = Some(key);
+        }
+        *state.credentials.write().await = Some(creds);
+        *state.is_unlocked.write().await = true;
+    }
+
+    Ok(RegisterResponse {
+        success: true,
+        error: None,
+        connection_id: Some(outcome.connection_id),
+        session_id: Some(outcome.session_id),
+        expires_at: Some(outcome.expires_at),
+    })
+}
+
+fn collect_device_fingerprint() -> crate::registration::pairing::DeviceFingerprint {
+    use crate::fingerprint::binary::binary_fingerprint;
+    use crate::registration::pairing::DeviceFingerprint;
+
+    let hostname = hostname::get()
+        .ok()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    let binary_fp = binary_fingerprint().unwrap_or_default();
+    // Machine fingerprint derivation is done by the platform_key module, which
+    // returns a key rather than the raw fingerprint. For now we leave this
+    // empty; the binary fingerprint gives the user enough to verify identity.
+    let machine_fp = String::new();
+
+    DeviceFingerprint {
+        hostname,
+        platform,
+        os_name: std::env::consts::OS.to_string(),
+        os_version: String::new(),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        binary_fingerprint: binary_fp,
+        machine_fingerprint: machine_fp,
     }
 }
 

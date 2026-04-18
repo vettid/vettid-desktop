@@ -140,6 +140,7 @@ impl Default for Argon2Params {
 #[zeroize(drop)]
 pub struct ConnectionCredentials {
     pub connection_id: String,
+    /// Session key derived from X25519 + HKDF. Zeroized on expiry.
     #[serde(with = "serde_bytes")]
     pub connection_key: Vec<u8>,
     pub key_id: String,
@@ -149,11 +150,18 @@ pub struct ConnectionCredentials {
     pub device_public_key: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub vault_public_key: Vec<u8>,
+    /// JWT+seed block for the device's scoped NATS account.
     pub message_space_token: String,
     pub message_space_url: String,
     pub owner_guid: String,
     pub owner_name: String,
     pub session_id: String,
+    /// Unix seconds at which the current session expires. 0 = unknown/expired.
+    #[serde(default)]
+    pub session_expires_at: i64,
+    /// User-approved session duration in seconds, for re-request on extension.
+    #[serde(default)]
+    pub session_duration_seconds: i64,
 }
 
 /// The on-disk JSON format for encrypted credentials.
