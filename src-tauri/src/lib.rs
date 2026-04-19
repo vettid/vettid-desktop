@@ -38,6 +38,9 @@ pub fn run() {
             auth::register,
             auth::unlock,
             auth::lock,
+            auth::logout,
+            auth::extend_session,
+            auth::get_session_info,
             auth::get_status,
             // Vault commands — independent
             vault::list_connections,

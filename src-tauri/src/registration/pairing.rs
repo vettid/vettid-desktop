@@ -436,3 +436,125 @@ pub struct PairingOutcome {
     pub session_id: String,
     pub expires_at: i64,
 }
+
+// ---------------------------------------------------------------------------
+// Extension flow (same connection_id, fresh session key)
+// ---------------------------------------------------------------------------
+
+/// Extend a session that has expired (or is about to). Reuses the stored NATS
+/// creds + connection_id from the existing credential store, but generates a
+/// fresh ephemeral X25519 keypair and approval token — matching the vault's
+/// key-rotation semantics.
+///
+/// Returns an `InviteSession` + `PairingRuntime` the caller can pass to
+/// `complete_pairing` to finish stage 2. Used by the desktop "session expired"
+/// UI: the app prompts the user to scan a new QR, then we do the same
+/// request-session → await-activation dance as an initial pair.
+pub async fn start_extension(
+    config_dir: &PathBuf,
+    passphrase: &str,
+) -> Result<(InviteSession, PairingRuntime), RegistrationError> {
+    use crate::credential::store;
+
+    let (creds, _) = store::load_with_tolerance(config_dir, passphrase)
+        .map_err(|e| RegistrationError::Internal(format!("load creds: {}", e)))?;
+
+    // Parse JWT+seed out of the stored creds block so we can reuse them for
+    // NATS auth. Format matches what complete_pairing wrote.
+    let (scoped_jwt, scoped_seed) = parse_creds_block(&creds.message_space_token)
+        .ok_or_else(|| RegistrationError::Internal("stored NATS creds malformed".to_string()))?;
+
+    let (device_secret, device_public) = generate_x25519_keypair();
+    let approval_token_bytes = generate_random_bytes(32);
+    let approval_token = hex::encode(&approval_token_bytes);
+
+    let qr_payload = serde_json::json!({
+        "t": approval_token,
+        "c": creds.connection_id,
+    })
+    .to_string();
+
+    let session = InviteSession {
+        connection_id: creds.connection_id.clone(),
+        owner_space: creds.owner_guid.clone(),
+        nats_url: creds.message_space_url.clone(),
+        scoped_jwt,
+        scoped_seed,
+        approval_token: approval_token.clone(),
+        qr_payload,
+    };
+
+    let runtime = PairingRuntime {
+        device_secret,
+        device_public,
+        approval_token_hex: approval_token,
+        connection_id: creds.connection_id.clone(),
+    };
+
+    Ok((session, runtime))
+}
+
+/// Extract `jwt` and `seed` from a NATS `.creds`-format block.
+fn parse_creds_block(creds: &str) -> Option<(String, String)> {
+    let jwt = extract_block(creds, "-----BEGIN NATS USER JWT-----", "------END NATS USER JWT------")?;
+    let seed = extract_block(creds, "-----BEGIN USER NKEY SEED-----", "------END USER NKEY SEED------")?;
+    Some((jwt, seed))
+}
+
+fn extract_block(s: &str, start: &str, end: &str) -> Option<String> {
+    let i = s.find(start)? + start.len();
+    let rest = &s[i..];
+    let j = rest.find(end)?;
+    Some(rest[..j].trim().to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Revocation (logout)
+// ---------------------------------------------------------------------------
+
+/// Publish `device.revoke` to the vault, signalling that this desktop is
+/// logging out. Fire-and-forget — we don't block on a response because the
+/// credentials may already be invalid and the caller wants to wipe local
+/// state regardless.
+pub async fn publish_revoke(config_dir: &PathBuf, passphrase: &str) -> Result<(), RegistrationError> {
+    use crate::credential::store;
+
+    let (creds, _) = store::load_with_tolerance(config_dir, passphrase)
+        .map_err(|e| RegistrationError::Internal(format!("load creds: {}", e)))?;
+
+    let (scoped_jwt, scoped_seed) = parse_creds_block(&creds.message_space_token)
+        .ok_or_else(|| RegistrationError::Internal("stored NATS creds malformed".to_string()))?;
+
+    let mut client = NatsClient::new();
+    client
+        .connect_with_credentials(
+            &creds.message_space_url,
+            &scoped_jwt,
+            &scoped_seed,
+            &creds.owner_guid,
+        )
+        .await?;
+
+    let subject = format!(
+        "MessageSpace.{}.forOwner.device.{}.revoke",
+        creds.owner_guid, creds.connection_id,
+    );
+    let request_id = hex::encode(generate_random_bytes(16));
+    let payload = serde_json::json!({
+        "id": request_id,
+        "type": "device.revoke",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "payload": {
+            "connection_id": creds.connection_id,
+            "reason": "logout",
+        },
+    });
+
+    client
+        .publish_to(&subject, payload.to_string().as_bytes())
+        .await?;
+
+    // Give NATS a moment to flush; don't wait for an ack.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    Ok(())
+}

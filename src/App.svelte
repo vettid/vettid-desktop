@@ -1,35 +1,45 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { sessionStore, type SessionState } from './lib/stores/session';
+  import { onMount, onDestroy } from 'svelte';
+  import { sessionStore, type SessionState, refreshSessionFromBackend } from './lib/stores/session';
   import { natsStore, initNatsListener } from './lib/stores/nats';
   import { themeStore } from './lib/stores/theme';
   import { initCallListener } from './lib/stores/calls';
   import Pairing from './lib/views/Pairing.svelte';
+  import SessionExpired from './lib/views/SessionExpired.svelte';
   import Session from './lib/views/Session.svelte';
   import Vault from './lib/views/Vault.svelte';
   import Settings from './lib/views/Settings.svelte';
   import StatusBar from './lib/components/StatusBar.svelte';
   import CallOverlay from './lib/components/CallOverlay.svelte';
 
-  let currentView = $state<'pairing' | 'session' | 'vault' | 'settings'>('pairing');
+  let currentView = $state<'pairing' | 'expired' | 'session' | 'vault' | 'settings'>('pairing');
   let sessionState: SessionState = $derived($sessionStore);
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
 
-  // Subscribe to NATS state events on mount; the theme store self-applies
-  // when its subscribe handler fires on import.
   onMount(() => {
     initNatsListener();
     initCallListener();
-    // Touch the theme store so the subscriber fires once with the persisted
-    // value (handles the cold-start case where the document hadn't been
-    // populated yet).
     const unsub = themeStore.subscribe(() => {});
     unsub();
+
+    // Resolve the session state once on launch, then every 30s. `is_active`
+    // may flip to false between polls as the wall-clock expires; the effect
+    // below routes the user to SessionExpired when that happens.
+    refreshSessionFromBackend();
+    pollTimer = setInterval(refreshSessionFromBackend, 30_000);
+  });
+
+  onDestroy(() => {
+    if (pollTimer) clearInterval(pollTimer);
   });
 
   // Auto-navigate based on session state
   $effect(() => {
     if (sessionState.state === 'active') {
-      if (currentView === 'pairing') currentView = 'vault';
+      if (currentView === 'pairing' || currentView === 'expired') currentView = 'vault';
+    } else if (sessionState.state === 'expired') {
+      // Registered but session ran out — show the extension flow, not pairing.
+      if (currentView !== 'settings') currentView = 'expired';
     } else if (sessionState.state === 'inactive') {
       currentView = 'pairing';
     }
@@ -82,6 +92,8 @@
 
     {#if currentView === 'pairing'}
       <Pairing />
+    {:else if currentView === 'expired'}
+      <SessionExpired />
     {:else if currentView === 'vault'}
       <Vault />
     {:else if currentView === 'session'}

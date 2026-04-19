@@ -19,6 +19,11 @@
   let locking = $state(false);
   let lockMessage = $state('');
 
+  let loggingOut = $state(false);
+  let logoutPassphrase = $state('');
+  let showLogoutPrompt = $state(false);
+  let logoutMessage = $state('');
+
   async function loadDeviceInfo() {
     try {
       const status: any = await invoke('get_status');
@@ -53,6 +58,25 @@
       lockMessage = `Lock failed: ${e}`;
     }
     locking = false;
+  }
+
+  async function doLogout() {
+    if (loggingOut) return;
+    if (!logoutPassphrase) {
+      logoutMessage = 'Enter your passphrase — needed to notify the vault.';
+      return;
+    }
+    loggingOut = true;
+    logoutMessage = '';
+    try {
+      await invoke('logout', { passphrase: logoutPassphrase });
+      logoutPassphrase = '';
+      logoutMessage = 'Logged out. Reloading…';
+      setTimeout(() => window.location.reload(), 600);
+    } catch (e) {
+      logoutMessage = `Logout failed: ${e}`;
+      loggingOut = false;
+    }
   }
 
   $effect(() => {
@@ -129,6 +153,40 @@
           <span class="label">Connection ID</span>
           <span class="value mono truncate">{session.connectionId || 'N/A'}</span>
         </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Log out</h2>
+      <div class="card">
+        <p class="hint">
+          Logging out notifies the vault, removes this desktop from your device list,
+          and erases all local credentials. You'll need to pair again with a new invite code.
+        </p>
+        {#if !showLogoutPrompt}
+          <button class="danger-btn" onclick={() => showLogoutPrompt = true}>
+            Log out this desktop
+          </button>
+        {:else}
+          <input
+            type="password"
+            bind:value={logoutPassphrase}
+            placeholder="Enter passphrase to confirm"
+            class="input"
+            disabled={loggingOut}
+          />
+          <div class="btn-row">
+            <button class="danger-btn" onclick={doLogout} disabled={loggingOut || !logoutPassphrase}>
+              {loggingOut ? 'Logging out…' : 'Confirm logout'}
+            </button>
+            <button class="ghost-btn" onclick={() => { showLogoutPrompt = false; logoutPassphrase = ''; logoutMessage = ''; }}>
+              Cancel
+            </button>
+          </div>
+        {/if}
+        {#if logoutMessage}
+          <p class="logout-msg">{logoutMessage}</p>
+        {/if}
       </div>
     </div>
   {/if}
@@ -296,4 +354,40 @@
   }
   .lock-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .lock-msg { padding: 8px 0 0; font-size: 0.85rem; color: var(--text-muted); }
+
+  .hint { color: var(--text-muted); font-size: 0.85rem; margin: 0 0 12px; line-height: 1.5; }
+  .btn-row { display: flex; gap: 8px; margin-top: 8px; }
+  .danger-btn {
+    background: rgba(198, 40, 40, 0.15);
+    color: #ef5350;
+    border: 1px solid rgba(198, 40, 40, 0.4);
+    padding: 8px 16px;
+    border-radius: 4px;
+    cursor: pointer;
+    font: inherit;
+  }
+  .danger-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .ghost-btn {
+    background: transparent;
+    color: var(--text-muted);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    padding: 8px 16px;
+    border-radius: 4px;
+    cursor: pointer;
+    font: inherit;
+  }
+  .input {
+    width: 100%;
+    padding: 10px 12px;
+    background: var(--bg);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+    color: var(--text);
+    font-size: 0.95rem;
+    outline: none;
+    margin-bottom: 8px;
+  }
+  .input:focus { border-color: var(--accent); }
+  .input:disabled { opacity: 0.5; }
+  .logout-msg { padding: 8px 0 0; font-size: 0.85rem; color: var(--text-muted); }
 </style>
