@@ -24,27 +24,30 @@
   let photoBase64 = $state<string | null>(null);
   let secretsCount = $state<number | null>(null);
   let walletsCount = $state<number | null>(null);
-  let loading = $state(false);
+  // Header-load flag — flips true once profile.get has come back so
+  // the tab content (and especially PersonalData's own fetch) stays
+  // un-mounted until the header is rendered. Profile-first was the
+  // visible win the user asked for: otherwise the screen sits on a
+  // generic "loading" for 20-30s because 5 ops fight the same
+  // serialized vault queue.
+  let profileLoaded = $state(false);
   let errorMessage = $state('');
 
   /**
-   * profile.get returns FirstName / LastName / Email + the custom
-   * fields map; profile.photo.get returns the base64 photo as a
-   * separate op because it's the heaviest blob in the profile and
-   * most reads don't need it. We fire both in parallel.
+   * Sequential load: profile.get + profile.photo.get first so the
+   * header renders with real data; then secrets/wallets counts in
+   * the background for the tab badges. PersonalData's own fetch
+   * fires once the user is on the data tab AND profileLoaded flips
+   * true (gated below by the {#if profileLoaded} wrapper).
    */
   async function loadProfile() {
     if (session.state !== 'active') return;
-    loading = true;
     errorMessage = '';
     try {
-      const [profileResp, photoResp, secretsResp, walletsResp] = await Promise.all([
+      const [profileResp, photoResp] = await Promise.all([
         invoke<any>('get_profile'),
         invoke<any>('get_profile_photo').catch(() => null),
-        invoke<any>('list_secrets_catalog').catch(() => null),
-        invoke<any>('list_wallets').catch(() => null),
       ]);
-
       if (profileResp?.success && profileResp?.data) {
         firstName = profileResp.data.first_name ?? '';
         lastName = profileResp.data.last_name ?? '';
@@ -52,21 +55,27 @@
       } else if (profileResp?.error) {
         errorMessage = profileResp.error;
       }
-
       if (photoResp?.success && photoResp?.data?.photo) {
         photoBase64 = photoResp.data.photo;
       }
+      profileLoaded = true;
 
-      if (secretsResp?.success && secretsResp?.data?.items) {
-        secretsCount = (secretsResp.data.items as unknown[]).length;
-      }
-      if (walletsResp?.success && walletsResp?.data?.wallets) {
-        walletsCount = (walletsResp.data.wallets as unknown[]).length;
-      }
+      // Tab counts in the background — failures here don't block the
+      // header or the tab panel from rendering.
+      Promise.all([
+        invoke<any>('list_secrets_catalog').catch(() => null),
+        invoke<any>('list_wallets').catch(() => null),
+      ]).then(([secretsResp, walletsResp]) => {
+        if (secretsResp?.success && secretsResp?.data?.items) {
+          secretsCount = (secretsResp.data.items as unknown[]).length;
+        }
+        if (walletsResp?.success && walletsResp?.data?.wallets) {
+          walletsCount = (walletsResp.data.wallets as unknown[]).length;
+        }
+      });
     } catch (e) {
       errorMessage = `Failed to load vault: ${e}`;
-    } finally {
-      loading = false;
+      profileLoaded = true; // unblock tab even on error so user can navigate
     }
   }
 
@@ -97,19 +106,29 @@
 
 <div class="vault">
   <!-- Profile preview bar — pinned, always visible. Switching tabs
-       keeps the user oriented; the profile is the anchor. -->
+       keeps the user oriented; the profile is the anchor. Renders a
+       shimmer skeleton until profile.get returns so the first impression
+       isn't a flash of empty/anonymous chrome. -->
   <header class="profile-bar">
-    <div class="avatar">
-      {#if photoSrc}
-        <img src={photoSrc} alt="Profile" />
-      {:else}
-        <span class="initials">{initials}</span>
-      {/if}
-    </div>
-    <div class="profile-text">
-      <h1>{displayName}</h1>
-      {#if email}<p class="email">{email}</p>{/if}
-    </div>
+    {#if !profileLoaded}
+      <div class="avatar skeleton-avatar"></div>
+      <div class="profile-text">
+        <div class="skeleton-line skeleton-name"></div>
+        <div class="skeleton-line skeleton-email"></div>
+      </div>
+    {:else}
+      <div class="avatar">
+        {#if photoSrc}
+          <img src={photoSrc} alt="Profile" />
+        {:else}
+          <span class="initials">{initials}</span>
+        {/if}
+      </div>
+      <div class="profile-text">
+        <h1>{displayName}</h1>
+        {#if email}<p class="email">{email}</p>{/if}
+      </div>
+    {/if}
   </header>
 
   {#if errorMessage}<div class="error">{errorMessage}</div>{/if}
@@ -137,7 +156,12 @@
   </nav>
 
   <div class="tab-panel" role="tabpanel">
-    {#if activeTab === 'data'}
+    {#if !profileLoaded}
+      <!-- Wait for the header before mounting any tab content so
+           PersonalData's load doesn't fight the same vault queue
+           that's still draining profile.get + profile.photo.get. -->
+      <div class="loading-spinner-wrap"><span class="loading-spinner"></span></div>
+    {:else if activeTab === 'data'}
       <PersonalData />
     {:else if activeTab === 'secrets'}
       <div class="placeholder">
@@ -282,5 +306,53 @@
     padding: 12px 16px;
     border-radius: 8px;
     font-size: 0.9rem;
+  }
+  /* ---- Loading skeletons (header + spinner) ---- */
+  .skeleton-avatar {
+    background: linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0.04) 0%,
+      rgba(255, 255, 255, 0.10) 50%,
+      rgba(255, 255, 255, 0.04) 100%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.4s ease-in-out infinite;
+  }
+  .skeleton-line {
+    height: 14px;
+    border-radius: 4px;
+    background: linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0.04) 0%,
+      rgba(255, 255, 255, 0.10) 50%,
+      rgba(255, 255, 255, 0.04) 100%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.4s ease-in-out infinite;
+    margin-bottom: 6px;
+  }
+  .skeleton-name { width: 180px; height: 18px; }
+  .skeleton-email { width: 220px; }
+
+  @keyframes shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+
+  .loading-spinner-wrap {
+    display: flex;
+    justify-content: center;
+    padding: 60px 0;
+  }
+  .loading-spinner {
+    width: 28px;
+    height: 28px;
+    border: 3px solid rgba(255, 255, 255, 0.1);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
   }
 </style>

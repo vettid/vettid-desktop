@@ -12,6 +12,7 @@ pub mod webrtc;
 
 use commands::{auth, calls, vault, session as session_cmd};
 use state::AppState;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -29,6 +30,18 @@ pub fn run() {
     .try_init();
 
     tauri::Builder::default()
+        // Single-instance plugin: must be registered first per its
+        // docs so it can short-circuit before any other setup runs.
+        // On a second launch the callback fires in the running
+        // process — we show + focus the existing window instead of
+        // letting two binaries fight over the NATS subscription.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.set_focus();
+                let _ = win.unminimize();
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .manage(AppState::new())

@@ -26,11 +26,21 @@
     updatedAt: string;
   }
 
-  let firstName = $state('');
-  let lastName = $state('');
-  let email = $state('');
-  let fields = $state<Field[]>([]);
-  let loading = $state(true);
+  // Module-level cache so tab navigation away + back doesn't re-fire
+  // personal-data.get. The first mount populates it; subsequent
+  // mounts paint immediately from cache and refresh in the background.
+  // Cleared on session change (App.svelte handles that via remount).
+  const cache: { firstName: string; lastName: string; email: string; fields: Field[]; ts: number } | null = (window as any).__pd_cache ?? null;
+
+  let firstName = $state(cache?.firstName ?? '');
+  let lastName = $state(cache?.lastName ?? '');
+  let email = $state(cache?.email ?? '');
+  let fields = $state<Field[]>(cache?.fields ?? []);
+  // Loading is true only when we have no cached data to show. With
+  // cache, we render the stale snapshot immediately and refresh in
+  // the background — no full-screen spinner on navigate-back.
+  let loading = $state(cache === null);
+  let refreshing = $state(false);
   let errorMessage = $state('');
   let saving = $state(false);
 
@@ -41,7 +51,13 @@
   let deleteTarget = $state<Field | null>(null);
 
   async function load() {
-    loading = true;
+    // Background refresh when we already have cached data: don't
+    // flash a spinner, just fade in updates.
+    if (fields.length || firstName || lastName || email) {
+      refreshing = true;
+    } else {
+      loading = true;
+    }
     errorMessage = '';
     try {
       const resp: any = await invoke('list_personal_data');
@@ -61,38 +77,103 @@
         alias: v.alias ?? '',
         updatedAt: v.updated_at ?? '',
       }));
+      (window as any).__pd_cache = {
+        firstName, lastName, email, fields, ts: Date.now(),
+      };
     } catch (e) {
       errorMessage = `Failed to load personal data: ${e}`;
     } finally {
       loading = false;
+      refreshing = false;
     }
   }
 
   $effect(() => { load(); });
 
+  // Canonical category labels from the Android client's DataCategory
+  // enum. Keeps the desktop in sync with what the app shows so the
+  // user sees the same group names on either device.
+  const CATEGORY_LABELS: Record<string, string> = {
+    identity: 'Identity',
+    contact: 'Contact',
+    family: 'Family',
+    address: 'Address',
+    financial: 'Financial',
+    medical: 'Medical',
+    professional: 'Professional',
+    education: 'Education',
+    vehicle: 'Vehicle',
+    legal: 'Legal',
+    wallet: 'Wallet Addresses',
+    digital: 'Digital',
+    travel: 'Travel',
+    membership: 'Membership',
+    property: 'Property',
+    other: 'Other',
+  };
+  // Display order — same order the Android screen uses so groups
+  // line up top-to-bottom.
+  const CATEGORY_ORDER = [
+    'Identity', 'Contact', 'Family', 'Address', 'Financial', 'Medical',
+    'Professional', 'Education', 'Vehicle', 'Legal', 'Wallet Addresses',
+    'Digital', 'Travel', 'Membership', 'Property', 'Other',
+  ];
+
+  function categoryFor(namespace: string): string {
+    const head = (namespace.split('.')[0] || 'other').toLowerCase();
+    return CATEGORY_LABELS[head] ?? capitalize(head);
+  }
+
   /**
-   * Group fields by their top-level category (first segment of the
-   * namespace). Falls back to "Other" for namespaces that don't
-   * follow the convention. Within a category, sort by namespace
-   * for stable display; the vault's sort_order op is a Phase-4
-   * concern.
+   * Group fields by canonical category. System fields (first_name,
+   * last_name, email) land in Identity so the desktop matches the
+   * mobile app's full top-of-screen layout — earlier the desktop
+   * read these but never rendered them.
    */
   let grouped = $derived.by(() => {
     const groups = new Map<string, Field[]>();
-    for (const f of fields) {
-      const cat = capitalize(f.namespace.split('.')[0] || 'Other');
+    const push = (cat: string, f: Field) => {
       const list = groups.get(cat) ?? [];
       list.push(f);
       groups.set(cat, list);
+    };
+
+    // Synthesize system fields as virtual entries so they render
+    // alongside the rest under Identity. `key` starts with `__sys__`
+    // so the row renderer can hide Edit/Delete (managed elsewhere).
+    if (firstName) {
+      push('Identity', { key: '__sys__first_name', namespace: 'identity.first_name', value: firstName, alias: '', updatedAt: '' });
+    }
+    if (lastName) {
+      push('Identity', { key: '__sys__last_name', namespace: 'identity.last_name', value: lastName, alias: '', updatedAt: '' });
+    }
+    if (email) {
+      push('Identity', { key: '__sys__email', namespace: 'contact.email', value: email, alias: '', updatedAt: '' });
+    }
+
+    for (const f of fields) {
+      push(categoryFor(f.namespace), f);
     }
     for (const list of groups.values()) {
       list.sort((a, b) => a.namespace.localeCompare(b.namespace));
     }
-    return Array.from(groups.entries()).sort(([a], [b]) => a.localeCompare(b));
+    // Sort categories by CATEGORY_ORDER (known categories first, then
+    // anything else alphabetically).
+    return Array.from(groups.entries()).sort(([a], [b]) => {
+      const ai = CATEGORY_ORDER.indexOf(a);
+      const bi = CATEGORY_ORDER.indexOf(b);
+      if (ai === -1 && bi === -1) return a.localeCompare(b);
+      if (ai === -1) return 1;
+      if (bi === -1) return -1;
+      return ai - bi;
+    });
   });
 
   function capitalize(s: string): string {
     return s ? s[0].toUpperCase() + s.slice(1) : s;
+  }
+  function isSystemField(f: Field): boolean {
+    return f.key.startsWith('__sys__');
   }
 
   /**
@@ -181,12 +262,12 @@
 
 <div class="pd-view">
   <header>
-    <h1>Personal data</h1>
+    <h1>Personal data {#if refreshing}<span class="refresh-dot" title="Refreshing"></span>{/if}</h1>
     <button class="add-btn" onclick={startAdd}>+ Add</button>
   </header>
 
   {#if loading}
-    <div class="loading">Loading…</div>
+    <div class="loading-wrap"><span class="spinner"></span></div>
   {:else}
     {#if errorMessage}<div class="error">{errorMessage}</div>{/if}
 
@@ -195,10 +276,14 @@
         <h2>{category}</h2>
         <div class="card">
           {#each list as f (f.key)}
-            {@render rowSnippet(fieldLabel(f), f.value, {
-              onEdit: () => startEdit(f),
-              onDelete: () => confirmDelete(f),
-            })}
+            {#if isSystemField(f)}
+              {@render rowSnippet(fieldLabel(f), f.value, null)}
+            {:else}
+              {@render rowSnippet(fieldLabel(f), f.value, {
+                onEdit: () => startEdit(f),
+                onDelete: () => confirmDelete(f),
+              })}
+            {/if}
           {/each}
         </div>
       </section>
@@ -258,13 +343,13 @@
 <!-- Inline row composable. Svelte 5 snippets can stay in the same
      file; we declare it after the markup so the section structure
      reads top-to-bottom. -->
-{#snippet rowSnippet(label: string, value: string, opts: { readonly?: boolean; onEdit?: () => void; onDelete?: () => void })}
+{#snippet rowSnippet(label: string, value: string, opts: { onEdit?: () => void; onDelete?: () => void } | null)}
   <div class="row">
     <div class="row-text">
       <div class="row-label">{label}</div>
       <div class="row-value">{value || '—'}</div>
     </div>
-    {#if !opts.readonly}
+    {#if opts}
       <div class="row-actions">
         <button class="row-btn" onclick={opts.onEdit} aria-label="Edit">✎</button>
         <button class="row-btn danger" onclick={opts.onDelete} aria-label="Delete">×</button>
@@ -365,6 +450,35 @@
     text-align: center;
     padding: 24px;
     color: var(--text-muted);
+  }
+  .loading-wrap {
+    display: flex;
+    justify-content: center;
+    padding: 48px 0;
+  }
+  .spinner {
+    width: 28px;
+    height: 28px;
+    border: 3px solid rgba(255, 255, 255, 0.1);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: pd-spin 0.9s linear infinite;
+  }
+  @keyframes pd-spin { to { transform: rotate(360deg); } }
+  .refresh-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin-left: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    opacity: 0.7;
+    animation: pulse 1.2s ease-in-out infinite;
+    vertical-align: middle;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 0.3; }
+    50% { opacity: 0.85; }
   }
   .error {
     background: rgba(244, 67, 54, 0.1);
