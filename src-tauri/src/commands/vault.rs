@@ -127,10 +127,12 @@ pub async fn cast_vote(state: State<'_, AppState>, proposal_id: String, choice: 
     Ok(VaultOpResponse::from_op(result))
 }
 
-/// List personal data (independent).
+/// List personal data (independent). The vault exposes this as
+/// `personal-data.get` with an empty `namespaces` payload — passing
+/// no filter returns every field in the user's data index.
 #[tauri::command]
 pub async fn list_personal_data(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(&state, "personal-data.list", serde_json::json!({})).await;
+    let result = operations::execute(&state, "personal-data.get", serde_json::json!({})).await;
     Ok(VaultOpResponse::from_op(result))
 }
 
@@ -191,10 +193,20 @@ pub async fn list_devices(state: State<'_, AppState>) -> Result<VaultOpResponse,
     Ok(VaultOpResponse::from_op(result))
 }
 
-/// Get own profile (independent).
+/// Get own profile (independent). Vault routes this as `profile.get`
+/// (the older `.view` name doesn't resolve in the current handler).
 #[tauri::command]
 pub async fn get_profile(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(&state, "profile.view", serde_json::json!({})).await;
+    let result = operations::execute(&state, "profile.get", serde_json::json!({})).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+/// Get the user's profile photo (base64). Independent op — kept
+/// separate from `profile.get` server-side because photos can be
+/// hundreds of KB and most callers don't need them on every read.
+#[tauri::command]
+pub async fn get_profile_photo(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(&state, "profile.photo.get", serde_json::json!({})).await;
     Ok(VaultOpResponse::from_op(result))
 }
 

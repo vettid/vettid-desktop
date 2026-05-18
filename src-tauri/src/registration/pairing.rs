@@ -378,7 +378,14 @@ pub async fn complete_pairing(
     let creds = ConnectionCredentials {
         connection_id: session.connection_id.clone(),
         connection_key: session_key.to_vec(),
-        key_id: activation_result.session_id.clone(),
+        // envelope.KeyID is what the vault uses to look up the
+        // connection record (`connections/{KeyID}` in storage), so
+        // it has to be the connection_id — not the session_id, which
+        // is a per-session-rotation handle that the vault tracks
+        // separately under DeviceSession.SessionKeyID. Earlier builds
+        // set this to session_id and every encrypted op timed out
+        // because the lookup hit "connection not found".
+        key_id: session.connection_id.clone(),
         device_private_key: runtime.device_secret.to_bytes().to_vec(),
         device_public_key: runtime.device_public.as_bytes().to_vec(),
         vault_public_key: vault_pub_bytes,
@@ -507,7 +514,7 @@ pub async fn start_extension(
 }
 
 /// Extract `jwt` and `seed` from a NATS `.creds`-format block.
-fn parse_creds_block(creds: &str) -> Option<(String, String)> {
+pub fn parse_creds_block(creds: &str) -> Option<(String, String)> {
     let jwt = extract_block(creds, "-----BEGIN NATS USER JWT-----", "------END NATS USER JWT------")?;
     let seed = extract_block(creds, "-----BEGIN USER NKEY SEED-----", "------END USER NKEY SEED------")?;
     Some((jwt, seed))

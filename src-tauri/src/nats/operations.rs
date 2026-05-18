@@ -62,12 +62,19 @@ pub async fn execute_operation(
         key_guard.ok_or(OperationError::NoConnectionKey)?
     };
 
-    // Read credentials for connection_id and key_id
-    let (connection_id, key_id) = {
+    // Read credentials for the connection ID. The envelope's KeyID
+    // field is what the vault uses to look up `connections/{KeyID}` in
+    // storage, so it has to be the connection_id — not the session_id.
+    // Earlier the desktop stored session_id in creds.key_id and every
+    // encrypted op timed out because the vault hit "connection not
+    // found". Read connection_id directly so existing pairings work
+    // without re-pair.
+    let connection_id = {
         let creds_guard = state.credentials.read().await;
         let creds = creds_guard.as_ref().ok_or(OperationError::NotConnected)?;
-        (creds.connection_id.clone(), creds.key_id.clone())
+        creds.connection_id.clone()
     };
+    let key_id = connection_id.clone();
 
     // Build the request
     let request_id = hex::encode(crate::crypto::keys::generate_random_bytes(16));

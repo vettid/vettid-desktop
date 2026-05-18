@@ -135,14 +135,24 @@ pub async fn register(
     };
 
     *state.is_registered.write().await = true;
+    let mut listener_conn_id: Option<String> = None;
     if let Ok((creds, _)) = store::load(&config_dir) {
         if creds.connection_key.len() == 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&creds.connection_key);
             *state.connection_key.write().await = Some(key);
         }
+        listener_conn_id = Some(creds.connection_id.clone());
         *state.credentials.write().await = Some(creds);
         *state.is_unlocked.write().await = true;
+    }
+
+    // Start the response listener — same rationale as `unlock`. The
+    // NatsClient we used during pairing's stage 2 stays alive into
+    // post-pair operation handling, so the subscribe lands on the
+    // already-connected client.
+    if let Some(conn_id) = listener_conn_id {
+        crate::nats::listener::spawn_listener(app.clone(), conn_id);
     }
 
     Ok(RegisterResponse {
@@ -253,7 +263,7 @@ fn unquote(s: &str) -> String {
 /// gate is the security factor at the local layer.
 /// Populates AppState with credentials and connection key.
 #[tauri::command]
-pub async fn unlock(state: State<'_, AppState>) -> Result<bool, String> {
+pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
     use crate::credential::store;
 
     let config_dir = store::default_config_dir();
@@ -268,24 +278,52 @@ pub async fn unlock(state: State<'_, AppState>) -> Result<bool, String> {
         *state.connection_key.write().await = Some(key);
     }
 
-    // Reconnect NATS if we have the connection info
+    // Reconnect NATS so subsequent vault ops can publish + receive
+    // responses. The stored `message_space_token` is a NATS .creds
+    // block (JWT + seed), not a single auth token — so we have to
+    // parse it and go through connect_with_credentials, which also
+    // pins TLS-first + rustls (load-bearing for the NLB listener).
+    // The previous `nats.connect(.., token, ..)` call used `.token()`
+    // auth, which expects an opaque bearer string and never works
+    // against this account's JWT-based auth → every op hit
+    // "publish failed: NATS client not connected".
     if !creds.message_space_url.is_empty() && !creds.message_space_token.is_empty() {
-        let mut nats = state.nats.lock().await;
-        if let Err(e) = nats
-            .connect(
-                &creds.message_space_url,
-                &creds.message_space_token,
-                &creds.owner_guid,
-            )
-            .await
-        {
-            log::warn!("Failed to reconnect NATS on unlock: {}", e);
-            // Don't fail unlock if NATS reconnect fails — user can retry
+        match crate::registration::pairing::parse_creds_block(&creds.message_space_token) {
+            Some((jwt, seed)) => {
+                let mut nats = state.nats.lock().await;
+                if let Err(e) = nats
+                    .connect_with_credentials(
+                        &creds.message_space_url,
+                        &jwt,
+                        &seed,
+                        &creds.owner_guid,
+                    )
+                    .await
+                {
+                    log::warn!("Failed to reconnect NATS on unlock: {}", e);
+                    // Don't fail unlock if NATS reconnect fails — user
+                    // can retry; some op paths re-establish on demand.
+                }
+            }
+            None => {
+                log::warn!(
+                    "Stored NATS creds malformed — unlock continues but vault ops will fail until re-pair"
+                );
+            }
         }
     }
 
+    let connection_id = creds.connection_id.clone();
     *state.credentials.write().await = Some(creds);
     *state.is_unlocked.write().await = true;
+
+    // Spawn the background NATS listener so device_op_response
+    // envelopes get decrypted + matched to pending request_ids.
+    // Without this, every vault op hits the 30-second timeout —
+    // the request reaches the vault, the response is published
+    // back to MessageSpace.{owner}.forOwner.device.{conn}, and
+    // nobody's subscribed to it.
+    crate::nats::listener::spawn_listener(app.clone(), connection_id);
 
     Ok(true)
 }
@@ -383,13 +421,23 @@ pub async fn extend_session(
     };
 
     // Refresh AppState with the rotated session
+    let mut listener_conn_id: Option<String> = None;
     if let Ok((creds, _)) = store::load(&config_dir) {
         if creds.connection_key.len() == 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&creds.connection_key);
             *state.connection_key.write().await = Some(key);
         }
+        listener_conn_id = Some(creds.connection_id.clone());
         *state.credentials.write().await = Some(creds);
+    }
+
+    // Restart the response listener for the rotated session keys.
+    // Existing pending request channels are dropped by the previous
+    // listener's exit path; new requests register against the fresh
+    // listener.
+    if let Some(conn_id) = listener_conn_id {
+        crate::nats::listener::spawn_listener(app.clone(), conn_id);
     }
 
     Ok(RegisterResponse {

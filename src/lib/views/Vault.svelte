@@ -1,194 +1,286 @@
 <script lang="ts">
-    import { sessionStore } from '../stores/session';
-    import { initVaultListeners } from '../stores/vault';
-    import { selectedConnectionStore } from '../stores/navigation';
-    import PendingApproval from '../components/PendingApproval.svelte';
+  import { invoke } from '@tauri-apps/api/core';
+  import { sessionStore } from '../stores/session';
+  import PersonalData from './vault/PersonalData.svelte';
 
-    // Feature views
-    import ConnectionsList from './vault/ConnectionsList.svelte';
-    import MessagingView from './vault/MessagingView.svelte';
-    import SecretsView from './vault/SecretsView.svelte';
-    import FeedView from './vault/FeedView.svelte';
-    import VotingView from './vault/VotingView.svelte';
-    import WalletView from './vault/WalletView.svelte';
-    import DevicesView from './vault/DevicesView.svelte';
-    import ConnectionDetail from './vault/ConnectionDetail.svelte';
-    import Conversation from './vault/Conversation.svelte';
-    import ProfileView from './vault/ProfileView.svelte';
+  // Tabbed Vault home — matches the Android app's vault tab layout
+  // so the user has the same mental model on either device. Profile
+  // preview pinned at the top; tabs (Data / Secrets / Wallets) below.
+  // Phase 4 fills Secrets + Wallets with real content.
+  type TabId = 'data' | 'secrets' | 'wallets';
+  const tabs: { id: TabId; label: string }[] = [
+    { id: 'data', label: 'Personal data' },
+    { id: 'secrets', label: 'Secrets' },
+    { id: 'wallets', label: 'Wallets' },
+  ];
+  let activeTab = $state<TabId>('data');
 
-    type TabId =
-        | 'feed'
-        | 'connections'
-        | 'messages'
-        | 'profile'
-        | 'secrets'
-        | 'voting'
-        | 'wallets'
-        | 'devices';
+  let session = $derived($sessionStore);
 
-    const tabs: { id: TabId; label: string }[] = [
-        { id: 'feed', label: 'Feed' },
-        { id: 'connections', label: 'Connections' },
-        { id: 'messages', label: 'Messages' },
-        { id: 'profile', label: 'Profile' },
-        { id: 'secrets', label: 'Secrets' },
-        { id: 'voting', label: 'Voting' },
-        { id: 'wallets', label: 'Wallets' },
-        { id: 'devices', label: 'Devices' },
-    ];
+  // Profile preview state.
+  let firstName = $state('');
+  let lastName = $state('');
+  let email = $state('');
+  let photoBase64 = $state<string | null>(null);
+  let secretsCount = $state<number | null>(null);
+  let walletsCount = $state<number | null>(null);
+  let loading = $state(false);
+  let errorMessage = $state('');
 
-    let session = $derived($sessionStore);
-    let activeTab = $state<TabId>('feed');
-    let selectedConnection = $derived($selectedConnectionStore);
+  /**
+   * profile.get returns FirstName / LastName / Email + the custom
+   * fields map; profile.photo.get returns the base64 photo as a
+   * separate op because it's the heaviest blob in the profile and
+   * most reads don't need it. We fire both in parallel.
+   */
+  async function loadProfile() {
+    if (session.state !== 'active') return;
+    loading = true;
+    errorMessage = '';
+    try {
+      const [profileResp, photoResp, secretsResp, walletsResp] = await Promise.all([
+        invoke<any>('get_profile'),
+        invoke<any>('get_profile_photo').catch(() => null),
+        invoke<any>('list_secrets_catalog').catch(() => null),
+        invoke<any>('list_wallets').catch(() => null),
+      ]);
 
-    // When a connection is open, this toggles between the Conversation
-    // (default) and the read-only ConnectionDetail (profile/manage).
-    let detailMode = $state<'conversation' | 'profile'>('conversation');
+      if (profileResp?.success && profileResp?.data) {
+        firstName = profileResp.data.first_name ?? '';
+        lastName = profileResp.data.last_name ?? '';
+        email = profileResp.data.email ?? '';
+      } else if (profileResp?.error) {
+        errorMessage = profileResp.error;
+      }
 
-    // Reset to conversation view whenever a different connection is opened.
-    $effect(() => {
-        if (selectedConnection) detailMode = 'conversation';
-    });
+      if (photoResp?.success && photoResp?.data?.photo) {
+        photoBase64 = photoResp.data.photo;
+      }
 
-    // Pending approval overlay
-    let pendingApproval = $state<{ operation: string; requestId: string } | null>(null);
+      if (secretsResp?.success && secretsResp?.data?.items) {
+        secretsCount = (secretsResp.data.items as unknown[]).length;
+      }
+      if (walletsResp?.success && walletsResp?.data?.wallets) {
+        walletsCount = (walletsResp.data.wallets as unknown[]).length;
+      }
+    } catch (e) {
+      errorMessage = `Failed to load vault: ${e}`;
+    } finally {
+      loading = false;
+    }
+  }
 
-    // Initialize real-time event listeners
-    $effect(() => { initVaultListeners(); });
+  $effect(() => {
+    if (session.state === 'active') {
+      loadProfile();
+    }
+  });
+
+  let displayName = $derived.by(() => {
+    const full = `${firstName} ${lastName}`.trim();
+    return full || email || 'Your Vault';
+  });
+
+  let initials = $derived.by(() => {
+    if (firstName || lastName) {
+      return `${firstName[0] ?? ''}${lastName[0] ?? ''}`.toUpperCase();
+    }
+    return (email[0] ?? '?').toUpperCase();
+  });
+
+  // Photo data URI — vault returns raw base64; assume JPEG since
+  // that's what the photo-upload pipeline encodes to. If the user
+  // uploaded a PNG the browser still decodes it via the data: URL
+  // sniff, so the explicit mime here is a hint, not a constraint.
+  let photoSrc = $derived(photoBase64 ? `data:image/jpeg;base64,${photoBase64}` : null);
 </script>
 
-<div class="vault-container">
-    {#if session.state !== 'active'}
-        <div class="inactive-overlay">
-            <div class="inactive-message">
-                <h3>Session {session.state}</h3>
-                <p>
-                    {#if session.state === 'inactive'}
-                        Unlock your credentials to access the vault.
-                    {:else if session.state === 'suspended'}
-                        Session suspended — phone may be unreachable.
-                    {:else if session.state === 'expired'}
-                        Session expired. Re-authenticate from your phone.
-                    {:else if session.state === 'revoked'}
-                        Session revoked by vault owner.
-                    {/if}
-                </p>
-            </div>
-        </div>
-    {:else}
-        <!-- Tab bar -->
-        <div class="tab-bar" role="tablist">
-            {#each tabs as tab}
-                <button
-                    class="tab"
-                    class:active={activeTab === tab.id}
-                    onclick={() => activeTab = tab.id}
-                    role="tab"
-                    aria-selected={activeTab === tab.id}
-                >
-                    {tab.label}
-                </button>
-            {/each}
-        </div>
+<div class="vault">
+  <!-- Profile preview bar — pinned, always visible. Switching tabs
+       keeps the user oriented; the profile is the anchor. -->
+  <header class="profile-bar">
+    <div class="avatar">
+      {#if photoSrc}
+        <img src={photoSrc} alt="Profile" />
+      {:else}
+        <span class="initials">{initials}</span>
+      {/if}
+    </div>
+    <div class="profile-text">
+      <h1>{displayName}</h1>
+      {#if email}<p class="email">{email}</p>{/if}
+    </div>
+  </header>
 
-        <!-- Tab content. When a connection is selected, ConnectionDetail
-             takes over the panel regardless of which tab is active — the
-             back arrow returns to the previous tab. -->
-        <div class="tab-content" role="tabpanel">
-            {#if selectedConnection && detailMode === 'profile'}
-                <ConnectionDetail connection={selectedConnection} />
-            {:else if selectedConnection}
-                <Conversation
-                    connection={selectedConnection}
-                    onShowProfile={() => detailMode = 'profile'}
-                />
-            {:else if activeTab === 'connections'}
-                <ConnectionsList />
-            {:else if activeTab === 'messages'}
-                <MessagingView />
-            {:else if activeTab === 'secrets'}
-                <SecretsView />
-            {:else if activeTab === 'feed'}
-                <FeedView />
-            {:else if activeTab === 'profile'}
-                <ProfileView />
-            {:else if activeTab === 'voting'}
-                <VotingView />
-            {:else if activeTab === 'wallets'}
-                <WalletView />
-            {:else if activeTab === 'devices'}
-                <DevicesView />
-            {/if}
-        </div>
-    {/if}
+  {#if errorMessage}<div class="error">{errorMessage}</div>{/if}
 
-    <!-- Pending phone approval overlay -->
-    {#if pendingApproval}
-        <PendingApproval
-            operation={pendingApproval.operation}
-            requestId={pendingApproval.requestId}
-        />
+  <!-- Tab bar — same layout as the Android vault tabs. The
+       inactive tabs are subdued but always clickable so the user
+       can flip between sections without going back to a home. -->
+  <nav class="tabs" role="tablist">
+    {#each tabs as tab}
+      <button
+        class="tab"
+        class:active={activeTab === tab.id}
+        onclick={() => activeTab = tab.id}
+        role="tab"
+        aria-selected={activeTab === tab.id}
+      >
+        {tab.label}
+        {#if tab.id === 'secrets' && secretsCount !== null}
+          <span class="tab-count">{secretsCount}</span>
+        {:else if tab.id === 'wallets' && walletsCount !== null}
+          <span class="tab-count">{walletsCount}</span>
+        {/if}
+      </button>
+    {/each}
+  </nav>
+
+  <div class="tab-panel" role="tabpanel">
+    {#if activeTab === 'data'}
+      <PersonalData />
+    {:else if activeTab === 'secrets'}
+      <div class="placeholder">
+        <h2>Secrets</h2>
+        <p>Coming in Phase 4. Manage your critical credentials, PIN-protected items, and metadata visibility here.</p>
+        <p class="hint">For now, manage secrets from the VettID app on your phone.</p>
+      </div>
+    {:else if activeTab === 'wallets'}
+      <div class="placeholder">
+        <h2>Wallets</h2>
+        <p>Coming in Phase 4. Send and receive Bitcoin from this desktop with phone-side approval.</p>
+        <p class="hint">For now, manage wallets from the VettID app on your phone.</p>
+      </div>
     {/if}
+  </div>
 </div>
 
 <style>
-    .vault-container {
-        height: 100%;
-        display: flex;
-        flex-direction: column;
-        position: relative;
-    }
+  .vault {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+  }
 
-    .inactive-overlay {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        height: 100%;
-    }
+  .profile-bar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 20px 24px;
+    background: var(--surface);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  }
+  .avatar {
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    background: var(--accent-muted);
+    color: var(--accent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'Plus Jakarta Sans', 'Inter', sans-serif;
+    font-weight: 600;
+    font-size: 1.5rem;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+  .avatar img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  .profile-text { min-width: 0; }
+  .profile-text h1 {
+    font-size: 1.2rem;
+    margin: 0;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .email {
+    margin: 4px 0 0;
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 
-    .inactive-message {
-        text-align: center;
-        color: var(--text-secondary);
-    }
+  .tabs {
+    display: flex;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    padding: 0 16px;
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .tab {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    padding: 12px 18px;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.9rem;
+    margin-bottom: -1px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+    font-weight: 500;
+  }
+  .tab-count {
+    font-size: 0.7rem;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-muted);
+  }
+  .tab.active .tab-count {
+    background: var(--accent-muted);
+    color: var(--accent);
+  }
 
-    .inactive-message h3 {
-        text-transform: capitalize;
-        margin-bottom: 8px;
-    }
+  .tab-panel {
+    flex: 1;
+    overflow-y: auto;
+  }
 
-    .tab-bar {
-        display: flex;
-        border-bottom: 1px solid var(--border);
-        padding: 0 12px;
-        gap: 4px;
-        flex-shrink: 0;
-        overflow-x: auto;
-    }
+  .placeholder {
+    padding: 40px 24px;
+    text-align: center;
+    color: var(--text-muted);
+  }
+  .placeholder h2 {
+    font-size: 1.1rem;
+    margin: 0 0 12px;
+    color: var(--text);
+  }
+  .placeholder p {
+    margin: 0 0 8px;
+    line-height: 1.5;
+    max-width: 460px;
+    margin-left: auto;
+    margin-right: auto;
+  }
+  .placeholder .hint {
+    color: var(--text-subtle);
+    font-size: 0.9rem;
+  }
 
-    .tab {
-        padding: 10px 16px;
-        border: none;
-        background: none;
-        cursor: pointer;
-        font-size: 0.9em;
-        color: var(--text-secondary);
-        border-bottom: 2px solid transparent;
-        white-space: nowrap;
-    }
-
-    .tab:hover {
-        color: var(--text-primary);
-    }
-
-    .tab.active {
-        color: var(--accent);
-        border-bottom-color: var(--accent);
-        font-weight: 500;
-    }
-
-    .tab-content {
-        flex: 1;
-        overflow: hidden;
-        padding: 16px;
-    }
+  .error {
+    margin: 16px 24px 0;
+    background: rgba(244, 67, 54, 0.1);
+    border: 1px solid rgba(244, 67, 54, 0.25);
+    color: var(--error);
+    padding: 12px 16px;
+    border-radius: 8px;
+    font-size: 0.9rem;
+  }
 </style>

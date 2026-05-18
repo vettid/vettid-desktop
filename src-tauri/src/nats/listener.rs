@@ -1,6 +1,5 @@
 use futures::StreamExt;
-use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::crypto::encrypt;
 use crate::nats::client::NatsConnectionEvent;
@@ -27,10 +26,10 @@ use tokio::sync::mpsc;
 /// independent task boundaries.
 pub fn spawn_listener(
     app_handle: AppHandle,
-    state: Arc<AppState>,
     connection_id: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let state = app_handle.state::<AppState>();
         let (responses_sub, app_events_sub, event_rx_opt) = {
             let mut nats = state.nats.lock().await;
             let r = match nats.subscribe_responses(&connection_id).await {
@@ -66,7 +65,7 @@ pub fn spawn_listener(
         loop {
             tokio::select! {
                 Some(msg) = responses.next() => {
-                    if let Err(e) = handle_response_message(&app_handle, &state, &msg.payload).await {
+                    if let Err(e) = handle_response_message(&app_handle, state.inner(), &msg.payload).await {
                         log::warn!("Failed to handle response message: {}", e);
                     }
                 }

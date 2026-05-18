@@ -70,6 +70,7 @@ pub fn run() {
             vault::get_transaction_history,
             vault::list_devices,
             vault::get_profile,
+            vault::get_profile_photo,
             vault::get_conversation,
             vault::list_call_history,
             // Vault commands — phone-required
