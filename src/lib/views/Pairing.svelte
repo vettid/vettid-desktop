@@ -7,6 +7,7 @@
   let inviteCode = $state('');
   let passphrase = $state('');
   let confirmPassphrase = $state('');
+  let showPassphrase = $state(false);
   let step = $state<'code' | 'passphrase' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error'>('code');
   let errorMessage = $state('');
   let qrDataUrl = $state('');
@@ -17,9 +18,23 @@
     unlistenQr?.();
   });
 
+  // Svelte action: focus the element as soon as it mounts. Used to
+  // give the invite-code field focus when the Pairing view appears,
+  // and to move focus into the passphrase field the moment we step
+  // into the passphrase view (since the inputs are conditionally
+  // rendered, each step transition re-mounts a fresh input and the
+  // action fires).
+  function autofocus(node: HTMLInputElement) {
+    queueMicrotask(() => node.focus());
+  }
+
   async function advanceToPassphrase() {
-    if (inviteCode.length !== 8) {
-      errorMessage = 'Invite code must be 8 characters.';
+    // The phone app generates 12-char codes displayed as three
+    // 4-character blocks (ABCD-EFGH-JKLM). Accept either form on
+    // input — we strip dashes/whitespace before validating.
+    inviteCode = inviteCode.replace(/[\s-]/g, '').toUpperCase();
+    if (inviteCode.length !== 12) {
+      errorMessage = 'Invite code must be 12 characters.';
       return;
     }
     errorMessage = '';
@@ -89,19 +104,28 @@
       <ol class="instructions">
         <li>Open VettID on your phone.</li>
         <li>Tap <strong>Connect Desktop</strong> from the feed FAB.</li>
-        <li>Enter the 8-character code shown below.</li>
+        <li>Type the 12-character code shown below — dashes are optional.</li>
       </ol>
 
       <input
         type="text"
         bind:value={inviteCode}
-        maxlength="8"
-        placeholder="ABC23456"
+        maxlength="14"
+        placeholder="ABCD-EFGH-JKLM"
         class="code-field"
+        use:autofocus
         oninput={() => { inviteCode = inviteCode.toUpperCase(); errorMessage = ''; }}
+        onkeydown={(e) => {
+          // Enter submits when the code is the right length — same as
+          // clicking Continue. Keeps the keyboard-driven flow snappy.
+          if (e.key === 'Enter' && inviteCode.replace(/[\s-]/g, '').length === 12) {
+            e.preventDefault();
+            advanceToPassphrase();
+          }
+        }}
       />
 
-      <button class="btn primary" onclick={advanceToPassphrase} disabled={inviteCode.length !== 8}>
+      <button class="btn primary" onclick={advanceToPassphrase} disabled={inviteCode.replace(/[\s-]/g, '').length !== 12}>
         Continue
       </button>
 
@@ -111,17 +135,40 @@
         It's combined with your machine's fingerprint, so the store can't be decrypted on another machine.
       </p>
 
+      <div class="pw-row">
+        <input
+          type={showPassphrase ? 'text' : 'password'}
+          bind:value={passphrase}
+          placeholder="Encryption passphrase"
+          class="input pw-input"
+          use:autofocus
+          onkeydown={(e) => {
+            if (e.key === 'Enter' && passphrase && passphrase === confirmPassphrase) {
+              e.preventDefault();
+              submit();
+            }
+          }}
+        />
+        <button
+          type="button"
+          class="pw-toggle"
+          onclick={() => showPassphrase = !showPassphrase}
+          aria-label={showPassphrase ? 'Hide passphrase' : 'Show passphrase'}
+        >
+          {showPassphrase ? 'Hide' : 'Show'}
+        </button>
+      </div>
       <input
-        type="password"
-        bind:value={passphrase}
-        placeholder="Encryption passphrase"
-        class="input"
-      />
-      <input
-        type="password"
+        type={showPassphrase ? 'text' : 'password'}
         bind:value={confirmPassphrase}
         placeholder="Confirm passphrase"
         class="input"
+        onkeydown={(e) => {
+          if (e.key === 'Enter' && passphrase && passphrase === confirmPassphrase) {
+            e.preventDefault();
+            submit();
+          }
+        }}
       />
 
       <button class="btn primary" onclick={submit}
@@ -171,10 +218,21 @@
   .instructions { padding-left: 20px; margin-bottom: 24px; line-height: 1.6; color: var(--text-muted); }
   .instructions li { margin-bottom: 8px; }
   .code-field {
-    width: 100%; padding: 16px; font-size: 2rem; text-align: center;
-    letter-spacing: 0.5em; font-family: 'Courier New', monospace;
-    background: var(--bg); border: 2px solid rgba(255,255,255,0.1);
-    border-radius: 8px; color: var(--text); outline: none; margin-bottom: 20px;
+    width: 100%;
+    padding: 16px;
+    /* Sized so all 14 chars (12 code + 2 dashes) fit at once.
+       The phone displays the code as ABCD-EFGH-JKLM; we want
+       the entry field to render the same shape comfortably. */
+    font-size: 1.4rem;
+    text-align: center;
+    letter-spacing: 0.18em;
+    font-family: 'Courier New', monospace;
+    background: var(--bg);
+    border: 2px solid rgba(255,255,255,0.1);
+    border-radius: 8px;
+    color: var(--text);
+    outline: none;
+    margin-bottom: 20px;
   }
   .code-field:focus { border-color: var(--accent); }
   .input {
@@ -183,6 +241,33 @@
     border-radius: 6px; color: var(--text); font-size: 1rem; outline: none;
   }
   .input:focus { border-color: var(--accent); }
+
+  /* Passphrase row: input + inline show/hide toggle. The first
+     passphrase input is wrapped so the toggle sits over its right
+     edge; the confirm input below keeps the same width since both
+     fields hide-or-show together when the toggle flips. */
+  .pw-row {
+    position: relative;
+    margin-bottom: 12px;
+  }
+  .pw-row .pw-input {
+    margin-bottom: 0;
+    padding-right: 64px;
+  }
+  .pw-toggle {
+    position: absolute;
+    right: 4px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 0.85rem;
+    padding: 6px 10px;
+    cursor: pointer;
+  }
+  .pw-toggle:hover { color: var(--text); }
   .btn { width: 100%; padding: 12px; border: none; border-radius: 6px;
          font-size: 1rem; cursor: pointer; margin-bottom: 8px; }
   .btn.primary { background: var(--accent); color: white; }

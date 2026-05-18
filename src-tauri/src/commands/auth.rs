@@ -8,11 +8,22 @@ pub struct AuthStatus {
     pub is_registered: bool,
     pub is_unlocked: bool,
     pub has_active_session: bool,
+    // Device-identity fields surfaced in the Settings view so the
+    // user can confirm which desktop they're looking at and verify
+    // the binary fingerprint matches what the vault recorded at
+    // pairing time. Cheap to compute (env vars + a hash of the on-
+    // disk binary) so we include them on every get_status call.
+    pub hostname: String,
+    pub platform: String,
+    pub binary_fingerprint: String,
+    pub app_version: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
-    /// 8-char code the user typed in from the phone app.
+    /// 12-char code the user typed in from the phone app, displayed
+    /// to them as `ABCD-EFGH-JKLM`. The frontend strips dashes/whitespace
+    /// before sending, but we also normalize defensively below.
     pub invite_code: String,
     /// Passphrase for encrypting the on-disk credential store.
     pub passphrase: String,
@@ -35,7 +46,7 @@ pub struct PairingQrEvent {
     pub qr_payload: String,
 }
 
-/// Pair this desktop with a vault via an 8-char invite code typed by the user.
+/// Pair this desktop with a vault via a 12-char invite code typed by the user.
 ///
 /// Two-stage flow (see vettid-dev/docs/DESKTOP-CONNECTION-FLOW.md):
 ///   1. Resolve invite via the embedded guest NATS account → scoped creds +
@@ -57,11 +68,19 @@ pub async fn register(
     std::fs::create_dir_all(&config_dir)
         .map_err(|e| format!("Failed to create config dir: {}", e))?;
 
-    let invite_code = request.invite_code.trim().to_string();
-    if invite_code.len() != 8 {
+    // Strip dashes/whitespace so users can paste either the grouped
+    // `ABCD-EFGH-JKLM` form they see on the phone or a flat 12-char run.
+    // Uppercase to match the vault's code alphabet exactly.
+    let invite_code: String = request
+        .invite_code
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect::<String>()
+        .to_uppercase();
+    if invite_code.len() != 12 {
         return Ok(RegisterResponse {
             success: false,
-            error: Some("Invite code must be 8 characters".to_string()),
+            error: Some("Invite code must be 12 characters".to_string()),
             connection_id: None,
             session_id: None,
             expires_at: None,
@@ -405,9 +424,15 @@ pub async fn get_status(state: State<'_, AppState>) -> Result<AuthStatus, String
         is_registered
     };
 
+    let fp = collect_device_fingerprint();
+
     Ok(AuthStatus {
         is_registered,
         is_unlocked,
         has_active_session,
+        hostname: fp.hostname,
+        platform: fp.platform,
+        binary_fingerprint: fp.binary_fingerprint,
+        app_version: fp.app_version,
     })
 }

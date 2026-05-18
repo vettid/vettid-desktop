@@ -15,6 +15,19 @@ use state::AppState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Initialize env_logger so `log::info!` / `log::warn!` calls across
+    // the codebase actually surface. Defaults to `info` for our crate
+    // and `warn` for noisy dependencies; users can override at launch
+    // time with `RUST_LOG=...`. Without this every log call was a no-op
+    // and pairing failures left no breadcrumb in stderr.
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(
+            "info,vettid_desktop=debug,async_nats=info,reqwest=warn",
+        ),
+    )
+    .format_timestamp_millis()
+    .try_init();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())

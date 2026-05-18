@@ -9,7 +9,7 @@ license = "AGPL-3.0-or-later"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri = { version = "2", features = ["tray-icon", "image-png", "devtools"] }
 tauri-plugin-shell = "2"
 tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
@@ -31,7 +31,13 @@ async-nats = "0.37"
 futures = "0.3"
 
 # HTTP
-reqwest = { version = "0.12", features = ["json"] }
+# Use rustls-tls instead of native-tls so we share a single TLS stack
+# with async-nats (which uses tokio-rustls). Having both rustls and
+# native-tls linked was correlated with intermittent "connection reset
+# by peer" on the NATS TLS handshake from the desktop, while a binary
+# with rustls only handshakes cleanly against the same NLB. Saves a
+# few MB of binary too.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Hex encoding
 hex = "0.4"

@@ -5,16 +5,104 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>VettID Desktop</title>
     <style>
+      /* Palette: mirrors vettid.dev — warm near-black with gold accent
+         for dark mode, warm off-white with a darker gold for light mode.
+         Sourced from https://vettid.dev/ root stylesheet.
+
+         Theme classes are toggled by src/lib/stores/theme.ts:
+           - `<html class="theme-dark">` forces dark
+           - `<html class="theme-light">` forces light
+           - no class = `auto`, follows prefers-color-scheme
+      */
       :root {
-        --bg: #1a1a2e;
-        --surface: #16213e;
-        --primary: #0f3460;
-        --accent: #e94560;
-        --text: #eee;
-        --text-muted: #999;
+        /* DARK is the default — applied when no theme class is present
+           and the OS doesn't prefer light. */
+        --accent: #ffc125;
+        --accent-hover: #ffd940;
+        --accent-dark: #a68319;
+        --accent-muted: rgba(255, 193, 37, 0.15);
+
+        --bg-dark: #0a0908;
+        --bg-pure: #000;
+        --bg-card: #12110f;
+        --bg-elevated: #1a1816;
+
+        --text: #f5f5f4;
+        --text-muted: #a8a29e;
+        --text-subtle: #78716c;
+
+        --border-accent: rgba(255, 193, 37, 0.2);
+
+        /* Aliases kept under the names existing Svelte components
+           already reference so the rebrand is non-breaking. */
+        --bg: var(--bg-dark);
+        --surface: var(--bg-card);
+        --primary: var(--accent);
+        --primary-light: var(--accent-hover);
         --success: #4caf50;
         --warning: #ff9800;
         --error: #f44336;
+      }
+
+      /* LIGHT theme overrides — applied when the user picks Light in
+         Settings, OR when in Auto mode and the OS prefers light. The
+         accent is darkened so gold-on-cream stays AA-readable. */
+      :root.theme-light,
+      :root:not(.theme-dark) {
+        /* placeholder; light values come in via the media query and
+           explicit theme-light below — this empty rule keeps specificity
+           ordering predictable. */
+      }
+
+      :root.theme-light {
+        --accent: #b8870f;
+        --accent-hover: #946a0b;
+        --accent-dark: #6b4d08;
+        --accent-muted: rgba(184, 135, 15, 0.12);
+
+        --bg-dark: #faf8f3;
+        --bg-pure: #ffffff;
+        --bg-card: #ffffff;
+        --bg-elevated: #f5f2eb;
+
+        --text: #1c1917;
+        --text-muted: #57534e;
+        --text-subtle: #a8a29e;
+
+        --border-accent: rgba(184, 135, 15, 0.3);
+
+        --success: #2e7d32;
+        --warning: #c66900;
+        --error: #c62828;
+      }
+
+      /* AUTO mode: no `theme-light` / `theme-dark` class on <html>.
+         The default :root rules cover dark; when the OS prefers light
+         we re-emit the light palette. Forced overrides (`theme-light`
+         / `theme-dark`) take precedence because they're set later in
+         the cascade and via higher-specificity class selectors. */
+      @media (prefers-color-scheme: light) {
+        :root:not(.theme-dark):not(.theme-light) {
+          --accent: #b8870f;
+          --accent-hover: #946a0b;
+          --accent-dark: #6b4d08;
+          --accent-muted: rgba(184, 135, 15, 0.12);
+
+          --bg-dark: #faf8f3;
+          --bg-pure: #ffffff;
+          --bg-card: #ffffff;
+          --bg-elevated: #f5f2eb;
+
+          --text: #1c1917;
+          --text-muted: #57534e;
+          --text-subtle: #a8a29e;
+
+          --border-accent: rgba(184, 135, 15, 0.3);
+
+          --success: #2e7d32;
+          --warning: #c66900;
+          --error: #c62828;
+        }
       }
 
       * {
@@ -24,10 +112,19 @@
       }
 
       body {
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        /* Use the alias rather than --bg-dark directly so the theme
+           overrides actually swap the body background. */
         background: var(--bg);
         color: var(--text);
+        line-height: 1.6;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
         overflow: hidden;
+      }
+
+      h1, h2, h3, h4, h5, h6 {
+        font-family: 'Plus Jakarta Sans', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
       }
     </style>
   </head>

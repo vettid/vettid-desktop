@@ -121,8 +121,10 @@ impl NatsClient {
         owner_guid: &str,
     ) -> Result<(), NatsError> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        // Trailing newline is load-bearing — async-nats's nkey parser
+        // requires `\r?\n` after the closing dash-line of each block.
         let creds = format!(
-            "-----BEGIN NATS USER JWT-----\n{}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\n{}\n------END USER NKEY SEED------",
+            "-----BEGIN NATS USER JWT-----\n{}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\n{}\n------END USER NKEY SEED------\n",
             jwt, seed,
         );
 
@@ -314,11 +316,23 @@ impl NatsClient {
 
 /// Apply standard resilience options: retry initial connect, unlimited
 /// reconnect attempts, and forward connection-state events to the listener.
+///
+/// `tls_first()` is load-bearing: our NATS endpoint lives behind an AWS NLB
+/// that does TLS termination at port 443 (the listener expects ClientHello
+/// immediately on TCP accept). async-nats's default flow is to TCP-connect
+/// first, read the server INFO frame in plaintext, then STARTTLS — that
+/// hangs forever against a TLS-first NLB listener. The `tls_first()`
+/// option inverts the flow so the TLS handshake fires before any NATS
+/// protocol bytes. Also disables discovered-server fallback because the
+/// server's cluster gossip contains private VPC IPs that desktop clients
+/// can't reach directly.
 fn with_resilience(
     opts: async_nats::ConnectOptions,
     event_tx: mpsc::UnboundedSender<NatsConnectionEvent>,
 ) -> async_nats::ConnectOptions {
-    opts.retry_on_initial_connect()
+    opts.tls_first()
+        .ignore_discovered_servers()
+        .retry_on_initial_connect()
         .max_reconnects(None) // unlimited
         .event_callback(move |event| {
             let tx = event_tx.clone();

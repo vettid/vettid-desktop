@@ -137,10 +137,11 @@
 
   .badge {
     font-size: 0.65rem;
-    background: var(--accent);
-    padding: 2px 6px;
-    border-radius: 4px;
+    color: var(--accent);
+    background: transparent;
+    padding: 2px 0;
     text-transform: uppercase;
+    letter-spacing: 0.08em;
     font-weight: 600;
   }
 

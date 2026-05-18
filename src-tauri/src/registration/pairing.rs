@@ -156,14 +156,32 @@ pub async fn resolve_invite(
     );
 
     // Ephemeral guest connection purely for JetStream read.
+    //
+    // async-nats's parse_decorated_nkey regex requires `\r?\n` AFTER the
+    // closing dash-line of each block — so the trailing newlines below
+    // are load-bearing, not cosmetic. Without them, the second block
+    // (the NKEY SEED) fails to match and the connect call rejects the
+    // creds with "cannot parse nkey from the credentials file".
+    //
+    // `.tls_first()` is also load-bearing — the NLB on port 443 expects
+    // a TLS ClientHello as the very first bytes; the default async-nats
+    // flow (TCP→INFO→STARTTLS) hangs against it. See `nats::client::
+    // with_resilience` for the full rationale.
+    log::info!("Stage-1: connecting to NATS at {}", guest.nats_endpoint);
     let guest_client = async_nats::ConnectOptions::with_credentials(&format!(
-        "-----BEGIN NATS USER JWT-----\n{}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\n{}\n------END USER NKEY SEED------",
+        "-----BEGIN NATS USER JWT-----\n{}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\n{}\n------END USER NKEY SEED------\n",
         guest.jwt, guest.seed,
     ))
     .map_err(|e| RegistrationError::InviteResolutionFailed(format!("guest creds: {}", e)))?
+    .tls_first()
+    .ignore_discovered_servers()
     .connect(&guest.nats_endpoint)
     .await
-    .map_err(|e| RegistrationError::NatsConnectionFailed(format!("guest connect: {}", e)))?;
+    .map_err(|e| {
+        log::warn!("Stage-1 NATS connect failed: {}", e);
+        RegistrationError::NatsConnectionFailed(format!("guest connect: {}", e))
+    })?;
+    log::info!("Stage-1: NATS connected; fetching INVITATIONS consumer");
 
     let js = jetstream::new(guest_client.clone());
 
