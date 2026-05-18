@@ -72,8 +72,8 @@ export function resetSession() {
  * expiry UI.
  */
 export async function refreshSessionFromBackend(): Promise<void> {
+  const { invoke } = await import('@tauri-apps/api/core');
   try {
-    const { invoke } = await import('@tauri-apps/api/core');
     const info = await invoke<{
       connection_id: string;
       session_id: string;
@@ -98,6 +98,35 @@ export async function refreshSessionFromBackend(): Promise<void> {
       sessionStore.update(s => ({ ...s, state: 'expired', secondsRemaining: 0 }));
     }
   } catch {
-    // Not unlocked yet or another benign state — caller will decide.
+    // `get_session_info` throws "not unlocked" when AppState has no
+    // credentials in memory — which happens right after end_session,
+    // lock, or logout, AND on a fresh launch before auto-unlock has
+    // run. Previously the catch silently swallowed this, leaving the
+    // store stuck on its previous state (active → user clicks End
+    // session → store still says active → routing doesn't flip).
+    //
+    // Disambiguate by asking get_status whether we're even registered:
+    //   - registered but locked → state: 'expired' (lock screen path)
+    //   - not registered → state: 'inactive' (pair screen path)
+    try {
+      const status = await invoke<{ is_registered: boolean }>('get_status');
+      if (status.is_registered) {
+        sessionStore.update(s => ({ ...s, state: 'expired', secondsRemaining: 0 }));
+      } else {
+        sessionStore.set({
+          state: 'inactive',
+          sessionId: null,
+          connectionId: null,
+          ownerName: null,
+          expiresAt: 0,
+          secondsRemaining: 0,
+          extendedCount: 0,
+          maxExtensions: 3,
+          phoneReachable: false,
+        });
+      }
+    } catch {
+      // Can't reach the backend at all — leave whatever state we had.
+    }
   }
 }

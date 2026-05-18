@@ -10,12 +10,15 @@ pub struct AuthStatus {
     pub has_active_session: bool,
     // Device-identity fields surfaced in the Settings view so the
     // user can confirm which desktop they're looking at and verify
-    // the binary fingerprint matches what the vault recorded at
-    // pairing time. Cheap to compute (env vars + a hash of the on-
-    // disk binary) so we include them on every get_status call.
+    // the binary + machine fingerprints match what the phone's
+    // Authorize Desktop screen displays at pairing time. Mirrors the
+    // DeviceMetadata we send to the vault in `device.request-session`.
     pub hostname: String,
     pub platform: String,
+    pub os_name: String,
+    pub os_version: String,
     pub binary_fingerprint: String,
+    pub machine_fingerprint: String,
     pub app_version: String,
 }
 
@@ -153,6 +156,7 @@ pub async fn register(
 
 fn collect_device_fingerprint() -> crate::registration::pairing::DeviceFingerprint {
     use crate::fingerprint::binary::binary_fingerprint;
+    use crate::fingerprint::platform_linux::{collect_machine_attributes, compute_machine_fingerprint_hex};
     use crate::registration::pairing::DeviceFingerprint;
 
     let hostname = hostname::get()
@@ -161,10 +165,15 @@ fn collect_device_fingerprint() -> crate::registration::pairing::DeviceFingerpri
         .unwrap_or_default();
     let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
     let binary_fp = binary_fingerprint().unwrap_or_default();
-    // Machine fingerprint derivation is done by the platform_key module, which
-    // returns a key rather than the raw fingerprint. For now we leave this
-    // empty; the binary fingerprint gives the user enough to verify identity.
-    let machine_fp = String::new();
+    // Hex SHA-256 over a stable set of machine attributes (hostname,
+    // CPU brand, primary MAC, OS release fingerprint). Same source the
+    // credential store's machine-bound fallback key uses — surfacing it
+    // here lets the phone-side authorize screen show a value the user
+    // can compare against Settings → Device on the desktop.
+    let machine_fp = collect_machine_attributes()
+        .ok()
+        .map(|attrs| compute_machine_fingerprint_hex(&attrs))
+        .unwrap_or_default();
 
     // os_name + os_version are surfaced verbatim in the phone-side
     // detail screen so the user can verify which physical machine is
@@ -538,7 +547,10 @@ pub async fn get_status(state: State<'_, AppState>) -> Result<AuthStatus, String
         has_active_session,
         hostname: fp.hostname,
         platform: fp.platform,
+        os_name: fp.os_name,
+        os_version: fp.os_version,
         binary_fingerprint: fp.binary_fingerprint,
+        machine_fingerprint: fp.machine_fingerprint,
         app_version: fp.app_version,
     })
 }

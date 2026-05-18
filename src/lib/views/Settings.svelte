@@ -1,35 +1,32 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
-  import { sessionStore } from '../stores/session';
   import { themeStore, setTheme, type Theme } from '../stores/theme';
-  import { natsStore } from '../stores/nats';
 
-  let session = $derived($sessionStore);
   let theme = $derived($themeStore);
-  let nats = $derived($natsStore);
+
+  // Sub-pages cover persistent preferences only — live session ops
+  // (Lock, End session, NATS diagnostics) moved to the Session
+  // screen since they're transient operations the user reaches via
+  // the top-bar pill. Settings keeps Device / Appearance / Danger
+  // Zone (Log out) / About.
+  type SubPage = 'device' | 'appearance' | 'danger' | 'about';
+  let subPage = $state<SubPage>('device');
 
   let deviceInfo = $state<{
     hostname: string;
     platform: string;
+    osName: string;
+    osVersion: string;
     binaryFingerprint: string;
+    machineFingerprint: string;
     appVersion: string;
   } | null>(null);
 
   let loading = $state(true);
-  let locking = $state(false);
-  let lockMessage = $state('');
 
   let loggingOut = $state(false);
   let showLogoutPrompt = $state(false);
   let logoutMessage = $state('');
-
-  // End-session flow — kills the current vault session without
-  // dropping the pairing. The user can immediately start a new
-  // session from the SessionExpired view we land on. No
-  // passphrase under the keyring/machine-bound credential model.
-  let endingSession = $state(false);
-  let showEndSessionPrompt = $state(false);
-  let endSessionMessage = $state('');
 
   async function loadDeviceInfo() {
     try {
@@ -37,34 +34,25 @@
       deviceInfo = {
         hostname: status.hostname || 'Unknown',
         platform: status.platform || 'Unknown',
-        binaryFingerprint: status.binary_fingerprint || 'Unknown',
+        osName: status.os_name || '',
+        osVersion: status.os_version || '',
+        binaryFingerprint: status.binary_fingerprint || '',
+        machineFingerprint: status.machine_fingerprint || '',
         appVersion: status.app_version || '0.1.0',
       };
     } catch {
       deviceInfo = {
         hostname: 'Unknown',
         platform: 'linux',
-        binaryFingerprint: 'N/A',
+        osName: '',
+        osVersion: '',
+        binaryFingerprint: '',
+        machineFingerprint: '',
         appVersion: '0.1.0',
       };
     } finally {
       loading = false;
     }
-  }
-
-  async function lockApp() {
-    if (locking) return;
-    const ok = confirm('Lock the app? You will need to enter your passphrase to unlock.');
-    if (!ok) return;
-    locking = true;
-    lockMessage = '';
-    try {
-      await invoke('lock');
-      lockMessage = 'Locked.';
-    } catch (e) {
-      lockMessage = `Lock failed: ${e}`;
-    }
-    locking = false;
   }
 
   async function doLogout() {
@@ -81,110 +69,103 @@
     }
   }
 
-  async function doEndSession() {
-    if (endingSession) return;
-    endingSession = true;
-    endSessionMessage = '';
-    try {
-      await invoke('end_session');
-      endSessionMessage = 'Session ended.';
-      showEndSessionPrompt = false;
-    } catch (e) {
-      endSessionMessage = `Failed to end session: ${e}`;
-    } finally {
-      endingSession = false;
-    }
-  }
-
   $effect(() => {
     loadDeviceInfo();
   });
 </script>
 
-<div class="settings-view">
-  <h1>Settings</h1>
+<div class="settings">
+  <aside class="settings-nav">
+    <h1>Settings</h1>
+    <nav>
+      <button class:active={subPage === 'device'}     onclick={() => subPage = 'device'}>Device</button>
+      <button class:active={subPage === 'appearance'} onclick={() => subPage = 'appearance'}>Appearance</button>
+      <button class:active={subPage === 'danger'}     onclick={() => subPage = 'danger'}>Danger zone</button>
+      <button class:active={subPage === 'about'}      onclick={() => subPage = 'about'}>About</button>
+    </nav>
+  </aside>
 
-  <div class="section">
-    <h2>Device Information</h2>
-    <div class="card">
-      {#if loading}
-        <div class="loading">Loading...</div>
-      {:else if deviceInfo}
-        <div class="row">
-          <span class="label">Hostname</span>
-          <span class="value">{deviceInfo.hostname}</span>
-        </div>
-        <div class="row">
-          <span class="label">Platform</span>
-          <span class="value">{deviceInfo.platform}</span>
-        </div>
-        <div class="row">
-          <span class="label">App Version</span>
-          <span class="value">{deviceInfo.appVersion}</span>
-        </div>
-        <div class="row">
-          <span class="label">Binary Fingerprint</span>
-          <span class="value mono truncate">{deviceInfo.binaryFingerprint}</span>
-        </div>
-      {/if}
-    </div>
-  </div>
+  <section class="settings-pane">
+    {#if subPage === 'device'}
+      <h2>Device</h2>
+      <p class="hint">
+        Identity this desktop sends to the vault at pairing time. The phone's
+        Authorize Desktop screen shows the same values — compare to confirm
+        you're approving the right machine.
+      </p>
+      <div class="card">
+        {#if loading}
+          <div class="loading">Loading…</div>
+        {:else if deviceInfo}
+          <div class="row">
+            <span class="label">Hostname</span>
+            <span class="value">{deviceInfo.hostname}</span>
+          </div>
+          {#if deviceInfo.osName}
+            <div class="row">
+              <span class="label">OS</span>
+              <span class="value">{deviceInfo.osName} {deviceInfo.osVersion}</span>
+            </div>
+          {/if}
+          <div class="row">
+            <span class="label">Platform</span>
+            <span class="value">{deviceInfo.platform}</span>
+          </div>
+          <div class="row">
+            <span class="label">App version</span>
+            <span class="value">{deviceInfo.appVersion}</span>
+          </div>
+          <div class="row stacked">
+            <span class="label">Binary fingerprint</span>
+            <span class="value mono wrap">{deviceInfo.binaryFingerprint || '—'}</span>
+          </div>
+          <div class="row stacked">
+            <span class="label">Machine fingerprint</span>
+            <span class="value mono wrap">{deviceInfo.machineFingerprint || '—'}</span>
+          </div>
+        {/if}
+      </div>
 
-  {#if session.state !== 'inactive'}
-    <div class="section">
-      <h2>Session</h2>
+    {:else if subPage === 'appearance'}
+      <h2>Appearance</h2>
+      <p class="hint">Pick how the desktop looks. Auto follows your OS preference.</p>
       <div class="card">
         <div class="row">
-          <span class="label">Session ID</span>
-          <span class="value mono">{session.sessionId || 'N/A'}</span>
-        </div>
-        <div class="row">
-          <span class="label">Status</span>
-          <span class="value status" class:active={session.state === 'active'}
-                class:suspended={session.state === 'suspended'}
-                class:expired={session.state === 'expired'}>
-            {session.state}
-          </span>
-        </div>
-        <div class="row">
-          <span class="label">Extensions Used</span>
-          <span class="value">{session.extendedCount} / {session.maxExtensions}</span>
-        </div>
-        <div class="row">
-          <span class="label">Phone Reachable</span>
-          <span class="value" class:reachable={session.phoneReachable} class:unreachable={!session.phoneReachable}>
-            {session.phoneReachable ? 'Yes' : 'No'}
-          </span>
+          <span class="label">Theme</span>
+          <div class="theme-options">
+            {#each ['light', 'dark', 'auto'] as opt}
+              <button
+                class="theme-btn"
+                class:active={theme === opt}
+                onclick={() => setTheme(opt as Theme)}
+              >{opt}</button>
+            {/each}
+          </div>
         </div>
       </div>
-    </div>
 
-    <div class="section">
-      <h2>Connection</h2>
-      <div class="card">
+    {:else if subPage === 'danger'}
+      <h2>Danger zone</h2>
+      <p class="hint">
+        Log out removes this desktop's pairing entirely. For lock or end-session
+        (which keep the pairing), open the Session screen from the top-bar pill.
+      </p>
+      <div class="card danger">
         <div class="row">
-          <span class="label">Owner</span>
-          <span class="value">{session.ownerName || 'N/A'}</span>
+          <div>
+            <div class="label">Log out this desktop</div>
+            <div class="hint inline">
+              Wipes the credentials on disk + the keyring entry and notifies
+              the vault. You'll need to pair again from your phone.
+            </div>
+          </div>
+          {#if !showLogoutPrompt}
+            <button class="danger-btn" onclick={() => showLogoutPrompt = true}>
+              Log out
+            </button>
+          {/if}
         </div>
-        <div class="row">
-          <span class="label">Connection ID</span>
-          <span class="value mono truncate">{session.connectionId || 'N/A'}</span>
-        </div>
-      </div>
-    </div>
-
-    <div class="section">
-      <h2>Log out</h2>
-      <div class="card">
-        <p class="hint">
-          Logging out notifies the vault, removes this desktop from your device list,
-          and erases all local credentials. You'll need to pair again with a new invite code.
-        </p>
-        {#if !showLogoutPrompt}
-          <button class="danger-btn" onclick={() => showLogoutPrompt = true}>
-            Log out this desktop
-          </button>
-        {:else}
+        {#if showLogoutPrompt}
           <p class="hint">Are you sure? This wipes the pairing — you'll need to pair again from your phone.</p>
           <div class="btn-row">
             <button class="danger-btn" onclick={doLogout} disabled={loggingOut}>
@@ -199,132 +180,93 @@
           <p class="logout-msg">{logoutMessage}</p>
         {/if}
       </div>
-    </div>
-  {/if}
 
-  <div class="section">
-    <h2>Appearance</h2>
-    <div class="card">
-      <div class="row">
-        <span class="label">Theme</span>
-        <div class="theme-options">
-          {#each ['light', 'dark', 'auto'] as opt}
-            <button
-              class="theme-btn"
-              class:active={theme === opt}
-              onclick={() => setTheme(opt as Theme)}
-            >{opt}</button>
-          {/each}
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="section">
-    <h2>Security</h2>
-    <div class="card">
-      <div class="row">
-        <span class="label">Lock vault</span>
-        <button class="lock-btn" onclick={lockApp} disabled={locking || session.state === 'inactive'}>
-          {locking ? 'Locking…' : 'Lock now'}
-        </button>
-      </div>
-      {#if lockMessage}
-        <div class="lock-msg">{lockMessage}</div>
-      {/if}
-
-      <div class="row" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 14px; margin-top: 8px;">
-        <div>
-          <div class="label" style="margin-bottom: 4px;">End session</div>
-          <div class="hint" style="margin: 0; max-width: 260px;">
-            Ends the vault session immediately. Pairing stays — start a new session
-            from the lock screen without re-pairing on your phone.
-          </div>
-        </div>
-        {#if !showEndSessionPrompt}
-          <button
-            class="lock-btn"
-            onclick={() => { showEndSessionPrompt = true; endSessionMessage = ''; }}
-            disabled={session.state !== 'active'}
-          >
-            End now
-          </button>
-        {/if}
-      </div>
-      {#if showEndSessionPrompt}
-        <p class="hint">End the current session now? You'll start a fresh one from the lock screen.</p>
-        <div class="btn-row">
-          <button class="danger-btn" onclick={doEndSession} disabled={endingSession}>
-            {endingSession ? 'Ending…' : 'Confirm end session'}
-          </button>
-          <button class="ghost-btn" onclick={() => { showEndSessionPrompt = false; endSessionMessage = ''; }}>
-            Cancel
-          </button>
-        </div>
-      {/if}
-      {#if endSessionMessage}
-        <div class="lock-msg">{endSessionMessage}</div>
-      {/if}
-    </div>
-  </div>
-
-  <div class="section">
-    <h2>Network</h2>
-    <div class="card">
-      <div class="row">
-        <span class="label">NATS state</span>
-        <span class="value" class:reachable={nats.connected} class:unreachable={!nats.connected}>
-          {nats.rawState ?? 'unknown'}
-        </span>
-      </div>
-      {#if nats.error}
+    {:else if subPage === 'about'}
+      <h2>About</h2>
+      <p class="hint">Build info for this VettID Desktop install.</p>
+      <div class="card">
         <div class="row">
-          <span class="label">Last error</span>
-          <span class="value">{nats.error}</span>
+          <span class="label">Application</span>
+          <span class="value">VettID Desktop</span>
         </div>
-      {/if}
-    </div>
-  </div>
-
-  <div class="section">
-    <h2>About</h2>
-    <div class="card">
-      <div class="row">
-        <span class="label">Application</span>
-        <span class="value">VettID Desktop</span>
+        <div class="row">
+          <span class="label">Version</span>
+          <span class="value">{deviceInfo?.appVersion ?? '0.1.0'}</span>
+        </div>
       </div>
-      <div class="row">
-        <span class="label">Version</span>
-        <span class="value">0.1.0</span>
-      </div>
-    </div>
-  </div>
+    {/if}
+  </section>
 </div>
 
 <style>
-  .settings-view {
-    padding: 24px;
+  .settings {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
   }
 
-  h1 {
-    font-size: 1.3rem;
-    margin-bottom: 20px;
+  .settings-nav {
+    width: 200px;
+    padding: 20px;
+    border-right: 1px solid rgba(255, 255, 255, 0.05);
+    overflow-y: auto;
+    flex-shrink: 0;
   }
-
-  .section {
-    margin-bottom: 24px;
+  .settings-nav h1 {
+    font-size: 1.2rem;
+    margin-bottom: 18px;
   }
-
-  h2 {
-    font-size: 1rem;
+  .settings-nav nav {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .settings-nav button {
+    background: transparent;
+    border: none;
     color: var(--text-muted);
-    margin-bottom: 8px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.9rem;
+  }
+  .settings-nav button:hover { background: rgba(255, 255, 255, 0.04); color: var(--text); }
+  .settings-nav button.active {
+    color: var(--accent);
+    background: var(--accent-muted);
+  }
+
+  .settings-pane {
+    flex: 1;
+    padding: 24px;
+    overflow-y: auto;
+    max-width: 720px;
+  }
+  .settings-pane h2 {
+    font-size: 1.25rem;
+    margin-bottom: 6px;
+  }
+  .settings-pane .hint {
+    color: var(--text-muted);
+    margin-bottom: 16px;
+    font-size: 0.9rem;
+    line-height: 1.5;
+  }
+  .settings-pane .hint.inline {
+    margin: 4px 0 0;
+    max-width: 380px;
   }
 
   .card {
     background: var(--surface);
     border-radius: 8px;
-    padding: 16px 20px;
+    padding: 14px 18px;
+    margin-bottom: 24px;
+  }
+  .card.danger {
+    border: 1px solid rgba(244, 67, 54, 0.18);
   }
 
   .row {
@@ -333,36 +275,35 @@
     align-items: center;
     padding: 10px 0;
     border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    gap: 16px;
   }
-
-  .row:last-child {
-    border-bottom: none;
+  .row:last-child { border-bottom: none; }
+  /* Stacked rows are for long mono values (full 64-char hashes)
+     that can't sit on the same line as the label without ellipsis.
+     Label on top, value below, full width. */
+  .row.stacked {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
   }
 
   .label {
     color: var(--text-muted);
     font-size: 0.9rem;
   }
-
-  .value {
-    font-size: 0.9rem;
+  .value { font-size: 0.9rem; }
+  .mono { font-family: 'Courier New', monospace; font-size: 0.8rem; }
+  .wrap {
+    word-break: break-all;
+    white-space: normal;
+    max-width: 100%;
   }
-
-  .mono {
-    font-family: 'Courier New', monospace;
-    font-size: 0.8rem;
-  }
-
   .truncate {
-    max-width: 250px;
+    max-width: 320px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-
-  .status.active { color: var(--success); }
-  .status.suspended { color: var(--warning); }
-  .status.expired { color: var(--error); }
 
   .reachable { color: var(--success); }
   .unreachable { color: var(--error); }
@@ -370,7 +311,7 @@
   .loading {
     text-align: center;
     color: var(--text-muted);
-    padding: 20px;
+    padding: 16px;
   }
 
   .theme-options { display: flex; gap: 6px; }
@@ -385,53 +326,56 @@
     text-transform: capitalize;
     font-size: 0.85rem;
   }
-  .theme-btn.active { background: var(--accent, #ffc125); color: #000; border-color: var(--accent, #ffc125); }
+  .theme-btn.active { background: var(--accent); color: #000; border-color: var(--accent); }
 
-  .lock-btn {
-    background: rgba(198, 40, 40, 0.15);
-    color: #ef5350;
-    border: 1px solid rgba(198, 40, 40, 0.4);
+  .action-btn {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text);
+    border: 1px solid rgba(255,255,255,0.1);
     padding: 6px 14px;
-    border-radius: 4px;
+    border-radius: 6px;
     cursor: pointer;
     font: inherit;
+    font-size: 0.85rem;
+    white-space: nowrap;
   }
-  .lock-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  .lock-msg { padding: 8px 0 0; font-size: 0.85rem; color: var(--text-muted); }
+  .action-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.1); }
+  .action-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
-  .hint { color: var(--text-muted); font-size: 0.85rem; margin: 0 0 12px; line-height: 1.5; }
-  .btn-row { display: flex; gap: 8px; margin-top: 8px; }
+  .danger-heading {
+    margin-top: 24px;
+    margin-bottom: 12px;
+    font-size: 0.85rem;
+    color: var(--error);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
   .danger-btn {
-    background: rgba(198, 40, 40, 0.15);
+    background: rgba(244, 67, 54, 0.15);
     color: #ef5350;
-    border: 1px solid rgba(198, 40, 40, 0.4);
-    padding: 8px 16px;
-    border-radius: 4px;
+    border: 1px solid rgba(244, 67, 54, 0.4);
+    padding: 6px 14px;
+    border-radius: 6px;
     cursor: pointer;
     font: inherit;
+    font-size: 0.85rem;
+    white-space: nowrap;
   }
   .danger-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
   .ghost-btn {
     background: transparent;
     color: var(--text-muted);
     border: 1px solid rgba(255, 255, 255, 0.1);
-    padding: 8px 16px;
-    border-radius: 4px;
+    padding: 6px 14px;
+    border-radius: 6px;
     cursor: pointer;
     font: inherit;
+    font-size: 0.85rem;
   }
-  .input {
-    width: 100%;
-    padding: 10px 12px;
-    background: var(--bg);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 4px;
-    color: var(--text);
-    font-size: 0.95rem;
-    outline: none;
-    margin-bottom: 8px;
-  }
-  .input:focus { border-color: var(--accent); }
-  .input:disabled { opacity: 0.5; }
+
+  .btn-row { display: flex; gap: 8px; margin-top: 10px; }
+  .lock-msg { padding: 6px 0 0; font-size: 0.85rem; color: var(--text-muted); }
   .logout-msg { padding: 8px 0 0; font-size: 0.85rem; color: var(--text-muted); }
 </style>
