@@ -12,9 +12,21 @@
   import StatusBar from './lib/components/StatusBar.svelte';
   import CallOverlay from './lib/components/CallOverlay.svelte';
 
+  import { invoke } from '@tauri-apps/api/core';
+
   let currentView = $state<'pairing' | 'expired' | 'session' | 'vault' | 'settings'>('pairing');
   let sessionState: SessionState = $derived($sessionStore);
+  let isRegistered = $state(false);
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+  async function refreshRegistration() {
+    try {
+      const status: any = await invoke('get_status');
+      isRegistered = !!status?.is_registered;
+    } catch {
+      isRegistered = false;
+    }
+  }
 
   onMount(() => {
     initNatsListener();
@@ -22,18 +34,31 @@
     const unsub = themeStore.subscribe(() => {});
     unsub();
 
-    // Resolve the session state once on launch, then every 30s. `is_active`
-    // may flip to false between polls as the wall-clock expires; the effect
-    // below routes the user to SessionExpired when that happens.
+    // Resolve registration + session state on launch, then every 30s.
+    // is_registered reflects "the on-disk credential store exists" and
+    // drives the locked-vs-fresh routing distinction below.
+    // `is_active` may flip to false between polls as the wall-clock
+    // expires; the effect below routes the user to SessionExpired when
+    // that happens.
+    refreshRegistration();
     refreshSessionFromBackend();
-    pollTimer = setInterval(refreshSessionFromBackend, 30_000);
+    pollTimer = setInterval(() => {
+      refreshRegistration();
+      refreshSessionFromBackend();
+    }, 30_000);
   });
 
   onDestroy(() => {
     if (pollTimer) clearInterval(pollTimer);
   });
 
-  // Auto-navigate based on session state
+  // Auto-navigate based on session state. The trick here is the
+  // `inactive` branch: a fresh app launch always starts at inactive
+  // because the in-memory credential cache is empty, but the user
+  // may already be paired (creds file on disk). Route those users to
+  // the SessionExpired view — it accepts a passphrase and runs the
+  // extend flow, which doubles as an unlock-and-start-new-session
+  // path. Only truly-unregistered users get sent to Pairing.
   $effect(() => {
     if (sessionState.state === 'active') {
       if (currentView === 'pairing' || currentView === 'expired') currentView = 'vault';
@@ -41,7 +66,14 @@
       // Registered but session ran out — show the extension flow, not pairing.
       if (currentView !== 'settings') currentView = 'expired';
     } else if (sessionState.state === 'inactive') {
-      currentView = 'pairing';
+      if (isRegistered) {
+        // Locked: creds exist on disk, no session yet. Land on the
+        // extension flow so the user can unlock + start a new
+        // session in one go.
+        if (currentView !== 'settings') currentView = 'expired';
+      } else {
+        currentView = 'pairing';
+      }
     }
   });
 </script>

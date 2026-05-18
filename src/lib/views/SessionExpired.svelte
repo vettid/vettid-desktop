@@ -77,10 +77,11 @@
 
 <div class="wrap">
   <div class="card">
-    <h1>Session expired</h1>
+    <h1>Start a new session</h1>
     <p class="subtitle">
-      Scan a new QR with your phone to extend this desktop's session. Your data is
-      hidden until a phone approves the extension.
+      Enter your passphrase to start a new session with your phone.
+      You won't need to re-pair — your phone will get a QR to authorize
+      this desktop, and the existing pairing stays in place.
     </p>
 
     {#if step === 'idle'}
@@ -91,7 +92,7 @@
         class="input"
       />
       <button class="btn primary" onclick={start} disabled={!passphrase}>
-        Scan to Extend
+        Start New Session
       </button>
       <button class="btn ghost" onclick={logoutFromHere}>
         Log out instead

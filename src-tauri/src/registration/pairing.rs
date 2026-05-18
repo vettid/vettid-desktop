@@ -530,6 +530,59 @@ fn extract_block(s: &str, start: &str, end: &str) -> Option<String> {
 // Revocation (logout)
 // ---------------------------------------------------------------------------
 
+/// Publish `device.end-session` to the vault, signalling that the user
+/// wants to end the active session now (without wiping the connection).
+/// Vault wipes the server-side session key + flips DeviceSession to
+/// expired; the desktop can immediately re-request a session without
+/// re-pairing. Caller is expected to local-zeroize afterwards.
+pub async fn publish_end_session(
+    config_dir: &PathBuf,
+    passphrase: &str,
+    reason: &str,
+) -> Result<(), RegistrationError> {
+    use crate::credential::store;
+
+    let (creds, _) = store::load_with_tolerance(config_dir, passphrase)
+        .map_err(|e| RegistrationError::Internal(format!("load creds: {}", e)))?;
+
+    let (scoped_jwt, scoped_seed) = parse_creds_block(&creds.message_space_token)
+        .ok_or_else(|| RegistrationError::Internal("stored NATS creds malformed".to_string()))?;
+
+    let mut client = NatsClient::new();
+    client
+        .connect_with_credentials(
+            &creds.message_space_url,
+            &scoped_jwt,
+            &scoped_seed,
+            &creds.owner_guid,
+        )
+        .await?;
+
+    let subject = format!(
+        "MessageSpace.{}.forOwner.device.{}.end-session",
+        creds.owner_guid, creds.connection_id,
+    );
+    let request_id = hex::encode(generate_random_bytes(16));
+    let payload = serde_json::json!({
+        "id": request_id,
+        "type": "device.end-session",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "payload": {
+            "connection_id": creds.connection_id,
+            "reason": reason,
+        },
+    });
+
+    client
+        .publish_to(&subject, payload.to_string().as_bytes())
+        .await?;
+
+    // Give NATS a moment to flush; don't wait for an ack — the local
+    // state wipe must happen even if the vault round-trip is slow.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    Ok(())
+}
+
 /// Publish `device.revoke` to the vault, signalling that this desktop is
 /// logging out. Fire-and-forget — we don't block on a response because the
 /// credentials may already be invalid and the caller wants to wipe local

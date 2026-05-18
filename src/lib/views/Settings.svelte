@@ -24,6 +24,16 @@
   let showLogoutPrompt = $state(false);
   let logoutMessage = $state('');
 
+  // End-session flow — kills the current vault session without
+  // dropping the pairing. The user can immediately start a new
+  // session from the SessionExpired view we land on. Needs the
+  // passphrase since it has to load the stored creds to publish
+  // device.end-session to the vault.
+  let endingSession = $state(false);
+  let endSessionPassphrase = $state('');
+  let showEndSessionPrompt = $state(false);
+  let endSessionMessage = $state('');
+
   async function loadDeviceInfo() {
     try {
       const status: any = await invoke('get_status');
@@ -76,6 +86,29 @@
     } catch (e) {
       logoutMessage = `Logout failed: ${e}`;
       loggingOut = false;
+    }
+  }
+
+  async function doEndSession() {
+    if (endingSession) return;
+    if (!endSessionPassphrase) {
+      endSessionMessage = 'Enter your passphrase to confirm.';
+      return;
+    }
+    endingSession = true;
+    endSessionMessage = '';
+    try {
+      await invoke('end_session', { passphrase: endSessionPassphrase });
+      endSessionPassphrase = '';
+      endSessionMessage = 'Session ended.';
+      // Drop the prompt so the SessionExpired view (auto-routed
+      // because we just flipped session.state to expired) is what
+      // the user sees on their next render.
+      showEndSessionPrompt = false;
+    } catch (e) {
+      endSessionMessage = `Failed to end session: ${e}`;
+    } finally {
+      endingSession = false;
     }
   }
 
@@ -220,6 +253,45 @@
       </div>
       {#if lockMessage}
         <div class="lock-msg">{lockMessage}</div>
+      {/if}
+
+      <div class="row" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 14px; margin-top: 8px;">
+        <div>
+          <div class="label" style="margin-bottom: 4px;">End session</div>
+          <div class="hint" style="margin: 0; max-width: 260px;">
+            Ends the vault session immediately. Pairing stays — start a new session
+            from the lock screen without re-pairing on your phone.
+          </div>
+        </div>
+        {#if !showEndSessionPrompt}
+          <button
+            class="lock-btn"
+            onclick={() => { showEndSessionPrompt = true; endSessionMessage = ''; }}
+            disabled={session.state !== 'active'}
+          >
+            End now
+          </button>
+        {/if}
+      </div>
+      {#if showEndSessionPrompt}
+        <input
+          type="password"
+          bind:value={endSessionPassphrase}
+          placeholder="Enter passphrase to confirm"
+          class="input"
+          disabled={endingSession}
+        />
+        <div class="btn-row">
+          <button class="danger-btn" onclick={doEndSession} disabled={endingSession || !endSessionPassphrase}>
+            {endingSession ? 'Ending…' : 'Confirm end session'}
+          </button>
+          <button class="ghost-btn" onclick={() => { showEndSessionPrompt = false; endSessionPassphrase = ''; endSessionMessage = ''; }}>
+            Cancel
+          </button>
+        </div>
+      {/if}
+      {#if endSessionMessage}
+        <div class="lock-msg">{endSessionMessage}</div>
       {/if}
     </div>
   </div>

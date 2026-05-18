@@ -169,14 +169,73 @@ fn collect_device_fingerprint() -> crate::registration::pairing::DeviceFingerpri
     // empty; the binary fingerprint gives the user enough to verify identity.
     let machine_fp = String::new();
 
+    // os_name + os_version are surfaced verbatim in the phone-side
+    // detail screen so the user can verify which physical machine is
+    // talking to the vault. `std::env::consts::OS` only gives the
+    // kernel family ("linux", "macos", "windows"), which is already
+    // redundant with `platform`. Resolve the real distribution name
+    // and version per-OS so the row reads "Fedora · 43" instead of
+    // "linux".
+    let (os_name, os_version) = resolve_os_details();
+
     DeviceFingerprint {
         hostname,
         platform,
-        os_name: std::env::consts::OS.to_string(),
-        os_version: String::new(),
+        os_name,
+        os_version,
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         binary_fingerprint: binary_fp,
         machine_fingerprint: machine_fp,
+    }
+}
+
+/// Best-effort distribution name + version for the current OS. The
+/// values are display-only — surfaced to the user in the phone's
+/// device-detail screen so they can verify what machine paired.
+///
+/// Linux: parses `/etc/os-release` (the freedesktop standard) for
+///   NAME + VERSION_ID, falling back to PRETTY_NAME on either.
+/// macOS / Windows: returns the kernel family for now; we can
+///   shell out to `sw_vers` or read the Windows registry later if
+///   the desktop ever ships on those platforms.
+fn resolve_os_details() -> (String, String) {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(text) = std::fs::read_to_string("/etc/os-release") {
+            let mut name = String::new();
+            let mut version = String::new();
+            let mut pretty = String::new();
+            for line in text.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("NAME=") {
+                    name = unquote(rest);
+                } else if let Some(rest) = line.strip_prefix("VERSION_ID=") {
+                    version = unquote(rest);
+                } else if let Some(rest) = line.strip_prefix("PRETTY_NAME=") {
+                    pretty = unquote(rest);
+                }
+            }
+            if !name.is_empty() {
+                return (name, version);
+            }
+            if !pretty.is_empty() {
+                return (pretty, version);
+            }
+        }
+    }
+    (std::env::consts::OS.to_string(), String::new())
+}
+
+/// Strip surrounding double-quotes from a /etc/os-release value.
+/// Values may be unquoted, double-quoted, or single-quoted per
+/// the spec — we handle the first two; single-quoted is rare in
+/// practice.
+fn unquote(s: &str) -> String {
+    let s = s.trim();
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
     }
 }
 
@@ -377,6 +436,52 @@ pub async fn logout(state: State<'_, AppState>, passphrase: String) -> Result<bo
             let _ = std::fs::remove_file(config_dir.join("connection.enc"));
         }
     }
+
+    Ok(true)
+}
+
+/// End the current vault session immediately, server-side AND locally.
+///
+/// Unlike `logout` (which wipes the on-disk credential store and ends the
+/// desktop's pairing entirely), this preserves the pairing so the user can
+/// start a new session under the same connection without re-pairing on the
+/// phone. The flow is:
+///   1. Publish device.end-session to the vault — wipes the session key
+///      server-side, flips DeviceSession.Status to "expired", notifies the
+///      desktop via forApp.device.{conn}.ended.
+///   2. Locally expire the session: zero the connection key, clear
+///      credentials from memory, flip the local session state to expired
+///      so the UI routes to SessionExpired (where "Scan to Extend"
+///      restarts the session without re-pair).
+///
+/// Passphrase is required to load the stored creds for the vault publish.
+#[tauri::command]
+pub async fn end_session(state: State<'_, AppState>, passphrase: String) -> Result<bool, String> {
+    use crate::credential::store;
+    use crate::registration::pairing;
+    use zeroize::Zeroize;
+
+    let config_dir = store::default_config_dir();
+
+    // Best-effort vault publish first — if it fails, we still want to
+    // locally expire so the desktop UI doesn't claim an active session
+    // the vault is about to reject anyway.
+    if let Err(e) = pairing::publish_end_session(&config_dir, &passphrase, "user_locked").await {
+        log::warn!("device.end-session publish failed (continuing with local expire): {}", e);
+    }
+
+    state.nats.lock().await.disconnect().await;
+
+    {
+        let mut key_guard = state.connection_key.write().await;
+        if let Some(ref mut key) = *key_guard {
+            key.zeroize();
+        }
+        *key_guard = None;
+    }
+    *state.credentials.write().await = None;
+    *state.is_unlocked.write().await = false;
+    state.session.write().await.expire();
 
     Ok(true)
 }
