@@ -272,7 +272,6 @@ pub async fn complete_pairing(
     runtime: PairingRuntime,
     fingerprint: DeviceFingerprint,
     config_dir: &PathBuf,
-    passphrase: &str,
 ) -> Result<PairingOutcome, RegistrationError> {
     let mut client = NatsClient::new();
     client
@@ -367,7 +366,6 @@ pub async fn complete_pairing(
 
     // Save encrypted credentials
     use crate::credential::store::{self, ConnectionCredentials};
-    use crate::fingerprint::platform_key::derive_platform_key;
 
     std::fs::create_dir_all(config_dir)
         .map_err(|e| RegistrationError::Internal(format!("create config dir: {}", e)))?;
@@ -393,10 +391,7 @@ pub async fn complete_pairing(
         session_duration_seconds: activation_result.duration_s,
     };
 
-    let platform_key = derive_platform_key()
-        .map_err(|e| RegistrationError::Internal(format!("platform key: {}", e)))?;
-
-    store::save(config_dir, &creds, passphrase.as_bytes(), &platform_key)
+    store::save(config_dir, &creds)
         .map_err(|e| RegistrationError::Internal(format!("save credentials: {}", e)))?;
 
     session_key.zeroize();
@@ -470,11 +465,10 @@ pub struct PairingOutcome {
 /// request-session → await-activation dance as an initial pair.
 pub async fn start_extension(
     config_dir: &PathBuf,
-    passphrase: &str,
 ) -> Result<(InviteSession, PairingRuntime), RegistrationError> {
     use crate::credential::store;
 
-    let (creds, _) = store::load_with_tolerance(config_dir, passphrase)
+    let (creds, _) = store::load(config_dir)
         .map_err(|e| RegistrationError::Internal(format!("load creds: {}", e)))?;
 
     // Parse JWT+seed out of the stored creds block so we can reuse them for
@@ -537,12 +531,11 @@ fn extract_block(s: &str, start: &str, end: &str) -> Option<String> {
 /// re-pairing. Caller is expected to local-zeroize afterwards.
 pub async fn publish_end_session(
     config_dir: &PathBuf,
-    passphrase: &str,
     reason: &str,
 ) -> Result<(), RegistrationError> {
     use crate::credential::store;
 
-    let (creds, _) = store::load_with_tolerance(config_dir, passphrase)
+    let (creds, _) = store::load(config_dir)
         .map_err(|e| RegistrationError::Internal(format!("load creds: {}", e)))?;
 
     let (scoped_jwt, scoped_seed) = parse_creds_block(&creds.message_space_token)
@@ -587,10 +580,10 @@ pub async fn publish_end_session(
 /// logging out. Fire-and-forget — we don't block on a response because the
 /// credentials may already be invalid and the caller wants to wipe local
 /// state regardless.
-pub async fn publish_revoke(config_dir: &PathBuf, passphrase: &str) -> Result<(), RegistrationError> {
+pub async fn publish_revoke(config_dir: &PathBuf) -> Result<(), RegistrationError> {
     use crate::credential::store;
 
-    let (creds, _) = store::load_with_tolerance(config_dir, passphrase)
+    let (creds, _) = store::load(config_dir)
         .map_err(|e| RegistrationError::Internal(format!("load creds: {}", e)))?;
 
     let (scoped_jwt, scoped_seed) = parse_creds_block(&creds.message_space_token)

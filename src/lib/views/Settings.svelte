@@ -20,17 +20,14 @@
   let lockMessage = $state('');
 
   let loggingOut = $state(false);
-  let logoutPassphrase = $state('');
   let showLogoutPrompt = $state(false);
   let logoutMessage = $state('');
 
   // End-session flow — kills the current vault session without
   // dropping the pairing. The user can immediately start a new
-  // session from the SessionExpired view we land on. Needs the
-  // passphrase since it has to load the stored creds to publish
-  // device.end-session to the vault.
+  // session from the SessionExpired view we land on. No
+  // passphrase under the keyring/machine-bound credential model.
   let endingSession = $state(false);
-  let endSessionPassphrase = $state('');
   let showEndSessionPrompt = $state(false);
   let endSessionMessage = $state('');
 
@@ -72,15 +69,10 @@
 
   async function doLogout() {
     if (loggingOut) return;
-    if (!logoutPassphrase) {
-      logoutMessage = 'Enter your passphrase — needed to notify the vault.';
-      return;
-    }
     loggingOut = true;
     logoutMessage = '';
     try {
-      await invoke('logout', { passphrase: logoutPassphrase });
-      logoutPassphrase = '';
+      await invoke('logout');
       logoutMessage = 'Logged out. Reloading…';
       setTimeout(() => window.location.reload(), 600);
     } catch (e) {
@@ -91,19 +83,11 @@
 
   async function doEndSession() {
     if (endingSession) return;
-    if (!endSessionPassphrase) {
-      endSessionMessage = 'Enter your passphrase to confirm.';
-      return;
-    }
     endingSession = true;
     endSessionMessage = '';
     try {
-      await invoke('end_session', { passphrase: endSessionPassphrase });
-      endSessionPassphrase = '';
+      await invoke('end_session');
       endSessionMessage = 'Session ended.';
-      // Drop the prompt so the SessionExpired view (auto-routed
-      // because we just flipped session.state to expired) is what
-      // the user sees on their next render.
       showEndSessionPrompt = false;
     } catch (e) {
       endSessionMessage = `Failed to end session: ${e}`;
@@ -201,18 +185,12 @@
             Log out this desktop
           </button>
         {:else}
-          <input
-            type="password"
-            bind:value={logoutPassphrase}
-            placeholder="Enter passphrase to confirm"
-            class="input"
-            disabled={loggingOut}
-          />
+          <p class="hint">Are you sure? This wipes the pairing — you'll need to pair again from your phone.</p>
           <div class="btn-row">
-            <button class="danger-btn" onclick={doLogout} disabled={loggingOut || !logoutPassphrase}>
+            <button class="danger-btn" onclick={doLogout} disabled={loggingOut}>
               {loggingOut ? 'Logging out…' : 'Confirm logout'}
             </button>
-            <button class="ghost-btn" onclick={() => { showLogoutPrompt = false; logoutPassphrase = ''; logoutMessage = ''; }}>
+            <button class="ghost-btn" onclick={() => { showLogoutPrompt = false; logoutMessage = ''; }}>
               Cancel
             </button>
           </div>
@@ -274,18 +252,12 @@
         {/if}
       </div>
       {#if showEndSessionPrompt}
-        <input
-          type="password"
-          bind:value={endSessionPassphrase}
-          placeholder="Enter passphrase to confirm"
-          class="input"
-          disabled={endingSession}
-        />
+        <p class="hint">End the current session now? You'll start a fresh one from the lock screen.</p>
         <div class="btn-row">
-          <button class="danger-btn" onclick={doEndSession} disabled={endingSession || !endSessionPassphrase}>
+          <button class="danger-btn" onclick={doEndSession} disabled={endingSession}>
             {endingSession ? 'Ending…' : 'Confirm end session'}
           </button>
-          <button class="ghost-btn" onclick={() => { showEndSessionPrompt = false; endSessionPassphrase = ''; endSessionMessage = ''; }}>
+          <button class="ghost-btn" onclick={() => { showEndSessionPrompt = false; endSessionMessage = ''; }}>
             Cancel
           </button>
         </div>

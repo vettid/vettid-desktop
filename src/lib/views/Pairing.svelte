@@ -5,10 +5,7 @@
   import { onDestroy } from 'svelte';
 
   let inviteCode = $state('');
-  let passphrase = $state('');
-  let confirmPassphrase = $state('');
-  let showPassphrase = $state(false);
-  let step = $state<'code' | 'passphrase' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error'>('code');
+  let step = $state<'code' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error'>('code');
   let errorMessage = $state('');
   let qrDataUrl = $state('');
   let connectionId = $state('');
@@ -18,39 +15,22 @@
     unlistenQr?.();
   });
 
-  // Svelte action: focus the element as soon as it mounts. Used to
-  // give the invite-code field focus when the Pairing view appears,
-  // and to move focus into the passphrase field the moment we step
-  // into the passphrase view (since the inputs are conditionally
-  // rendered, each step transition re-mounts a fresh input and the
-  // action fires).
+  // Svelte action: focus the input when it mounts so the user can
+  // start typing immediately. Re-applies on each step transition
+  // because the input gets remounted under a fresh `{#if}` branch.
   function autofocus(node: HTMLInputElement) {
     queueMicrotask(() => node.focus());
   }
 
-  async function advanceToPassphrase() {
+  async function submit() {
     // The phone app generates 12-char codes displayed as three
     // 4-character blocks (ABCD-EFGH-JKLM). Accept either form on
-    // input — we strip dashes/whitespace before validating.
+    // input — strip dashes/whitespace before validating.
     inviteCode = inviteCode.replace(/[\s-]/g, '').toUpperCase();
     if (inviteCode.length !== 12) {
       errorMessage = 'Invite code must be 12 characters.';
       return;
     }
-    errorMessage = '';
-    step = 'passphrase';
-  }
-
-  async function submit() {
-    if (passphrase !== confirmPassphrase) {
-      errorMessage = 'Passphrases do not match.';
-      return;
-    }
-    if (passphrase.length < 8) {
-      errorMessage = 'Passphrase must be at least 8 characters.';
-      return;
-    }
-
     errorMessage = '';
     step = 'awaiting-qr';
 
@@ -67,7 +47,7 @@
 
     try {
       const result: any = await invoke('register', {
-        request: { invite_code: inviteCode, passphrase },
+        request: { invite_code: inviteCode },
       });
 
       if (result.success) {
@@ -85,8 +65,6 @@
   function reset() {
     step = 'code';
     inviteCode = '';
-    passphrase = '';
-    confirmPassphrase = '';
     errorMessage = '';
     qrDataUrl = '';
     connectionId = '';
@@ -116,67 +94,15 @@
         use:autofocus
         oninput={() => { inviteCode = inviteCode.toUpperCase(); errorMessage = ''; }}
         onkeydown={(e) => {
-          // Enter submits when the code is the right length — same as
-          // clicking Continue. Keeps the keyboard-driven flow snappy.
           if (e.key === 'Enter' && inviteCode.replace(/[\s-]/g, '').length === 12) {
-            e.preventDefault();
-            advanceToPassphrase();
-          }
-        }}
-      />
-
-      <button class="btn primary" onclick={advanceToPassphrase} disabled={inviteCode.replace(/[\s-]/g, '').length !== 12}>
-        Continue
-      </button>
-
-    {:else if step === 'passphrase'}
-      <p class="subtitle">
-        Choose a passphrase to encrypt this desktop's credentials on disk.
-        It's combined with your machine's fingerprint, so the store can't be decrypted on another machine.
-      </p>
-
-      <div class="pw-row">
-        <input
-          type={showPassphrase ? 'text' : 'password'}
-          bind:value={passphrase}
-          placeholder="Encryption passphrase"
-          class="input pw-input"
-          use:autofocus
-          onkeydown={(e) => {
-            if (e.key === 'Enter' && passphrase && passphrase === confirmPassphrase) {
-              e.preventDefault();
-              submit();
-            }
-          }}
-        />
-        <button
-          type="button"
-          class="pw-toggle"
-          onclick={() => showPassphrase = !showPassphrase}
-          aria-label={showPassphrase ? 'Hide passphrase' : 'Show passphrase'}
-        >
-          {showPassphrase ? 'Hide' : 'Show'}
-        </button>
-      </div>
-      <input
-        type={showPassphrase ? 'text' : 'password'}
-        bind:value={confirmPassphrase}
-        placeholder="Confirm passphrase"
-        class="input"
-        onkeydown={(e) => {
-          if (e.key === 'Enter' && passphrase && passphrase === confirmPassphrase) {
             e.preventDefault();
             submit();
           }
         }}
       />
 
-      <button class="btn primary" onclick={submit}
-              disabled={!passphrase || passphrase !== confirmPassphrase}>
+      <button class="btn primary" onclick={submit} disabled={inviteCode.replace(/[\s-]/g, '').length !== 12}>
         Connect
-      </button>
-      <button class="btn secondary" onclick={() => { step = 'code'; errorMessage = ''; }}>
-        Back
       </button>
 
     {:else if step === 'awaiting-qr'}

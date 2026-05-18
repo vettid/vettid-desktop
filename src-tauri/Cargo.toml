@@ -69,6 +69,13 @@ hostname = "0.4"
 dirs = "5"
 serde_bytes = "0.11"
 
+# OS keyring (Secret Service on Linux, Keychain on macOS). Used to hold
+# the master encryption key for the on-disk credential blob, so users
+# don't have to enter a passphrase at pairing time. `linux-native`
+# avoids the Secret Service D-Bus dependency mismatch some distros
+# have; on macOS the default platform store is the Keychain.
+keyring = { version = "3", default-features = false, features = ["apple-native", "linux-native", "sync-secret-service"] }
+
 [dev-dependencies]
 tempfile = "3"
 

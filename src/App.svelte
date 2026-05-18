@@ -28,23 +28,37 @@
     }
   }
 
-  onMount(() => {
+  /**
+   * If the desktop is paired (credentials on disk) but the in-memory
+   * state is empty, auto-unlock it. The unlock command pulls the
+   * master key from the OS keyring (or the machine-bound fallback),
+   * decrypts the credential blob, and populates AppState — no user
+   * input needed. After this, `refreshSessionFromBackend` will see
+   * either an active or expired session and the routing effect picks
+   * the right view.
+   */
+  async function autoUnlockIfNeeded() {
+    if (!isRegistered) return;
+    try {
+      await invoke('unlock');
+    } catch (e) {
+      console.warn('Auto-unlock failed:', e);
+    }
+  }
+
+  onMount(async () => {
     initNatsListener();
     initCallListener();
     const unsub = themeStore.subscribe(() => {});
     unsub();
 
-    // Resolve registration + session state on launch, then every 30s.
-    // is_registered reflects "the on-disk credential store exists" and
-    // drives the locked-vs-fresh routing distinction below.
-    // `is_active` may flip to false between polls as the wall-clock
-    // expires; the effect below routes the user to SessionExpired when
-    // that happens.
-    refreshRegistration();
-    refreshSessionFromBackend();
-    pollTimer = setInterval(() => {
-      refreshRegistration();
-      refreshSessionFromBackend();
+    // Resolve registration first so we know whether to auto-unlock.
+    await refreshRegistration();
+    await autoUnlockIfNeeded();
+    await refreshSessionFromBackend();
+    pollTimer = setInterval(async () => {
+      await refreshRegistration();
+      await refreshSessionFromBackend();
     }, 30_000);
   });
 

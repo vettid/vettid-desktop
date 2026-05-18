@@ -25,8 +25,6 @@ pub struct RegisterRequest {
     /// to them as `ABCD-EFGH-JKLM`. The frontend strips dashes/whitespace
     /// before sending, but we also normalize defensively below.
     pub invite_code: String,
-    /// Passphrase for encrypting the on-disk credential store.
-    pub passphrase: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -118,7 +116,6 @@ pub async fn register(
         runtime,
         fingerprint,
         &config_dir,
-        &request.passphrase,
     )
     .await
     {
@@ -135,7 +132,7 @@ pub async fn register(
     };
 
     *state.is_registered.write().await = true;
-    if let Ok((creds, _)) = store::load_with_tolerance(&config_dir, &request.passphrase) {
+    if let Ok((creds, _)) = store::load(&config_dir) {
         if creds.connection_key.len() == 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&creds.connection_key);
@@ -239,18 +236,20 @@ fn unquote(s: &str) -> String {
     }
 }
 
-/// Unlock the credential store with passphrase.
+/// Unlock the credential store.
 ///
-/// Loads the encrypted connection.enc file using passphrase + platform key.
-/// Uses 4-of-5 fingerprint tolerance for hardware changes.
+/// Loads the encrypted connection.enc file using the master key from
+/// the OS keyring (or the machine-bound fallback). No user input —
+/// the keyring is unlocked by the user's OS login session and that
+/// gate is the security factor at the local layer.
 /// Populates AppState with credentials and connection key.
 #[tauri::command]
-pub async fn unlock(state: State<'_, AppState>, passphrase: String) -> Result<bool, String> {
+pub async fn unlock(state: State<'_, AppState>) -> Result<bool, String> {
     use crate::credential::store;
 
     let config_dir = store::default_config_dir();
 
-    let (creds, _re_encrypted) = store::load_with_tolerance(&config_dir, &passphrase)
+    let (creds, _binding) = store::load(&config_dir)
         .map_err(|e| format!("Failed to unlock: {}", e))?;
 
     // Load connection key (stored as raw bytes in ConnectionCredentials)
@@ -325,14 +324,13 @@ pub async fn get_session_info(state: State<'_, AppState>) -> Result<SessionInfoR
 pub async fn extend_session(
     app: AppHandle,
     state: State<'_, AppState>,
-    passphrase: String,
 ) -> Result<RegisterResponse, String> {
     use crate::credential::store;
     use crate::registration::pairing;
 
     let config_dir = store::default_config_dir();
 
-    let (session, runtime) = match pairing::start_extension(&config_dir, &passphrase).await {
+    let (session, runtime) = match pairing::start_extension(&config_dir).await {
         Ok(v) => v,
         Err(e) => {
             return Ok(RegisterResponse {
@@ -360,7 +358,6 @@ pub async fn extend_session(
         runtime,
         fingerprint,
         &config_dir,
-        &passphrase,
     )
     .await
     {
@@ -377,7 +374,7 @@ pub async fn extend_session(
     };
 
     // Refresh AppState with the rotated session
-    if let Ok((creds, _)) = store::load_with_tolerance(&config_dir, &passphrase) {
+    if let Ok((creds, _)) = store::load(&config_dir) {
         if creds.connection_key.len() == 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&creds.connection_key);
@@ -399,7 +396,8 @@ pub async fn extend_session(
 /// credential store and reset AppState. Returns even if the revoke publish
 /// fails — we want the local wipe to happen regardless.
 #[tauri::command]
-pub async fn logout(state: State<'_, AppState>, passphrase: String) -> Result<bool, String> {
+pub async fn logout(state: State<'_, AppState>) -> Result<bool, String> {
+    use crate::credential::keystore;
     use crate::credential::store;
     use crate::registration::pairing;
     use zeroize::Zeroize;
@@ -408,7 +406,7 @@ pub async fn logout(state: State<'_, AppState>, passphrase: String) -> Result<bo
 
     // Best-effort revoke. Ignore errors: the vault may be unreachable or the
     // creds may already be invalid — local wipe still has to happen.
-    if let Err(e) = pairing::publish_revoke(&config_dir, &passphrase).await {
+    if let Err(e) = pairing::publish_revoke(&config_dir).await {
         log::warn!("device.revoke publish failed (continuing with local wipe): {}", e);
     }
 
@@ -437,6 +435,11 @@ pub async fn logout(state: State<'_, AppState>, passphrase: String) -> Result<bo
         }
     }
 
+    // Wipe the master key from the keyring too. A future pairing on
+    // this machine will mint a fresh key — a leaked disk image from
+    // an earlier install can't be decrypted under the new key.
+    keystore::delete_keyring_key();
+
     Ok(true)
 }
 
@@ -451,12 +454,10 @@ pub async fn logout(state: State<'_, AppState>, passphrase: String) -> Result<bo
 ///      desktop via forApp.device.{conn}.ended.
 ///   2. Locally expire the session: zero the connection key, clear
 ///      credentials from memory, flip the local session state to expired
-///      so the UI routes to SessionExpired (where "Scan to Extend"
+///      so the UI routes to SessionExpired (where "Start New Session"
 ///      restarts the session without re-pair).
-///
-/// Passphrase is required to load the stored creds for the vault publish.
 #[tauri::command]
-pub async fn end_session(state: State<'_, AppState>, passphrase: String) -> Result<bool, String> {
+pub async fn end_session(state: State<'_, AppState>) -> Result<bool, String> {
     use crate::credential::store;
     use crate::registration::pairing;
     use zeroize::Zeroize;
@@ -466,7 +467,7 @@ pub async fn end_session(state: State<'_, AppState>, passphrase: String) -> Resu
     // Best-effort vault publish first — if it fails, we still want to
     // locally expire so the desktop UI doesn't claim an active session
     // the vault is about to reject anyway.
-    if let Err(e) = pairing::publish_end_session(&config_dir, &passphrase, "user_locked").await {
+    if let Err(e) = pairing::publish_end_session(&config_dir, "user_locked").await {
         log::warn!("device.end-session publish failed (continuing with local expire): {}", e);
     }
 

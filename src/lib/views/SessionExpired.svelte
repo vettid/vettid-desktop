@@ -5,7 +5,6 @@
   import { onDestroy } from 'svelte';
   import { activateSession } from '../stores/session';
 
-  let passphrase = $state('');
   let step = $state<'idle' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error'>('idle');
   let errorMessage = $state('');
   let qrDataUrl = $state('');
@@ -21,11 +20,15 @@
     expires_at?: number;
   }
 
+  /**
+   * Starts a fresh session against the existing pairing. The desktop
+   * publishes device.request-session with new ephemeral keys; the
+   * phone gets a notification + auto-navigates to the authorize
+   * screen; the user scans the QR shown here to approve. No
+   * passphrase — the on-disk creds are unlocked by the OS keyring
+   * (or the machine-bound fallback).
+   */
   async function start() {
-    if (passphrase.length < 8) {
-      errorMessage = 'Enter your passphrase (minimum 8 characters).';
-      return;
-    }
     errorMessage = '';
     step = 'awaiting-qr';
 
@@ -39,7 +42,7 @@
     });
 
     try {
-      const result = await invoke<RegisterResponse>('extend_session', { passphrase });
+      const result = await invoke<RegisterResponse>('extend_session');
       if (result.success && result.session_id && result.expires_at) {
         step = 'success';
         activateSession(result.session_id, result.expires_at, result.connection_id);
@@ -53,13 +56,15 @@
     }
   }
 
+  /**
+   * Logout removes this desktop's pairing entirely — wipes the
+   * on-disk credentials + asks the vault to revoke the device. The
+   * user has to re-pair after this. Distinct from "End session,
+   * keep pairing" which is the default reason to be on this screen.
+   */
   async function logoutFromHere() {
-    if (!passphrase) {
-      errorMessage = 'Enter passphrase to log out (needed to notify the vault).';
-      return;
-    }
     try {
-      await invoke('logout', { passphrase });
+      await invoke('logout');
       window.location.reload();
     } catch (e: any) {
       errorMessage = `Logout failed: ${e}`;
@@ -79,32 +84,26 @@
   <div class="card">
     <h1>Start a new session</h1>
     <p class="subtitle">
-      Enter your passphrase to start a new session with your phone.
-      You won't need to re-pair — your phone will get a QR to authorize
-      this desktop, and the existing pairing stays in place.
+      Your pairing is in place — tap Start to ask your phone to authorize this
+      desktop again. You'll see a QR here that your phone will scan to approve.
+      Your data stays hidden until the phone approves.
     </p>
 
     {#if step === 'idle'}
-      <input
-        type="password"
-        bind:value={passphrase}
-        placeholder="Passphrase"
-        class="input"
-      />
-      <button class="btn primary" onclick={start} disabled={!passphrase}>
+      <button class="btn primary" onclick={start}>
         Start New Session
       </button>
       <button class="btn ghost" onclick={logoutFromHere}>
-        Log out instead
+        Remove this desktop instead
       </button>
 
     {:else if step === 'awaiting-qr'}
-      <div class="waiting"><div class="spinner"></div><p>Requesting extension…</p></div>
+      <div class="waiting"><div class="spinner"></div><p>Requesting authorization…</p></div>
 
     {:else if step === 'awaiting-approval'}
       <p class="subtitle">Scan this QR with your phone.</p>
       {#if qrDataUrl}
-        <img src={qrDataUrl} alt="Extension QR" class="qr" />
+        <img src={qrDataUrl} alt="Authorization QR" class="qr" />
       {/if}
       <div class="waiting">
         <div class="spinner"></div>
@@ -112,7 +111,7 @@
       </div>
 
     {:else if step === 'success'}
-      <div class="success-msg">Session extended.</div>
+      <div class="success-msg">Session started.</div>
 
     {:else if step === 'error'}
       <p class="error-text">{errorMessage}</p>
@@ -130,12 +129,6 @@
   .card { background: var(--surface); padding: 40px; border-radius: 12px; max-width: 460px; width: 100%; }
   h1 { font-size: 1.5rem; margin-bottom: 8px; }
   .subtitle { color: var(--text-muted); margin-bottom: 20px; line-height: 1.5; }
-  .input {
-    width: 100%; padding: 12px; margin-bottom: 12px;
-    background: var(--bg); border: 1px solid rgba(255,255,255,0.1);
-    border-radius: 6px; color: var(--text); font-size: 1rem; outline: none;
-  }
-  .input:focus { border-color: var(--accent); }
   .btn { width: 100%; padding: 12px; border: none; border-radius: 6px;
          font-size: 1rem; cursor: pointer; margin-bottom: 8px; }
   .btn.primary { background: var(--accent); color: white; }
