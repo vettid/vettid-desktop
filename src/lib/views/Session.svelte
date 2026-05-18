@@ -12,6 +12,32 @@
   let lockDialogOpen = $state(false);
   let endDialogOpen = $state(false);
 
+  // Identity for the "Session for {name} ({email})" line. Pulled
+  // from profile.get on mount — the same op the Vault view uses for
+  // its header, so cached server-side after the first fetch.
+  let ownerName = $state('');
+  let ownerEmail = $state('');
+
+  async function loadIdentity() {
+    try {
+      const resp: any = await invoke('get_profile');
+      if (resp?.success && resp?.data) {
+        const d = resp.data;
+        const first = d.first_name ?? '';
+        const last = d.last_name ?? '';
+        ownerName = `${first} ${last}`.trim();
+        ownerEmail = d.email ?? '';
+      }
+    } catch (e) {
+      // Identity is a nicety, not a hard requirement — if profile.get
+      // fails the rest of the session view is still useful.
+    }
+  }
+
+  $effect(() => {
+    if (session.state === 'active') loadIdentity();
+  });
+
   async function doLock() {
     if (busy) return;
     busy = true;
@@ -67,6 +93,11 @@
 <div class="session-view">
   <header>
     <h1>Session</h1>
+    {#if ownerName || ownerEmail}
+      <p class="owner">
+        for <strong>{ownerName || ownerEmail}</strong>{#if ownerName && ownerEmail} <span class="email">({ownerEmail})</span>{/if}
+      </p>
+    {/if}
     <p class="hint">Live state of this desktop's vault session.</p>
   </header>
 
@@ -149,6 +180,18 @@
     color: var(--text-muted);
     font-size: 0.9rem;
     line-height: 1.5;
+  }
+  .owner {
+    color: var(--text);
+    font-size: 0.95rem;
+    margin: 2px 0 4px;
+  }
+  .owner strong {
+    font-weight: 600;
+  }
+  .owner .email {
+    color: var(--text-muted);
+    font-weight: 400;
   }
 
   .actions {
