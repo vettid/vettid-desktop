@@ -205,14 +205,22 @@ impl NatsClient {
     /// Subscribe to the connection-specific topic for operational messages
     /// after registration is complete.
     ///
-    /// Topic: `MessageSpace.{owner_guid}.forOwner.device.{connection_id}`
+    /// Topic: `MessageSpace.{owner_guid}.forApp.device.{connection_id}.response`
+    ///
+    /// Lives on the forApp side (paired with the activated/ended/revoked
+    /// pattern from `device_pairing.go`). The vault used to publish
+    /// responses on `forOwner.device.{conn}`, which the parent's broad
+    /// `MessageSpace.*.forOwner.>` subscription also captured, so every
+    /// response was logged as a replay attack and Phase 4.5 of the
+    /// deploy aborted on the noise. The new subject is outside that
+    /// subscription's prefix — clean separation, no re-ingest.
     pub async fn subscribe_responses(
         &self,
         connection_id: &str,
     ) -> Result<Subscriber, NatsError> {
         let client = self.client.as_ref().ok_or(NatsError::NotConnected)?;
         let subject = format!(
-            "MessageSpace.{}.forOwner.device.{}",
+            "MessageSpace.{}.forApp.device.{}.response",
             self.owner_guid, connection_id,
         );
         client
