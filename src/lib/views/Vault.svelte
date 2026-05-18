@@ -2,6 +2,8 @@
   import { invoke } from '@tauri-apps/api/core';
   import { sessionStore } from '../stores/session';
   import PersonalData from './vault/PersonalData.svelte';
+  import Wallets from './vault/Wallets.svelte';
+  import Secrets from './vault/Secrets.svelte';
 
   // Tabbed Vault home — matches the Android app's vault tab layout
   // so the user has the same mental model on either device. Profile
@@ -191,17 +193,9 @@
     {:else if activeTab === 'data'}
       <PersonalData />
     {:else if activeTab === 'secrets'}
-      <div class="placeholder">
-        <h2>Secrets</h2>
-        <p>Coming in Phase 4. Manage your critical credentials, PIN-protected items, and metadata visibility here.</p>
-        <p class="hint">For now, manage secrets from the VettID app on your phone.</p>
-      </div>
+      <Secrets />
     {:else if activeTab === 'wallets'}
-      <div class="placeholder">
-        <h2>Wallets</h2>
-        <p>Coming in Phase 4. Send and receive Bitcoin from this desktop with phone-side approval.</p>
-        <p class="hint">For now, manage wallets from the VettID app on your phone.</p>
-      </div>
+      <Wallets />
     {/if}
   </div>
 </div>

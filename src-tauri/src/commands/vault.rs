@@ -74,10 +74,13 @@ pub async fn list_messages(state: State<'_, AppState>) -> Result<VaultOpResponse
     Ok(VaultOpResponse::from_op(result))
 }
 
-/// List secrets catalog (metadata only, no secret values).
+/// List the user's secrets (metadata only — names, types, categories,
+/// discoverability). Values stay on the phone. Calls `secret.list`
+/// (singular form is the modern dispatch in the vault; the older
+/// `secrets.catalog` referenced an op that never existed).
 #[tauri::command]
 pub async fn list_secrets_catalog(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(&state, "secrets.catalog", serde_json::json!({})).await;
+    let result = operations::execute(&state, "secret.list", serde_json::json!({})).await;
     Ok(VaultOpResponse::from_op(result))
 }
 
