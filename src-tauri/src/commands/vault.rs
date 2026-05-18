@@ -210,6 +210,18 @@ pub async fn get_profile_photo(state: State<'_, AppState>) -> Result<VaultOpResp
     Ok(VaultOpResponse::from_op(result))
 }
 
+/// One-round-trip screen-load: profile + photo + personal-data
+/// bundled into a single vault op. Eliminates 3 separate vsock
+/// round-trips on the Vault home; per-op overhead (queue
+/// serialization, ChaCha20, JSON encode/decode, response routing)
+/// dominates the work for tiny read ops, so bundling cuts the
+/// wall-clock load time substantially.
+#[tauri::command]
+pub async fn get_vault_snapshot(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(&state, "vault.snapshot", serde_json::json!({})).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
 /// Update fields in the user's published profile (phone-required).
 ///
 /// `fields` is a JSON object whose keys are field IDs and whose values are

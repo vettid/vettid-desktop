@@ -34,29 +34,56 @@
   let errorMessage = $state('');
 
   /**
-   * Sequential load: profile.get + profile.photo.get first so the
-   * header renders with real data; then secrets/wallets counts in
-   * the background for the tab badges. PersonalData's own fetch
-   * fires once the user is on the data tab AND profileLoaded flips
-   * true (gated below by the {#if profileLoaded} wrapper).
+   * One-round-trip screen load via `vault.snapshot` — the vault
+   * runs profile.get + profile.photo.get + personal-data.get in-
+   * process and returns one bundle. Cuts the 3 per-op overheads
+   * (queue serialization, ChaCha20, JSON encode/decode, response
+   * routing) that dominate read-op wall-clock time. Personal-data
+   * payload is also pre-cached so the data tab paints instantly
+   * when the user navigates to it.
+   *
+   * Tab-count fetches (secrets, wallets) fire in the background
+   * after the snapshot lands — they don't gate the header or the
+   * data tab.
    */
   async function loadProfile() {
     if (session.state !== 'active') return;
     errorMessage = '';
     try {
-      const [profileResp, photoResp] = await Promise.all([
-        invoke<any>('get_profile'),
-        invoke<any>('get_profile_photo').catch(() => null),
-      ]);
-      if (profileResp?.success && profileResp?.data) {
-        firstName = profileResp.data.first_name ?? '';
-        lastName = profileResp.data.last_name ?? '';
-        email = profileResp.data.email ?? '';
-      } else if (profileResp?.error) {
-        errorMessage = profileResp.error;
-      }
-      if (photoResp?.success && photoResp?.data?.photo) {
-        photoBase64 = photoResp.data.photo;
+      const snap: any = await invoke('get_vault_snapshot');
+      if (snap?.success && snap?.data) {
+        const profile = snap.data.profile;
+        if (profile) {
+          firstName = profile.first_name ?? '';
+          lastName = profile.last_name ?? '';
+          email = profile.email ?? '';
+        }
+        const photo = snap.data.photo;
+        if (photo?.photo) {
+          photoBase64 = photo.photo;
+        }
+        // Prime PersonalData's module-level cache so the data tab
+        // paints from this snapshot the moment the user clicks the
+        // tab — no extra round-trip.
+        const pd = snap.data.personal_data;
+        if (pd) {
+          const fields = Object.entries(pd.fields ?? {}).map(([key, v]: [string, any]) => ({
+            key,
+            namespace: v.namespace ?? key.split('::')[0] ?? key,
+            value: v.value ?? '',
+            alias: v.alias ?? '',
+            updatedAt: v.updated_at ?? '',
+          }));
+          (window as any).__pd_cache = {
+            firstName: pd.first_name ?? '',
+            lastName: pd.last_name ?? '',
+            email: pd.email ?? '',
+            fields,
+            ts: Date.now(),
+          };
+        }
+      } else if (snap?.error) {
+        errorMessage = snap.error;
       }
       profileLoaded = true;
 
