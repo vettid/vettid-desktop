@@ -85,6 +85,9 @@ pub fn run() {
             vault::get_profile,
             vault::get_profile_photo,
             vault::get_vault_snapshot,
+            vault::get_secret,
+            vault::request_secrets_unlock,
+            vault::get_wallet_transactions,
             vault::get_conversation,
             vault::list_call_history,
             // Vault commands — phone-required

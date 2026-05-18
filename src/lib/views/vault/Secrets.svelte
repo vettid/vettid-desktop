@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { secretsUnlockStore, isSecretsUnlocked } from '../../stores/secrets';
 
   // Module-level cache so navigating away + back paints from the
   // snapshot instead of re-fetching.
@@ -21,6 +22,16 @@
   let loading = $state(cache === null);
   let refreshing = $state(false);
   let errorMessage = $state('');
+
+  // Per-row reveal state. Keys are secret IDs. Values either contain
+  // the revealed value or a pending/error marker so the row can
+  // render its state without coordinating through the parent.
+  let revealedById = $state<Record<string, string>>({});
+  let revealingId = $state<string | null>(null); // currently fetching
+  let unlockPending = $state(false);             // waiting on phone
+
+  let unlockState = $derived($secretsUnlockStore);
+  let unlocked = $derived(isSecretsUnlocked(unlockState));
 
   async function load() {
     if (secrets.length) {
@@ -71,6 +82,73 @@
     return t.toLowerCase().split('_').map((w) => w[0]?.toUpperCase() + w.slice(1)).join(' ');
   }
 
+  async function ensureUnlocked(): Promise<boolean> {
+    if (unlocked) return true;
+    unlockPending = true;
+    secretsUnlockStore.update((s) => ({ ...s, pending: true, error: null }));
+    try {
+      const resp: any = await invoke('request_secrets_unlock');
+      // The op queues for phone approval. The vault then fires the
+      // approval-execution path which embeds the result in the
+      // device_op_response. Success means the phone approved AND the
+      // vault set the grant — `unlocked_until` comes back in the data.
+      if (resp?.success && resp?.data?.unlocked_until) {
+        const until = Number(resp.data.unlocked_until);
+        secretsUnlockStore.set({ unlockedUntil: until, pending: false, error: null });
+        return true;
+      }
+      // Pending or denied — show error/state to the user.
+      if (resp?.pending_approval) {
+        secretsUnlockStore.update((s) => ({ ...s, pending: false, error: 'Phone approval pending — try again after approving on your phone' }));
+        return false;
+      }
+      const errMsg = resp?.error || 'Failed to unlock secrets for this session';
+      secretsUnlockStore.update((s) => ({ ...s, pending: false, error: errMsg }));
+      return false;
+    } catch (e) {
+      secretsUnlockStore.update((s) => ({ ...s, pending: false, error: `Unlock failed: ${e}` }));
+      return false;
+    } finally {
+      unlockPending = false;
+    }
+  }
+
+  async function reveal(s: SecretRow) {
+    if (revealedById[s.id]) {
+      // Toggle off — hide.
+      const next = { ...revealedById };
+      delete next[s.id];
+      revealedById = next;
+      return;
+    }
+    if (!unlocked) {
+      const ok = await ensureUnlocked();
+      if (!ok) return;
+    }
+    revealingId = s.id;
+    try {
+      const resp: any = await invoke('get_secret', { id: s.id });
+      if (resp?.success && resp?.data) {
+        const v = resp.data.value ?? '';
+        revealedById = { ...revealedById, [s.id]: String(v) };
+      } else {
+        errorMessage = resp?.error || 'Failed to retrieve value';
+      }
+    } catch (e) {
+      errorMessage = `Failed to retrieve value: ${e}`;
+    } finally {
+      revealingId = null;
+    }
+  }
+
+  async function copyValue(value: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch (e) {
+      // Clipboard denied — fail silently.
+    }
+  }
+
   function fmtDiscoverability(d: string): { label: string; tone: string } {
     switch ((d || '').toLowerCase()) {
       case 'public': return { label: 'Public', tone: 'public' };
@@ -97,12 +175,17 @@
         <p class="hint">Add secrets from the VettID app on your phone — desktop secret management is read-only for now.</p>
       </div>
     {:else if !errorMessage}
+      {#if unlockState.error}
+        <div class="error">{unlockState.error}</div>
+      {/if}
+
       {#each grouped as [category, list] (category)}
         <section class="group">
           <h2>{category}</h2>
           <div class="card">
             {#each list as s (s.id)}
               {@const disc = fmtDiscoverability(s.discoverability)}
+              {@const revealed = revealedById[s.id]}
               <div class="row">
                 <div class="row-text">
                   <div class="row-name">
@@ -112,15 +195,38 @@
                     <span class="type">{fmtType(s.type)}</span>
                     {#if s.description}<span class="desc">{s.description}</span>{/if}
                   </div>
+                  {#if revealed !== undefined}
+                    <div class="revealed-value">
+                      <span class="mono">{revealed}</span>
+                      <button class="copy-btn" onclick={() => copyValue(revealed)} title="Copy">copy</button>
+                    </div>
+                  {/if}
                 </div>
-                <div class="pill {disc.tone}">{disc.label}</div>
+                <div class="row-actions">
+                  <button
+                    class="reveal-btn"
+                    class:revealed={revealed !== undefined}
+                    onclick={() => reveal(s)}
+                    disabled={revealingId === s.id || unlockPending}
+                  >
+                    {#if revealingId === s.id}…
+                    {:else if unlockPending && !unlocked}…approve on phone
+                    {:else if revealed !== undefined}Hide
+                    {:else}Reveal{/if}
+                  </button>
+                  <div class="pill {disc.tone}">{disc.label}</div>
+                </div>
               </div>
             {/each}
           </div>
         </section>
       {/each}
       <p class="hint footer-hint">
-        Secret values stay on the phone — desktop sees only metadata. To retrieve a value, use the VettID app.
+        {#if unlocked}
+          Secrets unlocked for this session — Reveal works without re-prompting until the session ends.
+        {:else}
+          First Reveal prompts your phone for approval. Approval covers the rest of this session.
+        {/if}
       </p>
     {/if}
   {/if}
@@ -177,6 +283,67 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
+  }
+
+  .row-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .reveal-btn {
+    background: var(--accent);
+    color: #1a1a1a;
+    border: none;
+    padding: 5px 12px;
+    border-radius: 5px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.8rem;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .reveal-btn.revealed {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+  }
+  .reveal-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .revealed-value {
+    margin-top: 6px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 5px;
+    padding: 6px 10px;
+  }
+  .revealed-value .mono {
+    font-family: 'JetBrains Mono', 'Consolas', monospace;
+    font-size: 0.9rem;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    word-break: break-all;
+    flex: 1;
+    min-width: 0;
+  }
+  .copy-btn {
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: var(--text-muted);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 0.7rem;
+    cursor: pointer;
+  }
+  .copy-btn:hover {
+    background: rgba(255, 255, 255, 0.15);
+    color: var(--text);
   }
 
   .pill {

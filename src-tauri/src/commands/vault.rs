@@ -213,6 +213,34 @@ pub async fn get_profile_photo(state: State<'_, AppState>) -> Result<VaultOpResp
     Ok(VaultOpResponse::from_op(result))
 }
 
+/// Retrieve a specific secret value. Phone-required by default;
+/// becomes independent once this session has been unlocked via
+/// `request_secrets_unlock` (and until the grant expires).
+#[tauri::command]
+pub async fn get_secret(state: State<'_, AppState>, id: String) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(&state, "secret.get", serde_json::json!({ "id": id })).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+/// Request a once-per-session unlock for viewing secret values.
+/// Routes through the phone-required approval flow; on phone
+/// approval, the vault sets DeviceSession.SecretsUnlockedUntil so
+/// subsequent `get_secret` calls within the session don't re-prompt.
+#[tauri::command]
+pub async fn request_secrets_unlock(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(&state, "secret.unlock-session", serde_json::json!({})).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+/// Get a wallet's transaction history. Independent op — same data
+/// the Android wallet detail screen pulls. Sibling to the existing
+/// get_wallet_balance + get_wallet_address commands below.
+#[tauri::command]
+pub async fn get_wallet_transactions(state: State<'_, AppState>, wallet_id: String) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(&state, "wallet.get-transaction-history", serde_json::json!({ "wallet_id": wallet_id })).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
 /// One-round-trip screen-load: profile + photo + personal-data
 /// bundled into a single vault op. Eliminates 3 separate vsock
 /// round-trips on the Vault home; per-op overhead (queue
