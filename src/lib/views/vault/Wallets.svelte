@@ -1,5 +1,14 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { secretsUnlockStore, isSecretsUnlocked } from '../../stores/secrets';
+
+  // Read the shared lock state from the Sensitive Data chip in the
+  // header. Public wallet info (label, address, balance, history) is
+  // always visible; future sensitive actions (Send BTC, View seed
+  // backup) gate on this. The chip is the single unlock surface for
+  // the whole vault.
+  let unlockState = $derived($secretsUnlockStore);
+  let unlocked = $derived(isSecretsUnlocked(unlockState));
 
   // Module-level cache so tab navigation away + back doesn't re-fire
   // wallet.list. Mirrors the pattern in PersonalData.svelte. Cleared
@@ -238,7 +247,12 @@
         {/each}
       </div>
       <p class="hint footer-hint">
-        Send requires phone approval — use the VettID app. Receive: copy the address above and share with the sender.
+        {#if unlocked}
+          Sensitive actions (Send BTC, view seed backup) are available while the chip above is Unlocked.
+        {:else}
+          🔒 Unlock <strong>Sensitive Data</strong> in the header above to enable Send BTC and seed-backup viewing.
+        {/if}
+        Receive is always available — copy any address above and share with the sender.
       </p>
     {/if}
   {/if}

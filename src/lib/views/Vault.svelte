@@ -4,6 +4,7 @@
   import PersonalData from './vault/PersonalData.svelte';
   import Wallets from './vault/Wallets.svelte';
   import Secrets from './vault/Secrets.svelte';
+  import SensitiveDataChip from '../components/SensitiveDataChip.svelte';
 
   // Tabbed Vault home — matches the Android app's vault tab layout
   // so the user has the same mental model on either device. Profile
@@ -157,6 +158,8 @@
         <h1>{displayName}</h1>
         {#if email}<p class="email">{email}</p>{/if}
       </div>
+      <div class="header-spacer"></div>
+      <SensitiveDataChip />
     {/if}
   </header>
 
@@ -235,7 +238,8 @@
     height: 100%;
     object-fit: cover;
   }
-  .profile-text { min-width: 0; }
+  .profile-text { min-width: 0; flex-shrink: 1; }
+  .header-spacer { flex: 1; }
   .profile-text h1 {
     font-size: 1.2rem;
     margin: 0;

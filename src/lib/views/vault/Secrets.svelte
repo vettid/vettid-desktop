@@ -1,7 +1,5 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
-  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import { onDestroy } from 'svelte';
   import { secretsUnlockStore, isSecretsUnlocked } from '../../stores/secrets';
 
   // Module-level cache so navigating away + back paints from the
@@ -30,71 +28,20 @@
   // render its state without coordinating through the parent.
   let revealedById = $state<Record<string, string>>({});
   let revealingId = $state<string | null>(null); // currently fetching
-  let unlockPending = $state(false);             // waiting on phone
 
-  // Active pending-approval state. Filled when the vault sends the
-  // `pending_approval` ack for the in-flight unlock request. Drives
-  // the "Waiting for phone — Cancel" UI and the elapsed timer.
-  let pendingRequestId = $state<string | null>(null);
-  let pendingStartedAt = $state<number>(0);
-  let pendingElapsed = $state<number>(0);
-  let elapsedTimerId: ReturnType<typeof setInterval> | null = null;
-
+  // The unlock flow lives in the SensitiveDataChip at the top of
+  // the vault — this tab just reads the lock state and gates the
+  // Reveal buttons on it. When locked, the Reveal column is hidden
+  // and a hint points the user at the chip.
   let unlockState = $derived($secretsUnlockStore);
   let unlocked = $derived(isSecretsUnlocked(unlockState));
 
-  // Subscribe to the vault's pending-approval ack so we can switch
-  // the UI from "loading…" to "waiting for phone" with an elapsed
-  // counter. The ack carries the request_id so we can match against
-  // an in-flight unlock and ignore acks for other ops.
-  let unlistenPending: UnlistenFn | null = null;
+  // If the grant expires (or the user taps Lock now), collapse any
+  // currently-visible values so we don't leave plaintext on screen.
   $effect(() => {
-    listen<any>('vault:operation-pending-approval', (e) => {
-      const payload = e.payload ?? {};
-      const op = payload.operation;
-      const rid = payload.request_id;
-      if (op !== 'secret.unlock-session' || !rid) return;
-      pendingRequestId = rid;
-      pendingStartedAt = Date.now();
-      pendingElapsed = 0;
-      if (elapsedTimerId) clearInterval(elapsedTimerId);
-      elapsedTimerId = setInterval(() => {
-        pendingElapsed = Math.floor((Date.now() - pendingStartedAt) / 1000);
-      }, 500);
-    }).then((fn) => { unlistenPending = fn; });
-
-    return () => {
-      if (unlistenPending) unlistenPending();
-      if (elapsedTimerId) clearInterval(elapsedTimerId);
-    };
-  });
-
-  function clearPendingState() {
-    pendingRequestId = null;
-    pendingStartedAt = 0;
-    pendingElapsed = 0;
-    if (elapsedTimerId) {
-      clearInterval(elapsedTimerId);
-      elapsedTimerId = null;
+    if (!unlocked && Object.keys(revealedById).length > 0) {
+      revealedById = {};
     }
-  }
-
-  async function cancelPendingApproval() {
-    if (!pendingRequestId) return;
-    const rid = pendingRequestId;
-    clearPendingState();
-    try {
-      await invoke('cancel_pending_operation', { requestId: rid });
-    } catch (_) {
-      // Local cancel can't really fail in a way that needs surfacing.
-    }
-    secretsUnlockStore.update((s) => ({ ...s, pending: false, error: 'Approval cancelled' }));
-    unlockPending = false;
-  }
-
-  onDestroy(() => {
-    if (unlistenPending) unlistenPending();
-    if (elapsedTimerId) clearInterval(elapsedTimerId);
   });
 
   async function load() {
@@ -146,46 +93,6 @@
     return t.toLowerCase().split('_').map((w) => w[0]?.toUpperCase() + w.slice(1)).join(' ');
   }
 
-  async function ensureUnlocked(): Promise<boolean> {
-    if (unlocked) return true;
-    unlockPending = true;
-    secretsUnlockStore.update((s) => ({ ...s, pending: true, error: null }));
-    try {
-      // execute_phone_required on the Rust side waits for the FINAL
-      // response — i.e. after the phone has approved. The intermediate
-      // pending_approval ack arrives as a Tauri event (handled above)
-      // and drives the "Waiting for phone…" UI, but doesn't resolve
-      // this promise. Success here means the user actually approved
-      // and `unlocked_until` is set.
-      const resp: any = await invoke('request_secrets_unlock');
-      clearPendingState();
-      if (resp?.success && resp?.data?.unlocked_until) {
-        const until = Number(resp.data.unlocked_until);
-        secretsUnlockStore.set({ unlockedUntil: until, pending: false, error: null });
-        return true;
-      }
-      // Denied / approval-timeout / cancelled — surface the reason.
-      const errMsg = resp?.error || (resp?.data?.status === 'denied'
-        ? 'You denied the approval on your phone.'
-        : 'Approval did not complete.');
-      secretsUnlockStore.update((s) => ({ ...s, pending: false, error: errMsg }));
-      return false;
-    } catch (e) {
-      clearPendingState();
-      const msg = String(e);
-      // Tauri serializes our OperationError Display strings, so we
-      // can pick out the specific failure for cleaner copy.
-      let friendly = msg;
-      if (msg.includes('Phone approval timed out')) friendly = 'Phone approval timed out. Try again when you have your phone handy.';
-      else if (msg.includes('cancelled')) friendly = 'Approval cancelled';
-      else if (msg.includes('did not acknowledge')) friendly = 'Vault is not responding — try again in a moment.';
-      secretsUnlockStore.update((s) => ({ ...s, pending: false, error: friendly }));
-      return false;
-    } finally {
-      unlockPending = false;
-    }
-  }
-
   async function reveal(s: SecretRow) {
     if (revealedById[s.id]) {
       // Toggle off — hide.
@@ -194,10 +101,9 @@
       revealedById = next;
       return;
     }
-    if (!unlocked) {
-      const ok = await ensureUnlocked();
-      if (!ok) return;
-    }
+    // Reveal button only renders when unlocked — but guard anyway in
+    // case the grant expired mid-click.
+    if (!unlocked) return;
     revealingId = s.id;
     try {
       const resp: any = await invoke('get_secret', { id: s.id });
@@ -248,19 +154,6 @@
         <p class="hint">Add secrets from the VettID app on your phone — desktop secret management is read-only for now.</p>
       </div>
     {:else if !errorMessage}
-      {#if pendingRequestId}
-        <div class="pending-banner">
-          <div class="pending-icon">📱</div>
-          <div class="pending-text">
-            <div class="pending-title">Waiting for phone approval</div>
-            <div class="pending-sub">Approve the request on your phone to view secret values · {pendingElapsed}s</div>
-          </div>
-          <button class="cancel-btn" onclick={cancelPendingApproval}>Cancel</button>
-        </div>
-      {:else if unlockState.error}
-        <div class="error">{unlockState.error}</div>
-      {/if}
-
       {#each grouped as [category, list] (category)}
         <section class="group">
           <h2>{category}</h2>
@@ -285,17 +178,18 @@
                   {/if}
                 </div>
                 <div class="row-actions">
-                  <button
-                    class="reveal-btn"
-                    class:revealed={revealed !== undefined}
-                    onclick={() => reveal(s)}
-                    disabled={revealingId === s.id || unlockPending}
-                  >
-                    {#if revealingId === s.id}…
-                    {:else if unlockPending && !unlocked}…approve on phone
-                    {:else if revealed !== undefined}Hide
-                    {:else}Reveal{/if}
-                  </button>
+                  {#if unlocked}
+                    <button
+                      class="reveal-btn"
+                      class:revealed={revealed !== undefined}
+                      onclick={() => reveal(s)}
+                      disabled={revealingId === s.id}
+                    >
+                      {#if revealingId === s.id}…
+                      {:else if revealed !== undefined}Hide
+                      {:else}Reveal{/if}
+                    </button>
+                  {/if}
                   <div class="pill {disc.tone}">{disc.label}</div>
                 </div>
               </div>
@@ -303,13 +197,11 @@
           </div>
         </section>
       {/each}
-      <p class="hint footer-hint">
-        {#if unlocked}
-          Secrets unlocked for this session — Reveal works without re-prompting until the session ends.
-        {:else}
-          First Reveal prompts your phone for approval. Approval covers the rest of this session.
-        {/if}
-      </p>
+      {#if !unlocked}
+        <p class="hint footer-hint">
+          🔒 Unlock <strong>Sensitive Data</strong> in the header above to reveal secret values.
+        </p>
+      {/if}
     {/if}
   {/if}
 </div>
@@ -477,46 +369,6 @@
     padding: 12px 16px;
     border-radius: 6px;
     margin-bottom: 12px;
-  }
-
-  .pending-banner {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    background: rgba(105, 180, 255, 0.08);
-    border: 1px solid rgba(105, 180, 255, 0.25);
-    border-radius: 8px;
-    padding: 12px 14px;
-    margin-bottom: 14px;
-  }
-  .pending-icon {
-    font-size: 1.5rem;
-    line-height: 1;
-  }
-  .pending-text { flex: 1; min-width: 0; }
-  .pending-title {
-    font-weight: 500;
-    color: var(--text);
-    font-size: 0.95rem;
-  }
-  .pending-sub {
-    color: var(--text-muted);
-    font-size: 0.82rem;
-    margin-top: 2px;
-  }
-  .cancel-btn {
-    background: rgba(255, 255, 255, 0.08);
-    color: var(--text);
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    border-radius: 5px;
-    padding: 6px 14px;
-    font: inherit;
-    font-size: 0.85rem;
-    cursor: pointer;
-    flex-shrink: 0;
-  }
-  .cancel-btn:hover {
-    background: rgba(255, 255, 255, 0.12);
   }
 
   .loading-wrap { display: flex; justify-content: center; padding: 48px 0; }
