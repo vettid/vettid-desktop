@@ -27,6 +27,7 @@
   let photoBase64 = $state<string | null>(null);
   let secretsCount = $state<number | null>(null);
   let walletsCount = $state<number | null>(null);
+  let dataCount = $state<number | null>(null);
   // Header-load flag — flips true once profile.get has come back so
   // the tab content (and especially PersonalData's own fetch) stays
   // un-mounted until the header is rendered. Profile-first was the
@@ -84,6 +85,7 @@
             fields,
             ts: Date.now(),
           };
+          dataCount = fields.length;
         }
       } else if (snap?.error) {
         errorMessage = snap.error;
@@ -96,11 +98,14 @@
         invoke<any>('list_secrets_catalog').catch(() => null),
         invoke<any>('list_wallets').catch(() => null),
       ]).then(([secretsResp, walletsResp]) => {
-        if (secretsResp?.success && secretsResp?.data?.items) {
-          secretsCount = (secretsResp.data.items as unknown[]).length;
+        // Vault returns the list as `data.secrets`, not `data.items` —
+        // the older key was a stale guess.
+        if (secretsResp?.success && secretsResp?.data?.secrets) {
+          secretsCount = (secretsResp.data.secrets as unknown[]).length;
         }
         if (walletsResp?.success && walletsResp?.data?.wallets) {
-          walletsCount = (walletsResp.data.wallets as unknown[]).length;
+          const all = walletsResp.data.wallets as Array<{ is_archived?: boolean }>;
+          walletsCount = all.filter((w) => !w.is_archived).length;
         }
       });
     } catch (e) {
@@ -178,7 +183,9 @@
         aria-selected={activeTab === tab.id}
       >
         {tab.label}
-        {#if tab.id === 'secrets' && secretsCount !== null}
+        {#if tab.id === 'data' && dataCount !== null}
+          <span class="tab-count">{dataCount}</span>
+        {:else if tab.id === 'secrets' && secretsCount !== null}
           <span class="tab-count">{secretsCount}</span>
         {:else if tab.id === 'wallets' && walletsCount !== null}
           <span class="tab-count">{walletsCount}</span>

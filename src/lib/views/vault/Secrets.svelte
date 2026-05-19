@@ -22,6 +22,12 @@
   let loading = $state(cache === null);
   let refreshing = $state(false);
   let errorMessage = $state('');
+  // Separate state for reveal failures so they don't get clobbered
+  // when the catalog reloads (load() clears errorMessage on entry,
+  // and $effect can re-trigger load if anything reactive changes —
+  // before this split, the reveal error flashed for milliseconds
+  // and the user couldn't read it).
+  let revealError = $state('');
 
   // Per-row reveal state. Keys are secret IDs. Values either contain
   // the revealed value or a pending/error marker so the row can
@@ -95,26 +101,29 @@
 
   async function reveal(s: SecretRow) {
     if (revealedById[s.id]) {
-      // Toggle off — hide.
       const next = { ...revealedById };
       delete next[s.id];
       revealedById = next;
       return;
     }
-    // Reveal button only renders when unlocked — but guard anyway in
-    // case the grant expired mid-click.
     if (!unlocked) return;
     revealingId = s.id;
+    revealError = '';
     try {
       const resp: any = await invoke('get_secret', { id: s.id });
+      console.log('[secret.get]', s.id, resp);
       if (resp?.success && resp?.data) {
-        const v = resp.data.value ?? '';
-        revealedById = { ...revealedById, [s.id]: String(v) };
+        const raw = resp.data.value;
+        if (raw == null || raw === '') {
+          revealError = `${s.name}: no stored value (likely a metadata-only row — its actual value lives in your credential and is accessed by a different path).`;
+        } else {
+          revealedById = { ...revealedById, [s.id]: String(raw) };
+        }
       } else {
-        errorMessage = resp?.error || 'Failed to retrieve value';
+        revealError = resp?.error || `${s.name}: failed to retrieve value`;
       }
     } catch (e) {
-      errorMessage = `Failed to retrieve value: ${e}`;
+      revealError = `${s.name}: ${e}`;
     } finally {
       revealingId = null;
     }
@@ -147,6 +156,12 @@
     <div class="loading-wrap"><span class="spinner"></span></div>
   {:else}
     {#if errorMessage}<div class="error">{errorMessage}</div>{/if}
+    {#if revealError}
+      <div class="error reveal-error">
+        <span>{revealError}</span>
+        <button class="dismiss-btn" onclick={() => (revealError = '')} aria-label="Dismiss">✕</button>
+      </div>
+    {/if}
 
     {#if secrets.length === 0 && !errorMessage}
       <div class="empty">
@@ -370,6 +385,23 @@
     border-radius: 6px;
     margin-bottom: 12px;
   }
+  .reveal-error {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+  }
+  .reveal-error span { flex: 1; }
+  .dismiss-btn {
+    background: transparent;
+    border: none;
+    color: var(--error);
+    cursor: pointer;
+    font-size: 0.9rem;
+    padding: 0 6px;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  .dismiss-btn:hover { opacity: 0.7; }
 
   .loading-wrap { display: flex; justify-content: center; padding: 48px 0; }
   .spinner {
