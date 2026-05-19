@@ -186,8 +186,28 @@ pub async fn execute_operation(
     };
 
     // Parse as DeviceOpResponse
-    let response: DeviceOpResponse = serde_json::from_value(final_value)
+    let mut response: DeviceOpResponse = serde_json::from_value(final_value)
         .map_err(|e| OperationError::ResponseError(e.to_string()))?;
+
+    // Some ops (e.g. secret.unlock-session) return op-specific fields
+    // at the top level rather than nested under `data`. Fold those
+    // captured extras into `data` so the frontend has one place to
+    // look. Don't overwrite `data` if the vault already populated it.
+    if response.data.is_none() && !response.extra.is_empty() {
+        // Drop the structural fields we already mapped, keep only
+        // the op-specific extras.
+        let mut data_map = serde_json::Map::new();
+        for (k, v) in response.extra.iter() {
+            // `status` is purely a flow signal; keep the data clean
+            // unless the op surfaces a meaningful status (denied is
+            // already surfaced via error/success, executed is the
+            // happy path so the UI doesn't need it).
+            data_map.insert(k.clone(), v.clone());
+        }
+        if !data_map.is_empty() {
+            response.data = Some(serde_json::Value::Object(data_map));
+        }
+    }
 
     Ok(response)
 }

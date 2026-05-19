@@ -110,6 +110,15 @@ pub struct DeviceOpResponse {
     pub error: Option<String>,
     #[serde(default)]
     pub pending_phone_approval: bool,
+
+    /// Captures any top-level fields the vault returns ad-hoc rather
+    /// than nesting under `data`. The clearest example is
+    /// `secret.unlock-session`, which returns `unlocked_until` and
+    /// `status` as flat top-level keys instead of inside `data`.
+    /// `execute_operation` folds these into `data` when `data` is
+    /// empty so the frontend has one stable place to look.
+    #[serde(flatten, default)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
