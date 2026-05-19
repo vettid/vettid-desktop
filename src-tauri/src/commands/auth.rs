@@ -143,14 +143,40 @@ pub async fn register(
             *state.connection_key.write().await = Some(key);
         }
         listener_conn_id = Some(creds.connection_id.clone());
+
+        // Reconnect the AppState NatsClient with the freshly-saved
+        // creds. complete_pairing uses its own ephemeral NatsClient
+        // that gets dropped on return, so the AppState client is
+        // whatever was last connected (could be the now-closed pre-
+        // end_session one). Without this rebind, spawn_listener
+        // below tries to subscribe on a dropped client and fails
+        // with "NATS client not connected". Mirrors unlock()'s
+        // reconnect dance.
+        if !creds.message_space_url.is_empty() && !creds.message_space_token.is_empty() {
+            if let Some((jwt, seed)) = crate::registration::pairing::parse_creds_block(&creds.message_space_token) {
+                let mut nats = state.nats.lock().await;
+                if let Err(e) = nats
+                    .connect_with_credentials(
+                        &creds.message_space_url,
+                        &jwt,
+                        &seed,
+                        &creds.owner_guid,
+                    )
+                    .await
+                {
+                    log::warn!("Failed to reconnect AppState NATS after pairing: {}", e);
+                }
+            } else {
+                log::warn!("Stored NATS creds malformed post-pairing — listener will fail until reconnect");
+            }
+        }
+
         *state.credentials.write().await = Some(creds);
         *state.is_unlocked.write().await = true;
     }
 
-    // Start the response listener — same rationale as `unlock`. The
-    // NatsClient we used during pairing's stage 2 stays alive into
-    // post-pair operation handling, so the subscribe lands on the
-    // already-connected client.
+    // Start the response listener now that AppState.nats is bound to
+    // a live connection.
     if let Some(conn_id) = listener_conn_id {
         crate::nats::listener::spawn_listener(app.clone(), conn_id).await;
     }
