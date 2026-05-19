@@ -1,6 +1,6 @@
 use std::fmt;
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 
 use crate::crypto::encrypt;
 use crate::nats::messages::{
@@ -19,7 +19,14 @@ pub enum OperationError {
     EncryptionFailed(String),
     EncodingFailed(String),
     PublishFailed(String),
-    Timeout,
+    /// Timed out waiting for the vault to acknowledge the request at all.
+    /// Suggests network/vault issue, not a slow human.
+    AckTimeout,
+    /// Vault acknowledged, but no final response within the longer
+    /// phone-approval window. Almost always means the human didn't
+    /// approve in time (or denied without producing a response).
+    ApprovalTimeout,
+    Cancelled,
     ResponseError(String),
 }
 
@@ -31,7 +38,9 @@ impl fmt::Display for OperationError {
             Self::EncryptionFailed(e) => write!(f, "Encryption failed: {}", e),
             Self::EncodingFailed(e) => write!(f, "Encoding failed: {}", e),
             Self::PublishFailed(e) => write!(f, "Publish failed: {}", e),
-            Self::Timeout => write!(f, "Operation timed out"),
+            Self::AckTimeout => write!(f, "Vault did not acknowledge the request"),
+            Self::ApprovalTimeout => write!(f, "Phone approval timed out"),
+            Self::Cancelled => write!(f, "Operation cancelled"),
             Self::ResponseError(e) => write!(f, "Response error: {}", e),
         }
     }
@@ -45,16 +54,29 @@ impl std::error::Error for OperationError {}
 
 /// Send a `device_op_request` to the vault and await the response.
 ///
-/// 1. Builds a DeviceOpRequest with a unique request_id
-/// 2. Encrypts the payload with the connection key
-/// 3. Wraps in an Envelope and publishes via NATS
-/// 4. Registers a oneshot channel in AppState.pending_responses
-/// 5. Awaits the response (background listener resolves it) with timeout
+/// Two-stage timeout model. Phone-required ops produce two responses:
+/// an immediate `status: "pending_approval"` ack from the vault, then
+/// a final response once the human taps approve/deny. The split
+/// timeouts preserve the diagnostic value of a failure:
+///
+///   * `ack_timeout_secs`: short (~5s). If the vault never sends *any*
+///     response in this window, something is wrong with the vault or
+///     NATS path — not the human. Surfaces as `AckTimeout`.
+///   * `final_timeout_secs`: longer (~120s for phone-required ops).
+///     Starts ticking either from the original publish (for ops the
+///     vault answers directly) or after the ack arrives. The ack
+///     "extends" the deadline because it confirms the request is now
+///     in the human's hands.
+///
+/// Ops that don't require phone approval return their final response
+/// directly without an intermediate ack — those still resolve within
+/// the ack window, which is the common path.
 pub async fn execute_operation(
     state: &AppState,
     operation: &str,
     params: serde_json::Value,
-    timeout_secs: u64,
+    ack_timeout_secs: u64,
+    final_timeout_secs: u64,
 ) -> Result<DeviceOpResponse, OperationError> {
     // Read connection key
     let connection_key = {
@@ -65,10 +87,6 @@ pub async fn execute_operation(
     // Read credentials for the connection ID. The envelope's KeyID
     // field is what the vault uses to look up `connections/{KeyID}` in
     // storage, so it has to be the connection_id — not the session_id.
-    // Earlier the desktop stored session_id in creds.key_id and every
-    // encrypted op timed out because the vault hit "connection not
-    // found". Read connection_id directly so existing pairings work
-    // without re-pair.
     let connection_id = {
         let creds_guard = state.credentials.read().await;
         let creds = creds_guard.as_ref().ok_or(OperationError::NotConnected)?;
@@ -86,15 +104,12 @@ pub async fn execute_operation(
         timestamp: chrono::Utc::now().to_rfc3339(),
     };
 
-    // Serialize the request to JSON
     let request_json = serde_json::to_vec(&request)
         .map_err(|e| OperationError::EncodingFailed(e.to_string()))?;
 
-    // Encrypt with connection key
     let encrypted = encrypt::encrypt(&connection_key, &request_json)
         .map_err(|e| OperationError::EncryptionFailed(e.to_string()))?;
 
-    // Wrap in envelope
     let nats_client = state.nats.lock().await;
     let sequence = nats_client.next_sequence();
     let envelope_bytes = encode_envelope(
@@ -105,47 +120,106 @@ pub async fn execute_operation(
     )
     .map_err(|e| OperationError::EncodingFailed(e.to_string()))?;
 
-    // Register a pending response channel
-    let (tx, rx) = oneshot::channel();
+    // Register a pending mpsc — listener.rs forwards every response
+    // for this request_id here, but only removes the entry on a
+    // non-ack response. We loop-drain.
+    let (tx, mut rx) = mpsc::unbounded_channel();
     {
         let mut pending = state.pending_responses.lock().await;
         pending.insert(request_id.clone(), tx);
     }
 
-    // Publish
     nats_client
         .publish_message(&envelope_bytes)
         .await
-        .map_err(|e| OperationError::PublishFailed(e.to_string()))?;
+        .map_err(|e| {
+            // Couldn't publish — drop our pending entry before bubbling.
+            let pending = state.pending_responses.clone();
+            let rid = request_id.clone();
+            tokio::spawn(async move { pending.lock().await.remove(&rid); });
+            OperationError::PublishFailed(e.to_string())
+        })?;
 
     drop(nats_client);
 
-    // Await response with timeout
-    let response_value = tokio::time::timeout(Duration::from_secs(timeout_secs), rx)
-        .await
-        .map_err(|_| {
-            // Clean up the pending entry on timeout
+    // First read: short window. The vault should answer almost
+    // immediately — either the final response (no phone needed) or
+    // a pending_approval ack (phone-required).
+    let first = tokio::time::timeout(Duration::from_secs(ack_timeout_secs), rx.recv()).await;
+
+    let first_value = match first {
+        Err(_) => {
+            // No response at all — clean up and bail.
             let pending = state.pending_responses.clone();
             let rid = request_id.clone();
-            tokio::spawn(async move {
-                pending.lock().await.remove(&rid);
-            });
-            OperationError::Timeout
-        })?
-        .map_err(|_| OperationError::ResponseError("Response channel closed".to_string()))?;
+            tokio::spawn(async move { pending.lock().await.remove(&rid); });
+            return Err(OperationError::AckTimeout);
+        }
+        Ok(None) => {
+            // Channel closed without a message — cancellation or listener teardown.
+            return Err(OperationError::Cancelled);
+        }
+        Ok(Some(v)) => v,
+    };
+
+    // If the first message is an ack, wait for the final one. Otherwise
+    // it's already the final.
+    let is_ack = first_value
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(|s| s == "pending_approval")
+        .unwrap_or(false);
+
+    let final_value = if is_ack {
+        match tokio::time::timeout(Duration::from_secs(final_timeout_secs), rx.recv()).await {
+            Err(_) => {
+                let pending = state.pending_responses.clone();
+                let rid = request_id.clone();
+                tokio::spawn(async move { pending.lock().await.remove(&rid); });
+                return Err(OperationError::ApprovalTimeout);
+            }
+            Ok(None) => return Err(OperationError::Cancelled),
+            Ok(Some(v)) => v,
+        }
+    } else {
+        first_value
+    };
 
     // Parse as DeviceOpResponse
-    let response: DeviceOpResponse = serde_json::from_value(response_value)
+    let response: DeviceOpResponse = serde_json::from_value(final_value)
         .map_err(|e| OperationError::ResponseError(e.to_string()))?;
 
     Ok(response)
 }
 
-/// Convenience wrapper with default 30-second timeout.
+/// Default for ops that don't require phone approval. Short ack and
+/// final windows — these ops answer immediately or not at all.
 pub async fn execute(
     state: &AppState,
     operation: &str,
     params: serde_json::Value,
 ) -> Result<DeviceOpResponse, OperationError> {
-    execute_operation(state, operation, params, 30).await
+    execute_operation(state, operation, params, 30, 30).await
+}
+
+/// For ops that may route through phone approval. Same short ack
+/// window so a dead vault still fails fast, but a long final window
+/// for the human to tap Approve.
+pub async fn execute_phone_required(
+    state: &AppState,
+    operation: &str,
+    params: serde_json::Value,
+) -> Result<DeviceOpResponse, OperationError> {
+    execute_operation(state, operation, params, 5, 120).await
+}
+
+/// Cancel a pending operation locally. Removes the channel from
+/// `pending_responses` so the awaiter wakes with `Cancelled`. The
+/// vault is not notified — orphan approval requests on the phone
+/// will time out on their own. A future enhancement could publish
+/// a `device.cancel` op so the phone dismisses the prompt
+/// immediately.
+pub async fn cancel(state: &AppState, request_id: &str) -> bool {
+    let mut pending = state.pending_responses.lock().await;
+    pending.remove(request_id).is_some()
 }

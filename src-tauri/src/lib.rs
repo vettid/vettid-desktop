@@ -87,6 +87,7 @@ pub fn run() {
             vault::get_vault_snapshot,
             vault::get_secret,
             vault::request_secrets_unlock,
+            vault::cancel_pending_operation,
             vault::get_wallet_transactions,
             vault::get_conversation,
             vault::list_call_history,

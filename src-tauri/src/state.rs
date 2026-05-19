@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, oneshot};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::credential::store::ConnectionCredentials;
 use crate::nats::client::NatsClient;
@@ -37,8 +37,15 @@ pub struct AppState {
     pub is_unlocked: Arc<RwLock<bool>>,
 
     /// Pending operation response channels, keyed by request_id.
-    /// The background listener resolves these when a matching response arrives.
-    pub pending_responses: Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>>,
+    ///
+    /// Multi-shot (mpsc) rather than oneshot because phone-required ops
+    /// produce TWO vault responses against the same request_id: an
+    /// immediate `status: "pending_approval"` ack, then the eventual
+    /// final response after the human taps approve/deny on their phone.
+    /// A oneshot would close after the ack and silently drop the
+    /// final result. The receiver side filters: it forwards the ack
+    /// to the UI as an event and waits for the final response.
+    pub pending_responses: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<serde_json::Value>>>>,
 
     /// Currently active WebRTC call session, if any. Only one call at a time
     /// — multi-call (call-waiting) would warrant a HashMap keyed by call_id,

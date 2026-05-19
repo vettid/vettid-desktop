@@ -137,9 +137,33 @@ async fn handle_response_message(
             }
 
             // Resolve pending operation by request_id.
+            //
+            // Phone-required ops send TWO responses against the same
+            // request_id: a `status: "pending_approval"` ack, then the
+            // eventual final response after the phone responds. Don't
+            // remove the pending entry on the ack — only forward it on
+            // the channel and keep waiting for the final result. The
+            // ack is also surfaced to the UI so the user gets a
+            // "Waiting for phone..." indicator rather than a frozen
+            // spinner.
             if let Some(request_id) = payload_data.get("request_id").and_then(|v| v.as_str()) {
+                let is_pending_ack = payload_data
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == "pending_approval")
+                    .unwrap_or(false);
+
+                if is_pending_ack {
+                    let _ = app_handle.emit("vault:operation-pending-approval", &payload_data);
+                    log::debug!("Pending-approval ack for {}", request_id);
+                }
+
                 let mut pending = state.pending_responses.lock().await;
-                if let Some(sender) = pending.remove(request_id) {
+                if is_pending_ack {
+                    if let Some(sender) = pending.get(request_id) {
+                        let _ = sender.send(payload_data.clone());
+                    }
+                } else if let Some(sender) = pending.remove(request_id) {
                     let _ = sender.send(payload_data.clone());
                     log::debug!("Resolved pending operation: {}", request_id);
                 } else {

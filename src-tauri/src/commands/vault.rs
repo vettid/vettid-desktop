@@ -88,23 +88,14 @@ pub async fn list_secrets_catalog(state: State<'_, AppState>) -> Result<VaultOpR
 // Phone-approval-required operations
 // ---------------------------------------------------------------------------
 
-/// Request a secret value. Returns pending_approval: true.
+/// Request a secret value (phone-required).
 #[tauri::command]
 pub async fn request_secret(state: State<'_, AppState>, secret_id: String) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(
+    let result = operations::execute_phone_required(
         &state,
         "secrets.retrieve",
         serde_json::json!({ "secret_id": secret_id }),
     ).await;
-
-    // Track pending delegation if awaiting phone approval
-    if let Ok(ref resp) = result {
-        if resp.pending_phone_approval {
-            let mut delegation = state.delegation.lock().await;
-            delegation.add_pending(resp.request_id.clone(), "secrets.retrieve".to_string());
-        }
-    }
-
     Ok(VaultOpResponse::from_op(result))
 }
 
@@ -122,7 +113,7 @@ pub async fn list_proposals(state: State<'_, AppState>) -> Result<VaultOpRespons
 /// Cast a vote (phone-required).
 #[tauri::command]
 pub async fn cast_vote(state: State<'_, AppState>, proposal_id: String, choice: String) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(
+    let result = operations::execute_phone_required(
         &state,
         "vote.cast",
         serde_json::json!({ "proposal_id": proposal_id, "choice": choice }),
@@ -168,7 +159,7 @@ pub async fn get_transaction_history(state: State<'_, AppState>, wallet_id: Stri
     Ok(VaultOpResponse::from_op(result))
 }
 
-/// Send BTC (phone-required, 60s timeout for signing).
+/// Send BTC (phone-required — signing in enclave gated on phone approval).
 #[tauri::command]
 pub async fn send_btc(
     state: State<'_, AppState>,
@@ -185,7 +176,7 @@ pub async fn send_btc(
     if let Some(rate) = fee_rate {
         params["fee_rate"] = serde_json::json!(rate);
     }
-    let result = operations::execute_operation(&state, "wallet.send", params, 60).await;
+    let result = operations::execute_phone_required(&state, "wallet.send", params).await;
     Ok(VaultOpResponse::from_op(result))
 }
 
@@ -218,7 +209,11 @@ pub async fn get_profile_photo(state: State<'_, AppState>) -> Result<VaultOpResp
 /// `request_secrets_unlock` (and until the grant expires).
 #[tauri::command]
 pub async fn get_secret(state: State<'_, AppState>, id: String) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(&state, "secret.get", serde_json::json!({ "id": id })).await;
+    // Phone-required if the session hasn't been unlocked yet —
+    // independent once SecretsUnlockedUntil is set. Use the
+    // phone-required helper so a non-unlocked call doesn't trip the
+    // short ack window mid-approval.
+    let result = operations::execute_phone_required(&state, "secret.get", serde_json::json!({ "id": id })).await;
     Ok(VaultOpResponse::from_op(result))
 }
 
@@ -228,8 +223,18 @@ pub async fn get_secret(state: State<'_, AppState>, id: String) -> Result<VaultO
 /// subsequent `get_secret` calls within the session don't re-prompt.
 #[tauri::command]
 pub async fn request_secrets_unlock(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(&state, "secret.unlock-session", serde_json::json!({})).await;
+    let result = operations::execute_phone_required(&state, "secret.unlock-session", serde_json::json!({})).await;
     Ok(VaultOpResponse::from_op(result))
+}
+
+/// Cancel a pending phone-approval operation by request_id. The
+/// awaiter wakes with a Cancelled error and the UI returns to the
+/// pre-request state. Vault-side orphan cleanup (dismissing the
+/// approval prompt on the phone) is a future enhancement; right
+/// now the orphan on the phone times out on its own.
+#[tauri::command]
+pub async fn cancel_pending_operation(state: State<'_, AppState>, request_id: String) -> Result<bool, String> {
+    Ok(operations::cancel(&state, &request_id).await)
 }
 
 /// Get a wallet's transaction history. Independent op — same data
@@ -263,7 +268,7 @@ pub async fn update_profile(
     state: State<'_, AppState>,
     fields: serde_json::Value,
 ) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(
+    let result = operations::execute_phone_required(
         &state,
         "profile.update",
         serde_json::json!({ "fields": fields }),
@@ -282,7 +287,7 @@ pub async fn update_personal_data(
     section: String,
     entries: serde_json::Value,
 ) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(
+    let result = operations::execute_phone_required(
         &state,
         "personal-data.update",
         serde_json::json!({ "section": section, "entries": entries }),
@@ -297,7 +302,7 @@ pub async fn revoke_connection(
     state: State<'_, AppState>,
     connection_id: String,
 ) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(
+    let result = operations::execute_phone_required(
         &state,
         "connection.revoke",
         serde_json::json!({ "connection_id": connection_id }),
@@ -369,7 +374,7 @@ pub async fn list_call_history(state: State<'_, AppState>) -> Result<VaultOpResp
 /// Create a new wallet (phone-required — key generation in enclave).
 #[tauri::command]
 pub async fn create_wallet(state: State<'_, AppState>, label: String, network: String) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(
+    let result = operations::execute_phone_required(
         &state,
         "wallet.create",
         serde_json::json!({ "label": label, "network": network }),
@@ -398,7 +403,7 @@ pub async fn get_fee_estimates(state: State<'_, AppState>) -> Result<VaultOpResp
 /// Delete a wallet (phone-required).
 #[tauri::command]
 pub async fn delete_wallet(state: State<'_, AppState>, wallet_id: String) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(
+    let result = operations::execute_phone_required(
         &state,
         "wallet.delete",
         serde_json::json!({ "wallet_id": wallet_id }),
@@ -409,7 +414,7 @@ pub async fn delete_wallet(state: State<'_, AppState>, wallet_id: String) -> Res
 /// Set wallet visibility (phone-required — making public is irreversible).
 #[tauri::command]
 pub async fn set_wallet_visibility(state: State<'_, AppState>, wallet_id: String, is_public: bool) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(
+    let result = operations::execute_phone_required(
         &state,
         "wallet.set-visibility",
         serde_json::json!({ "wallet_id": wallet_id, "is_public": is_public }),
