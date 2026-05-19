@@ -174,7 +174,12 @@
     </button>
   {/if}
 
-  {#if unlockState.error && !pending}
+  <!-- Only show the error in the locked state — once a successful
+       unlock or an explicit lock-now has happened, an old failure
+       message is no longer relevant. Avoids the contradictory UI
+       where the chip says "Unlocked" but a stale "did not
+       acknowledge" sits below it. -->
+  {#if unlockState.error && !pending && !unlocked}
     <div class="chip-error">{unlockState.error}</div>
   {/if}
 </div>

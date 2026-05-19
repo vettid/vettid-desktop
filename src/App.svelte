@@ -6,6 +6,7 @@
   import { initNatsListener } from './lib/stores/nats';
   import { themeStore } from './lib/stores/theme';
   import { initCallListener } from './lib/stores/calls';
+  import { resetSecretsUnlock } from './lib/stores/secrets';
 
   import Pairing from './lib/views/Pairing.svelte';
   import SessionExpired from './lib/views/SessionExpired.svelte';
@@ -107,6 +108,14 @@
       } else {
         currentView = 'pairing';
       }
+    }
+
+    // Any non-active state means the prior unlock grant (if any) is
+    // meaningless — clear the local mirror so the chip doesn't show
+    // a stale "Unlocked" reading or carry an old error across a
+    // reconnect/end-session cycle.
+    if (sessionState.state !== 'active') {
+      resetSecretsUnlock();
     }
   });
 
