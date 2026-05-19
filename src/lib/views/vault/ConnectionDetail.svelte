@@ -5,9 +5,14 @@
 
     interface Props {
         connection: Connection;
+        // Back action. The Connections shell passes a handler that
+        // returns to the conversation view; defaults to clearing the
+        // selection (→ list) when used standalone.
+        onBack?: () => void;
     }
 
-    let { connection }: Props = $props();
+    let { connection, onBack }: Props = $props();
+    const handleBack = (): void => (onBack ?? clearSelectedConnection)();
 
     // svelte-ignore state_referenced_locally
     let detail = $state<Connection>({ ...connection });
@@ -85,7 +90,7 @@
 
 <div class="detail">
     <header class="bar">
-        <button class="back" onclick={clearSelectedConnection} aria-label="Back">←</button>
+        <button class="back" onclick={handleBack} aria-label="Back">←</button>
         <h3>{peerName(detail)}</h3>
         <span class="status-badge {detail.status}">{detail.status}</span>
     </header>

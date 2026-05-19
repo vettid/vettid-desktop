@@ -1,47 +1,46 @@
 <script lang="ts">
-  // Phase 2 placeholder. The full Connections surface (list +
-  // detail + conversation + invite) lands in Phase 5 of
-  // DESKTOP-REWORK-PLAN.md. This stub exists so the new top-bar
-  // chrome can ship without leaving the Connections rail entry
-  // pointing at nothing.
+  // Phase 5 — Connections surface. Three sub-views, one shell:
+  //
+  //   ConnectionsList  → no connection selected
+  //   Conversation     → a connection is selected, mode = chat
+  //   ConnectionDetail → a connection is selected, mode = profile
+  //
+  // selectedConnectionStore is the single source of truth for "is a
+  // connection open?". `mode` only matters while one is — it toggles
+  // between the conversation and the peer's profile/manage card.
+  import { selectedConnectionStore } from '../stores/navigation';
+  import ConnectionsList from './vault/ConnectionsList.svelte';
+  import Conversation from './vault/Conversation.svelte';
+  import ConnectionDetail from './vault/ConnectionDetail.svelte';
+
+  let selected = $derived($selectedConnectionStore);
+  let mode = $state<'conversation' | 'detail'>('conversation');
+
+  // Land on the conversation every time a (different) connection is
+  // opened from the list. The effect tracks `selected` only — flipping
+  // `mode` from within Conversation/Detail doesn't re-trigger it, so
+  // there's no fight between this reset and the in-view toggle.
+  $effect(() => {
+    if (selected) mode = 'conversation';
+  });
 </script>
 
-<div class="wrap">
-  <div class="placeholder">
-    <h1>Connections</h1>
-    <p>
-      Your peer connections will live here — connection list, messaging,
-      voice + video calls. Coming in Phase 5 of the desktop rework.
-    </p>
-    <p class="hint">
-      For now, manage your connections from the VettID app on your phone.
-    </p>
-  </div>
+<div class="connections-shell">
+  {#if !selected}
+    <ConnectionsList />
+  {:else if mode === 'conversation'}
+    <Conversation connection={selected} onShowProfile={() => (mode = 'detail')} />
+  {:else}
+    <ConnectionDetail connection={selected} onBack={() => (mode = 'conversation')} />
+  {/if}
 </div>
 
 <style>
-  .wrap {
+  .connections-shell {
     flex: 1;
     display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 40px;
-  }
-  .placeholder {
-    text-align: center;
-    max-width: 440px;
-  }
-  h1 {
-    font-size: 1.4rem;
-    margin-bottom: 12px;
-  }
-  p {
-    color: var(--text-muted);
-    line-height: 1.55;
-    margin-bottom: 8px;
-  }
-  .hint {
-    color: var(--text-subtle);
-    font-size: 0.9rem;
+    flex-direction: column;
+    min-height: 0;
+    padding: 16px 20px;
   }
 </style>

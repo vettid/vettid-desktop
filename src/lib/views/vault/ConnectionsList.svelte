@@ -1,10 +1,23 @@
 <script lang="ts">
     import { invoke } from '@tauri-apps/api/core';
     import type { Connection, VaultOpResponse } from '../../types';
+    import { selectedConnectionStore } from '../../stores/navigation';
 
     let connections: Connection[] = $state([]);
     let loading = $state(true);
     let error = $state('');
+
+    function peerName(c: Connection): string {
+        const p = c.peer_profile;
+        const full = `${p?.first_name ?? ''} ${p?.last_name ?? ''}`.trim();
+        return full || c.label || c.peer_guid.slice(0, 8);
+    }
+
+    // Clicking a row opens it — the Connections shell watches
+    // selectedConnectionStore and swaps to the conversation view.
+    function openConnection(conn: Connection): void {
+        selectedConnectionStore.set(conn);
+    }
 
     async function loadConnections() {
         loading = true;
@@ -40,13 +53,15 @@
         <div class="status">No connections yet</div>
     {:else}
         <ul class="list">
-            {#each connections as conn}
-                <li class="connection-item">
-                    <div class="name">{conn.label || conn.peer_guid}</div>
-                    <div class="meta">
-                        <span class="status-badge {conn.status}">{conn.status}</span>
-                        <span class="direction">{conn.direction}</span>
-                    </div>
+            {#each connections as conn (conn.connection_id)}
+                <li>
+                    <button class="connection-item" onclick={() => openConnection(conn)}>
+                        <div class="name">{peerName(conn)}</div>
+                        <div class="meta">
+                            <span class="status-badge {conn.status}">{conn.status}</span>
+                            <span class="direction">{conn.direction}</span>
+                        </div>
+                    </button>
                 </li>
             {/each}
         </ul>
@@ -61,7 +76,18 @@
     .status { color: var(--text-secondary); padding: 24px; text-align: center; }
     .status.error { color: var(--danger); }
     .list { list-style: none; padding: 0; margin: 0; overflow-y: auto; flex: 1; }
-    .connection-item { padding: 12px; border-bottom: 1px solid var(--border); }
+    .connection-item {
+        width: 100%;
+        text-align: left;
+        background: none;
+        border: none;
+        border-bottom: 1px solid var(--border);
+        padding: 12px;
+        cursor: pointer;
+        color: inherit;
+        font: inherit;
+    }
+    .connection-item:hover { background: rgba(255, 255, 255, 0.04); }
     .name { font-weight: 500; }
     .meta { display: flex; gap: 8px; margin-top: 4px; font-size: 0.85em; color: var(--text-secondary); }
     .status-badge { padding: 2px 6px; border-radius: 3px; font-size: 0.8em; }
