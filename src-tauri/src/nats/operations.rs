@@ -142,6 +142,15 @@ pub async fn execute_operation(
 
     drop(nats_client);
 
+    // Helper: is this message a `pending_approval` ack (no payload,
+    // just "vault saw your request and is waiting on the human")?
+    fn is_pending_ack(v: &serde_json::Value) -> bool {
+        v.get("status")
+            .and_then(|s| s.as_str())
+            .map(|s| s == "pending_approval")
+            .unwrap_or(false)
+    }
+
     // First read: short window. The vault should answer almost
     // immediately — either the final response (no phone needed) or
     // a pending_approval ack (phone-required).
@@ -149,37 +158,40 @@ pub async fn execute_operation(
 
     let first_value = match first {
         Err(_) => {
-            // No response at all — clean up and bail.
             let pending = state.pending_responses.clone();
             let rid = request_id.clone();
             tokio::spawn(async move { pending.lock().await.remove(&rid); });
             return Err(OperationError::AckTimeout);
         }
-        Ok(None) => {
-            // Channel closed without a message — cancellation or listener teardown.
-            return Err(OperationError::Cancelled);
-        }
+        Ok(None) => return Err(OperationError::Cancelled),
         Ok(Some(v)) => v,
     };
 
-    // If the first message is an ack, wait for the final one. Otherwise
-    // it's already the final.
-    let is_ack = first_value
-        .get("status")
-        .and_then(|v| v.as_str())
-        .map(|s| s == "pending_approval")
-        .unwrap_or(false);
-
-    let final_value = if is_ack {
-        match tokio::time::timeout(Duration::from_secs(final_timeout_secs), rx.recv()).await {
-            Err(_) => {
-                let pending = state.pending_responses.clone();
-                let rid = request_id.clone();
-                tokio::spawn(async move { pending.lock().await.remove(&rid); });
-                return Err(OperationError::ApprovalTimeout);
+    // If the first message is an ack, keep reading until we get a
+    // non-ack message — that's the real final response. Duplicate acks
+    // can arrive (e.g. listener fan-out, NATS replay, intermediate
+    // status updates) and must not poison the result, otherwise the
+    // caller sees `status: pending_approval` as if it were the final
+    // payload and reports "Approval did not complete" right after the
+    // human actually approved.
+    let final_value = if is_pending_ack(&first_value) {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(final_timeout_secs), rx.recv()).await {
+                Err(_) => {
+                    let pending = state.pending_responses.clone();
+                    let rid = request_id.clone();
+                    tokio::spawn(async move { pending.lock().await.remove(&rid); });
+                    return Err(OperationError::ApprovalTimeout);
+                }
+                Ok(None) => return Err(OperationError::Cancelled),
+                Ok(Some(v)) => {
+                    if is_pending_ack(&v) {
+                        log::debug!("Ignoring duplicate pending_approval ack for {}", request_id);
+                        continue;
+                    }
+                    break v;
+                }
             }
-            Ok(None) => return Err(OperationError::Cancelled),
-            Ok(Some(v)) => v,
         }
     } else {
         first_value

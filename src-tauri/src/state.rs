@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::task::JoinHandle;
 
 use crate::credential::store::ConnectionCredentials;
 use crate::nats::client::NatsClient;
@@ -47,6 +48,15 @@ pub struct AppState {
     /// to the UI as an event and waits for the final response.
     pub pending_responses: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<serde_json::Value>>>>,
 
+    /// Handle to the currently running background NATS listener task.
+    /// Held so callers that re-spawn the listener (unlock,
+    /// extend_session, register) can abort the previous one first.
+    /// Without this, each re-spawn stacked another subscriber on the
+    /// same subjects and every response was processed N times, which
+    /// poisoned multi-shot ops (the second listener's duplicate ack
+    /// got mistaken for the final response).
+    pub listener_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+
     /// Currently active WebRTC call session, if any. Only one call at a time
     /// — multi-call (call-waiting) would warrant a HashMap keyed by call_id,
     /// but the Android app is single-call and we follow that model.
@@ -65,6 +75,7 @@ impl AppState {
             is_registered: Arc::new(RwLock::new(false)),
             is_unlocked: Arc::new(RwLock::new(false)),
             pending_responses: Arc::new(Mutex::new(HashMap::new())),
+            listener_handle: Arc::new(Mutex::new(None)),
             #[cfg(feature = "webrtc")]
             active_call: Arc::new(Mutex::new(None)),
         }

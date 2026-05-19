@@ -152,7 +152,7 @@ pub async fn register(
     // post-pair operation handling, so the subscribe lands on the
     // already-connected client.
     if let Some(conn_id) = listener_conn_id {
-        crate::nats::listener::spawn_listener(app.clone(), conn_id);
+        crate::nats::listener::spawn_listener(app.clone(), conn_id).await;
     }
 
     Ok(RegisterResponse {
@@ -323,7 +323,7 @@ pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<bool, 
     // the request reaches the vault, the response is published
     // back to MessageSpace.{owner}.forOwner.device.{conn}, and
     // nobody's subscribed to it.
-    crate::nats::listener::spawn_listener(app.clone(), connection_id);
+    crate::nats::listener::spawn_listener(app.clone(), connection_id).await;
 
     Ok(true)
 }
@@ -437,7 +437,7 @@ pub async fn extend_session(
     // listener's exit path; new requests register against the fresh
     // listener.
     if let Some(conn_id) = listener_conn_id {
-        crate::nats::listener::spawn_listener(app.clone(), conn_id);
+        crate::nats::listener::spawn_listener(app.clone(), conn_id).await;
     }
 
     Ok(RegisterResponse {

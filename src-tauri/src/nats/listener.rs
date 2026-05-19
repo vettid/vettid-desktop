@@ -24,11 +24,32 @@ use tokio::sync::mpsc;
 /// Both streams are multiplexed via `tokio::select!` inside one task so that
 /// shutdown semantics stay simple and AppState locks aren't contended across
 /// independent task boundaries.
-pub fn spawn_listener(
+pub async fn spawn_listener(
     app_handle: AppHandle,
     connection_id: String,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) {
+    // Abort any prior listener under the lock so we don't end up with
+    // overlapping subscribers on the same subjects. Without this,
+    // re-spawning across unlock / extend_session / register stacked
+    // listeners and every NATS message got processed N times — the
+    // duplicate ack from listener #2 poisoned the multi-shot
+    // phone-approval reader ("Approval did not complete" after the
+    // human approved).
+    let listener_slot = {
+        let state = app_handle.state::<AppState>();
+        state.listener_handle.clone()
+    };
+    {
+        let mut slot = listener_slot.lock().await;
+        if let Some(prev) = slot.take() {
+            prev.abort();
+            log::debug!("Aborted previous background listener before respawn");
+        }
+    }
+
+    let app_handle_for_task = app_handle.clone();
+    let handle = tokio::spawn(async move {
+        let app_handle = app_handle_for_task;
         let state = app_handle.state::<AppState>();
         let (responses_sub, app_events_sub, event_rx_opt) = {
             let mut nats = state.nats.lock().await;
@@ -95,7 +116,11 @@ pub fn spawn_listener(
         }));
 
         log::info!("Background listener ended for connection {}", connection_id);
-    })
+    });
+
+    // Track the new task so the next respawn can abort it.
+    let mut slot = listener_slot.lock().await;
+    *slot = Some(handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +242,19 @@ async fn handle_response_message(
 /// event detail; per-feature handlers in later phases will decrypt with the
 /// appropriate key (vault key, connection key, or unencrypted depending on type).
 async fn handle_app_event(app_handle: &AppHandle, subject: &str, payload: &[u8]) {
+    // Drop request/response reply traffic at the door. Subjects like
+    // `OwnerSpace.{owner}.forApp.feed.sync.{id}.response` are phone-
+    // originated request/reply pairs that land on this broad
+    // forApp.> subscription as a side effect. They aren't events the
+    // desktop should react to (the phone has its own subscriber for
+    // its own responses), so emit nothing and skip the decode work.
+    // The desktop's own op responses come back on a different prefix
+    // (MessageSpace.{owner}.forApp.device.{conn}.response) handled by
+    // handle_response_message.
+    if subject.ends_with(".response") {
+        return;
+    }
+
     let event_payload = serde_json::json!({
         "subject": subject,
         "payload_b64": base64_encode(payload),
