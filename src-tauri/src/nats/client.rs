@@ -202,42 +202,27 @@ impl NatsClient {
             .map_err(|e| NatsError::SubscribeFailed(e.to_string()))
     }
 
-    /// Subscribe to the connection-specific topic for operational messages
-    /// after registration is complete.
+    /// Subscribe to every vault-pushed message for this paired device.
     ///
-    /// Topic: `MessageSpace.{owner_guid}.forApp.device.{connection_id}.response`
+    /// Topic: `MessageSpace.{owner_guid}.forApp.device.{connection_id}.>`
     ///
-    /// Lives on the forApp side (paired with the activated/ended/revoked
-    /// pattern from `device_pairing.go`). The vault used to publish
-    /// responses on `forOwner.device.{conn}`, which the parent's broad
-    /// `MessageSpace.*.forOwner.>` subscription also captured, so every
-    /// response was logged as a replay attack and Phase 4.5 of the
-    /// deploy aborted on the noise. The new subject is outside that
-    /// subscription's prefix — clean separation, no re-ingest.
-    pub async fn subscribe_responses(
+    /// Phase 2 NATS separation: the desktop no longer listens on the
+    /// shared `OwnerSpace.{owner}.forApp.>` bus. The vault mirrors
+    /// every forApp event onto each paired device's MessageSpace
+    /// channel via `VsockPublisher.PublishToApp`, so this single
+    /// subscription covers both device-op responses and push events
+    /// (profile changes, connection lifecycle, security alerts, etc.).
+    /// Phones continue to use the OwnerSpace bus as before — clean
+    /// separation, no cross-traffic, no duplicate dispatch.
+    pub async fn subscribe_device_channel(
         &self,
         connection_id: &str,
     ) -> Result<Subscriber, NatsError> {
         let client = self.client.as_ref().ok_or(NatsError::NotConnected)?;
         let subject = format!(
-            "MessageSpace.{}.forApp.device.{}.response",
+            "MessageSpace.{}.forApp.device.{}.>",
             self.owner_guid, connection_id,
         );
-        client
-            .subscribe(subject)
-            .await
-            .map_err(|e| NatsError::SubscribeFailed(e.to_string()))
-    }
-
-    /// Subscribe to the broad vault push-event channel.
-    ///
-    /// Topic: `OwnerSpace.{owner_guid}.forApp.>` — this is the channel the vault
-    /// uses to push events to the user's apps (messages received, read receipts,
-    /// connection lifecycle, calls, feed events, etc.). Mirrors Android's
-    /// `OwnerSpaceClient.subscribeToVaultEvents()`.
-    pub async fn subscribe_app_events(&self) -> Result<Subscriber, NatsError> {
-        let client = self.client.as_ref().ok_or(NatsError::NotConnected)?;
-        let subject = format!("OwnerSpace.{}.forApp.>", self.owner_guid);
         client
             .subscribe(subject)
             .await

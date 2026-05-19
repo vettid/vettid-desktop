@@ -51,33 +51,25 @@ pub async fn spawn_listener(
     let handle = tokio::spawn(async move {
         let app_handle = app_handle_for_task;
         let state = app_handle.state::<AppState>();
-        let (responses_sub, app_events_sub, event_rx_opt) = {
+        let (responses_sub, event_rx_opt) = {
             let mut nats = state.nats.lock().await;
-            let r = match nats.subscribe_responses(&connection_id).await {
+            let r = match nats.subscribe_device_channel(&connection_id).await {
                 Ok(s) => s,
                 Err(e) => {
-                    log::error!("Failed to subscribe for responses: {}", e);
-                    return;
-                }
-            };
-            let a = match nats.subscribe_app_events().await {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!("Failed to subscribe to forApp events: {}", e);
+                    log::error!("Failed to subscribe to device channel: {}", e);
                     return;
                 }
             };
             let evs = nats.take_event_receiver();
-            (r, a, evs)
+            (r, evs)
         };
 
         log::info!(
-            "Background listener started for connection {} (responses + forApp + state-events)",
+            "Background listener started for connection {} (MessageSpace device channel + state events)",
             connection_id,
         );
 
-        let mut responses = responses_sub;
-        let mut app_events = app_events_sub;
+        let mut device_channel = responses_sub;
         // The connection-event receiver may be `None` if the listener is
         // restarted on the same NatsClient without a fresh connect — in that
         // case skip the state-events arm in the select.
@@ -85,13 +77,20 @@ pub async fn spawn_listener(
 
         loop {
             tokio::select! {
-                Some(msg) = responses.next() => {
-                    if let Err(e) = handle_response_message(&app_handle, state.inner(), &msg.payload).await {
-                        log::warn!("Failed to handle response message: {}", e);
+                Some(msg) = device_channel.next() => {
+                    // The device channel carries both op responses
+                    // (MessageSpace.{o}.forApp.device.{c}.response) and
+                    // vault push events fanned out by PublishToApp
+                    // (MessageSpace.{o}.forApp.device.{c}.{event}).
+                    // Route on subject suffix so each lands on its
+                    // intended handler.
+                    if msg.subject.ends_with(".response") {
+                        if let Err(e) = handle_response_message(&app_handle, state.inner(), &msg.payload).await {
+                            log::warn!("Failed to handle response message: {}", e);
+                        }
+                    } else {
+                        handle_app_event(&app_handle, &msg.subject, &msg.payload).await;
                     }
-                }
-                Some(msg) = app_events.next() => {
-                    handle_app_event(&app_handle, &msg.subject, &msg.payload).await;
                 }
                 Some(ev) = recv_state_event(event_rx.as_mut()) => {
                     handle_state_event(&app_handle, ev);
