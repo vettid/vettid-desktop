@@ -454,6 +454,40 @@ pub async fn extend_session(
             key.copy_from_slice(&creds.connection_key);
             *state.connection_key.write().await = Some(key);
         }
+
+        // Reconnect the SHARED state.nats client with the rotated
+        // session's scoped creds. The Stage-2 handshake in
+        // complete_pairing ran on its own short-lived NatsClient, and
+        // the preceding end_session left state.nats disconnected.
+        // spawn_listener (below) subscribes through state.nats — so
+        // without this reconnect it fails with "NATS client not
+        // connected" and the desktop never receives vault op
+        // responses for the new session. Mirrors unlock()'s connect.
+        if !creds.message_space_url.is_empty() && !creds.message_space_token.is_empty() {
+            match pairing::parse_creds_block(&creds.message_space_token) {
+                Some((jwt, seed)) => {
+                    let mut nats = state.nats.lock().await;
+                    if let Err(e) = nats
+                        .connect_with_credentials(
+                            &creds.message_space_url,
+                            &jwt,
+                            &seed,
+                            &creds.owner_guid,
+                        )
+                        .await
+                    {
+                        log::error!(
+                            "extend_session: failed to connect state.nats for the new session: {}",
+                            e
+                        );
+                    }
+                }
+                None => log::error!(
+                    "extend_session: stored NATS creds malformed — listener will fail"
+                ),
+            }
+        }
+
         listener_conn_id = Some(creds.connection_id.clone());
         *state.credentials.write().await = Some(creds);
     }
