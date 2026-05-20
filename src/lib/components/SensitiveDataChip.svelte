@@ -67,6 +67,7 @@
   // The Secrets/Wallets tabs no longer carry their own banner — this
   // chip is the single status surface for sensitive-data access.
   let unlistenPending: UnlistenFn | null = null;
+  let unlistenUnlocked: UnlistenFn | null = null;
   $effect(() => {
     listen<any>('vault:operation-pending-approval', (e) => {
       const payload = e.payload ?? {};
@@ -76,8 +77,22 @@
       pendingElapsed = 0;
     }).then((fn) => { unlistenPending = fn; });
 
+    // A secret.unlock-session grant can land after request_secrets_unlock
+    // already timed out (slow enclave, or the phone approved late). The
+    // Rust listener forwards that late result here so the chip still
+    // flips to Unlocked instead of stranding the user on a stale
+    // "request timed out" error.
+    listen<any>('vault:secrets-unlocked', (e) => {
+      const until = Number(e.payload?.unlocked_until ?? 0);
+      if (until > Math.floor(Date.now() / 1000)) {
+        clearPendingState();
+        secretsUnlockStore.set({ unlockedUntil: until, pending: false, error: null });
+      }
+    }).then((fn) => { unlistenUnlocked = fn; });
+
     return () => {
       if (unlistenPending) unlistenPending();
+      if (unlistenUnlocked) unlistenUnlocked();
     };
   });
 
@@ -142,6 +157,7 @@
 
   onDestroy(() => {
     if (unlistenPending) unlistenPending();
+    if (unlistenUnlocked) unlistenUnlocked();
     if (tickerId) clearInterval(tickerId);
   });
 </script>

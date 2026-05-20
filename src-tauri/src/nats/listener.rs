@@ -192,6 +192,25 @@ async fn handle_response_message(
                     log::debug!("Resolved pending operation: {}", request_id);
                 } else {
                     log::debug!("No pending handler for request_id: {}", request_id);
+                    // WS2: a secret.unlock-session result can land after
+                    // its caller already gave up (slow enclave, or the
+                    // phone approved late). The grant is still valid —
+                    // surface it so the Sensitive Data chip flips to
+                    // Unlocked instead of stranding the user on a stale
+                    // "request timed out" error.
+                    let is_late_unlock = payload_data
+                        .get("operation")
+                        .and_then(|v| v.as_str())
+                        .map(|op| op == "secret.unlock-session")
+                        .unwrap_or(false)
+                        && payload_data
+                            .get("unlocked_until")
+                            .map(|v| !v.is_null())
+                            .unwrap_or(false);
+                    if is_late_unlock {
+                        let _ = app_handle.emit("vault:secrets-unlocked", &payload_data);
+                        log::info!("Late secret.unlock-session grant applied for {}", request_id);
+                    }
                 }
             }
         }
