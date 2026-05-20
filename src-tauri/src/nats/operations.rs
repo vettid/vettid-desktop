@@ -1,5 +1,6 @@
 use std::fmt;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::crypto::encrypt;
@@ -7,6 +8,88 @@ use crate::nats::messages::{
     encode_envelope, DeviceOpRequest, DeviceOpResponse, MSG_DEVICE_OP_REQUEST,
 };
 use crate::state::AppState;
+
+// ---------------------------------------------------------------------------
+// Dev watchdog — runaway vault-op detector
+// ---------------------------------------------------------------------------
+//
+// Every vault op funnels through execute_operation, so it is the one
+// place to measure op rate. A frontend reactive loop (a Svelte $effect
+// that re-fires its own load) sprays vault ops in a tight loop. On a
+// slow vault that crawled and went unnoticed; once the vsock multiplex
+// made ops fast it flooded — 8k ops in 6 minutes — and the symptom was
+// a frozen UI with no clue what caused it (2026-05-20).
+//
+// This watchdog is always on and silent in normal use. When the op
+// rate goes pathological it logs one loud line naming the dominant
+// operation — so the *next* loop announces its own culprit instead of
+// presenting as a mystery freeze. The log fires on the Rust thread, so
+// it still reaches the console even when the WebView/JS thread is
+// pinned by the loop.
+
+const OP_WATCH_WINDOW: Duration = Duration::from_secs(10);
+/// >40 ops in 10s is far above any legitimate burst (a screen load is
+/// a handful); a reactive loop does hundreds.
+const OP_WATCH_THRESHOLD: usize = 40;
+/// Warn at most this often while a flood persists — one loud line, not
+/// a second flood in the log.
+const OP_WATCH_WARN_COOLDOWN: Duration = Duration::from_secs(5);
+
+struct OpRateWatch {
+    recent: Vec<(Instant, String)>,
+    last_warned: Option<Instant>,
+}
+
+static OP_RATE_WATCH: Mutex<OpRateWatch> = Mutex::new(OpRateWatch {
+    recent: Vec::new(),
+    last_warned: None,
+});
+
+/// Record one vault op and, if the recent rate is pathological, log a
+/// single loud line naming the operations that dominate the window.
+fn record_op_and_check(operation: &str) {
+    let now = Instant::now();
+    let mut w = match OP_RATE_WATCH.lock() {
+        Ok(w) => w,
+        Err(_) => return, // poisoned — a watchdog must never break the app
+    };
+    w.recent.push((now, operation.to_string()));
+    let cutoff = now.checked_sub(OP_WATCH_WINDOW).unwrap_or(now);
+    w.recent.retain(|(t, _)| *t >= cutoff);
+
+    if w.recent.len() <= OP_WATCH_THRESHOLD {
+        return;
+    }
+    if let Some(last) = w.last_warned {
+        if now.duration_since(last) < OP_WATCH_WARN_COOLDOWN {
+            return;
+        }
+    }
+    w.last_warned = Some(now);
+
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (_, op) in &w.recent {
+        *counts.entry(op.as_str()).or_insert(0) += 1;
+    }
+    let mut top: Vec<(&str, usize)> = counts.into_iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1));
+    let breakdown = top
+        .iter()
+        .take(3)
+        .map(|(op, n)| format!("{}×{}", op, n))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    log::error!(
+        "DEV-WATCHDOG: runaway vault-op rate — {} ops in {}s (top: {}). \
+         A frontend reactive loop is almost certainly re-firing a load — \
+         check $effect blocks that read state their own load() writes; \
+         load-once belongs in onMount.",
+        w.recent.len(),
+        OP_WATCH_WINDOW.as_secs(),
+        breakdown,
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -78,6 +161,11 @@ pub async fn execute_operation(
     ack_timeout_secs: u64,
     final_timeout_secs: u64,
 ) -> Result<DeviceOpResponse, OperationError> {
+    // DEV-WATCHDOG: sample the op rate through this single chokepoint
+    // so a runaway frontend loop is named in the log instead of
+    // silently freezing the UI.
+    record_op_and_check(operation);
+
     // Read connection key
     let connection_key = {
         let key_guard = state.connection_key.read().await;
