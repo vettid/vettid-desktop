@@ -22,6 +22,7 @@
   // rail entirely — they're full-screen actions, not destinations
   // the user lives in. See DESKTOP-REWORK-PLAN.md §1 for the layout.
   type View =
+    | 'loading'
     | 'pairing'
     | 'expired'
     | 'session-detail'
@@ -29,7 +30,15 @@
     | 'connections'
     | 'settings';
 
-  let currentView = $state<View>('pairing');
+  // Start on a neutral loading view, NOT pairing. On launch the
+  // backend has to be queried (registration + auto-unlock + session
+  // state) before we know where the user belongs; defaulting to
+  // 'pairing' flashed the QR-pair screen at an already-paired user
+  // with an active session for the ~1s that took. stateResolved gates
+  // the routing effect so it can't route off the store's pre-query
+  // 'inactive' placeholder.
+  let currentView = $state<View>('loading');
+  let stateResolved = $state(false);
   let sessionState: SessionState = $derived($sessionStore);
   let isRegistered = $state(false);
   let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -66,6 +75,9 @@
     await refreshRegistration();
     await autoUnlockIfNeeded();
     await refreshSessionFromBackend();
+    // State is now known — let the routing effect take over from the
+    // loading view.
+    stateResolved = true;
     pollTimer = setInterval(async () => {
       await refreshRegistration();
       await refreshSessionFromBackend();
@@ -86,10 +98,15 @@
   // and we keep them there until they navigate away. Same for
   // Settings / Connections / Vault.
   $effect(() => {
+    // Hold on the loading view until the launch-time backend queries
+    // have resolved — otherwise we'd route off the session store's
+    // pre-query 'inactive' placeholder and flash the pairing screen.
+    if (!stateResolved) return;
+
     if (sessionState.state === 'active') {
-      // Transition out of pre-session takeovers (pairing / expired)
-      // → land on Vault. Already on a real destination → stay.
-      if (currentView === 'pairing' || currentView === 'expired') {
+      // Transition out of pre-session takeovers (loading / pairing /
+      // expired) → land on Vault. Already on a real destination → stay.
+      if (currentView === 'loading' || currentView === 'pairing' || currentView === 'expired') {
         currentView = 'vault';
       }
     } else if (sessionState.state === 'expired' || sessionState.state === 'suspended') {
@@ -157,6 +174,14 @@
   let railVisible = $derived(sessionState.state === 'active');
 </script>
 
+{#if currentView === 'loading'}
+  <!-- Launch-time takeover while we query the backend for registration
+       + session state. Replaces the old pairing-screen flash. -->
+  <div class="loading-screen">
+    <div class="loading-spinner"></div>
+    <p>Checking your vault session…</p>
+  </div>
+{:else}
 <div class="app">
   <TopBar
     onSessionClick={onSessionPillClick}
@@ -213,12 +238,35 @@
   <!-- Global call overlay — present in any view -->
   <CallOverlay />
 </div>
+{/if}
 
 <style>
   .app {
     display: flex;
     flex-direction: column;
     height: 100vh;
+  }
+  .loading-screen {
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    background: var(--bg, #0e0e12);
+    color: var(--text-muted, #888);
+    font-size: 0.9rem;
+  }
+  .loading-spinner {
+    width: 28px;
+    height: 28px;
+    border: 3px solid rgba(255, 255, 255, 0.1);
+    border-top-color: var(--accent, #6b8afd);
+    border-radius: 50%;
+    animation: app-spin 0.9s linear infinite;
+  }
+  @keyframes app-spin {
+    to { transform: rotate(360deg); }
   }
   .body {
     flex: 1;
