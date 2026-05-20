@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { onMount } from 'svelte';
   import { secretsUnlockStore, isSecretsUnlocked } from '../../stores/secrets';
 
   // Module-level cache so navigating away + back paints from the
@@ -23,10 +24,10 @@
   let refreshing = $state(false);
   let errorMessage = $state('');
   // Separate state for reveal failures so they don't get clobbered
-  // when the catalog reloads (load() clears errorMessage on entry,
-  // and $effect can re-trigger load if anything reactive changes —
-  // before this split, the reveal error flashed for milliseconds
-  // and the user couldn't read it).
+  // when the catalog reloads (load() clears errorMessage on entry, and
+  // load() also runs on the manual refresh + on every tab remount —
+  // before this split, the reveal error flashed for milliseconds and
+  // the user couldn't read it).
   let revealError = $state('');
 
   // Per-row reveal state. Keys are secret IDs. Values either contain
@@ -74,7 +75,10 @@
     }
   }
 
-  $effect(() => { load(); });
+  // onMount, NOT $effect: load() reads `secrets` in its entry guard
+  // and then writes a fresh `secrets` array, so an $effect would
+  // register it as a dependency and re-fire itself in a tight loop.
+  onMount(() => { load(); });
 
   // Group secrets by category for display — matches the Android
   // secrets screen's grouping. Unknown categories fall under "Other".

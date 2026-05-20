@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { onMount } from 'svelte';
   import { secretsUnlockStore, isSecretsUnlocked } from '../../stores/secrets';
 
   // Read the shared lock state from the Sensitive Data chip in the
@@ -55,7 +56,10 @@
     }
   }
 
-  $effect(() => { load(); });
+  // onMount, NOT $effect: load() reads `wallets` in its entry guard
+  // and then writes a fresh `wallets` array, so an $effect would
+  // register it as a dependency and re-fire itself in a tight loop.
+  onMount(() => { load(); });
 
   // Sats → BTC with 8 decimals; locale-aware grouping on the integer
   // side so balances stay readable.

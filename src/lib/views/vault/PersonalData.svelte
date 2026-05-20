@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { onMount } from 'svelte';
   import ConfirmDialog from '../../components/ConfirmDialog.svelte';
 
   // PersonalData renders inside the Vault tab panel — the profile
@@ -88,7 +89,11 @@
     }
   }
 
-  $effect(() => { load(); });
+  // onMount, NOT $effect: load() reads `fields`/`firstName`/etc. in its
+  // entry guard and then writes them, so an $effect would register them
+  // as dependencies and re-fire itself forever. The slow vault hid this
+  // (one reload/minute); a fast vault spins it into a freeze.
+  onMount(() => { load(); });
 
   // Canonical category labels from the Android client's DataCategory
   // enum. Keeps the desktop in sync with what the app shows so the
