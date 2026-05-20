@@ -577,9 +577,18 @@ pub async fn publish_end_session(
         .publish_to(&subject, payload.to_string().as_bytes())
         .await?;
 
-    // Give NATS a moment to flush; don't wait for an ack — the local
-    // state wipe must happen even if the vault round-trip is slow.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Flush before returning. The caller tears the NATS connection
+    // down right after this; a bare publish is fire-and-forget, so
+    // without the flush the end-session frame can be dropped before it
+    // reaches the server and the vault never learns the session
+    // ended. flush() sends a PING and awaits the PONG — on return the
+    // server has the message and delivery to the vault is guaranteed.
+    if let Err(e) = client.flush().await {
+        log::warn!(
+            "end-session: NATS flush failed; the frame may not have reached the server: {}",
+            e
+        );
+    }
     Ok(())
 }
 

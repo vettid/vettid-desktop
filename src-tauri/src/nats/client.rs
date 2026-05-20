@@ -153,6 +153,19 @@ impl NatsClient {
         Ok(())
     }
 
+    /// Flush pending publishes. Sends a PING and awaits the server's
+    /// PONG, so on return every prior publish has reached the NATS
+    /// server — used before tearing the connection down so a
+    /// fire-and-forget publish can't be dropped by the disconnect.
+    pub async fn flush(&self) -> Result<(), NatsError> {
+        let client = self.client.as_ref().ok_or(NatsError::NotConnected)?;
+        client
+            .flush()
+            .await
+            .map_err(|e| NatsError::PublishFailed(e.to_string()))?;
+        Ok(())
+    }
+
     /// Subscribe to a specific subject.
     pub async fn subscribe_to(&self, subject: &str) -> Result<Subscriber, NatsError> {
         let client = self.client.as_ref().ok_or(NatsError::NotConnected)?;

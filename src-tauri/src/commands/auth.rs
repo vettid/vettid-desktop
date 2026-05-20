@@ -547,11 +547,35 @@ pub async fn end_session(state: State<'_, AppState>) -> Result<bool, String> {
 
     let config_dir = store::default_config_dir();
 
-    // Best-effort vault publish first — if it fails, we still want to
-    // locally expire so the desktop UI doesn't claim an active session
-    // the vault is about to reject anyway.
+    // Tell the vault to end the session. publish_end_session flushes
+    // the NATS connection before returning, so on a clean return the
+    // end-session frame has reached the server and delivery to the
+    // vault is guaranteed; on error we still reset locally.
     if let Err(e) = pairing::publish_end_session(&config_dir, "user_locked").await {
-        log::warn!("device.end-session publish failed (continuing with local expire): {}", e);
+        log::warn!("device.end-session publish failed (continuing with local reset): {}", e);
+    }
+
+    // Persist the session-end to disk. The device stays PAIRED — the
+    // device keypair, connection_key and NATS creds are untouched, so
+    // "Start New Session" needs no re-pair — but the session fields
+    // MUST be cleared here. get_session_info derives is_active purely
+    // from the on-disk session_expires_at, so leaving it set meant a
+    // relaunch reloaded a dead session: the desktop routed straight to
+    // the vault and every op hung because the vault no longer had it.
+    match store::load(&config_dir) {
+        Ok((mut creds, _)) => {
+            creds.session_id.clear();
+            creds.session_expires_at = 0;
+            creds.session_duration_seconds = 0;
+            if let Err(e) = store::save(&config_dir, &creds) {
+                log::error!("end_session: failed to persist cleared session state: {}", e);
+            } else {
+                log::info!("end_session: on-disk session fields cleared (pairing preserved)");
+            }
+        }
+        Err(e) => log::warn!(
+            "end_session: could not load creds to clear on-disk session fields: {}", e
+        ),
     }
 
     state.nats.lock().await.disconnect().await;

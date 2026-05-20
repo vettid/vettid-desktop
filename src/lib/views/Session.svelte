@@ -7,6 +7,7 @@
   let session = $derived($sessionStore);
 
   let busy = $state(false);
+  let busyLabel = $state('');
   let statusMessage = $state('');
 
   let lockDialogOpen = $state(false);
@@ -41,6 +42,7 @@
   async function doLock() {
     if (busy) return;
     busy = true;
+    busyLabel = 'Locking…';
     statusMessage = '';
     try {
       await invoke('lock');
@@ -56,6 +58,7 @@
   async function doEnd() {
     if (busy) return;
     busy = true;
+    busyLabel = 'Ending your session…';
     statusMessage = '';
     try {
       await invoke('end_session');
@@ -89,6 +92,17 @@
   tone="danger"
   onConfirm={doEnd}
 />
+
+{#if busy}
+  <!-- Full-view takeover while end-session / lock is in flight. The
+       end-session round-trip (publish + NATS flush + on-disk reset)
+       can take a beat; without this the user sees a frozen, still-
+       clickable screen and assumes nothing happened. -->
+  <div class="busy-overlay">
+    <div class="busy-spinner"></div>
+    <p>{busyLabel}</p>
+  </div>
+{/if}
 
 <div class="session-view">
   <header>
@@ -270,5 +284,30 @@
     background: rgba(255, 152, 0, 0.1);
     border: 1px solid rgba(255, 152, 0, 0.3);
     color: var(--warning);
+  }
+
+  .busy-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    background: var(--bg, #0e0e12);
+    color: var(--text, #e8e8ea);
+    font-size: 0.95rem;
+  }
+  .busy-spinner {
+    width: 30px;
+    height: 30px;
+    border: 3px solid rgba(255, 255, 255, 0.1);
+    border-top-color: var(--accent, #6b8afd);
+    border-radius: 50%;
+    animation: session-busy-spin 0.9s linear infinite;
+  }
+  @keyframes session-busy-spin {
+    to { transform: rotate(360deg); }
   }
 </style>
