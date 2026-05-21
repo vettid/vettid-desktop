@@ -104,23 +104,26 @@
     return t.toLowerCase().split('_').map((w) => w[0]?.toUpperCase() + w.slice(1)).join(' ');
   }
 
-  async function reveal(s: SecretRow) {
-    if (revealedById[s.id]) {
-      const next = { ...revealedById };
-      delete next[s.id];
-      revealedById = next;
-      return;
-    }
-    if (!unlocked) return;
+  // Credential-bound ("critical") secrets keep their value in the
+  // sealed credential, not the minor-secrets store the desktop's
+  // secret.get path reads — so a Reveal here would always come back
+  // empty. Surface them as phone-managed instead. The vault tags these
+  // with a "Critical Secret" category.
+  function isCredentialBound(s: SecretRow): boolean {
+    return (s.category || '').toLowerCase().includes('critical');
+  }
+
+  // Fetch one secret's value into revealedById. Shared by the per-row
+  // reveal and the alias-bundle reveal.
+  async function fetchSecret(s: SecretRow) {
     revealingId = s.id;
     revealError = '';
     try {
       const resp: any = await invoke('get_secret', { id: s.id });
-      console.log('[secret.get]', s.id, resp);
       if (resp?.success && resp?.data) {
         const raw = resp.data.value;
         if (raw == null || raw === '') {
-          revealError = `${s.name}: no stored value (likely a metadata-only row — its actual value lives in your credential and is accessed by a different path).`;
+          revealError = `${s.name}: no value to reveal here — this secret is managed on your phone.`;
         } else {
           revealedById = { ...revealedById, [s.id]: String(raw) };
         }
@@ -131,6 +134,35 @@
       revealError = `${s.name}: ${e}`;
     } finally {
       revealingId = null;
+    }
+  }
+
+  async function reveal(s: SecretRow) {
+    if (revealedById[s.id]) {
+      const next = { ...revealedById };
+      delete next[s.id];
+      revealedById = next;
+      return;
+    }
+    if (!unlocked || isCredentialBound(s)) return;
+    await fetchSecret(s);
+  }
+
+  // Reveal — or hide — every revealable secret in an alias card at
+  // once. The alias is the bundle; credential-bound members are skipped
+  // (they have no desktop-revealable value).
+  async function toggleGroupReveal(members: SecretRow[]) {
+    const minors = members.filter((m) => !isCredentialBound(m));
+    if (minors.length === 0) return;
+    if (minors.some((m) => revealedById[m.id] !== undefined)) {
+      const next = { ...revealedById };
+      for (const m of minors) delete next[m.id];
+      revealedById = next;
+      return;
+    }
+    if (!unlocked) return;
+    for (const m of minors) {
+      if (revealedById[m.id] === undefined) await fetchSecret(m);
     }
   }
 
@@ -181,13 +213,28 @@
           <!-- Alias-card model: ungrouped secrets first, each its own
                card; then one card per alias with its secrets inside. -->
           {#each groups.filter((g) => g.label === null) as g (g.key)}
-            <div class="card">{@render secretRow(g.items[0], false)}</div>
+            <div class="card">{@render secretRow(g.items[0], false, true)}</div>
           {/each}
           {#each groups.filter((g) => g.label !== null) as g (g.key)}
+            {@const minors = g.items.filter((s) => !isCredentialBound(s))}
+            {@const anyRevealed = minors.some((m) => revealedById[m.id] !== undefined)}
             <div class="card">
-              <div class="alias-header">{g.label}</div>
+              <!-- The alias is the bundle: one Reveal on the card
+                   header reveals every revealable secret at once. -->
+              <div class="alias-header">
+                <span>{g.label}</span>
+                {#if unlocked && minors.length > 0}
+                  <button
+                    class="reveal-btn small"
+                    class:revealed={anyRevealed}
+                    onclick={() => toggleGroupReveal(g.items)}
+                  >
+                    {anyRevealed ? 'Hide' : 'Reveal'}
+                  </button>
+                {/if}
+              </div>
               {#each g.items as s (s.id)}
-                {@render secretRow(s, true)}
+                {@render secretRow(s, true, false)}
               {/each}
             </div>
           {/each}
@@ -202,11 +249,13 @@
   {/if}
 </div>
 
-<!-- One secret row. `inGroup` drops the alias from the name since the
-     alias card's header already shows it. -->
-{#snippet secretRow(s: SecretRow, inGroup: boolean)}
+<!-- One secret row. `inGroup` drops the alias from the name (the card
+     header shows it); `showRowReveal` is false for grouped rows since
+     the alias card has one bundle Reveal in its header. -->
+{#snippet secretRow(s: SecretRow, inGroup: boolean, showRowReveal: boolean)}
   {@const disc = fmtDiscoverability(s.discoverability)}
   {@const revealed = revealedById[s.id]}
+  {@const credBound = isCredentialBound(s)}
   <div class="row">
     <div class="row-text">
       <div class="row-name">
@@ -224,7 +273,12 @@
       {/if}
     </div>
     <div class="row-actions">
-      {#if unlocked}
+      {#if credBound}
+        <span
+          class="cred-note"
+          title="This secret's value is held in your credential — reveal it from the VettID app on your phone."
+        >🔒 on phone</span>
+      {:else if showRowReveal && unlocked}
         <button
           class="reveal-btn"
           class:revealed={revealed !== undefined}
@@ -263,14 +317,28 @@
   }
   .card:last-child { margin-bottom: 0; }
 
-  /* Alias-card header band — names the alias the card's secrets share. */
+  /* Alias-card header band — names the alias the card's secrets share,
+     and carries the one bundle-Reveal button. */
   .alias-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
     font-size: 0.78rem;
     font-weight: 600;
     color: var(--text-muted);
-    padding: 8px 14px 6px;
+    padding: 7px 14px;
     background: rgba(255, 255, 255, 0.02);
     border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  }
+  .reveal-btn.small { padding: 3px 10px; font-size: 0.72rem; }
+
+  /* Credential-bound secrets — value lives in the credential, revealed
+     from the phone. Shown in place of a Reveal button. */
+  .cred-note {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    white-space: nowrap;
   }
   .row {
     display: flex;
