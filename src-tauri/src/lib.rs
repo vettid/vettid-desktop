@@ -47,6 +47,11 @@ pub fn run() {
         .manage(AppState::new())
         .setup(|app| {
             tray::install(app.handle())?;
+            // Compute the device fingerprint now, on a background
+            // thread. Hashing the executable is slow on a debug build;
+            // doing it at startup means it is ready before the user
+            // can reach pairing, instead of blocking request-session.
+            auth::warm_device_fingerprint();
             Ok(())
         })
         .on_window_event(|window, event| {

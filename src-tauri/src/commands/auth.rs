@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::state::AppState;
@@ -190,7 +191,32 @@ pub async fn register(
     })
 }
 
-fn collect_device_fingerprint() -> crate::registration::pairing::DeviceFingerprint {
+/// Cached device fingerprint. `compute_device_fingerprint` hashes the
+/// whole executable with SHA-256 — several seconds on a debug build —
+/// so it is computed exactly once. `warm_device_fingerprint()` kicks
+/// that off at app startup (see lib.rs) so a pairing's request-session
+/// never blocks on it; the value is known before the request is made.
+static DEVICE_FINGERPRINT: OnceLock<crate::registration::pairing::DeviceFingerprint> =
+    OnceLock::new();
+
+/// Return the device fingerprint, computing it once and caching it.
+/// Effectively instant after `warm_device_fingerprint()` has run.
+pub(crate) fn collect_device_fingerprint() -> crate::registration::pairing::DeviceFingerprint {
+    DEVICE_FINGERPRINT
+        .get_or_init(compute_device_fingerprint)
+        .clone()
+}
+
+/// Compute the device fingerprint on a background thread at app
+/// startup so it is ready before the user can reach the pairing flow.
+pub(crate) fn warm_device_fingerprint() {
+    std::thread::spawn(|| {
+        let _ = collect_device_fingerprint();
+        log::info!("Device fingerprint warmed");
+    });
+}
+
+fn compute_device_fingerprint() -> crate::registration::pairing::DeviceFingerprint {
     use crate::fingerprint::binary::binary_fingerprint;
     use crate::fingerprint::platform_linux::{collect_machine_attributes, compute_machine_fingerprint_hex};
     use crate::registration::pairing::DeviceFingerprint;
