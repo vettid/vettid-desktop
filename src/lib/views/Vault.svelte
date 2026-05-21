@@ -85,7 +85,12 @@
             fields,
             ts: Date.now(),
           };
-          dataCount = fields.length;
+          // The data tab also lists the system fields (first/last name,
+          // email), so count them too — otherwise the badge reads low
+          // by however many the user has set.
+          const sysCount = [pd.first_name, pd.last_name, pd.email]
+            .filter((s: unknown) => typeof s === 'string' && s.trim() !== '').length;
+          dataCount = fields.length + sysCount;
         }
       } else if (snap?.error) {
         errorMessage = snap.error;

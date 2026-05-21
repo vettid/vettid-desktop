@@ -2,6 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import ConfirmDialog from '../../components/ConfirmDialog.svelte';
+  import { buildAliasGroups } from '../../aliasGroups';
 
   // PersonalData renders inside the Vault tab panel — the profile
   // header + tab nav sit above us, so this view stays focused on
@@ -186,10 +187,12 @@
    * Composite "wife::phone" aliases render as "Wife: phone" so the
    * grouping is visible per Android's catalog UX.
    */
-  function fieldLabel(f: Field): string {
+  function fieldLabel(f: Field, withAlias = true): string {
     const last = f.namespace.split('.').pop() ?? f.namespace;
     const cap = last.charAt(0).toUpperCase() + last.slice(1);
-    return f.alias ? `${cap}: ${f.alias}` : cap;
+    // Inside an alias card the alias is the card header — don't repeat
+    // it in every row.
+    return (withAlias && f.alias) ? `${cap}: ${f.alias}` : cap;
   }
 
   function startEdit(f: Field) {
@@ -277,20 +280,22 @@
     {#if errorMessage}<div class="error">{errorMessage}</div>{/if}
 
     {#each grouped as [category, list] (category)}
+      {@const groups = buildAliasGroups(list, (f) => f.alias, (f) => f.key)}
       <section class="group">
         <h2>{category}</h2>
-        <div class="card">
-          {#each list as f (f.key)}
-            {#if isSystemField(f)}
-              {@render rowSnippet(fieldLabel(f), f.value, null)}
-            {:else}
-              {@render rowSnippet(fieldLabel(f), f.value, {
-                onEdit: () => startEdit(f),
-                onDelete: () => confirmDelete(f),
-              })}
-            {/if}
-          {/each}
-        </div>
+        <!-- Alias-card model: ungrouped fields first, each its own
+             card; then one card per alias with its fields inside. -->
+        {#each groups.filter((g) => g.label === null) as g (g.key)}
+          <div class="card">{@render dataRow(g.items[0], false)}</div>
+        {/each}
+        {#each groups.filter((g) => g.label !== null) as g (g.key)}
+          <div class="card">
+            <div class="alias-header">{g.label}</div>
+            {#each g.items as f (f.key)}
+              {@render dataRow(f, true)}
+            {/each}
+          </div>
+        {/each}
       </section>
     {/each}
 
@@ -344,6 +349,19 @@
   tone="danger"
   onConfirm={doDelete}
 />
+
+<!-- One personal-data field row. `inGroup` drops the alias from the
+     label since the alias card's header already shows it. -->
+{#snippet dataRow(f: Field, inGroup: boolean)}
+  {#if isSystemField(f)}
+    {@render rowSnippet(fieldLabel(f, !inGroup), f.value, null)}
+  {:else}
+    {@render rowSnippet(fieldLabel(f, !inGroup), f.value, {
+      onEdit: () => startEdit(f),
+      onDelete: () => confirmDelete(f),
+    })}
+  {/if}
+{/snippet}
 
 <!-- Inline row composable. Svelte 5 snippets can stay in the same
      file; we declare it after the markup so the section structure
@@ -419,6 +437,18 @@
     background: var(--surface);
     border-radius: 8px;
     overflow: hidden;
+    margin-bottom: 8px;
+  }
+  .card:last-child { margin-bottom: 0; }
+
+  /* Alias-card header band — names the alias the card's fields share. */
+  .alias-header {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    padding: 8px 16px 6px;
+    background: rgba(255, 255, 255, 0.02);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
   }
 
   .row {

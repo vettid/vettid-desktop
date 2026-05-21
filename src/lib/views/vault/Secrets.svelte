@@ -2,6 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import { secretsUnlockStore, isSecretsUnlocked } from '../../stores/secrets';
+  import { buildAliasGroups } from '../../aliasGroups';
 
   // Module-level cache so navigating away + back paints from the
   // snapshot instead of re-fetching.
@@ -174,46 +175,22 @@
       </div>
     {:else if !errorMessage}
       {#each grouped as [category, list] (category)}
+        {@const groups = buildAliasGroups(list, (s) => s.alias, (s) => s.id)}
         <section class="group">
           <h2>{category}</h2>
-          <div class="card">
-            {#each list as s (s.id)}
-              {@const disc = fmtDiscoverability(s.discoverability)}
-              {@const revealed = revealedById[s.id]}
-              <div class="row">
-                <div class="row-text">
-                  <div class="row-name">
-                    {s.name}{#if s.alias} <span class="alias">· {s.alias}</span>{/if}
-                  </div>
-                  <div class="row-meta">
-                    <span class="type">{fmtType(s.type)}</span>
-                    {#if s.description}<span class="desc">{s.description}</span>{/if}
-                  </div>
-                  {#if revealed !== undefined}
-                    <div class="revealed-value">
-                      <span class="mono">{revealed}</span>
-                      <button class="copy-btn" onclick={() => copyValue(revealed)} title="Copy">copy</button>
-                    </div>
-                  {/if}
-                </div>
-                <div class="row-actions">
-                  {#if unlocked}
-                    <button
-                      class="reveal-btn"
-                      class:revealed={revealed !== undefined}
-                      onclick={() => reveal(s)}
-                      disabled={revealingId === s.id}
-                    >
-                      {#if revealingId === s.id}…
-                      {:else if revealed !== undefined}Hide
-                      {:else}Reveal{/if}
-                    </button>
-                  {/if}
-                  <div class="pill {disc.tone}">{disc.label}</div>
-                </div>
-              </div>
-            {/each}
-          </div>
+          <!-- Alias-card model: ungrouped secrets first, each its own
+               card; then one card per alias with its secrets inside. -->
+          {#each groups.filter((g) => g.label === null) as g (g.key)}
+            <div class="card">{@render secretRow(g.items[0], false)}</div>
+          {/each}
+          {#each groups.filter((g) => g.label !== null) as g (g.key)}
+            <div class="card">
+              <div class="alias-header">{g.label}</div>
+              {#each g.items as s (s.id)}
+                {@render secretRow(s, true)}
+              {/each}
+            </div>
+          {/each}
         </section>
       {/each}
       {#if !unlocked}
@@ -224,6 +201,45 @@
     {/if}
   {/if}
 </div>
+
+<!-- One secret row. `inGroup` drops the alias from the name since the
+     alias card's header already shows it. -->
+{#snippet secretRow(s: SecretRow, inGroup: boolean)}
+  {@const disc = fmtDiscoverability(s.discoverability)}
+  {@const revealed = revealedById[s.id]}
+  <div class="row">
+    <div class="row-text">
+      <div class="row-name">
+        {s.name}{#if s.alias && !inGroup} <span class="alias">· {s.alias}</span>{/if}
+      </div>
+      <div class="row-meta">
+        <span class="type">{fmtType(s.type)}</span>
+        {#if s.description}<span class="desc">{s.description}</span>{/if}
+      </div>
+      {#if revealed !== undefined}
+        <div class="revealed-value">
+          <span class="mono">{revealed}</span>
+          <button class="copy-btn" onclick={() => copyValue(revealed)} title="Copy">copy</button>
+        </div>
+      {/if}
+    </div>
+    <div class="row-actions">
+      {#if unlocked}
+        <button
+          class="reveal-btn"
+          class:revealed={revealed !== undefined}
+          onclick={() => reveal(s)}
+          disabled={revealingId === s.id}
+        >
+          {#if revealingId === s.id}…
+          {:else if revealed !== undefined}Hide
+          {:else}Reveal{/if}
+        </button>
+      {/if}
+      <div class="pill {disc.tone}">{disc.label}</div>
+    </div>
+  </div>
+{/snippet}
 
 <style>
   .secrets-view { padding: 24px; max-width: 720px; margin: 0 auto; }
@@ -243,6 +259,18 @@
     border: 1px solid rgba(255, 255, 255, 0.06);
     border-radius: 10px;
     overflow: hidden;
+    margin-bottom: 8px;
+  }
+  .card:last-child { margin-bottom: 0; }
+
+  /* Alias-card header band — names the alias the card's secrets share. */
+  .alias-header {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    padding: 8px 14px 6px;
+    background: rgba(255, 255, 255, 0.02);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
   }
   .row {
     display: flex;
