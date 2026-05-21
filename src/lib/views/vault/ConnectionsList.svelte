@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { onMount } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
     import type { Connection, VaultOpResponse } from '../../types';
     import { selectedConnectionStore } from '../../stores/navigation';
@@ -36,7 +37,10 @@
         loading = false;
     }
 
-    $effect(() => { loadConnections(); });
+    // Load once when the list mounts. This was a $effect, which re-runs
+    // on reactivity cycles — a one-shot fetch belongs in onMount so a
+    // parent re-render can't re-fire connection.list.
+    onMount(() => { loadConnections(); });
 </script>
 
 <div class="connections-list">
