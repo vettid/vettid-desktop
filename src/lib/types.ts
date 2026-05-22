@@ -14,12 +14,41 @@ export interface Connection {
     peer_alias?: string;
     /** @deprecated `connection.list` sends `peer_alias`; this is never populated. */
     label?: string;
+    /** Kind of connection — "peer" by default, also "agent" or "device". */
+    connection_type?: 'peer' | 'agent' | 'device';
     status: 'pending' | 'active' | 'revoked' | 'expired';
     /** Not returned by `connection.list` — optional until the vault sends it. */
     direction?: 'outbound' | 'inbound';
     created_at: string;
     e2e_public_key?: string;
     peer_profile?: PeerProfile;
+
+    // --- Card-display fields — connection.list already returns these. ---
+    unread_count?: number;
+    last_message_preview?: string;
+    last_message_at?: string;
+    last_message_direction?: 'incoming' | 'outgoing';
+    last_activity_type?: 'activity' | 'call';
+    last_activity_at?: string;
+    last_activity_title?: string;
+    last_activity_direction?: 'incoming' | 'outgoing';
+    last_activity_subtype?: 'voice' | 'video';
+    last_activity_outcome?: 'completed' | 'missed' | 'rejected';
+    missed_call_count?: number;
+    is_favorite?: boolean;
+    is_archived?: boolean;
+    needs_attention?: boolean;
+    peer_verifications?: string[];
+
+    // --- Other ConnectionInfo fields — used by the detail screen. ---
+    last_active_at?: string;
+    last_rotated_at?: string;
+    key_exchange_at?: string;
+    key_rotation_count?: number;
+    activity_count?: number;
+    credentials_type?: string;
+    e2e_ready?: boolean;
+    credentials_expire_at?: string;
 }
 
 export interface PeerProfile {

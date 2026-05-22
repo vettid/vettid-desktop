@@ -6,6 +6,7 @@
   import { initNatsListener } from './lib/stores/nats';
   import { themeStore } from './lib/stores/theme';
   import { initCallListener } from './lib/stores/calls';
+  import { initVaultListeners } from './lib/stores/vault';
   import { initNotifications } from './lib/notifications';
   import { resetSecretsUnlock } from './lib/stores/secrets';
 
@@ -69,6 +70,7 @@
 
   onMount(async () => {
     initNatsListener();
+    initVaultListeners();
     initCallListener();
     initNotifications();
     const unsub = themeStore.subscribe(() => {});
