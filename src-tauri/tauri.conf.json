@@ -38,6 +38,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": ["icons/128x128.png"],
     "category": "SocialNetworking",
     "shortDescription": "VettID Desktop",
     "longDescription": "VettID desktop client — encrypted vault access, messaging, and calling delegated through your VettID phone.",

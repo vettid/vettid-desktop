@@ -14,6 +14,7 @@
 
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { resolveResource } from '@tauri-apps/api/path';
 import {
   isPermissionGranted,
   requestPermission,
@@ -25,6 +26,23 @@ import { sessionStore, type SessionState } from './stores/session';
 let initialized = false;
 // null = not yet checked; resolved to a boolean on first use.
 let permissionGranted: boolean | null = null;
+
+// Absolute path to the bundled VettID icon, passed to every notification
+// so the OS shows the VettID logo rather than a generic placeholder.
+// Resolved once; falls back to no icon if the resource can't be found.
+let iconPath: string | undefined;
+let iconResolved = false;
+async function notificationIcon(): Promise<string | undefined> {
+  if (!iconResolved) {
+    iconResolved = true;
+    try {
+      iconPath = await resolveResource('icons/128x128.png');
+    } catch {
+      iconPath = undefined;
+    }
+  }
+  return iconPath;
+}
 
 /** Resolve (and cache) notification permission. On Linux libnotify needs
  *  no grant; on macOS the first call surfaces the system prompt. */
@@ -50,7 +68,7 @@ async function windowFocused(): Promise<boolean> {
 async function notify(title: string, body: string): Promise<void> {
   if (await windowFocused()) return;
   if (!(await ensurePermission())) return;
-  sendNotification({ title, body });
+  sendNotification({ title, body, icon: await notificationIcon() });
 }
 
 /**
