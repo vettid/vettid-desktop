@@ -170,11 +170,43 @@
     return 'pairing';
   }
 
+  /**
+   * Global keyboard shortcuts — Cmd (macOS) or Ctrl (Linux) +
+   *   1 → Vault, 2 → Connections, , → Settings.
+   * The modifier requirement keeps these clear of text entry, so no
+   * input-focus guard is needed. Rail destinations are gated on an
+   * active session — the same rule the rail itself follows.
+   */
+  function handleKeydown(e: KeyboardEvent) {
+    if (!stateResolved) return;
+    if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey) return;
+    switch (e.key) {
+      case '1':
+        if (sessionState.state === 'active') {
+          currentView = 'vault';
+          e.preventDefault();
+        }
+        break;
+      case '2':
+        if (sessionState.state === 'active') {
+          currentView = 'connections';
+          e.preventDefault();
+        }
+        break;
+      case ',':
+        onSettingsClick();
+        e.preventDefault();
+        break;
+    }
+  }
+
   // The rail is only useful when there's an active session — the
   // pre-session takeovers hide it to keep the user's attention on
   // the single thing they need to do.
   let railVisible = $derived(sessionState.state === 'active');
 </script>
+
+<svelte:window onkeydown={handleKeydown} />
 
 {#if currentView === 'loading'}
   <!-- Launch-time takeover while we query the backend for registration
