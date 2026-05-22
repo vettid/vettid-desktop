@@ -12,15 +12,9 @@
   import ConnectionsList from './vault/ConnectionsList.svelte';
   import Conversation from './vault/Conversation.svelte';
   import ConnectionDetail from './vault/ConnectionDetail.svelte';
-  import { feLog } from '../diag';
 
   let selected = $derived($selectedConnectionStore);
   let mode = $state<'conversation' | 'detail'>('conversation');
-
-  // WEDGE-DIAG (2026-05-22): which sub-view the shell resolves to.
-  $effect(() => {
-    feLog(`Connections shell: selected=${selected ? 'yes' : 'no'} mode=${mode}`);
-  });
 
   // Land on the conversation every time a (different) connection is
   // opened from the list. The effect tracks `selected` only — flipping

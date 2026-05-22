@@ -198,15 +198,7 @@ pub async fn execute_operation(
     let encrypted = encrypt::encrypt(&connection_key, &request_json)
         .map_err(|e| OperationError::EncryptionFailed(e.to_string()))?;
 
-    // WEDGE-DIAG (2026-05-22): instrument the NATS lock + publish to
-    // pinpoint where the desktop op pipeline wedges. Remove once fixed.
-    log::warn!("WEDGE-DIAG op={} req={} — acquiring nats lock", operation, request_id);
-    let wedge_lock_t0 = Instant::now();
     let nats_client = state.nats.lock().await;
-    log::warn!(
-        "WEDGE-DIAG op={} req={} — nats lock acquired in {:?}",
-        operation, request_id, wedge_lock_t0.elapsed()
-    );
     let sequence = nats_client.next_sequence();
     let envelope_bytes = encode_envelope(
         MSG_DEVICE_OP_REQUEST,
@@ -225,11 +217,6 @@ pub async fn execute_operation(
         pending.insert(request_id.clone(), tx);
     }
 
-    log::warn!(
-        "WEDGE-DIAG op={} req={} — publishing {} bytes",
-        operation, request_id, envelope_bytes.len()
-    );
-    let wedge_pub_t0 = Instant::now();
     nats_client
         .publish_message(&envelope_bytes)
         .await
@@ -240,10 +227,6 @@ pub async fn execute_operation(
             tokio::spawn(async move { pending.lock().await.remove(&rid); });
             OperationError::PublishFailed(e.to_string())
         })?;
-    log::warn!(
-        "WEDGE-DIAG op={} req={} — publish returned in {:?}",
-        operation, request_id, wedge_pub_t0.elapsed()
-    );
 
     drop(nats_client);
 
@@ -260,15 +243,6 @@ pub async fn execute_operation(
     // immediately — either the final response (no phone needed) or
     // a pending_approval ack (phone-required).
     let first = tokio::time::timeout(Duration::from_secs(ack_timeout_secs), rx.recv()).await;
-    log::warn!(
-        "WEDGE-DIAG op={} req={} — first recv: {}",
-        operation, request_id,
-        match &first {
-            Ok(Some(_)) => "got response",
-            Ok(None) => "channel closed (cancelled)",
-            Err(_) => "ACK TIMEOUT",
-        }
-    );
 
     let first_value = match first {
         Err(_) => {

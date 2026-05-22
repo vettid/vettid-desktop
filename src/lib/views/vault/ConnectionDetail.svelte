@@ -2,6 +2,7 @@
     import { invoke } from '@tauri-apps/api/core';
     import type { Connection, VaultOpResponse } from '../../types';
     import { clearSelectedConnection } from '../../stores/navigation';
+    import { peerName } from '../../connectionName';
 
     interface Props {
         connection: Connection;
@@ -44,12 +45,6 @@
             error = String(e);
         }
         loading = false;
-    }
-
-    function peerName(c: Connection): string {
-        const p = c.peer_profile;
-        const full = `${p?.first_name ?? ''} ${p?.last_name ?? ''}`.trim();
-        return full || c.label || c.peer_guid.slice(0, 8);
     }
 
     function formatField(key: string, value: unknown): string {

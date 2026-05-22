@@ -4,10 +4,19 @@
 
 export interface Connection {
     connection_id: string;
-    peer_guid: string;
-    label: string;
+    /**
+     * Peer's global identity. Absent (`omitempty` server-side) for the
+     * system connection, device pairings, and agent connections —
+     * always guard before dereferencing.
+     */
+    peer_guid?: string;
+    /** The vault's `peer_alias` — the user-facing name for this connection. */
+    peer_alias?: string;
+    /** @deprecated `connection.list` sends `peer_alias`; this is never populated. */
+    label?: string;
     status: 'pending' | 'active' | 'revoked' | 'expired';
-    direction: 'outbound' | 'inbound';
+    /** Not returned by `connection.list` — optional until the vault sends it. */
+    direction?: 'outbound' | 'inbound';
     created_at: string;
     e2e_public_key?: string;
     peer_profile?: PeerProfile;

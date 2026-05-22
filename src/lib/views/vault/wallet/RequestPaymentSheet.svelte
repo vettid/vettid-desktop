@@ -4,6 +4,7 @@
   import { onMount, onDestroy } from 'svelte';
   import type { Connection } from '../../../types';
   import { modal } from '../../../actions/modal';
+  import { peerName } from '../../../connectionName';
 
   // --- Request payment sheet ------------------------------------------
   //
@@ -32,12 +33,6 @@
   let connections = $state<Connection[]>([]);
   let connLoading = $state(true);
   let connError = $state('');
-
-  function peerName(c: Connection): string {
-    const p = c.peer_profile;
-    const full = `${p?.first_name ?? ''} ${p?.last_name ?? ''}`.trim();
-    return full || c.label || c.peer_guid.slice(0, 8);
-  }
 
   async function loadConnections() {
     connLoading = true;

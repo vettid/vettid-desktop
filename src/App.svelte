@@ -8,7 +8,6 @@
   import { initCallListener } from './lib/stores/calls';
   import { initNotifications } from './lib/notifications';
   import { resetSecretsUnlock } from './lib/stores/secrets';
-  import { feLog } from './lib/diag';
 
   import Pairing from './lib/views/Pairing.svelte';
   import SessionExpired from './lib/views/SessionExpired.svelte';
@@ -44,12 +43,6 @@
   let sessionState: SessionState = $derived($sessionStore);
   let isRegistered = $state(false);
   let pollTimer: ReturnType<typeof setInterval> | null = null;
-  // WEDGE-DIAG (2026-05-22): JS-thread heartbeat. A frozen thread stops
-  // ticking — the Rust log then shows the last heartbeat seq plus a
-  // timestamp gap, and the last FE-DIAG breadcrumb before that gap
-  // localizes the freeze. Remove with the rest of WEDGE-DIAG.
-  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  let heartbeatSeq = 0;
 
   async function refreshRegistration() {
     try {
@@ -75,10 +68,6 @@
   }
 
   onMount(async () => {
-    // WEDGE-DIAG: start the heartbeat before anything else so the trace
-    // covers the whole session.
-    heartbeatTimer = setInterval(() => { feLog(`heartbeat ${++heartbeatSeq}`); }, 1000);
-
     initNatsListener();
     initCallListener();
     initNotifications();
@@ -99,7 +88,6 @@
 
   onDestroy(() => {
     if (pollTimer) clearInterval(pollTimer);
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
   });
 
   // Auto-routing on state transitions. The user can navigate around
@@ -119,9 +107,10 @@
 
     if (sessionState.state === 'active') {
       // Transition out of pre-session takeovers (loading / pairing /
-      // expired) → land on Vault. Already on a real destination → stay.
+      // expired) → land on Connections, the default destination.
+      // Already on a real destination → stay.
       if (currentView === 'loading' || currentView === 'pairing' || currentView === 'expired') {
-        currentView = 'vault';
+        currentView = 'connections';
       }
     } else if (sessionState.state === 'expired' || sessionState.state === 'suspended') {
       // Session ran out (or got revoked from another device). Route
@@ -177,14 +166,14 @@
   }
 
   function defaultDestination(): View {
-    if (sessionState.state === 'active') return 'vault';
+    if (sessionState.state === 'active') return 'connections';
     if (isRegistered) return 'expired';
     return 'pairing';
   }
 
   /**
    * Global keyboard shortcuts — Cmd (macOS) or Ctrl (Linux) +
-   *   1 → Vault, 2 → Connections, , → Settings.
+   *   1 → Connections, 2 → Vault, , → Settings.
    * The modifier requirement keeps these clear of text entry, so no
    * input-focus guard is needed. Rail destinations are gated on an
    * active session — the same rule the rail itself follows.
@@ -195,13 +184,13 @@
     switch (e.key) {
       case '1':
         if (sessionState.state === 'active') {
-          currentView = 'vault';
+          currentView = 'connections';
           e.preventDefault();
         }
         break;
       case '2':
         if (sessionState.state === 'active') {
-          currentView = 'connections';
+          currentView = 'vault';
           e.preventDefault();
         }
         break;
@@ -240,17 +229,6 @@
       <nav class="rail">
         <button
           class="rail-item"
-          class:active={currentView === 'vault'}
-          onclick={() => currentView = 'vault'}
-        >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="3" y="3" width="18" height="18" rx="2" />
-            <circle cx="12" cy="12" r="3" />
-          </svg>
-          <span>Vault</span>
-        </button>
-        <button
-          class="rail-item"
           class:active={currentView === 'connections'}
           onclick={() => currentView = 'connections'}
         >
@@ -260,6 +238,17 @@
             <path d="M9 10v4a3 3 0 0 0 3 3h2" />
           </svg>
           <span>Connections</span>
+        </button>
+        <button
+          class="rail-item"
+          class:active={currentView === 'vault'}
+          onclick={() => currentView = 'vault'}
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2" />
+            <circle cx="12" cy="12" r="3" />
+          </svg>
+          <span>Vault</span>
         </button>
       </nav>
     {/if}

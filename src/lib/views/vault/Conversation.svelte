@@ -6,6 +6,7 @@
     import { clearSelectedConnection, selectedConnectionStore } from '../../stores/navigation';
     import { markConversationRead } from '../../stores/vault';
     import { placeCall, type CallType } from '../../stores/calls';
+    import { peerName } from '../../connectionName';
 
     interface Props {
         connection: Connection;
@@ -20,12 +21,6 @@
     let sending = $state(false);
     let error = $state('');
     let scrollEl: HTMLDivElement | undefined = $state();
-
-    function peerName(c: Connection): string {
-        const p = c.peer_profile;
-        const full = `${p?.first_name ?? ''} ${p?.last_name ?? ''}`.trim();
-        return full || c.label || c.peer_guid.slice(0, 8);
-    }
 
     async function loadMessages() {
         loading = true;
@@ -158,11 +153,14 @@
     }
 
     async function startCall(type: CallType) {
+        // Calls need a peer identity — the system connection, device
+        // pairings, and agents have no peer_guid and can't be called.
+        if (!connection.peer_guid) {
+            error = "This connection can't be called.";
+            return;
+        }
         try {
-            const peerName = `${connection.peer_profile?.first_name ?? ''} ${connection.peer_profile?.last_name ?? ''}`.trim()
-                || connection.label
-                || 'Peer';
-            await placeCall(connection.peer_guid, peerName, type);
+            await placeCall(connection.peer_guid, peerName(connection), type);
         } catch (e) {
             error = `Call failed: ${e}`;
         }

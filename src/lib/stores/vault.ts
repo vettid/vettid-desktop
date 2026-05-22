@@ -239,7 +239,7 @@ async function maybeNotifyMessage(connectionId: string): Promise<void> {
     if (conn) {
         const p = conn.peer_profile;
         const name = `${p?.first_name ?? ''} ${p?.last_name ?? ''}`.trim();
-        title = name || conn.label || title;
+        title = name || conn.peer_alias || conn.label || title;
     }
 
     sendNotification({

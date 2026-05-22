@@ -39,43 +39,7 @@ impl VaultOpResponse {
 #[tauri::command]
 pub async fn list_connections(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
     let result = operations::execute(&state, "connection.list", serde_json::json!({})).await;
-    let resp = VaultOpResponse::from_op(result);
-    // WEDGE-DIAG (2026-05-22): the Connections tab freezes the client.
-    // Measure the payload that crosses the IPC boundary — size + photo
-    // count — so we can rule the large-response theory in or out.
-    // Remove with the rest of the WEDGE-DIAG instrumentation.
-    if let Some(data) = &resp.data {
-        let bytes = serde_json::to_vec(data).map(|v| v.len()).unwrap_or(0);
-        let conns = data.get("connections").and_then(|c| c.as_array());
-        let count = conns.map(|a| a.len()).unwrap_or(0);
-        let with_photo = conns
-            .map(|a| {
-                a.iter()
-                    .filter(|c| {
-                        c.get("peer_profile")
-                            .and_then(|p| p.get("photo"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| !s.is_empty())
-                            .unwrap_or(false)
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
-        log::warn!(
-            "WEDGE-DIAG list_connections — {} connections ({} with photo), {} bytes of data",
-            count, with_photo, bytes
-        );
-    }
-    Ok(resp)
-}
-
-/// WEDGE-DIAG (2026-05-22): frontend breadcrumb sink. Lets Svelte log
-/// lines land in the same `cargo tauri dev` stdout as the Rust
-/// diagnostics, so a freeze trace reads as one continuous timeline.
-/// Remove with the rest of the WEDGE-DIAG instrumentation.
-#[tauri::command]
-pub fn frontend_log(msg: String) {
-    log::warn!("FE-DIAG {}", msg);
+    Ok(VaultOpResponse::from_op(result))
 }
 
 /// Get a specific connection.
