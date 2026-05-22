@@ -8,6 +8,7 @@
   import { initCallListener } from './lib/stores/calls';
   import { initNotifications } from './lib/notifications';
   import { resetSecretsUnlock } from './lib/stores/secrets';
+  import { feLog } from './lib/diag';
 
   import Pairing from './lib/views/Pairing.svelte';
   import SessionExpired from './lib/views/SessionExpired.svelte';
@@ -43,6 +44,12 @@
   let sessionState: SessionState = $derived($sessionStore);
   let isRegistered = $state(false);
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  // WEDGE-DIAG (2026-05-22): JS-thread heartbeat. A frozen thread stops
+  // ticking — the Rust log then shows the last heartbeat seq plus a
+  // timestamp gap, and the last FE-DIAG breadcrumb before that gap
+  // localizes the freeze. Remove with the rest of WEDGE-DIAG.
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let heartbeatSeq = 0;
 
   async function refreshRegistration() {
     try {
@@ -68,6 +75,10 @@
   }
 
   onMount(async () => {
+    // WEDGE-DIAG: start the heartbeat before anything else so the trace
+    // covers the whole session.
+    heartbeatTimer = setInterval(() => { feLog(`heartbeat ${++heartbeatSeq}`); }, 1000);
+
     initNatsListener();
     initCallListener();
     initNotifications();
@@ -88,6 +99,7 @@
 
   onDestroy(() => {
     if (pollTimer) clearInterval(pollTimer);
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
   });
 
   // Auto-routing on state transitions. The user can navigate around

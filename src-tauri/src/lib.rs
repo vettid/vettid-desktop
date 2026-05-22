@@ -96,6 +96,7 @@ pub fn run() {
             vault::get_wallet_transactions,
             vault::get_conversation,
             vault::list_call_history,
+            vault::frontend_log,
             // Vault commands — phone-required
             vault::request_secret,
             vault::cast_vote,
