@@ -222,13 +222,14 @@
     saving = true;
     errorMessage = '';
     try {
-      const entries: Array<{ field_id: string; value: string }> = [
-        { field_id: namespace, value: editing.value },
-      ];
-      const resp: any = await invoke('update_personal_data', {
-        section: namespace.split('.')[0] || 'general',
-        entries,
-      });
+      // Vault's PersonalDataUpdateRequest expects {fields, aliases} —
+      // each keyed by namespace. Alias is optional. The earlier
+      // {section, entries} shape never matched the handler.
+      const fields: Record<string, string> = { [namespace]: editing.value };
+      const args: { fields: Record<string, string>; aliases?: Record<string, string> } = { fields };
+      const aliasTrim = editing.alias.trim();
+      if (aliasTrim) args.aliases = { [namespace]: aliasTrim };
+      const resp: any = await invoke('update_personal_data', args);
       if (!resp?.success) {
         errorMessage = resp?.error || 'Failed to save';
         return;
@@ -328,6 +329,11 @@
     <label class="field-label">
       <span>Value</span>
       <input type="text" bind:value={editing.value} />
+    </label>
+    <label class="field-label">
+      <span>Alias (optional)</span>
+      <input type="text" bind:value={editing.alias} placeholder="e.g. Wife, Mom, Work" />
+      <span class="hint">Helps tell similar entries apart in your catalog.</span>
     </label>
     <div class="modal-actions">
       <button class="btn ghost" onclick={cancelEdit} disabled={saving}>Cancel</button>

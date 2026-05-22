@@ -97,6 +97,7 @@ pub fn run() {
             vault::list_call_history,
             // Vault commands — phone-required
             vault::request_secret,
+            vault::add_secret,
             vault::cast_vote,
             vault::send_btc,
             vault::send_message,

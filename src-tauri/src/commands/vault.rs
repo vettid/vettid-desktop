@@ -270,22 +270,56 @@ pub async fn update_profile(
     Ok(VaultOpResponse::from_op(result))
 }
 
-/// Update a personal-data section (phone-required).
+/// Upsert one or more personal-data fields (phone-required).
 ///
-/// `section` identifies the category (e.g., `"medical"`, `"financial"`) and
-/// `entries` is an array of `{ field_id, value, visibility }` items.
+/// `fields` is a `{namespace: value}` map and `aliases` is an optional
+/// `{namespace: alias}` map for grouping related entries in the catalog.
+/// Matches the vault's PersonalDataUpdateRequest shape exactly — the
+/// earlier `{section, entries}` shape was a frontend invention and never
+/// reached the handler intact.
 #[tauri::command]
 pub async fn update_personal_data(
     state: State<'_, AppState>,
-    section: String,
-    entries: serde_json::Value,
+    fields: serde_json::Value,
+    aliases: Option<serde_json::Value>,
 ) -> Result<VaultOpResponse, String> {
+    let mut payload = serde_json::json!({ "fields": fields });
+    if let Some(a) = aliases {
+        payload["aliases"] = a;
+    }
     let result = operations::execute_phone_required(
         &state,
         "personal-data.update",
-        serde_json::json!({ "section": section, "entries": entries }),
-    )
-    .await;
+        payload,
+    ).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+/// Add a minor (catalog-visible) secret. Phone-required.
+/// Matches the vault's SecretAddRequest shape. `discoverability`
+/// defaults to "cataloged" — same default the Android client uses.
+#[tauri::command]
+pub async fn add_secret(
+    state: State<'_, AppState>,
+    name: String,
+    value: String,
+    category: String,
+    alias: Option<String>,
+    description: Option<String>,
+) -> Result<VaultOpResponse, String> {
+    let mut payload = serde_json::json!({
+        "name": name,
+        "value": value,
+        "category": category,
+        "discoverability": "cataloged",
+    });
+    if let Some(a) = alias.filter(|s| !s.trim().is_empty()) {
+        payload["alias"] = serde_json::Value::String(a);
+    }
+    if let Some(d) = description.filter(|s| !s.trim().is_empty()) {
+        payload["description"] = serde_json::Value::String(d);
+    }
+    let result = operations::execute_phone_required(&state, "secret.add", payload).await;
     Ok(VaultOpResponse::from_op(result))
 }
 
