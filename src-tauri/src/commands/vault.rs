@@ -148,17 +148,6 @@ pub async fn get_wallet_balance(state: State<'_, AppState>, wallet_id: String) -
     Ok(VaultOpResponse::from_op(result))
 }
 
-/// Get transaction history (independent).
-#[tauri::command]
-pub async fn get_transaction_history(state: State<'_, AppState>, wallet_id: String) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(
-        &state,
-        "wallet.get-history",
-        serde_json::json!({ "wallet_id": wallet_id, "limit": 50 }),
-    ).await;
-    Ok(VaultOpResponse::from_op(result))
-}
-
 /// Send BTC (phone-required — signing in enclave gated on phone approval).
 #[tauri::command]
 pub async fn send_btc(
@@ -242,7 +231,11 @@ pub async fn cancel_pending_operation(state: State<'_, AppState>, request_id: St
 /// get_wallet_balance + get_wallet_address commands below.
 #[tauri::command]
 pub async fn get_wallet_transactions(state: State<'_, AppState>, wallet_id: String) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(&state, "wallet.get-transaction-history", serde_json::json!({ "wallet_id": wallet_id })).await;
+    let result = operations::execute(
+        &state,
+        "wallet.get-history",
+        serde_json::json!({ "wallet_id": wallet_id, "limit": 50 }),
+    ).await;
     Ok(VaultOpResponse::from_op(result))
 }
 

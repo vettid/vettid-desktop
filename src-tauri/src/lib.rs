@@ -85,7 +85,6 @@ pub fn run() {
             vault::list_personal_data,
             vault::list_wallets,
             vault::get_wallet_balance,
-            vault::get_transaction_history,
             vault::list_devices,
             vault::get_profile,
             vault::get_profile_photo,
