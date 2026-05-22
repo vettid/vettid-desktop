@@ -9,6 +9,8 @@
    * with $bindable). Click backdrop or Cancel to dismiss; Confirm
    * fires `onConfirm` and the parent closes the dialog.
    */
+  import { modal } from '../actions/modal';
+
   let {
     open = $bindable(false),
     title = 'Confirm',
@@ -36,23 +38,25 @@
     onConfirm();
     close();
   }
-
-  // Close on Escape — matches OS-level dialog behavior so the user
-  // doesn't have to mouse over to Cancel for a quick dismiss.
-  function handleKey(e: KeyboardEvent) {
-    if (!open) return;
-    if (e.key === 'Escape') close();
-    if (e.key === 'Enter') confirm();
-  }
 </script>
-
-<svelte:window onkeydown={handleKey} />
 
 {#if open}
   <!-- Backdrop — click to dismiss. -->
   <div class="backdrop" onclick={close} role="presentation"></div>
 
-  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+  <!-- `use:modal` traps Tab inside the dialog, focuses Confirm
+       (data-autofocus), closes on Escape, and restores focus to the
+       trigger on close. Confirm being the focused default means a
+       bare Enter activates it natively — and Tab-to-Cancel + Enter
+       correctly cancels, unlike the old window-level Enter that
+       confirmed regardless of where focus sat. -->
+  <div
+    class="dialog"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="confirm-title"
+    use:modal={{ onEscape: close }}
+  >
     <h2 id="confirm-title">{title}</h2>
     {#if message}<p class="message">{message}</p>{/if}
     <div class="actions">
@@ -61,7 +65,7 @@
         class="btn primary"
         class:danger={tone === 'danger'}
         onclick={confirm}
-        autofocus
+        data-autofocus
       >{confirmLabel}</button>
     </div>
   </div>

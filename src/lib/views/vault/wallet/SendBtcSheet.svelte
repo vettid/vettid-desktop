@@ -2,6 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { onMount, onDestroy } from 'svelte';
+  import { modal } from '../../../actions/modal';
 
   // --- Send BTC sheet -------------------------------------------------
   //
@@ -300,7 +301,13 @@
 </script>
 
 <div class="modal-backdrop" onclick={tryClose} role="presentation"></div>
-<div class="modal send-modal" role="dialog" aria-modal="true" aria-label="Send Bitcoin">
+<div
+  class="modal send-modal"
+  role="dialog"
+  aria-modal="true"
+  aria-label="Send Bitcoin"
+  use:modal={{ onEscape: tryClose }}
+>
   <header class="modal-head">
     <h2>Send Bitcoin</h2>
     <button class="x-btn" onclick={tryClose} disabled={sending} aria-label="Close">✕</button>
@@ -348,6 +355,7 @@
           placeholder="bc1q…"
           spellcheck="false"
           autocapitalize="off"
+          data-autofocus
         />
         {#if addressFeedback}
           <span class="feedback" class:ok={addressValid} class:bad={!addressValid && toAddress.trim().length > 0}>

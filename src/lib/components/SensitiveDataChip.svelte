@@ -38,6 +38,17 @@
     return `${m}:${s.toString().padStart(2, '0')}`;
   });
 
+  // Screen-reader status — the state name only, not the ticking
+  // countdown, so the announcement fires on a real transition
+  // (Locked → Waiting → Unlocked) rather than every second.
+  let a11yStatus = $derived(
+    pending
+      ? 'Waiting for phone approval'
+      : unlocked
+        ? 'Sensitive data unlocked'
+        : 'Sensitive data locked',
+  );
+
   // Ticker for the countdown. Started while unlocked, stopped when
   // not — avoids running a 1s interval in the background when there's
   // nothing to count.
@@ -163,6 +174,10 @@
 </script>
 
 <div class="chip-wrap">
+  <!-- Stable live region — must sit outside the {#if} branches so the
+       screen reader sees a text change, not a node swap. -->
+  <span class="sr-only" role="status" aria-live="polite">{a11yStatus}</span>
+
   {#if pending}
     <button class="chip pending" onclick={cancelPending} title="Cancel approval request">
       <span class="spinner-sm"></span>
@@ -172,7 +187,7 @@
       </span>
     </button>
   {:else if unlocked}
-    <div class="chip unlocked" role="status">
+    <div class="chip unlocked">
       <span class="icon">🔓</span>
       <span class="label">
         <span class="title">Unlocked</span>

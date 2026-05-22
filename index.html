@@ -126,6 +126,31 @@
       h1, h2, h3, h4, h5, h6 {
         font-family: 'Plus Jakarta Sans', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
       }
+
+      /* Keyboard focus ring — :focus-visible only, so mouse clicks
+         don't draw a ring but Tab navigation always does. Gold to
+         match the accent, offset so it reads against dark surfaces.
+         Inputs that already restyle :focus (accent border) keep that
+         treatment: their own `outline: none` out-specifies this. */
+      :focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+        border-radius: 2px;
+      }
+
+      /* Visually-hidden but screen-reader-visible. For aria-live
+         status regions and off-screen labels. */
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
     </style>
   </head>
   <body>

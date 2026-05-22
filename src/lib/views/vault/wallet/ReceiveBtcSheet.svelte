@@ -2,6 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import QRCode from 'qrcode';
+  import { modal } from '../../../actions/modal';
 
   // --- Receive BTC sheet ----------------------------------------------
   //
@@ -88,7 +89,13 @@
 </script>
 
 <div class="modal-backdrop" onclick={onClose} role="presentation"></div>
-<div class="modal receive-modal" role="dialog" aria-modal="true" aria-label="Receive Bitcoin">
+<div
+  class="modal receive-modal"
+  role="dialog"
+  aria-modal="true"
+  aria-label="Receive Bitcoin"
+  use:modal={{ onEscape: onClose }}
+>
   <header class="modal-head">
     <h2>Receive Bitcoin</h2>
     <button class="x-btn" onclick={onClose} aria-label="Close">✕</button>

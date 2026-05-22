@@ -3,6 +3,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { onMount, onDestroy } from 'svelte';
   import type { Connection } from '../../../types';
+  import { modal } from '../../../actions/modal';
 
   // --- Request payment sheet ------------------------------------------
   //
@@ -158,7 +159,13 @@
 </script>
 
 <div class="modal-backdrop" onclick={tryClose} role="presentation"></div>
-<div class="modal req-modal" role="dialog" aria-modal="true" aria-label="Request payment">
+<div
+  class="modal req-modal"
+  role="dialog"
+  aria-modal="true"
+  aria-label="Request payment"
+  use:modal={{ onEscape: tryClose }}
+>
   <header class="modal-head">
     <h2>Request payment</h2>
     <button class="x-btn" onclick={tryClose} disabled={sending} aria-label="Close">✕</button>
@@ -202,6 +209,7 @@
             value={satsInput}
             oninput={(e) => onSatsInput((e.currentTarget as HTMLInputElement).value)}
             placeholder="0"
+            data-autofocus
           />
         </label>
         <label class="field amount-field">
