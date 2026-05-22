@@ -23,6 +23,17 @@
     type SortOrder = 'recent' | 'alpha' | 'created';
     let sort: SortOrder = $state('recent');
 
+    // Active vs archived split — mirrors Android's Connection History
+    // screen. Active (status active|pending) is the main list; archived
+    // (revoked|expired) sits behind a "Connection history" card at the
+    // bottom and gets its own view.
+    type ViewMode = 'active' | 'history';
+    let viewMode: ViewMode = $state('active');
+    function isArchived(c: Connection): boolean {
+        return c.status === 'revoked' || c.status === 'expired';
+    }
+    let historyCount = $derived(connections.filter(isArchived).length);
+
     // Highlight the currently-selected connection's card. Read via
     // $derived so the highlight tracks the store across the parent
     // shell's swap to/from Conversation/Detail.
@@ -75,10 +86,13 @@
     }
 
     let visible = $derived.by(() => {
+        const base = connections.filter((c) =>
+            viewMode === 'history' ? isArchived(c) : !isArchived(c),
+        );
         const q = search.trim().toLowerCase();
         const filtered = q
-            ? connections.filter((c) => peerName(c).toLowerCase().includes(q))
-            : connections.slice();
+            ? base.filter((c) => peerName(c).toLowerCase().includes(q))
+            : base.slice();
         switch (sort) {
             case 'alpha':
                 filtered.sort((a, b) => peerName(a).localeCompare(peerName(b)));
@@ -114,7 +128,12 @@
 
 <div class="connections-list">
     <div class="header">
-        <h3>Connections</h3>
+        <div class="header-left">
+            {#if viewMode === 'history'}
+                <button class="back-btn" onclick={() => (viewMode = 'active')} aria-label="Back to connections">←</button>
+            {/if}
+            <h3>{viewMode === 'history' ? 'Connection history' : 'Connections'}</h3>
+        </div>
         <button class="refresh" aria-label="Refresh" onclick={loadConnections}>↻</button>
     </div>
 
@@ -137,17 +156,27 @@
         <div class="status">Loading connections…</div>
     {:else if error}
         <div class="status error">{error}</div>
-    {:else if connections.length === 0}
-        <div class="empty">
-            <div class="empty-icon" aria-hidden="true">👥</div>
-            <p class="empty-title">No connections yet</p>
-            <p class="empty-hint">
-                New connections are created from your VettID phone app —
-                invite or scan from there and they'll show up here.
-            </p>
-        </div>
     {:else if visible.length === 0}
-        <div class="status">No connections match "{search}".</div>
+        {#if search.trim()}
+            <div class="status">No connections match "{search}".</div>
+        {:else if viewMode === 'history'}
+            <div class="empty">
+                <div class="empty-icon" aria-hidden="true">🗄️</div>
+                <p class="empty-title">No connection history</p>
+                <p class="empty-hint">
+                    Revoked, declined, and expired connections will show up here.
+                </p>
+            </div>
+        {:else}
+            <div class="empty">
+                <div class="empty-icon" aria-hidden="true">👥</div>
+                <p class="empty-title">No connections yet</p>
+                <p class="empty-hint">
+                    New connections are created from your VettID phone app —
+                    invite or scan from there and they'll show up here.
+                </p>
+            </div>
+        {/if}
     {:else}
         <ul class="list">
             {#each visible as conn (conn.connection_id)}
@@ -180,6 +209,13 @@
                 </li>
             {/each}
         </ul>
+        {#if viewMode === 'active' && historyCount > 0}
+            <button class="history-link" onclick={() => (viewMode = 'history')}>
+                <span class="history-label">Connection history</span>
+                <span class="history-count">{historyCount}</span>
+                <span class="history-chevron">›</span>
+            </button>
+        {/if}
     {/if}
 </div>
 
@@ -310,4 +346,58 @@
         min-width: 18px;
         text-align: center;
     }
+
+    .header-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .back-btn {
+        background: none;
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 4px 9px;
+        cursor: pointer;
+        color: inherit;
+        font: inherit;
+        line-height: 1;
+    }
+    .back-btn:hover { background: var(--bg-elevated); }
+
+    /* Explicit option colors — native <select> dropdowns in some
+       WebView builds ignore the .sort CSS for the expanded option list
+       and fall back to OS-default colors (which can land white-on-white
+       in either theme). Plus index.html's color-scheme tells the WebView
+       which theme to use for native controls overall. */
+    .sort option {
+        background: var(--bg-elevated);
+        color: var(--text);
+    }
+
+    .history-link {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        width: 100%;
+        padding: 10px 12px;
+        margin-top: 12px;
+        background: var(--surface);
+        border: 1px dashed var(--border);
+        border-radius: 8px;
+        cursor: pointer;
+        color: var(--text-muted);
+        font: inherit;
+        text-align: left;
+        transition: background 0.12s, color 0.12s;
+    }
+    .history-link:hover {
+        background: var(--bg-elevated);
+        color: var(--text);
+    }
+    .history-label { flex: 1; font-weight: 500; }
+    .history-count {
+        background: var(--bg-elevated);
+        color: var(--text-muted);
+        font-size: 0.75rem;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-weight: 500;
+    }
+    .history-chevron { font-size: 1.2em; line-height: 1; opacity: 0.6; }
 </style>

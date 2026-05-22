@@ -43,6 +43,7 @@
       :root {
         /* DARK is the default — applied when no theme class is present
            and the OS doesn't prefer light. */
+        color-scheme: dark;
         --accent: #ffc125;
         --accent-hover: #ffd940;
         --accent-dark: #a68319;
@@ -81,6 +82,7 @@
       }
 
       :root.theme-light {
+        color-scheme: light;
         --accent: #b8870f;
         --accent-hover: #946a0b;
         --accent-dark: #6b4d08;
@@ -109,6 +111,7 @@
          the cascade and via higher-specificity class selectors. */
       @media (prefers-color-scheme: light) {
         :root:not(.theme-dark):not(.theme-light) {
+          color-scheme: light;
           --accent: #b8870f;
           --accent-hover: #946a0b;
           --accent-dark: #6b4d08;
