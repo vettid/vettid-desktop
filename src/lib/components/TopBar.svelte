@@ -90,7 +90,7 @@
     gap: 8px;
   }
   .logo {
-    font-family: 'Plus Jakarta Sans', 'Inter', sans-serif;
+    font-family: 'Poppins', 'Inter', sans-serif;
     font-weight: 600;
     font-size: 1.1rem;
     color: var(--text);

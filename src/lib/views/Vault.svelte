@@ -239,7 +239,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-family: 'Plus Jakarta Sans', 'Inter', sans-serif;
+    font-family: 'Poppins', 'Inter', sans-serif;
     font-weight: 600;
     font-size: 1.5rem;
     overflow: hidden;

@@ -5,6 +5,32 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>VettID Desktop</title>
     <style>
+      /* Typography: Inter (body) + Poppins (headings) — the vettid.dev
+         typefaces, bundled locally (woff2 in public/fonts/) so there is
+         no Google Fonts network call on launch and the CSP needs no
+         exception. Inter is the variable font (one file, weights 100-900). */
+      @font-face {
+        font-family: 'Inter';
+        src: url('/fonts/inter-variable.woff2') format('woff2');
+        font-weight: 100 900;
+        font-style: normal;
+        font-display: swap;
+      }
+      @font-face {
+        font-family: 'Poppins';
+        src: url('/fonts/poppins-600.woff2') format('woff2');
+        font-weight: 600;
+        font-style: normal;
+        font-display: swap;
+      }
+      @font-face {
+        font-family: 'Poppins';
+        src: url('/fonts/poppins-700.woff2') format('woff2');
+        font-weight: 700;
+        font-style: normal;
+        font-display: swap;
+      }
+
       /* Palette: mirrors vettid.dev — warm near-black with gold accent
          for dark mode, warm off-white with a darker gold for light mode.
          Sourced from https://vettid.dev/ root stylesheet.
@@ -124,7 +150,7 @@
       }
 
       h1, h2, h3, h4, h5, h6 {
-        font-family: 'Plus Jakarta Sans', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+        font-family: 'Poppins', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
       }
 
       /* Keyboard focus ring — :focus-visible only, so mouse clicks
