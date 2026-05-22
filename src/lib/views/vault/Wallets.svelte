@@ -2,6 +2,9 @@
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import { secretsUnlockStore, isSecretsUnlocked } from '../../stores/secrets';
+  import SendBtcSheet from './wallet/SendBtcSheet.svelte';
+  import ReceiveBtcSheet from './wallet/ReceiveBtcSheet.svelte';
+  import RequestPaymentSheet from './wallet/RequestPaymentSheet.svelte';
 
   // Read the shared lock state from the Sensitive Data chip in the
   // header. Public wallet info (label, address, balance, history) is
@@ -161,6 +164,48 @@
     const abs = Math.abs(sats);
     return `${sign}${abs.toLocaleString()} sat`;
   }
+
+  // ---- Send / Receive / Request modals ------------------------------
+  //
+  // One modal open at a time, keyed by the wallet it was launched from.
+  // Send is gated on the Sensitive-Data unlock state (the header chip);
+  // Receive + Request are independent ops and stay available regardless.
+  type ActiveSheet = 'send' | 'receive' | 'request';
+  let activeSheet = $state<ActiveSheet | null>(null);
+  let activeWallet = $state<WalletItem | null>(null);
+
+  function openSheet(sheet: ActiveSheet, w: WalletItem, event: MouseEvent) {
+    event.stopPropagation();
+    activeWallet = w;
+    activeSheet = sheet;
+  }
+  function closeSheet() {
+    activeSheet = null;
+    activeWallet = null;
+  }
+  // After a send or payment-request, refresh the affected wallet's
+  // balance + drop its cached tx history so the next expand re-fetches.
+  async function onWalletActivity() {
+    const w = activeWallet;
+    if (!w) return;
+    try {
+      const resp: any = await invoke('get_wallet_balance', { walletId: w.wallet_id });
+      if (resp?.success && resp?.data) {
+        const sats = Number(resp.data.total_sats ?? resp.data.confirmed_sats ?? 0);
+        wallets = wallets.map((x) =>
+          x.wallet_id === w.wallet_id
+            ? { ...x, cached_balance_sats: sats, balance_updated_at: Math.floor(Date.now() / 1000) }
+            : x
+        );
+        (window as any).__wallets_cache = { wallets, ts: Date.now() };
+      }
+    } catch (e) {
+      // Non-fatal — the cached balance just stays slightly stale.
+    }
+    const next = { ...txByWallet };
+    delete next[w.wallet_id];
+    txByWallet = next;
+  }
 </script>
 
 <div class="wallets-view">
@@ -176,7 +221,7 @@
     {#if wallets.length === 0 && !errorMessage}
       <div class="empty">
         <p>No wallets yet.</p>
-        <p class="hint">Create a wallet from the VettID app on your phone — desktop wallet management is read-only for now.</p>
+        <p class="hint">Create a wallet from the VettID app on your phone. Once a wallet exists you can send, receive, and request payments here.</p>
       </div>
     {:else}
       <div class="list">
@@ -204,6 +249,25 @@
 
             {#if isExpanded}
               <div class="card-detail">
+                <div class="detail-section">
+                  <div class="action-row">
+                    <button
+                      class="action-btn primary"
+                      onclick={(e) => openSheet('send', w, e)}
+                      disabled={!unlocked}
+                      title={unlocked ? 'Send Bitcoin from this wallet' : 'Unlock Sensitive Data in the header to send'}
+                    >
+                      {unlocked ? 'Send' : '🔒 Send'}
+                    </button>
+                    <button class="action-btn" onclick={(e) => openSheet('receive', w, e)}>
+                      Receive
+                    </button>
+                    <button class="action-btn" onclick={(e) => openSheet('request', w, e)}>
+                      Request
+                    </button>
+                  </div>
+                </div>
+
                 <div class="detail-section">
                   <div class="detail-label">Receive address</div>
                   <div class="address-full">
@@ -252,15 +316,50 @@
       </div>
       <p class="hint footer-hint">
         {#if unlocked}
-          Sensitive actions (Send BTC, view seed backup) are available while the chip above is Unlocked.
+          Send BTC is available while the chip above is Unlocked. Expand a wallet to send, receive, or request a payment.
         {:else}
-          🔒 Unlock <strong>Sensitive Data</strong> in the header above to enable Send BTC and seed-backup viewing.
+          🔒 Unlock <strong>Sensitive Data</strong> in the header above to enable Send BTC.
         {/if}
-        Receive is always available — copy any address above and share with the sender.
+        Receive and Request payment are always available — expand any wallet above.
       </p>
     {/if}
   {/if}
 </div>
+
+{#if activeSheet === 'send' && activeWallet}
+  <SendBtcSheet
+    wallets={wallets.map((w) => ({
+      wallet_id: w.wallet_id,
+      label: w.label,
+      address: w.address,
+      network: w.network,
+      cached_balance_sats: w.cached_balance_sats,
+    }))}
+    preselectedWalletId={activeWallet.wallet_id}
+    onClose={closeSheet}
+    onSent={onWalletActivity}
+  />
+{:else if activeSheet === 'receive' && activeWallet}
+  <ReceiveBtcSheet
+    wallet={{
+      wallet_id: activeWallet.wallet_id,
+      label: activeWallet.label,
+      address: activeWallet.address,
+      network: activeWallet.network,
+    }}
+    onClose={closeSheet}
+  />
+{:else if activeSheet === 'request' && activeWallet}
+  <RequestPaymentSheet
+    wallet={{
+      wallet_id: activeWallet.wallet_id,
+      label: activeWallet.label,
+      network: activeWallet.network,
+    }}
+    onClose={closeSheet}
+    onSent={onWalletActivity}
+  />
+{/if}
 
 <style>
   .wallets-view { padding: 24px; max-width: 720px; margin: 0 auto; }
@@ -360,6 +459,38 @@
   }
   .detail-section { margin-bottom: 14px; }
   .detail-section:last-child { margin-bottom: 0; }
+
+  .action-row {
+    display: flex;
+    gap: 8px;
+  }
+  .action-btn {
+    flex: 1;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font: inherit;
+    font-size: 0.85rem;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .action-btn:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.12);
+  }
+  .action-btn.primary {
+    background: var(--accent);
+    color: #1a1a1a;
+    border-color: transparent;
+  }
+  .action-btn.primary:hover:not(:disabled) {
+    background: var(--accent-hover);
+  }
+  .action-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
   .detail-label {
     font-size: 0.7rem;
     color: var(--text-muted);
