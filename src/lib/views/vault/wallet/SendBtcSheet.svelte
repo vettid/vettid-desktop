@@ -235,7 +235,10 @@
         walletId: selectedWallet.wallet_id,
         toAddress: toAddress.trim(),
         amountSats,
-        feeRate: feeRate > 0 ? feeRate : null,
+        // send_btc's fee_rate is Option<i32> — round so a fractional
+        // sat/vB tier (some fee sources return decimals) can't fail
+        // deserialization on the Rust side.
+        feeRate: feeRate > 0 ? Math.round(feeRate) : null,
       });
       clearPending();
       if (resp?.success) {
