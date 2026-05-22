@@ -97,6 +97,13 @@ pub struct DeviceOpRequest {
     pub request_id: String,
     pub operation: String,
     pub connection_id: String,
+    /// Operation arguments. MUST serialize as `payload` — the vault's
+    /// device-op parser (`vault-manager/device_handler.go`) reads
+    /// `json:"payload"`. Sending `params` here silently drops every
+    /// op's arguments: ops with empty args still work, ops that need
+    /// arguments (`secret.get`, `connection.revoke`, `message.send`, …)
+    /// arrive with nothing.
+    #[serde(rename = "payload")]
     pub params: serde_json::Value,
     pub timestamp: String,
 }
