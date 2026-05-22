@@ -332,8 +332,10 @@ desktop, with phone approval where the Android app already requires it.
   `CriticalSecretsScreen`)
 - Wire `WalletView` against `wallet.list` / balance / send / receive;
   reuse the BTC send/receive sheets the Android app shipped
-- Hide both sections from the rail if the vault doesn't advertise
-  them (graceful degradation)
+
+Section-visibility gating was dropped — see §7 decision #7. Every
+user vault carries all three sections; the empty states handle
+"nothing here yet" gracefully on their own.
 
 **Acceptance:** parity with Android's vault management for secrets +
 wallet, minus mobile-specific affordances (biometric reveal, etc.).
@@ -405,6 +407,14 @@ read receipts and delivery state matching Android.
    connections but never originates them. This drops the former
    Phase 5 "Invitation flow" item entirely — no "+ Invite" button,
    no QR generation, no `connection.create` wiring on the desktop.
+7. **Section-visibility gating** (added 2026-05-22) → dropped from
+   Phase 4. The plan assumed the vault "advertises" which sections
+   it supports, but `vault.snapshot` carries no capability signal
+   and every user vault has the Personal-data / Secrets / Wallets
+   subsystems built in — there is no vault that lacks one. The
+   per-section empty states ("No wallets yet — create one from the
+   VettID app on your phone") already provide graceful degradation;
+   hiding a tab on a zero count would only remove that guidance.
 
 ---
 
