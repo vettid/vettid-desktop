@@ -123,7 +123,7 @@ Mirror the Android Feed/Connections list:
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│ [Search…]                                  [+ Invite]  │
+│ [Search…]                                              │
 ├────────────────────────────────────────────────────────┤
 │ [photo] Mesmer                                          │
 │         Last activity · 2h ago                          │
@@ -142,10 +142,11 @@ scaffolded; wire it to `messages.list` / `connection.send-message`).
 Tap Call/Video → WebRTC bridge (phase later; show a "coming soon"
 toast in the first cut).
 
-Notably: connection cards on desktop don't need the same status
-variants as Android (no `pending_review` UX because invitations on
-desktop are minimal). Pending invitations and review can live on a
-secondary tab inside Connections.
+Notably: the desktop never *creates* an invitation — that flow stays
+on the phone (§7 decision #6). The connection list still surfaces an
+"Outstanding invitation" status for invitations the user sent from
+their phone, since that state is read straight from vault data; the
+desktop just renders it. No "+ Invite" affordance, no QR generation.
 
 ---
 
@@ -346,8 +347,10 @@ wallet, minus mobile-specific affordances (biometric reveal, etc.).
 - Conversation view wired against `messages.list` /
   `connection.send-message` (E2E encryption via the existing
   session-key derivation)
-- Invitation flow: create QR + copy link (no scan-from-desktop — let
-  the phone scan)
+
+Connection *creation* (sending an invitation) is intentionally
+phone-only — see §7 decision #6. The desktop manages and converses
+with connections; it does not originate them.
 
 **Acceptance:** can chat with a peer end-to-end from desktop, with
 read receipts and delivery state matching Android.
@@ -396,6 +399,12 @@ read receipts and delivery state matching Android.
 5. **Distros without a keyring daemon** → same as #1. Resolved by
    the machine-bound fallback. Minimal Linux setups (kiosks,
    GrapheneOS-style) work without extra packaging.
+6. **Outbound invitations** (added 2026-05-22) → cut from the
+   desktop. Creating a connection (generate invite code → QR →
+   share) stays phone-only; the desktop manages and converses with
+   connections but never originates them. This drops the former
+   Phase 5 "Invitation flow" item entirely — no "+ Invite" button,
+   no QR generation, no `connection.create` wiring on the desktop.
 
 ---
 
