@@ -66,6 +66,14 @@ export const totalUnreadStore: Readable<number> = derived(
     ($unread) => Object.values($unread).reduce((sum, n) => sum + n, 0),
 );
 
+/** Count of inbound grant requests awaiting the user's approve/deny.
+ *  Driven by DataGrantApprovalModal — it polls grant.list-pending on
+ *  mount and on every data-request-received push, then writes the
+ *  count here. The Sharing rail icon reads this for a notification
+ *  dot so the user knows requests are queued even after dismissing
+ *  the modal. */
+export const pendingGrantCountStore: Writable<number> = writable(0);
+
 // ---------------------------------------------------------------------------
 // Loaders — call from views to (re)fetch from the vault
 // ---------------------------------------------------------------------------

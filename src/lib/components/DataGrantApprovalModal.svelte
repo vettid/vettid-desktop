@@ -9,6 +9,7 @@
         denyRequest,
         type PendingRequestSummary,
     } from '../grants';
+    import { pendingGrantCountStore } from '../stores/vault';
     import type { Connection } from '../types';
 
     // App-level modal — surfaces incoming grant requests so the user
@@ -45,6 +46,11 @@
             pending = await listPending();
             // Reset to the first non-dismissed when the list changes.
             activeIndex = 0;
+            // Update the global pending count so the rail nav can
+            // surface a dot — counts *all* pending (including those
+            // the user has dismissed/snoozed this session, since they
+            // still need a response on the vault side).
+            pendingGrantCountStore.set(pending.length);
         } catch (e) {
             console.warn('grant.list-pending failed', e);
         }

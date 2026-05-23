@@ -6,7 +6,7 @@
   import { initNatsListener } from './lib/stores/nats';
   import { themeStore } from './lib/stores/theme';
   import { initCallListener } from './lib/stores/calls';
-  import { initVaultListeners } from './lib/stores/vault';
+  import { initVaultListeners, pendingGrantCountStore } from './lib/stores/vault';
   import { initNotifications } from './lib/notifications';
   import { resetSecretsUnlock } from './lib/stores/secrets';
 
@@ -216,6 +216,11 @@
   // pre-session takeovers hide it to keep the user's attention on
   // the single thing they need to do.
   let railVisible = $derived(sessionState.state === 'active');
+
+  // Pending data-grant requests waiting on the user — the
+  // DataGrantApprovalModal writes this each refresh; we read it
+  // here to paint a notification dot on the Sharing rail icon.
+  let pendingGrantCount = $derived($pendingGrantCountStore);
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
@@ -266,13 +271,20 @@
           class:active={currentView === 'sharing'}
           onclick={() => currentView = 'sharing'}
         >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="18" cy="5" r="3" />
-            <circle cx="6" cy="12" r="3" />
-            <circle cx="18" cy="19" r="3" />
-            <line x1="8.59" y1="13.51" x2="15.42" y2="17.49" />
-            <line x1="15.41" y1="6.51" x2="8.59" y2="10.49" />
-          </svg>
+          <span class="rail-icon-wrap">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="18" cy="5" r="3" />
+              <circle cx="6" cy="12" r="3" />
+              <circle cx="18" cy="19" r="3" />
+              <line x1="8.59" y1="13.51" x2="15.42" y2="17.49" />
+              <line x1="15.41" y1="6.51" x2="8.59" y2="10.49" />
+            </svg>
+            {#if pendingGrantCount > 0}
+              <span class="rail-dot" aria-label="{pendingGrantCount} pending data requests">
+                {pendingGrantCount > 9 ? '9+' : pendingGrantCount}
+              </span>
+            {/if}
+          </span>
           <span>Sharing</span>
         </button>
       </nav>
@@ -372,6 +384,27 @@
   .rail-item.active {
     color: var(--accent);
     background: var(--accent-muted);
+  }
+  .rail-icon-wrap {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .rail-dot {
+    position: absolute;
+    top: -6px;
+    right: -10px;
+    background: #ef5350;
+    color: #fff;
+    font-size: 0.62rem;
+    font-weight: 700;
+    line-height: 1;
+    padding: 2px 5px;
+    border-radius: 999px;
+    min-width: 14px;
+    text-align: center;
+    pointer-events: none;
   }
 
   .content {
