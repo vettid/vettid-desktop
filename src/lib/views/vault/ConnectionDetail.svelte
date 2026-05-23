@@ -9,9 +9,32 @@
         requestAccess,
         setPresenceOverride,
         listMyRequests,
+        getSharePolicy,
+        setSharePolicy,
         type ItemKind,
         type OutgoingRequestSummary,
+        type SharePolicyItem,
     } from '../../grants';
+
+    /**
+     * One togglable row in the per-peer auto-allow editor.
+     * `key` is the canonical share-policy item key (`<kind>:<ref>`);
+     * `allowed` and the constraint fields mirror the vault's
+     * SharePolicyItem so a flip can be persisted without lookups.
+     */
+    interface AutoAllowRow {
+        key: string;
+        kind: ItemKind;
+        ref: string;
+        display_name: string;
+        category: string;
+        alias?: string;
+        allowed: boolean;
+        tier: 'required' | 'optional' | 'on_demand' | 'consent';
+        retention: 'session' | 'time_limited' | 'until_revoked';
+        rate_limit_per_hour: number;
+        expires_at: number;
+    }
 
     /**
      * Cached verify-identity state from the vault. Mirrors the
@@ -123,6 +146,153 @@
             error = `Request failed: ${e}`;
         }
         requestingKey = null;
+    }
+
+    // Auto-allow (share-policy) editor. Collapsed by default — opening
+    // it triggers the catalog enumeration so users who never touch it
+    // don't pay personal-data.get + credential.secret.list overhead.
+    let autoAllowOpen = $state(false);
+    let autoAllowRows = $state<AutoAllowRow[]>([]);
+    let autoAllowLoading = $state(false);
+    let autoAllowError = $state('');
+    let autoAllowBusyKey = $state<string | null>(null);
+
+    function humanizeNamespace(ns: string): string {
+        // contact.phone.mobile::Wife → "Mobile · Wife"
+        const [base, alias] = ns.split('::');
+        const parts = base.split('.');
+        const leaf = parts[parts.length - 1] ?? base;
+        const pretty = leaf
+            .replace(/[_-]/g, ' ')
+            .replace(/\b\w/g, (c) => c.toUpperCase());
+        return alias ? `${pretty} · ${alias}` : pretty;
+    }
+
+    async function loadAutoAllow() {
+        if (autoAllowLoading) return;
+        autoAllowLoading = true;
+        autoAllowError = '';
+        try {
+            const [pdResp, secResp, policy] = await Promise.all([
+                invoke('list_personal_data') as Promise<VaultOpResponse>,
+                invoke('list_secrets_catalog') as Promise<VaultOpResponse>,
+                getSharePolicy(connection.connection_id),
+            ]);
+
+            // Seed rows from own catalog — every personal-data field
+            // and every minor secret becomes a togglable row, defaulted
+            // to "not allowed".
+            const merged = new Map<string, AutoAllowRow>();
+
+            // Personal-data fields.
+            if (pdResp.success && pdResp.data) {
+                const data = pdResp.data as { fields?: Record<string, { alias?: string; value?: string; category?: string }> };
+                for (const [ns, field] of Object.entries(data.fields ?? {})) {
+                    if (ns.startsWith('_system_')) continue;
+                    merged.set(`data:${ns}`, {
+                        key: `data:${ns}`,
+                        kind: 'data',
+                        ref: ns,
+                        display_name: humanizeNamespace(ns),
+                        category: field?.category ?? 'Personal data',
+                        alias: field?.alias ?? undefined,
+                        allowed: false,
+                        tier: 'on_demand',
+                        retention: 'until_revoked',
+                        rate_limit_per_hour: 0,
+                        expires_at: 0,
+                    });
+                }
+            }
+
+            // Minor secrets (catalog-only; values stay sealed).
+            if (secResp.success && secResp.data) {
+                const data = secResp.data as { secrets?: Array<{ id?: string; name?: string; category?: string; alias?: string }> };
+                for (const s of data.secrets ?? []) {
+                    if (!s.name) continue;
+                    merged.set(`secret:${s.name}`, {
+                        key: `secret:${s.name}`,
+                        kind: 'secret',
+                        ref: s.name,
+                        display_name: s.name,
+                        category: s.category ?? 'Secret',
+                        alias: s.alias,
+                        allowed: false,
+                        tier: 'on_demand',
+                        retention: 'until_revoked',
+                        rate_limit_per_hour: 0,
+                        expires_at: 0,
+                    });
+                }
+            }
+
+            // Overlay stored policy — anything already configured wins.
+            for (const [key, item] of Object.entries(policy.items ?? {})) {
+                const existing = merged.get(key);
+                if (existing) {
+                    existing.allowed = item.allowed ?? false;
+                    existing.tier = (item.tier as AutoAllowRow['tier']) ?? existing.tier;
+                    existing.retention = (item.retention as AutoAllowRow['retention']) ?? existing.retention;
+                    existing.rate_limit_per_hour = item.rate_limit_per_hour ?? 0;
+                    existing.expires_at = item.expires_at ?? 0;
+                } else {
+                    // Stored row for an item not in current catalog —
+                    // surface it so the user can revoke it; the catalog
+                    // entry might have been deleted.
+                    const [kind, ref] = key.split(':', 2);
+                    merged.set(key, {
+                        key,
+                        kind: (kind as ItemKind) ?? 'data',
+                        ref: ref ?? key,
+                        display_name: ref ?? key,
+                        category: '(removed from catalog)',
+                        allowed: item.allowed ?? false,
+                        tier: (item.tier as AutoAllowRow['tier']) ?? 'on_demand',
+                        retention: (item.retention as AutoAllowRow['retention']) ?? 'until_revoked',
+                        rate_limit_per_hour: item.rate_limit_per_hour ?? 0,
+                        expires_at: item.expires_at ?? 0,
+                    });
+                }
+            }
+
+            autoAllowRows = Array.from(merged.values()).sort((a, b) => {
+                const cat = a.category.localeCompare(b.category);
+                if (cat !== 0) return cat;
+                return a.display_name.localeCompare(b.display_name);
+            });
+        } catch (e) {
+            autoAllowError = String(e);
+        }
+        autoAllowLoading = false;
+    }
+
+    async function toggleAutoAllow(row: AutoAllowRow) {
+        autoAllowBusyKey = row.key;
+        const next = !row.allowed;
+        try {
+            const item: SharePolicyItem = {
+                allowed: next,
+                tier: row.tier,
+                retention: row.retention,
+            };
+            if (row.rate_limit_per_hour > 0) item.rate_limit_per_hour = row.rate_limit_per_hour;
+            if (row.expires_at > 0) item.expires_at = row.expires_at;
+            await setSharePolicy(connection.connection_id, { [row.key]: item });
+            // Apply optimistically — vault upsert is single-row.
+            autoAllowRows = autoAllowRows.map((r) =>
+                r.key === row.key ? { ...r, allowed: next } : r,
+            );
+        } catch (e) {
+            autoAllowError = String(e);
+        }
+        autoAllowBusyKey = null;
+    }
+
+    function openAutoAllow() {
+        autoAllowOpen = true;
+        if (autoAllowRows.length === 0 && !autoAllowLoading) {
+            void loadAutoAllow();
+        }
     }
 
     async function setPresence(value: boolean | null) {
@@ -498,6 +668,60 @@
                 </dl>
             </section>
 
+            <!-- Auto-allow editor — per-peer share policy. Collapsed
+                 by default so users who only use the approval flow
+                 don't pay catalog-enumeration overhead. -->
+            <section class="card">
+                <button
+                    type="button"
+                    class="aa-toggle"
+                    onclick={autoAllowOpen ? () => (autoAllowOpen = false) : openAutoAllow}
+                    aria-expanded={autoAllowOpen}
+                >
+                    <span>Auto-allow for {peerName(detail)}</span>
+                    <span class="aa-chev" class:open={autoAllowOpen}>▾</span>
+                </button>
+                {#if autoAllowOpen}
+                    <p class="hint">
+                        Items you toggle on here are pre-authorized — this
+                        peer can fetch them without sending you a request.
+                        Toggle off to revoke or to gate behind an
+                        approval prompt next time.
+                    </p>
+                    {#if autoAllowLoading}
+                        <div class="aa-status">Loading your catalog…</div>
+                    {:else if autoAllowError}
+                        <div class="aa-status error">{autoAllowError}</div>
+                    {:else if autoAllowRows.length === 0}
+                        <div class="aa-status">No catalog items yet. Add personal data or secrets in the Vault tab.</div>
+                    {:else}
+                        <ul class="aa-list">
+                            {#each autoAllowRows as row (row.key)}
+                                <li class="aa-row">
+                                    <span class="aa-kind">{row.kind === 'data' ? '📇' : '🔑'}</span>
+                                    <div class="aa-body">
+                                        <div class="aa-name">{row.display_name}</div>
+                                        <div class="aa-meta">
+                                            {row.category}
+                                            {#if row.alias} · {row.alias}{/if}
+                                        </div>
+                                    </div>
+                                    <label class="aa-switch" title={row.allowed ? 'Auto-allowed' : 'Requires approval'}>
+                                        <input
+                                            type="checkbox"
+                                            checked={row.allowed}
+                                            disabled={autoAllowBusyKey === row.key}
+                                            onchange={() => toggleAutoAllow(row)}
+                                        />
+                                        <span class="aa-slider" class:on={row.allowed}></span>
+                                    </label>
+                                </li>
+                            {/each}
+                        </ul>
+                    {/if}
+                {/if}
+            </section>
+
             <!-- Call history (per-connection) -->
             {#if callHistory.length > 0 || callHistoryLoading}
                 <section class="card">
@@ -781,6 +1005,72 @@
     .ch-status-tag.missed { color: #ef5350; border-color: rgba(244,67,54,0.45); }
     .ch-meta { font-size: 0.75em; color: var(--text-secondary); margin-top: 1px; }
     .ch-time { font-size: 0.78em; color: var(--text-secondary); flex-shrink: 0; }
+
+    /* Auto-allow editor */
+    .aa-toggle {
+        display: flex;
+        width: 100%;
+        align-items: center;
+        justify-content: space-between;
+        background: transparent;
+        border: none;
+        color: inherit;
+        padding: 0;
+        margin: 0 0 4px;
+        cursor: pointer;
+        font: inherit;
+        font-size: 0.85em;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--text-secondary);
+    }
+    .aa-toggle:hover { color: var(--text); }
+    .aa-chev { transition: transform 0.15s; }
+    .aa-chev.open { transform: rotate(180deg); }
+    .aa-status { padding: 12px 0; color: var(--text-secondary); font-size: 0.85em; }
+    .aa-status.error { color: var(--danger); }
+    .aa-list { list-style: none; padding: 0; margin: 8px 0 0; display: flex; flex-direction: column; gap: 4px; max-height: 320px; overflow-y: auto; }
+    .aa-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 6px 8px;
+        border-bottom: 1px solid rgba(255,255,255,0.04);
+    }
+    .aa-row:last-child { border-bottom: none; }
+    .aa-kind { font-size: 1.05em; flex-shrink: 0; width: 22px; text-align: center; }
+    .aa-body { flex: 1; min-width: 0; }
+    .aa-name { font-size: 0.9em; }
+    .aa-meta { font-size: 0.72em; color: var(--text-secondary); margin-top: 1px; }
+    .aa-switch {
+        position: relative;
+        width: 38px;
+        height: 22px;
+        flex-shrink: 0;
+        cursor: pointer;
+    }
+    .aa-switch input { opacity: 0; width: 0; height: 0; }
+    .aa-slider {
+        position: absolute;
+        inset: 0;
+        background: rgba(255,255,255,0.12);
+        border-radius: 999px;
+        transition: background 0.18s;
+    }
+    .aa-slider::before {
+        content: '';
+        position: absolute;
+        top: 3px;
+        left: 3px;
+        width: 16px;
+        height: 16px;
+        background: var(--text-secondary);
+        border-radius: 50%;
+        transition: transform 0.18s, background 0.18s;
+    }
+    .aa-slider.on { background: rgba(255,193,37,0.35); }
+    .aa-slider.on::before { transform: translateX(16px); background: var(--accent); }
+    .aa-switch input:disabled + .aa-slider { opacity: 0.5; cursor: not-allowed; }
     .action-ghost {
         background: transparent;
         color: var(--text);
