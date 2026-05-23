@@ -30,13 +30,25 @@
     // Wallet the Send action was launched from. May be empty when
     // opened from a global "Send" button — then the picker shows.
     preselectedWalletId?: string;
+    // Prefill destination + amount when launched from a Pay action on
+    // an incoming payment_request bubble. The user can still edit
+    // before confirming — they own the final send.
+    prefillToAddress?: string;
+    prefillAmountSats?: number;
     onClose: () => void;
     // Called after a successful broadcast so the parent can refresh
     // balances/history.
     onSent?: () => void;
   }
 
-  let { wallets, preselectedWalletId = '', onClose, onSent }: Props = $props();
+  let {
+    wallets,
+    preselectedWalletId = '',
+    prefillToAddress = '',
+    prefillAmountSats = 0,
+    onClose,
+    onSent,
+  }: Props = $props();
 
   // ---- form state ----------------------------------------------------
   // The parent mounts a fresh SendBtcSheet each time the sheet opens,
@@ -48,12 +60,23 @@
       ? preselectedWalletId
       : wallets[0]?.wallet_id ?? ''
   );
-  let toAddress = $state('');
+  // svelte-ignore state_referenced_locally
+  let toAddress = $state(prefillToAddress);
   // Amount is held canonically in sats; the BTC field is a derived
   // mirror the user can also type into. `amountField` tracks which
   // input the user last edited so we don't clobber their text mid-type.
-  let satsInput = $state('');
-  let btcInput = $state('');
+  // svelte-ignore state_referenced_locally
+  let satsInput = $state(prefillAmountSats > 0 ? String(prefillAmountSats) : '');
+  // svelte-ignore state_referenced_locally
+  let btcInput = $state(
+    prefillAmountSats > 0
+      ? (() => {
+          const whole = Math.floor(prefillAmountSats / 1e8);
+          const frac = (prefillAmountSats % 1e8).toString().padStart(8, '0').replace(/0+$/, '');
+          return frac ? `${whole}.${frac}` : String(whole);
+        })()
+      : '',
+  );
   let feeTier = $state<'economy' | 'normal' | 'priority'>('normal');
 
   let stage = $state<'form' | 'confirm'>('form');

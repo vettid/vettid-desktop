@@ -3,10 +3,12 @@
     import { listen } from '@tauri-apps/api/event';
     import { open } from '@tauri-apps/plugin-shell';
     import type { Connection, Message, VaultOpResponse } from '../../types';
-    import { clearSelectedConnection, selectedConnectionStore } from '../../stores/navigation';
+    import { clearSelectedConnection } from '../../stores/navigation';
     import { markConversationRead } from '../../stores/vault';
     import { placeCall, type CallType } from '../../stores/calls';
     import { peerName } from '../../connectionName';
+    import SendBtcSheet from './wallet/SendBtcSheet.svelte';
+    import RequestPaymentSheet from './wallet/RequestPaymentSheet.svelte';
 
     interface Props {
         connection: Connection;
@@ -27,6 +29,40 @@
     // Scroll-to-bottom FAB only shows when the user has scrolled
     // up enough that they're no longer near the latest message.
     let nearBottom = $state(true);
+    // Pagination: vault returns the most-recent `limit` messages; when
+    // the user scrolls to within `LOAD_OLDER_THRESHOLD_PX` of the top
+    // we fetch the page before that (`before=<oldest message_id>`).
+    let loadingOlder = $state(false);
+    let hasMoreOlder = $state(true);
+    const PAGE_SIZE = 50;
+    const LOAD_OLDER_THRESHOLD_PX = 120;
+
+    // Per-incoming-payment-request action state. Keyed by request_id
+    // (or message_id as fallback) so each bubble tracks its own pay /
+    // decline state independently.
+    let paymentActionState = $state<Record<string, { busy: boolean; error?: string }>>({});
+    // Which payment_request_id (or message_id) is the user currently
+    // typing a decline reason for? Drives the inline decline composer.
+    let decliningFor = $state<string | null>(null);
+    let declineReason = $state('');
+
+    // Compose menu (➕) — Request payment lives here. Send-via-attach
+    // can come later (D.6 image/file).
+    let composeMenuOpen = $state(false);
+
+    // Sheets mounted by the conversation. Loaded lazily on demand so
+    // tabs that never touch payments don't pay the wallet.list cost.
+    interface WalletItem {
+        wallet_id: string;
+        label: string;
+        address: string;
+        network: string;
+        cached_balance_sats: number;
+    }
+    let activeSheet = $state<'send' | 'request' | null>(null);
+    let walletsForSheet = $state<WalletItem[]>([]);
+    let walletsError = $state('');
+    let payPrefill = $state<{ toAddress: string; amountSats: number } | null>(null);
 
     interface PaymentPayload {
         amount_sats?: number;
@@ -34,6 +70,8 @@
         address?: string;
         txid?: string;
         label?: string;
+        request_id?: string;
+        reason?: string;
     }
 
     function parsePayment(content: string): PaymentPayload | null {
@@ -45,6 +83,10 @@
         }
     }
 
+    function paymentKey(msg: Message, payload: PaymentPayload | null): string {
+        return payload?.request_id || msg.id;
+    }
+
     function formatBtc(sats?: number): string {
         if (typeof sats !== 'number' || !isFinite(sats)) return '';
         const btc = (sats / 100_000_000).toFixed(8);
@@ -54,15 +96,20 @@
     async function loadMessages() {
         loading = true;
         error = '';
+        hasMoreOlder = true;
         try {
             const resp: VaultOpResponse = await invoke('get_conversation', {
                 peerConnectionId: connection.connection_id,
+                limit: PAGE_SIZE,
             });
             if (resp.success && resp.data) {
                 const data = resp.data as { messages?: Message[] };
                 messages = (data.messages ?? []).sort(
                     (a, b) => Date.parse(a.sent_at) - Date.parse(b.sent_at),
                 );
+                // If the vault returned fewer than the page size, we
+                // already have every message — disable further fetches.
+                if (messages.length < PAGE_SIZE) hasMoreOlder = false;
             } else if (resp.error) {
                 error = resp.error;
             }
@@ -73,6 +120,53 @@
         scrollToBottom();
         markConversationRead(connection.connection_id);
         sendReadReceiptsForUnread();
+    }
+
+    /**
+     * Page older messages into the top of the list. Anchored on the
+     * scroll height before the prepend so the user's viewport stays
+     * locked to the message they were reading instead of jumping.
+     */
+    async function loadOlder() {
+        if (loadingOlder || !hasMoreOlder || messages.length === 0) return;
+        const oldest = messages[0];
+        if (!oldest) return;
+        loadingOlder = true;
+        const heightBefore = scrollEl?.scrollHeight ?? 0;
+        const topBefore = scrollEl?.scrollTop ?? 0;
+        try {
+            const resp: VaultOpResponse = await invoke('get_conversation', {
+                peerConnectionId: connection.connection_id,
+                limit: PAGE_SIZE,
+                before: oldest.id,
+            });
+            if (resp.success && resp.data) {
+                const data = resp.data as { messages?: Message[] };
+                const older = (data.messages ?? []).sort(
+                    (a, b) => Date.parse(a.sent_at) - Date.parse(b.sent_at),
+                );
+                // De-dupe by id in case the vault's `before` semantics
+                // are inclusive on either side.
+                const have = new Set(messages.map((m) => m.id));
+                const fresh = older.filter((m) => !have.has(m.id));
+                if (fresh.length === 0) {
+                    hasMoreOlder = false;
+                } else {
+                    messages = [...fresh, ...messages];
+                    if (fresh.length < PAGE_SIZE) hasMoreOlder = false;
+                    // Anchor the viewport to the same message after prepend.
+                    queueMicrotask(() => {
+                        if (!scrollEl) return;
+                        const newHeight = scrollEl.scrollHeight;
+                        scrollEl.scrollTop = topBefore + (newHeight - heightBefore);
+                    });
+                }
+            }
+        } catch (e) {
+            // Pagination failures are non-fatal — keep what we have.
+            console.warn('loadOlder failed', e);
+        }
+        loadingOlder = false;
     }
 
     /**
@@ -138,6 +232,124 @@
     function onMessagesScroll() {
         if (!scrollEl) return;
         nearBottom = scrollEl.scrollTop + scrollEl.clientHeight >= scrollEl.scrollHeight - 100;
+        if (scrollEl.scrollTop <= LOAD_OLDER_THRESHOLD_PX && hasMoreOlder && !loadingOlder) {
+            void loadOlder();
+        }
+    }
+
+    /**
+     * Pay an incoming payment request. Loads wallets (lazy) and opens
+     * SendBtcSheet prefilled with the address + amount. The user
+     * confirms in the sheet — we never silently send.
+     */
+    async function payPaymentRequest(msg: Message, payload: PaymentPayload | null) {
+        if (!payload?.address || !payload?.amount_sats) {
+            error = 'Payment request is missing address or amount.';
+            return;
+        }
+        const key = paymentKey(msg, payload);
+        paymentActionState = { ...paymentActionState, [key]: { busy: true } };
+        try {
+            await ensureWalletsLoaded();
+            if (walletsForSheet.length === 0) {
+                paymentActionState = {
+                    ...paymentActionState,
+                    [key]: { busy: false, error: walletsError || 'No wallets available' },
+                };
+                return;
+            }
+            payPrefill = { toAddress: payload.address, amountSats: payload.amount_sats };
+            activeSheet = 'send';
+            paymentActionState = { ...paymentActionState, [key]: { busy: false } };
+        } catch (e) {
+            paymentActionState = {
+                ...paymentActionState,
+                [key]: { busy: false, error: String(e) },
+            };
+        }
+    }
+
+    /**
+     * Decline an incoming payment request by sending a structured
+     * `btc_payment_decline` message with `{request_id, reason}`. The
+     * recipient renders it as a dedicated bubble.
+     */
+    async function declinePaymentRequest(msg: Message, payload: PaymentPayload | null) {
+        const key = paymentKey(msg, payload);
+        const reason = declineReason.trim() || 'Declined';
+        paymentActionState = { ...paymentActionState, [key]: { busy: true } };
+        try {
+            const body = JSON.stringify({
+                request_id: payload?.request_id ?? msg.id,
+                reason,
+            });
+            const resp: VaultOpResponse = await invoke('send_message', {
+                peerConnectionId: connection.connection_id,
+                content: body,
+                contentType: 'btc_payment_decline',
+            });
+            if (resp.success) {
+                decliningFor = null;
+                declineReason = '';
+                paymentActionState = { ...paymentActionState, [key]: { busy: false } };
+                await loadMessages();
+            } else {
+                paymentActionState = {
+                    ...paymentActionState,
+                    [key]: { busy: false, error: resp.error ?? 'Decline failed' },
+                };
+            }
+        } catch (e) {
+            paymentActionState = {
+                ...paymentActionState,
+                [key]: { busy: false, error: String(e) },
+            };
+        }
+    }
+
+    function openDecline(msg: Message, payload: PaymentPayload | null) {
+        decliningFor = paymentKey(msg, payload);
+        declineReason = '';
+    }
+
+    function cancelDecline() {
+        decliningFor = null;
+        declineReason = '';
+    }
+
+    async function ensureWalletsLoaded() {
+        if (walletsForSheet.length > 0) return;
+        walletsError = '';
+        try {
+            const resp: VaultOpResponse = await invoke('list_wallets');
+            if (resp.success && resp.data) {
+                const data = resp.data as { wallets?: (WalletItem & { is_archived?: boolean })[] };
+                walletsForSheet = (data.wallets ?? []).filter((w) => !w.is_archived);
+            } else {
+                walletsError = resp.error ?? 'Failed to load wallets';
+            }
+        } catch (e) {
+            walletsError = String(e);
+        }
+    }
+
+    async function openRequestPaymentSheet() {
+        composeMenuOpen = false;
+        await ensureWalletsLoaded();
+        if (walletsForSheet.length === 0) {
+            error = walletsError || 'You have no wallets. Create one in the Wallets tab first.';
+            return;
+        }
+        activeSheet = 'request';
+    }
+
+    function closeSheet() {
+        activeSheet = null;
+        payPrefill = null;
+    }
+
+    function onSheetSent() {
+        loadMessages();
     }
 
     /**
@@ -244,12 +456,19 @@
         <div class="status error">{error}</div>
     {:else}
         <div class="messages-scroll" bind:this={scrollEl} onscroll={onMessagesScroll}>
+            {#if loadingOlder}
+                <div class="older-status">Loading older messages…</div>
+            {:else if !hasMoreOlder && messages.length >= PAGE_SIZE}
+                <div class="older-status muted">— Start of conversation —</div>
+            {/if}
             {#each messages as msg (msg.id)}
                 {@const sent = isSent(msg)}
                 <div class="message" class:sent class:received={!sent}>
                     <div class="bubble">
                         {#if msg.content_type === 'payment_request'}
                             {@const p = parsePayment(msg.content)}
+                            {@const key = paymentKey(msg, p)}
+                            {@const action = paymentActionState[key]}
                             <div class="pay-head">{sent ? '📤 Payment request sent' : '📥 Payment request'}</div>
                             {#if p?.amount_sats !== undefined}
                                 <div class="pay-amount">{formatBtc(p.amount_sats)}</div>
@@ -257,8 +476,44 @@
                             {#if p?.memo}<div class="pay-memo">"{p.memo}"</div>{/if}
                             {#if p?.address}<div class="pay-addr mono">{p.address.slice(0, 18)}…</div>{/if}
                             {#if !sent}
-                                <div class="pay-hint">Pay or decline from your phone — desktop pay coming soon.</div>
+                                {#if decliningFor === key}
+                                    <div class="decline-row">
+                                        <input
+                                            type="text"
+                                            placeholder="Reason (optional)"
+                                            bind:value={declineReason}
+                                            maxlength="140"
+                                            class="decline-input"
+                                        />
+                                        <button
+                                            class="pay-action danger"
+                                            onclick={() => declinePaymentRequest(msg, p)}
+                                            disabled={action?.busy}
+                                        >{action?.busy ? '…' : 'Send decline'}</button>
+                                        <button class="pay-action ghost" onclick={cancelDecline} disabled={action?.busy}>Cancel</button>
+                                    </div>
+                                {:else}
+                                    <div class="pay-actions">
+                                        <button
+                                            class="pay-action primary"
+                                            onclick={() => payPaymentRequest(msg, p)}
+                                            disabled={action?.busy}
+                                        >Pay</button>
+                                        <button
+                                            class="pay-action ghost"
+                                            onclick={() => openDecline(msg, p)}
+                                            disabled={action?.busy}
+                                        >Decline</button>
+                                    </div>
+                                {/if}
+                                {#if action?.error}
+                                    <div class="pay-err">{action.error}</div>
+                                {/if}
                             {/if}
+                        {:else if msg.content_type === 'btc_payment_decline'}
+                            {@const p = parsePayment(msg.content)}
+                            <div class="pay-head">{sent ? '🚫 You declined a payment request' : '🚫 Payment request declined'}</div>
+                            {#if p?.reason}<div class="pay-memo">"{p.reason}"</div>{/if}
                         {:else if msg.content_type === 'btc_payment_receipt'}
                             {@const p = parsePayment(msg.content)}
                             <div class="pay-head">{sent ? '✅ Payment sent' : '✅ Payment received'}</div>
@@ -309,6 +564,24 @@
         </div>
 
         <form class="compose" onsubmit={(e) => { e.preventDefault(); sendMessage(); }}>
+            <div class="compose-menu-wrap">
+                <button
+                    type="button"
+                    class="compose-attach"
+                    aria-label="More actions"
+                    title="More"
+                    onclick={() => (composeMenuOpen = !composeMenuOpen)}
+                >+</button>
+                {#if composeMenuOpen}
+                    <div class="compose-menu" role="menu">
+                        <button
+                            type="button"
+                            class="compose-menu-item"
+                            onclick={openRequestPaymentSheet}
+                        >💸 Request payment</button>
+                    </div>
+                {/if}
+            </div>
             <textarea
                 bind:value={composeText}
                 onkeydown={handleKeydown}
@@ -321,6 +594,27 @@
         </form>
     {/if}
 </div>
+
+{#if activeSheet === 'send' && payPrefill}
+    <SendBtcSheet
+        wallets={walletsForSheet}
+        prefillToAddress={payPrefill.toAddress}
+        prefillAmountSats={payPrefill.amountSats}
+        onClose={closeSheet}
+        onSent={onSheetSent}
+    />
+{:else if activeSheet === 'request' && walletsForSheet[0]}
+    <RequestPaymentSheet
+        wallet={{
+            wallet_id: walletsForSheet[0].wallet_id,
+            label: walletsForSheet[0].label,
+            network: walletsForSheet[0].network,
+        }}
+        prefillConnectionId={connection.connection_id}
+        onClose={closeSheet}
+        onSent={onSheetSent}
+    />
+{/if}
 
 <style>
     .conversation { height: 100%; display: flex; flex-direction: column; }
@@ -480,6 +774,112 @@
         opacity: 0.75;
     }
     .mono { font-family: 'JetBrains Mono', 'Consolas', monospace; }
+
+    /* Payment-request action row inside an incoming bubble. */
+    .pay-actions { display: flex; gap: 8px; margin-top: 10px; }
+    .pay-action {
+        font: inherit;
+        font-size: 0.85em;
+        padding: 5px 12px;
+        border-radius: 6px;
+        cursor: pointer;
+        border: 1px solid currentColor;
+    }
+    .pay-action:disabled { opacity: 0.5; cursor: not-allowed; }
+    .pay-action.primary {
+        background: #000;
+        color: #ffc125;
+        border-color: #000;
+    }
+    .pay-action.ghost {
+        background: transparent;
+        color: inherit;
+    }
+    .pay-action.danger {
+        background: #c62828;
+        color: #fff;
+        border-color: #c62828;
+    }
+    .decline-row {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: 10px;
+    }
+    .decline-input {
+        background: rgba(0,0,0,0.18);
+        color: inherit;
+        border: 1px solid rgba(0,0,0,0.3);
+        border-radius: 6px;
+        padding: 6px 10px;
+        font: inherit;
+        font-size: 0.85em;
+    }
+    .decline-row { gap: 6px; }
+    .decline-row .pay-action { align-self: flex-start; }
+    .pay-err {
+        margin-top: 6px;
+        padding: 6px 8px;
+        background: rgba(198, 40, 40, 0.18);
+        border: 1px solid rgba(198, 40, 40, 0.45);
+        border-radius: 6px;
+        color: #ef5350;
+        font-size: 0.78em;
+    }
+
+    /* Older-messages indicator banner above the message list. */
+    .older-status {
+        text-align: center;
+        font-size: 0.78em;
+        color: var(--text-secondary);
+        padding: 6px 0;
+    }
+    .older-status.muted { opacity: 0.6; }
+
+    /* Compose ➕ menu (Request payment, future attach actions). */
+    .compose-menu-wrap { position: relative; display: flex; align-items: center; }
+    .compose-attach {
+        background: transparent;
+        color: var(--text-secondary);
+        border: 1px solid var(--border);
+        border-radius: 50%;
+        width: 32px;
+        height: 32px;
+        font-size: 1.2em;
+        line-height: 1;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .compose-attach:hover { color: var(--accent); border-color: var(--accent); }
+    .compose-menu {
+        position: absolute;
+        bottom: 100%;
+        left: 0;
+        margin-bottom: 6px;
+        background: var(--surface, #1c1c1c);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 4px;
+        box-shadow: 0 6px 18px rgba(0,0,0,0.45);
+        min-width: 180px;
+        z-index: 5;
+    }
+    .compose-menu-item {
+        display: block;
+        width: 100%;
+        background: transparent;
+        color: inherit;
+        border: none;
+        text-align: left;
+        padding: 8px 12px;
+        border-radius: 4px;
+        cursor: pointer;
+        font: inherit;
+        font-size: 0.9em;
+    }
+    .compose-menu-item:hover { background: rgba(255,255,255,0.06); }
 
     /* Scroll-to-latest FAB — only shown when scrolled up. */
     .messages-scroll { position: relative; }

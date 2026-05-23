@@ -64,7 +64,7 @@ export interface Message {
     connection_id: string;
     sender_id: string;
     content: string;
-    content_type: 'text' | 'image' | 'file' | 'btc_address' | 'payment_request' | 'btc_payment_receipt';
+    content_type: 'text' | 'image' | 'file' | 'btc_address' | 'payment_request' | 'btc_payment_receipt' | 'btc_payment_decline';
     sent_at: string;
     status: 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
 }

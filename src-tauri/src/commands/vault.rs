@@ -357,12 +357,16 @@ pub async fn mark_message_read(
     Ok(VaultOpResponse::from_op(result))
 }
 
-/// Send a message.
+/// Send a message. `content_type` defaults to "text"; pass
+/// "btc_payment_decline" (with a JSON `{request_id, reason}` body) for
+/// Decline-on-payment-request, or any structured content type the peer
+/// app understands.
 #[tauri::command]
 pub async fn send_message(
     state: State<'_, AppState>,
     peer_connection_id: String,
     content: String,
+    content_type: Option<String>,
 ) -> Result<VaultOpResponse, String> {
     let result = operations::execute(
         &state,
@@ -370,20 +374,32 @@ pub async fn send_message(
         serde_json::json!({
             "connection_id": peer_connection_id,
             "content": content,
-            "content_type": "text",
+            "content_type": content_type.unwrap_or_else(|| "text".to_string()),
         }),
     ).await;
     Ok(VaultOpResponse::from_op(result))
 }
 
-/// Get conversation messages for a connection.
+/// Get conversation messages for a connection. Vault returns the latest
+/// `limit` messages (default 50, max 100); `before` pages backwards
+/// using a message_id from the oldest currently-visible row.
 #[tauri::command]
-pub async fn get_conversation(state: State<'_, AppState>, peer_connection_id: String) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(
-        &state,
-        "message.list",
-        serde_json::json!({ "connection_id": peer_connection_id }),
-    ).await;
+pub async fn get_conversation(
+    state: State<'_, AppState>,
+    peer_connection_id: String,
+    limit: Option<i32>,
+    before: Option<String>,
+) -> Result<VaultOpResponse, String> {
+    let mut params = serde_json::json!({ "connection_id": peer_connection_id });
+    if let Some(l) = limit {
+        params["limit"] = serde_json::json!(l);
+    }
+    if let Some(b) = before {
+        if !b.is_empty() {
+            params["before"] = serde_json::json!(b);
+        }
+    }
+    let result = operations::execute(&state, "message.list", params).await;
     Ok(VaultOpResponse::from_op(result))
 }
 

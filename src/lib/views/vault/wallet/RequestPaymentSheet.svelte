@@ -23,11 +23,14 @@
 
   interface Props {
     wallet: WalletItem;
+    /** Pre-select a connection and hide the picker. Used when opened
+     *  from inside a Conversation — the target is already known. */
+    prefillConnectionId?: string;
     onClose: () => void;
     onSent?: () => void;
   }
 
-  let { wallet, onClose, onSent }: Props = $props();
+  let { wallet, prefillConnectionId = '', onClose, onSent }: Props = $props();
 
   // ---- connection list ----------------------------------------------
   let connections = $state<Connection[]>([]);
@@ -56,7 +59,8 @@
   onMount(() => { loadConnections(); });
 
   // ---- form state ----------------------------------------------------
-  let connectionId = $state('');
+  // svelte-ignore state_referenced_locally
+  let connectionId = $state(prefillConnectionId);
   let satsInput = $state('');
   let btcInput = $state('');
   let memo = $state('');
@@ -177,23 +181,25 @@
     <div class="body">
       <p class="lead">Send a payment request to one of your connections.</p>
 
-      <label class="field">
-        <span class="field-label">Connection</span>
-        {#if connLoading}
-          <div class="conn-status">Loading connections…</div>
-        {:else if connError}
-          <div class="conn-status err">{connError}</div>
-        {:else if connections.length === 0}
-          <div class="conn-status">No active connections to request from.</div>
-        {:else}
-          <select bind:value={connectionId}>
-            <option value="" disabled selected>Select a connection…</option>
-            {#each connections as c (c.connection_id)}
-              <option value={c.connection_id}>{peerName(c)}</option>
-            {/each}
-          </select>
-        {/if}
-      </label>
+      {#if !prefillConnectionId}
+        <label class="field">
+          <span class="field-label">Connection</span>
+          {#if connLoading}
+            <div class="conn-status">Loading connections…</div>
+          {:else if connError}
+            <div class="conn-status err">{connError}</div>
+          {:else if connections.length === 0}
+            <div class="conn-status">No active connections to request from.</div>
+          {:else}
+            <select bind:value={connectionId}>
+              <option value="" disabled selected>Select a connection…</option>
+              {#each connections as c (c.connection_id)}
+                <option value={c.connection_id}>{peerName(c)}</option>
+              {/each}
+            </select>
+          {/if}
+        </label>
+      {/if}
 
       <div class="amount-row">
         <label class="field amount-field">
