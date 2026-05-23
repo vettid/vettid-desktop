@@ -57,6 +57,64 @@
 
     let revoking = $state(false);
     let revokeMessage = $state('');
+    let rotating = $state(false);
+    let rotateMessage = $state('');
+    let verifying = $state(false);
+    let verifyMessage = $state('');
+
+    /**
+     * Rotate the E2E keys with this peer. Phone-required — the desktop
+     * initiates, the user approves on their phone, and the new keys are
+     * derived in the enclave and bound to both sides on success.
+     */
+    async function rotateKeys() {
+        const ok = confirm(`Rotate E2E keys with ${peerName(detail)}? Requires phone approval.`);
+        if (!ok) return;
+        rotating = true;
+        rotateMessage = '';
+        try {
+            const resp: VaultOpResponse = await invoke('rotate_connection_keys', {
+                connectionId: detail.connection_id,
+            });
+            if (resp.success) {
+                rotateMessage = 'Key rotation triggered.';
+                await refreshDetail();
+            } else if (resp.pending_approval) {
+                rotateMessage = 'Waiting for phone approval…';
+            } else {
+                rotateMessage = resp.error ?? 'Rotate failed';
+            }
+        } catch (e) {
+            rotateMessage = String(e);
+        }
+        rotating = false;
+    }
+
+    /**
+     * Challenge the peer to prove they still hold their private key.
+     * Phone-required to authorize the challenge. The verification
+     * result arrives asynchronously — peer's vault signs a nonce, ours
+     * verifies, and the verify-state push reaches us via the listener.
+     */
+    async function verifyIdentity() {
+        verifying = true;
+        verifyMessage = '';
+        try {
+            const resp: VaultOpResponse = await invoke('authenticate_connection', {
+                connectionId: detail.connection_id,
+            });
+            if (resp.success) {
+                verifyMessage = 'Challenge sent — result will appear once the peer responds.';
+            } else if (resp.pending_approval) {
+                verifyMessage = 'Waiting for phone approval…';
+            } else {
+                verifyMessage = resp.error ?? 'Verify failed';
+            }
+        } catch (e) {
+            verifyMessage = String(e);
+        }
+        verifying = false;
+    }
 
     /**
      * Revoke this connection. Phone-required — the desktop only initiates;
@@ -150,13 +208,41 @@
             <!-- Manage -->
             <section class="card">
                 <h4>Manage</h4>
-                <button class="danger" onclick={revoke} disabled={detail.status !== 'active' || revoking}>
-                    {revoking ? 'Submitting…' : 'Revoke connection'}
-                </button>
-                <p class="hint">Requires approval from your phone.</p>
-                {#if revokeMessage}
-                    <p class="revoke-msg">{revokeMessage}</p>
-                {/if}
+
+                <div class="action-group">
+                    <button
+                        class="action-ghost"
+                        onclick={verifyIdentity}
+                        disabled={detail.status !== 'active' || verifying}
+                    >{verifying ? 'Challenging…' : 'Verify identity'}</button>
+                    <p class="hint">
+                        Challenge the peer to prove they still hold the
+                        private key that bound this connection. Phone
+                        approval required.
+                    </p>
+                    {#if verifyMessage}<p class="action-msg">{verifyMessage}</p>{/if}
+                </div>
+
+                <div class="action-group">
+                    <button
+                        class="action-ghost"
+                        onclick={rotateKeys}
+                        disabled={detail.status !== 'active' || rotating}
+                    >{rotating ? 'Rotating…' : 'Rotate E2E keys'}</button>
+                    <p class="hint">
+                        Roll the end-to-end encryption keys with this peer.
+                        Phone approval required.
+                    </p>
+                    {#if rotateMessage}<p class="action-msg">{rotateMessage}</p>{/if}
+                </div>
+
+                <div class="action-group">
+                    <button class="danger" onclick={revoke} disabled={detail.status !== 'active' || revoking}>
+                        {revoking ? 'Submitting…' : 'Revoke connection'}
+                    </button>
+                    <p class="hint">Requires approval from your phone.</p>
+                    {#if revokeMessage}<p class="revoke-msg">{revokeMessage}</p>{/if}
+                </div>
             </section>
         </div>
     {/if}
@@ -227,4 +313,23 @@
     .danger:disabled { opacity: 0.4; cursor: not-allowed; }
     .hint { font-size: 0.8em; color: var(--text-secondary); margin: 8px 0 0; }
     .revoke-msg { margin: 8px 0 0; font-size: 0.85em; color: var(--text-primary); }
+
+    .action-group { margin-bottom: 14px; }
+    .action-group:last-child { margin-bottom: 0; }
+    .action-ghost {
+        background: transparent;
+        color: var(--text);
+        border: 1px solid var(--border);
+        padding: 8px 14px;
+        border-radius: 4px;
+        cursor: pointer;
+        font: inherit;
+        font-size: 0.9rem;
+    }
+    .action-ghost:hover:not(:disabled) {
+        background: var(--bg-elevated);
+        border-color: var(--accent);
+    }
+    .action-ghost:disabled { opacity: 0.4; cursor: not-allowed; }
+    .action-msg { margin: 8px 0 0; font-size: 0.85em; color: var(--text); }
 </style>

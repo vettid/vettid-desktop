@@ -482,6 +482,37 @@ pub async fn delete_secret(state: State<'_, AppState>, id: String) -> Result<Vau
     Ok(VaultOpResponse::from_op(result))
 }
 
+/// Rotate the E2E keys for a connection. Phone-required.
+#[tauri::command]
+pub async fn rotate_connection_keys(
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> Result<VaultOpResponse, String> {
+    let result = operations::execute_phone_required(
+        &state,
+        "connection.rotate",
+        serde_json::json!({ "connection_id": connection_id }),
+    ).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+/// Challenge a peer's identity (proves they still hold the private key
+/// that bound the connection). Phone-required to authorize the
+/// challenge — the verification result arrives asynchronously via the
+/// vault's verify-state push and is read with `connection.list`.
+#[tauri::command]
+pub async fn authenticate_connection(
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> Result<VaultOpResponse, String> {
+    let result = operations::execute_phone_required(
+        &state,
+        "connection.authenticate",
+        serde_json::json!({ "connection_id": connection_id }),
+    ).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
 /// Delete personal-data fields by namespace (phone-required). The vault
 /// keys storage as `personal-data/<namespace>`, so for aliased fields
 /// the composite key (e.g. `contact.phone.mobile::Wife`) is passed

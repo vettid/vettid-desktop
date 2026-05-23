@@ -101,6 +101,8 @@ pub fn run() {
             vault::update_secret,
             vault::delete_secret,
             vault::delete_personal_data_fields,
+            vault::rotate_connection_keys,
+            vault::authenticate_connection,
             vault::cast_vote,
             vault::send_btc,
             vault::send_message,
