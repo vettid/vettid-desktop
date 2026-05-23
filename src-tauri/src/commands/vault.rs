@@ -410,6 +410,33 @@ pub async fn list_call_history(state: State<'_, AppState>) -> Result<VaultOpResp
     Ok(VaultOpResponse::from_op(result))
 }
 
+/// Fetch short-lived Cloudflare TURN credentials for WebRTC NAT
+/// traversal. Returns `{ice_servers: [...], expires_at: "..."}`. The
+/// vault proxies to the AWS Lambda + caches the HMAC pair for the
+/// session — the desktop calls this once per call (or when the cached
+/// creds are near expiry).
+#[tauri::command]
+pub async fn get_turn_credentials(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(&state, "call.turn-credentials", serde_json::json!({})).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+/// Mark a set of call records as seen (clears the bold "Missed call"
+/// badge on connection cards). `call_ids` is the list of records to
+/// acknowledge; vault stamps SeenAt = now on each.
+#[tauri::command]
+pub async fn mark_calls_seen(
+    state: State<'_, AppState>,
+    call_ids: Vec<String>,
+) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(
+        &state,
+        "call.mark-seen",
+        serde_json::json!({ "call_ids": call_ids }),
+    ).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
 // ---------------------------------------------------------------------------
 // Missing wallet commands (parity with iOS WalletClient)
 // ---------------------------------------------------------------------------

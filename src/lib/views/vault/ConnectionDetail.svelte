@@ -329,6 +329,21 @@
                     .filter((c) => c.connection_id === connection.connection_id)
                     .sort((a, b) => (b.started_at ?? 0) - (a.started_at ?? 0))
                     .slice(0, 20);
+
+                // Clear missed-call badges for this connection — the
+                // user is looking at the record, which counts as
+                // acknowledging it. Best-effort; failure leaves the
+                // badge until the next time the user opens the screen.
+                const unseenMissed = callHistory
+                    .filter((c) => c.status === 'missed' && !c.seen_at)
+                    .map((c) => c.call_id);
+                if (unseenMissed.length > 0) {
+                    try {
+                        await invoke('mark_calls_seen', { callIds: unseenMissed });
+                    } catch (e) {
+                        console.warn('mark_calls_seen failed', e);
+                    }
+                }
             }
         } catch (e) {
             console.warn('list_call_history failed', e);

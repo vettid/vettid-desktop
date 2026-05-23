@@ -32,5 +32,6 @@
 pub mod audio;
 pub mod cryptor;
 pub mod session;
+pub mod turn;
 
 pub use session::CallSession;

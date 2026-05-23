@@ -53,10 +53,12 @@ impl From<webrtc::error::Error> for SessionError {
     }
 }
 
-/// Default STUN servers — Google's free public ones. For production we'd
-/// want to add VettID-operated TURN servers so calls survive symmetric NATs,
-/// but STUN is enough to validate the path in dev.
-fn default_ice_servers() -> Vec<RTCIceServer> {
+/// Fallback STUN servers — Google's free public ones. Only used when the
+/// vault TURN-credentials fetch fails (no network, op timeout, etc.) so
+/// calls degrade to STUN-only NAT traversal instead of refusing to set
+/// up. Symmetric NATs will fail without real TURN — the vault path
+/// (`call.turn-credentials`) is the production source.
+pub fn fallback_ice_servers() -> Vec<RTCIceServer> {
     vec![RTCIceServer {
         urls: vec![
             "stun:stun.l.google.com:19302".to_string(),
@@ -82,11 +84,14 @@ pub struct CallSession {
 
 impl CallSession {
     /// Create a new peer connection and wire the ICE / state callbacks to
-    /// the supplied event channel.
+    /// the supplied event channel. `ice_servers` should come from
+    /// `call.turn-credentials` for production; empty falls back to
+    /// Google STUN for dev convenience.
     pub async fn new(
         call_id: String,
         peer_guid: String,
         events_tx: mpsc::UnboundedSender<SessionEvent>,
+        ice_servers: Vec<RTCIceServer>,
     ) -> Result<Self, SessionError> {
         let mut media_engine = MediaEngine::default();
         // Audio codecs (Opus) are registered by `register_default_codecs`
@@ -95,8 +100,9 @@ impl CallSession {
 
         let api = APIBuilder::new().with_media_engine(media_engine).build();
 
+        let servers = if ice_servers.is_empty() { fallback_ice_servers() } else { ice_servers };
         let config = RTCConfiguration {
-            ice_servers: default_ice_servers(),
+            ice_servers: servers,
             ..Default::default()
         };
         let pc = Arc::new(api.new_peer_connection(config).await?);

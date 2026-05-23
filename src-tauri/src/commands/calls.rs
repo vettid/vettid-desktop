@@ -26,6 +26,8 @@ use tauri::Emitter;
 use tokio::sync::mpsc;
 #[cfg(feature = "webrtc")]
 use crate::webrtc::session::{CallSession, SessionEvent};
+#[cfg(feature = "webrtc")]
+use crate::webrtc::turn;
 
 /// Outcome of a signaling call. Mirrors `VaultOpResponse` shape so the
 /// frontend's response handling stays uniform across regular vault ops and
@@ -281,8 +283,11 @@ async fn start_call_session(
     is_caller: bool,
 ) -> Result<String, String> {
     let _ = is_caller; // currently informational; will matter for stats/logs
+    // Fetch fresh TURN credentials before we build the peer connection.
+    // Empty vec falls back to STUN-only inside CallSession::new.
+    let ice = turn::fetch_ice_servers(state).await;
     let (tx, rx) = mpsc::unbounded_channel();
-    let session = CallSession::new(call_id.to_string(), peer_guid.to_string(), tx)
+    let session = CallSession::new(call_id.to_string(), peer_guid.to_string(), tx, ice)
         .await
         .map_err(|e| e.to_string())?;
     let offer = session.create_offer().await.map_err(|e| e.to_string())?;
@@ -304,8 +309,9 @@ async fn accept_call_session(
     peer_guid: &str,
     remote_offer_sdp: &str,
 ) -> Result<String, String> {
+    let ice = turn::fetch_ice_servers(state).await;
     let (tx, rx) = mpsc::unbounded_channel();
-    let session = CallSession::new(call_id.to_string(), peer_guid.to_string(), tx)
+    let session = CallSession::new(call_id.to_string(), peer_guid.to_string(), tx, ice)
         .await
         .map_err(|e| e.to_string())?;
     let answer = session

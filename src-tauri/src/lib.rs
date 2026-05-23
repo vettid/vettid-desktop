@@ -118,6 +118,8 @@ pub fn run() {
             vault::share_policy_get,
             vault::share_policy_set,
             vault::presence_override_set,
+            vault::get_turn_credentials,
+            vault::mark_calls_seen,
             vault::cast_vote,
             vault::send_btc,
             vault::send_message,
