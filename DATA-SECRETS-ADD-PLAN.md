@@ -150,16 +150,27 @@ through to the Phase 1 sheets.
 - Personal Data category change → delete-then-re-add at the new
   namespace (matches Android).
 
-## Phase 4 — Critical (credential-bound) secrets
+## Phase 4 — Critical (credential-bound) secrets — CUT 2026-05-22
 
-- The heaviest piece — needs the desktop to encrypt the value with
-  the user's password-derived key + the credential's KMS-wrapped DEK.
-  Mirrors Android `TwoTierSecretsViewModel.addCriticalSecret`.
-- New `add_critical_secret` Tauri command (`credential.secret.add` op).
-- New `AddCriticalSecretSheet.svelte` with a password-confirmation
-  step before save.
-- Defer until Phase 1-3 are stable — the value of this on desktop is
-  lower than the data/minor-secret cases.
+**Decision:** critical secrets are phone-only. The desktop will not gain
+add/reveal for credential-bound secrets at any phase.
+
+**Rationale:** the desktop has no encrypted credential blob, no password
+salt, and no UTK pool — by design. `credential.secret.add` requires all
+of those fields as inputs (vault rejects without them — see
+`credential_secret_handler.go` HandleAdd validation). The two paths to
+fix that — (1) mirroring Android's credential store on desktop, or
+(2) adding a new phone-delegated vault op — were both rejected:
+(1) violates the project's "no user data on device" principle, and
+(2) wasn't worth the cross-repo lift for an op the user wants kept
+on the phone anyway.
+
+**What still works on desktop:** critical-secret metadata is visible
+(`credential.secret.list` is in `DeviceIndependentCapabilities`) so
+alias cards still show a Critical Secret row with the right
+subtitle/badge. Reveal is gated — `isCredentialBound` in
+`Secrets.svelte` returns early and tells the user the value is managed
+on their phone.
 
 ## Risks / notes
 
