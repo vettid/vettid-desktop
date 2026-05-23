@@ -7,6 +7,7 @@
     import { peerName } from '../../connectionName';
     import {
         requestAccess,
+        requestAccessGroup,
         setPresenceOverride,
         listMyRequests,
         getSharePolicy,
@@ -146,6 +147,86 @@
             error = `Request failed: ${e}`;
         }
         requestingKey = null;
+    }
+
+    /**
+     * Bundle multiple alias-shared items into a single multi-field
+     * request. Mirrors the Android alias-card behaviour (vettid-android
+     * `621b8ce`) — one approval prompt for the whole alias instead of
+     * one per field. Per-item state is mirrored so the row still shows
+     * pending/approved after the user taps Request.
+     */
+    async function requestCatalogGroup(group: CatalogGroup) {
+        const groupKey = `group:${group.kind}:${group.alias}`;
+        requestingKey = groupKey;
+        try {
+            const res = await requestAccessGroup(
+                connection.connection_id,
+                group.items.map((it) => ({
+                    item_kind: group.kind,
+                    item_ref: it.name,
+                    item_label: it.display_name ?? it.name,
+                })),
+                'one-shot',
+                '',
+            );
+            const next = { ...catalogRequestState };
+            for (const it of group.items) {
+                next[catalogKey(group.kind, it.name)] = {
+                    status: 'pending',
+                    requestId: res.request_id,
+                };
+            }
+            catalogRequestState = next;
+        } catch (e) {
+            error = `Request failed: ${e}`;
+        }
+        requestingKey = null;
+    }
+
+    interface CatalogGroup {
+        kind: ItemKind;
+        alias: string; // empty string for ungrouped singletons
+        label: string;
+        items: PublishedCatalogItem[];
+    }
+
+    /**
+     * Bucket catalog items by `(kind, alias)`. Items without an alias
+     * become single-item groups so the rendering loop can treat both
+     * shapes uniformly. Original published-list order is preserved
+     * within each group; group order is first-seen across the input.
+     */
+    function buildCatalogGroups(
+        items: PublishedCatalogItem[],
+        kind: ItemKind,
+    ): CatalogGroup[] {
+        const byKey = new Map<string, CatalogGroup>();
+        for (const it of items) {
+            const alias = (it.alias ?? '').trim();
+            const key = alias ? `${kind}::${alias}` : `${kind}::__solo__::${it.name}`;
+            const existing = byKey.get(key);
+            if (existing) {
+                existing.items.push(it);
+            } else {
+                byKey.set(key, {
+                    kind,
+                    alias,
+                    label: alias || (it.display_name ?? it.name),
+                    items: [it],
+                });
+            }
+        }
+        return Array.from(byKey.values());
+    }
+
+    /** Composite request status across a group's items — they're
+     *  approved/denied as a unit on the vault side, so the first
+     *  item's status is the group's status. */
+    function groupStatus(group: CatalogGroup): RequestRowState {
+        const first = group.items[0];
+        if (!first) return 'available';
+        return catalogRequestState[catalogKey(group.kind, first.name)]?.status ?? 'available';
     }
 
     // Auto-allow (share-policy) editor. Collapsed by default — opening
@@ -602,63 +683,97 @@
                 {/if}
             </section>
 
-            <!-- Peer catalog — request access to items they've published. -->
+            <!-- Peer catalog — request access to items they've published.
+                 Alias-shared items collapse into one card so a peer's
+                 "Wife" alias (phone + email + address) becomes ONE
+                 request prompt instead of three, matching Android's
+                 alias-card model. -->
             {#if (detail.peer_profile?.data_catalog?.length ?? 0) > 0 || (detail.peer_profile?.secret_catalog?.length ?? 0) > 0}
                 <section class="card">
                     <h4>What they share</h4>
                     <p class="catalog-hint">Items {peerName(detail)} has published. Tap Request to ask for access.</p>
                     <ul class="catalog">
-                        {#each (detail.peer_profile?.data_catalog ?? []) as item (item.name)}
-                            {@const key = catalogKey('data', item.name)}
-                            {@const state = catalogRequestState[key]?.status ?? 'available'}
-                            <li class="catalog-row">
+                        {#each buildCatalogGroups(detail.peer_profile?.data_catalog ?? [], 'data') as group (group.kind + ':' + (group.alias || group.items[0].name))}
+                            {@const status = groupStatus(group)}
+                            {@const groupKey = `group:${group.kind}:${group.alias || group.items[0].name}`}
+                            <li class="catalog-row" class:grouped={group.items.length > 1}>
                                 <span class="cat-kind">📇</span>
                                 <div class="cat-body">
-                                    <div class="cat-name">{item.display_name ?? item.name}</div>
-                                    <div class="cat-meta">
-                                        {item.category ?? 'Data'}
-                                        {#if item.alias} · {item.alias}{/if}
-                                    </div>
+                                    <div class="cat-name">{group.label}</div>
+                                    {#if group.items.length > 1}
+                                        <div class="cat-meta">{group.items.length} fields · {group.items[0].category ?? 'Data'}</div>
+                                        <ul class="cat-sub">
+                                            {#each group.items as it (it.name)}
+                                                <li>{it.display_name ?? it.name}</li>
+                                            {/each}
+                                        </ul>
+                                    {:else}
+                                        <div class="cat-meta">
+                                            {group.items[0].category ?? 'Data'}
+                                            {#if group.items[0].alias} · {group.items[0].alias}{/if}
+                                        </div>
+                                    {/if}
                                 </div>
-                                {#if state === 'pending'}
+                                {#if status === 'pending'}
                                     <span class="cat-pill pending">Pending</span>
-                                {:else if state === 'approved'}
+                                {:else if status === 'approved'}
                                     <span class="cat-pill approved">Approved</span>
-                                {:else if state === 'denied'}
+                                {:else if status === 'denied'}
                                     <span class="cat-pill denied">Denied</span>
+                                {:else if group.items.length > 1}
+                                    <button
+                                        class="cat-btn"
+                                        onclick={() => requestCatalogGroup(group)}
+                                        disabled={requestingKey === groupKey}
+                                    >{requestingKey === groupKey ? '…' : 'Request all'}</button>
                                 {:else}
                                     <button
                                         class="cat-btn"
-                                        onclick={() => requestCatalogItem('data', item)}
-                                        disabled={requestingKey === key}
-                                    >{requestingKey === key ? '…' : 'Request'}</button>
+                                        onclick={() => requestCatalogItem('data', group.items[0])}
+                                        disabled={requestingKey === catalogKey('data', group.items[0].name)}
+                                    >{requestingKey === catalogKey('data', group.items[0].name) ? '…' : 'Request'}</button>
                                 {/if}
                             </li>
                         {/each}
-                        {#each (detail.peer_profile?.secret_catalog ?? []) as item (item.name)}
-                            {@const key = catalogKey('secret', item.name)}
-                            {@const state = catalogRequestState[key]?.status ?? 'available'}
-                            <li class="catalog-row">
+                        {#each buildCatalogGroups(detail.peer_profile?.secret_catalog ?? [], 'secret') as group (group.kind + ':' + (group.alias || group.items[0].name))}
+                            {@const status = groupStatus(group)}
+                            {@const groupKey = `group:${group.kind}:${group.alias || group.items[0].name}`}
+                            <li class="catalog-row" class:grouped={group.items.length > 1}>
                                 <span class="cat-kind">🔑</span>
                                 <div class="cat-body">
-                                    <div class="cat-name">{item.display_name ?? item.name}</div>
-                                    <div class="cat-meta">
-                                        {item.category ?? 'Secret'}
-                                        {#if item.alias} · {item.alias}{/if}
-                                    </div>
+                                    <div class="cat-name">{group.label}</div>
+                                    {#if group.items.length > 1}
+                                        <div class="cat-meta">{group.items.length} items · {group.items[0].category ?? 'Secret'}</div>
+                                        <ul class="cat-sub">
+                                            {#each group.items as it (it.name)}
+                                                <li>{it.display_name ?? it.name}</li>
+                                            {/each}
+                                        </ul>
+                                    {:else}
+                                        <div class="cat-meta">
+                                            {group.items[0].category ?? 'Secret'}
+                                            {#if group.items[0].alias} · {group.items[0].alias}{/if}
+                                        </div>
+                                    {/if}
                                 </div>
-                                {#if state === 'pending'}
+                                {#if status === 'pending'}
                                     <span class="cat-pill pending">Pending</span>
-                                {:else if state === 'approved'}
+                                {:else if status === 'approved'}
                                     <span class="cat-pill approved">Approved</span>
-                                {:else if state === 'denied'}
+                                {:else if status === 'denied'}
                                     <span class="cat-pill denied">Denied</span>
+                                {:else if group.items.length > 1}
+                                    <button
+                                        class="cat-btn"
+                                        onclick={() => requestCatalogGroup(group)}
+                                        disabled={requestingKey === groupKey}
+                                    >{requestingKey === groupKey ? '…' : 'Request all'}</button>
                                 {:else}
                                     <button
                                         class="cat-btn"
-                                        onclick={() => requestCatalogItem('secret', item)}
-                                        disabled={requestingKey === key}
-                                    >{requestingKey === key ? '…' : 'Request'}</button>
+                                        onclick={() => requestCatalogItem('secret', group.items[0])}
+                                        disabled={requestingKey === catalogKey('secret', group.items[0].name)}
+                                    >{requestingKey === catalogKey('secret', group.items[0].name) ? '…' : 'Request'}</button>
                                 {/if}
                             </li>
                         {/each}
@@ -972,6 +1087,28 @@
     }
     .cat-pill.approved { background: rgba(46,125,50,0.18); color: #4caf50; }
     .cat-pill.denied { background: rgba(198,40,40,0.18); color: #ef5350; }
+    .catalog-row.grouped { align-items: flex-start; padding-top: 10px; padding-bottom: 10px; }
+    .catalog-row.grouped .cat-body { padding-top: 1px; }
+    .cat-sub {
+        list-style: none;
+        margin: 6px 0 0;
+        padding: 0 0 0 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+    .cat-sub li {
+        font-size: 0.78em;
+        color: var(--text-secondary);
+        position: relative;
+        padding-left: 10px;
+    }
+    .cat-sub li::before {
+        content: '•';
+        position: absolute;
+        left: 0;
+        color: var(--text-secondary);
+    }
 
     .presence-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
     .presence-label { font-size: 0.85em; color: var(--text-secondary); }
