@@ -257,13 +257,17 @@
     saving = true;
     errorMessage = '';
     try {
-      // The delete op is phone-required server-side. The Tauri layer
-      // doesn't have a direct command for it yet, so we route through
-      // a generic exec — for now we surface a hint until Phase 3
-      // wires a `delete_personal_data` command. This avoids a half-
-      // broken delete that updates the UI without confirming server
-      // success.
-      errorMessage = 'Delete from the phone for now — desktop delete coming next.';
+      // The vault keys storage by full key — composite for aliased
+      // fields, bare for un-aliased — so pass `key` rather than
+      // `namespace` to delete just this variant. Phone-required.
+      const resp: any = await invoke('delete_personal_data_fields', {
+        namespaces: [deleteTarget.key],
+      });
+      if (!resp?.success) {
+        errorMessage = resp?.error || 'Failed to delete';
+        return;
+      }
+      await load();
     } catch (e) {
       errorMessage = `Failed to delete: ${e}`;
     } finally {

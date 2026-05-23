@@ -3,6 +3,7 @@
   import { onMount } from 'svelte';
   import { secretsUnlockStore, isSecretsUnlocked } from '../../stores/secrets';
   import { buildAliasGroups } from '../../aliasGroups';
+  import ConfirmDialog from '../../components/ConfirmDialog.svelte';
   import { SECRET_TEMPLATES } from '../../secretTemplates';
   import type { SecretTemplate } from '../../secretTemplates';
   import TemplateChooserSheet from '../../components/TemplateChooserSheet.svelte';
@@ -208,8 +209,14 @@
   let addValueVisible = $state(false);
   let addSaving = $state(false);
   let addError = $state('');
+  // Phase 3 — edit & delete. editingId set ⇒ the modal saves via
+  // secret.update with this id instead of secret.add.
+  let editingId = $state<string | null>(null);
+  let deleteSecretOpen = $state(false);
+  let deleteSecretTarget = $state<SecretRow | null>(null);
 
   function openAddSecret() {
+    editingId = null;
     addName = '';
     addValue = '';
     addCategory = 'PASSWORD';
@@ -222,31 +229,102 @@
 
   function cancelAddSecret() {
     addOpen = false;
+    editingId = null;
+  }
+
+  async function openEditSecret(s: SecretRow) {
+    editingId = s.id;
+    addName = s.name;
+    addCategory = s.category;
+    addAlias = s.alias ?? '';
+    addNotes = s.description ?? '';
+    addValueVisible = false;
+    addError = '';
+    addValue = '';
+    addOpen = true;
+    if (isCredentialBound(s)) {
+      addError = 'Critical secrets are managed from the phone.';
+      return;
+    }
+    if (!unlocked) {
+      addError = 'Unlock Sensitive Data above to load the current value.';
+      return;
+    }
+    try {
+      const resp: any = await invoke('get_secret', { id: s.id });
+      if (resp?.success && resp?.data) {
+        addValue = String(resp.data.value ?? '');
+      }
+    } catch {
+      // Leave value blank — the user can re-enter it.
+    }
+  }
+
+  function confirmDeleteSecret(s: SecretRow) {
+    deleteSecretTarget = s;
+    deleteSecretOpen = true;
+  }
+
+  async function doDeleteSecret() {
+    if (!deleteSecretTarget) return;
+    try {
+      const resp: any = await invoke('delete_secret', { id: deleteSecretTarget.id });
+      if (resp?.success) {
+        await load();
+      } else {
+        revealError = resp?.error || 'Failed to delete secret';
+      }
+    } catch (e) {
+      revealError = `Failed to delete: ${e}`;
+    } finally {
+      deleteSecretTarget = null;
+      deleteSecretOpen = false;
+    }
   }
 
   async function saveAddSecret() {
-    if (!addName.trim() || !addValue) {
-      addError = 'Name and value are required.';
+    if (!addName.trim()) {
+      addError = 'Name is required.';
+      return;
+    }
+    if (!editingId && !addValue) {
+      addError = 'Value is required.';
       return;
     }
     addSaving = true;
     addError = '';
     try {
-      const resp: any = await invoke('add_secret', {
-        name: addName.trim(),
-        value: addValue,
-        category: addCategory,
-        alias: addAlias.trim() || null,
-        description: addNotes.trim() || null,
-      });
+      let resp: any;
+      if (editingId) {
+        // For edit, an empty value means "leave existing value alone"
+        // (the vault's secret.update treats omitted/empty value as
+        // no-op for that field).
+        resp = await invoke('update_secret', {
+          id: editingId,
+          name: addName.trim(),
+          value: addValue || null,
+          category: addCategory,
+          alias: addAlias.trim() || null,
+          description: addNotes.trim() || null,
+        });
+      } else {
+        resp = await invoke('add_secret', {
+          name: addName.trim(),
+          value: addValue,
+          category: addCategory,
+          alias: addAlias.trim() || null,
+          description: addNotes.trim() || null,
+        });
+      }
       if (!resp?.success) {
-        addError = resp?.error || 'Failed to add secret';
+        addError = resp?.error || (editingId ? 'Failed to update secret' : 'Failed to add secret');
         return;
       }
       addOpen = false;
+      editingId = null;
       await load();
     } catch (e) {
-      addError = `Failed to add secret: ${e}`;
+      addError = `Failed: ${e}`;
     } finally {
       addSaving = false;
     }
@@ -343,7 +421,7 @@
 {#if addOpen}
   <div class="modal-backdrop" onclick={cancelAddSecret} role="presentation"></div>
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="add-secret-title">
-    <h2 id="add-secret-title">Add secret</h2>
+    <h2 id="add-secret-title">{editingId ? 'Edit secret' : 'Add secret'}</h2>
     {#if addError}<div class="error" style="margin-bottom: 10px;">{addError}</div>{/if}
     <label class="field-label">
       <span>Name</span>
@@ -410,6 +488,15 @@
   />
 {/if}
 
+<ConfirmDialog
+  bind:open={deleteSecretOpen}
+  title="Delete this secret?"
+  message={deleteSecretTarget ? `Remove "${deleteSecretTarget.name}${deleteSecretTarget.alias ? ' (' + deleteSecretTarget.alias + ')' : ''}" from your vault? Requires phone approval.` : ''}
+  confirmLabel="Delete"
+  tone="danger"
+  onConfirm={doDeleteSecret}
+/>
+
 <!-- One secret row. `inGroup` drops the alias from the name (the card
      header shows it); `showRowReveal` is false for grouped rows since
      the alias card has one bundle Reveal in its header. -->
@@ -451,6 +538,10 @@
           {:else}Reveal{/if}
         </button>
       {/if}
+      {#if !credBound}
+        <button class="row-mini-btn" onclick={() => openEditSecret(s)} title="Edit" aria-label="Edit {s.name}">✎</button>
+      {/if}
+      <button class="row-mini-btn danger" onclick={() => confirmDeleteSecret(s)} title="Delete" aria-label="Delete {s.name}">×</button>
       <div class="pill {disc.tone}">{disc.label}</div>
     </div>
   </div>
@@ -791,4 +882,26 @@
   }
   .btn.primary:hover:not(:disabled) { background: var(--accent-hover); }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* Compact row-action buttons for Phase 3 edit + delete. */
+  .row-mini-btn {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    border-radius: 4px;
+    padding: 3px 8px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.8rem;
+    line-height: 1;
+  }
+  .row-mini-btn:hover {
+    background: var(--bg-elevated);
+    color: var(--text);
+  }
+  .row-mini-btn.danger:hover {
+    background: rgba(244, 67, 54, 0.12);
+    color: var(--error);
+    border-color: rgba(244, 67, 54, 0.4);
+  }
 </style>

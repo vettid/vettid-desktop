@@ -98,6 +98,9 @@ pub fn run() {
             // Vault commands — phone-required
             vault::request_secret,
             vault::add_secret,
+            vault::update_secret,
+            vault::delete_secret,
+            vault::delete_personal_data_fields,
             vault::cast_vote,
             vault::send_btc,
             vault::send_message,

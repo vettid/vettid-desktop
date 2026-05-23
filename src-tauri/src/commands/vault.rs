@@ -449,6 +449,56 @@ pub async fn set_wallet_visibility(state: State<'_, AppState>, wallet_id: String
     Ok(VaultOpResponse::from_op(result))
 }
 
+/// Update a minor secret in place (phone-required). Any field passed
+/// as Some(...) replaces the existing value; None leaves it alone.
+#[tauri::command]
+pub async fn update_secret(
+    state: State<'_, AppState>,
+    id: String,
+    name: Option<String>,
+    value: Option<String>,
+    category: Option<String>,
+    alias: Option<String>,
+    description: Option<String>,
+) -> Result<VaultOpResponse, String> {
+    let mut payload = serde_json::json!({ "id": id });
+    if let Some(n) = name { payload["name"] = serde_json::Value::String(n); }
+    if let Some(v) = value { payload["value"] = serde_json::Value::String(v); }
+    if let Some(c) = category { payload["category"] = serde_json::Value::String(c); }
+    if let Some(a) = alias { payload["alias"] = serde_json::Value::String(a); }
+    if let Some(d) = description { payload["description"] = serde_json::Value::String(d); }
+    let result = operations::execute_phone_required(&state, "secret.update", payload).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+/// Delete a minor secret (phone-required).
+#[tauri::command]
+pub async fn delete_secret(state: State<'_, AppState>, id: String) -> Result<VaultOpResponse, String> {
+    let result = operations::execute_phone_required(
+        &state,
+        "secret.delete",
+        serde_json::json!({ "id": id }),
+    ).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+/// Delete personal-data fields by namespace (phone-required). The vault
+/// keys storage as `personal-data/<namespace>`, so for aliased fields
+/// the composite key (e.g. `contact.phone.mobile::Wife`) is passed
+/// verbatim to delete just that variant.
+#[tauri::command]
+pub async fn delete_personal_data_fields(
+    state: State<'_, AppState>,
+    namespaces: Vec<String>,
+) -> Result<VaultOpResponse, String> {
+    let result = operations::execute_phone_required(
+        &state,
+        "personal-data.delete",
+        serde_json::json!({ "namespaces": namespaces }),
+    ).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
 /// Request payment from a connection.
 #[tauri::command]
 pub async fn request_payment(
