@@ -89,7 +89,7 @@ pub async fn spawn_listener(
                             log::warn!("Failed to handle response message: {}", e);
                         }
                     } else {
-                        handle_app_event(&app_handle, &msg.subject, &msg.payload).await;
+                        handle_app_event(&app_handle, state.inner(), &msg.subject, &msg.payload).await;
                     }
                 }
                 Some(ev) = recv_state_event(event_rx.as_mut()) => {
@@ -259,7 +259,7 @@ async fn handle_response_message(
 /// Payloads are forwarded raw to the frontend as base64-encoded bytes inside the
 /// event detail; per-feature handlers in later phases will decrypt with the
 /// appropriate key (vault key, connection key, or unencrypted depending on type).
-async fn handle_app_event(app_handle: &AppHandle, subject: &str, payload: &[u8]) {
+async fn handle_app_event(app_handle: &AppHandle, state: &AppState, subject: &str, payload: &[u8]) {
     // Drop request/response reply traffic at the door. Subjects like
     // `OwnerSpace.{owner}.forApp.feed.sync.{id}.response` are phone-
     // originated request/reply pairs that land on this broad
@@ -272,6 +272,33 @@ async fn handle_app_event(app_handle: &AppHandle, subject: &str, payload: &[u8])
     if subject.ends_with(".response") {
         return;
     }
+
+    // Backend interception of `call.accepted`: bind the per-call
+    // shared_secret to the active session's frame cryptor before the
+    // event is forwarded to the frontend. The secret arrives at the
+    // root of the CallEvent JSON (set by handleCallAccept in
+    // vault-manager/calls.go); the cryptor needs 32 raw bytes. We
+    // explicitly avoid round-tripping the secret through JS — once it
+    // is in the platform crypto layer, no other component needs to
+    // see it (matches Android's "secret stays in CallFrameCryptor"
+    // property).
+    #[cfg(feature = "webrtc")]
+    if subject.contains(".forApp.call.accepted") {
+        if let Ok(event) = serde_json::from_slice::<serde_json::Value>(payload) {
+            if let Some(secret_b64) = event.get("shared_secret").and_then(|v| v.as_str()) {
+                if let Err(e) = crate::commands::calls::bind_shared_secret_to_active_call(
+                    state,
+                    secret_b64,
+                )
+                .await
+                {
+                    log::warn!("Failed to bind shared_secret from call.accepted: {}", e);
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "webrtc"))]
+    let _ = state;
 
     let event_payload = serde_json::json!({
         "subject": subject,

@@ -37,7 +37,7 @@
       return;
     }
     try {
-      await placeCall(connection.peer_guid, peerName(connection), type);
+      await placeCall(connection.connection_id, connection.peer_guid, peerName(connection), type);
     } catch (e) {
       callError = `Call failed: ${e}`;
     }

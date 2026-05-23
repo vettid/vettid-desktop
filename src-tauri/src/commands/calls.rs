@@ -1,21 +1,37 @@
 //! Tauri commands for WebRTC call signaling and (when the `webrtc` feature
 //! is enabled) media negotiation.
 //!
-//! The signaling layer publishes to the target user's vault using the same
-//! `OwnerSpace.{guid}.forVault.{op}` pattern Android uses. When `webrtc` is
-//! on, every call also drives a `webrtc::CallSession` that produces SDP +
-//! ICE candidates and forwards them via the same signaling path; without
-//! the feature, the commands act as bare signal forwarders so the call UX
-//! still works for end-to-end testing.
+//! ## Wire shape (post-2026-05-23 vault-routed rewrite)
 //!
-//! Incoming call events flow back through the Phase 1 listener as
-//! `vault:call-event` Tauri events. The frontend stores route them into
-//! incoming/outgoing/active state and call into the apply_remote_*
-//! commands below to feed remote SDP/ICE into the active session.
+//! Every call op funnels through the same encrypted device-op envelope
+//! the rest of the desktop uses: `execute("call.start", payload)` →
+//! `MessageSpace.{own}.forOwner.device` (encrypted with conn key) →
+//! vault's `handleDeviceOpRequest` sees `call.*` as an independent
+//! capability and rebuilds a synthetic `forVault.call.*` subject →
+//! `handleCallOperation` → `HandleInitiateCall` (etc.) → response wraps
+//! under `data:` and lands on `MessageSpace.{own}.forApp.device.{conn}
+//! .response`, where `listener.rs::handle_response_message` resolves it
+//! by `request_id`.
+//!
+//! The vault generates the X25519 keypair, holds the per-call shared
+//! secret, encrypts peer signaling on the wire, and tracks active-call
+//! state — so the desktop only needs to (a) feed call control through
+//! `execute()` and (b) wire the WebRTC SDP/ICE exchange through
+//! `call.signal`. No more direct-to-peer `publish_to_target_vault`.
+//!
+//! Incoming peer events arrive as `vault:call-event` Tauri emits driven
+//! by the same listener: `call.incoming`, `call.offer`, `call.answer`,
+//! `call.candidate`, `call.accepted`, `call.cancelled`, `call.ended`.
+//! The listener also intercepts `call.accepted` to bind the per-call
+//! `shared_secret` into the active session's `CryptorConfig` without
+//! the secret crossing the JS boundary (see Phase C).
 
 use serde::Serialize;
+use serde_json::json;
 use tauri::{AppHandle, State};
 
+use crate::nats::messages::DeviceOpResponse;
+use crate::nats::operations;
 use crate::state::AppState;
 
 #[cfg(feature = "webrtc")]
@@ -48,116 +64,142 @@ impl CallSignalResponse {
     }
 }
 
-/// Build the VaultMessage envelope that wraps signaling payloads.
+/// Pull the vault-issued call_id out of a `call.start` response.
 ///
-/// Format matches Android's `VaultMessage`: a small JSON object with `id`,
-/// `type`, `payload`, and `timestamp`. The vault validates the type and
-/// relays an event to the recipient's `forApp.call.*` channel.
-fn build_envelope(
-    request_id: &str,
-    msg_type: &str,
-    payload: serde_json::Value,
-) -> Result<Vec<u8>, String> {
-    let envelope = serde_json::json!({
-        "id": request_id,
-        "type": msg_type,
-        "payload": payload,
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-    });
-    serde_json::to_vec(&envelope).map_err(|e| format!("encode envelope: {}", e))
+/// Vault returns `InitiateCallResponse{call_id, status, local_key_pub,
+/// initiated_at}` under the device-op envelope's `data:` wrapper.
+fn extract_call_id(resp: &DeviceOpResponse) -> Result<String, String> {
+    let data = resp
+        .data
+        .as_ref()
+        .ok_or_else(|| "vault response missing data".to_string())?;
+    data.get("call_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "vault response missing call_id".to_string())
 }
 
-/// Publish a signaling message to the target user's vault.
-async fn publish_signal(
+/// Bind a base64-encoded 32-byte per-call shared secret into the active
+/// session's frame cryptor. Used by both:
+///
+/// - The callee side, right after `execute("call.accept", ...)` returns
+///   with `AcceptCallResponse.shared_secret`.
+/// - The caller side, when the listener intercepts the `call.accepted`
+///   push event (which carries `shared_secret` at the root of the
+///   forwarded CallEvent).
+///
+/// Empty input is a no-op (peer hadn't sent its key yet — the other
+/// arrival path will deliver it). The secret never enters the JS layer.
+#[cfg(feature = "webrtc")]
+pub(crate) async fn bind_shared_secret_to_active_call(
     state: &AppState,
-    target_guid: &str,
-    operation: &str,
-    payload: serde_json::Value,
-) -> Result<String, String> {
-    let request_id = hex::encode(crate::crypto::keys::generate_random_bytes(16));
+    secret_b64: &str,
+) -> Result<(), String> {
+    if secret_b64.is_empty() {
+        return Ok(());
+    }
+    let secret_bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        secret_b64,
+    )
+    .map_err(|e| format!("shared_secret base64: {}", e))?;
+    let secret: [u8; 32] = secret_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "shared_secret must be 32 bytes".to_string())?;
 
-    // Add caller_id from our own credentials so the recipient knows who's
-    // ringing without trusting client-supplied claims. The vault re-checks
-    // this anyway, but it short-circuits trivial spoofing.
-    let payload = {
-        let creds = state.credentials.read().await;
-        let caller_id = creds.as_ref().map(|c| c.owner_guid.clone()).unwrap_or_default();
-        let mut p = payload;
-        if let serde_json::Value::Object(ref mut map) = p {
-            map.entry("caller_id")
-                .or_insert(serde_json::Value::String(caller_id));
+    let slot = state.active_call.lock().await;
+    if let Some(session) = slot.as_ref() {
+        if let Some(cryptor) = session.cryptor() {
+            cryptor.set_key_from_secret(&secret).await;
+            log::debug!("Bound per-call shared_secret to cryptor for {}", session.call_id);
         }
-        p
-    };
-
-    let envelope = build_envelope(&request_id, operation, payload)?;
-    let nats = state.nats.lock().await;
-    nats.publish_to_target_vault(target_guid, operation, &envelope)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(request_id)
+    }
+    Ok(())
 }
 
-/// Initiate an outgoing call to a peer.
+/// Initiate an outgoing call to a connection.
 ///
-/// With `--features webrtc`: creates a CallSession, generates an SDP offer,
-/// and includes it in the published signal — the caller-supplied
-/// `sdp_offer` arg is ignored since we own the negotiation. Without the
-/// feature: sends `sdp_offer` through unchanged, useful for testing the
-/// signaling path without media.
+/// Flow:
+/// 1. `execute("call.start", {connection_id, metadata})` — vault returns
+///    the call_id (vault-issued, not desktop-minted) and publishes the
+///    encrypted `call.initiate` event to the peer.
+/// 2. With `--features webrtc`: start a `CallSession` with that call_id,
+///    generate an SDP offer, and ship it via
+///    `execute("call.signal", {call_id, signal_type:"offer", payload:
+///    {sdp}})`. Vault encrypts and forwards to peer as `call.offer`.
 #[tauri::command]
-#[cfg_attr(feature = "webrtc", allow(unused_variables))]
+#[cfg_attr(not(feature = "webrtc"), allow(unused_variables))]
 pub async fn initiate_call(
     state: State<'_, AppState>,
     app_handle: AppHandle,
-    target_guid: String,
+    connection_id: String,
+    peer_guid: String,
     display_name: String,
     call_type: String, // "audio" | "video"
-    sdp_offer: Option<String>,
 ) -> Result<CallSignalResponse, String> {
-    let call_id = format!("call-{}", uuid_v4());
-
-    // When WebRTC is compiled in, ignore the caller-supplied SDP and
-    // generate one from a fresh CallSession instead.
-    #[cfg(feature = "webrtc")]
-    let sdp_offer = match start_call_session(&state, &app_handle, &call_id, &target_guid, true).await {
-        Ok(sdp) => Some(sdp),
+    // Step 1 — vault-issue the call_id.
+    let metadata = json!({
+        "call_type": call_type,
+        "caller_display_name": display_name,
+    });
+    let resp = match operations::execute(
+        &state,
+        "call.start",
+        json!({
+            "connection_id": connection_id,
+            "metadata": metadata,
+        }),
+    )
+    .await
+    {
+        Ok(r) if r.success => r,
+        Ok(r) => return Ok(CallSignalResponse::err(
+            r.error.unwrap_or_else(|| "call.start failed".to_string()),
+        )),
+        Err(e) => return Ok(CallSignalResponse::err(e.to_string())),
+    };
+    let call_id = match extract_call_id(&resp) {
+        Ok(id) => id,
         Err(e) => return Ok(CallSignalResponse::err(e)),
     };
+
+    // Step 2 — start WebRTC session and ship the SDP offer.
+    #[cfg(feature = "webrtc")]
+    {
+        let offer = match start_call_session(&state, &app_handle, &call_id, &peer_guid).await {
+            Ok(o) => o,
+            Err(e) => return Ok(CallSignalResponse::err(e)),
+        };
+        if let Err(e) = send_signal(&state, &call_id, "offer", json!({ "sdp": offer })).await {
+            return Ok(CallSignalResponse::err(e));
+        }
+    }
     #[cfg(not(feature = "webrtc"))]
-    let _ = &app_handle; // suppress unused warning
-
-    let mut payload = serde_json::json!({
-        "call_id": call_id,
-        "caller_display_name": display_name,
-        "call_type": call_type,
-    });
-    if let Some(offer) = sdp_offer {
-        payload["sdp_offer"] = serde_json::Value::String(offer);
+    {
+        let _ = &app_handle;
+        let _ = &peer_guid;
     }
 
-    match publish_signal(&state, &target_guid, "call.initiate", payload).await {
-        Ok(_) => Ok(CallSignalResponse::ok(call_id)),
-        Err(e) => Ok(CallSignalResponse::err(e)),
-    }
+    Ok(CallSignalResponse::ok(call_id))
 }
 
 /// Accept an incoming call.
 ///
-/// With `--features webrtc`: requires the remote SDP offer (the frontend
-/// pulled it out of the `vault:call-event` payload), creates a CallSession,
-/// applies the offer, generates an answer, and ships the answer back —
-/// `sdp_answer` is ignored. With the feature off: publishes call.answer with
-/// whatever `sdp_answer` the caller passes through.
+/// `sdp_offer` is the SDP the listener buffered from the most recent
+/// `call.offer` push (frontend's `pendingRemoteOffer`). Backend creates
+/// the WebRTC session, applies the offer, generates an answer, and
+/// publishes `call.accept` carrying that answer. The vault's accept
+/// response includes the per-call `shared_secret` — bind it to the
+/// active session's cryptor on the spot.
 #[tauri::command]
-#[cfg_attr(feature = "webrtc", allow(unused_variables))]
+#[cfg_attr(not(feature = "webrtc"), allow(unused_variables))]
 pub async fn answer_call(
     state: State<'_, AppState>,
     app_handle: AppHandle,
     call_id: String,
     peer_guid: String,
     sdp_offer: Option<String>,
-    sdp_answer: Option<String>,
 ) -> Result<CallSignalResponse, String> {
     #[cfg(feature = "webrtc")]
     let sdp_answer = match sdp_offer {
@@ -168,30 +210,57 @@ pub async fn answer_call(
         None => return Ok(CallSignalResponse::err("WebRTC enabled but no SDP offer in payload")),
     };
     #[cfg(not(feature = "webrtc"))]
-    {
-        let _ = (&app_handle, &sdp_offer);
-    }
+    let sdp_answer: Option<String> = {
+        let _ = (&app_handle, &peer_guid, &sdp_offer);
+        None
+    };
 
-    let mut payload = serde_json::json!({ "call_id": call_id });
+    let mut payload = json!({ "call_id": call_id });
     if let Some(answer) = sdp_answer {
         payload["sdp_answer"] = serde_json::Value::String(answer);
     }
-    match publish_signal(&state, &peer_guid, "call.answer", payload).await {
-        Ok(_) => Ok(CallSignalResponse::ok(call_id)),
-        Err(e) => Ok(CallSignalResponse::err(e)),
+    let resp = match operations::execute(&state, "call.accept", payload).await {
+        Ok(r) if r.success => r,
+        Ok(r) => return Ok(CallSignalResponse::err(
+            r.error.unwrap_or_else(|| "call.accept failed".to_string()),
+        )),
+        Err(e) => return Ok(CallSignalResponse::err(e.to_string())),
+    };
+
+    // Bind the per-call shared_secret to the cryptor on the callee side.
+    // If absent (peer didn't include its key yet) the caller-side
+    // `call.accepted` push will deliver it via listener interception.
+    #[cfg(feature = "webrtc")]
+    if let Some(secret_b64) = resp
+        .data
+        .as_ref()
+        .and_then(|d| d.get("shared_secret"))
+        .and_then(|v| v.as_str())
+    {
+        if let Err(e) = bind_shared_secret_to_active_call(&state, secret_b64).await {
+            log::warn!("Failed to bind shared_secret on accept: {}", e);
+        }
     }
+
+    Ok(CallSignalResponse::ok(call_id))
 }
 
 #[tauri::command]
 pub async fn decline_call(
     state: State<'_, AppState>,
     call_id: String,
-    peer_guid: String,
+    reason: Option<String>,
 ) -> Result<CallSignalResponse, String> {
-    let payload = serde_json::json!({ "call_id": call_id, "reason": "declined" });
-    match publish_signal(&state, &peer_guid, "call.decline", payload).await {
-        Ok(_) => Ok(CallSignalResponse::ok(call_id)),
-        Err(e) => Ok(CallSignalResponse::err(e)),
+    let mut payload = json!({ "call_id": call_id });
+    if let Some(r) = reason {
+        payload["reason"] = serde_json::Value::String(r);
+    }
+    match operations::execute(&state, "call.reject", payload).await {
+        Ok(r) if r.success => Ok(CallSignalResponse::ok(call_id)),
+        Ok(r) => Ok(CallSignalResponse::err(
+            r.error.unwrap_or_else(|| "call.reject failed".to_string()),
+        )),
+        Err(e) => Ok(CallSignalResponse::err(e.to_string())),
     }
 }
 
@@ -199,7 +268,6 @@ pub async fn decline_call(
 pub async fn end_call(
     state: State<'_, AppState>,
     call_id: String,
-    peer_guid: String,
 ) -> Result<CallSignalResponse, String> {
     // Tear down the local session before we lose the chance — once the
     // peer publishes call.ended back at us, we'll be racing the listener.
@@ -211,14 +279,16 @@ pub async fn end_call(
         }
     }
 
-    let payload = serde_json::json!({ "call_id": call_id });
-    match publish_signal(&state, &peer_guid, "call.end", payload).await {
-        Ok(_) => Ok(CallSignalResponse::ok(call_id)),
-        Err(e) => Ok(CallSignalResponse::err(e)),
+    match operations::execute(&state, "call.end", json!({ "call_id": call_id })).await {
+        Ok(r) if r.success => Ok(CallSignalResponse::ok(call_id)),
+        Ok(r) => Ok(CallSignalResponse::err(
+            r.error.unwrap_or_else(|| "call.end failed".to_string()),
+        )),
+        Err(e) => Ok(CallSignalResponse::err(e.to_string())),
     }
 }
 
-/// Apply a remote SDP answer received via `call.answered`.
+/// Apply a remote SDP answer received via `call.accepted`.
 ///
 /// Caller-side only: the callee never receives an answer (it's the side
 /// generating one). No-op when the webrtc feature is disabled.
@@ -270,6 +340,37 @@ pub async fn apply_remote_ice(
 }
 
 // ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Ship one WebRTC signaling message through the vault's `call.signal` op.
+/// `signal_type` ∈ {"offer", "answer", "candidate"}. The `payload`
+/// shape is app-pair convention — see the table in `sframe-cryptor.md`
+/// for the contract Android and desktop share.
+async fn send_signal(
+    state: &AppState,
+    call_id: &str,
+    signal_type: &str,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    let resp = operations::execute(
+        state,
+        "call.signal",
+        json!({
+            "call_id": call_id,
+            "signal_type": signal_type,
+            "payload": payload,
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    if !resp.success {
+        return Err(resp.error.unwrap_or_else(|| format!("call.signal {} failed", signal_type)));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // WebRTC session helpers (feature-gated)
 // ---------------------------------------------------------------------------
 
@@ -280,9 +381,7 @@ async fn start_call_session(
     app_handle: &AppHandle,
     call_id: &str,
     peer_guid: &str,
-    is_caller: bool,
 ) -> Result<String, String> {
-    let _ = is_caller; // currently informational; will matter for stats/logs
     // Fetch fresh TURN credentials before we build the peer connection.
     // Empty vec falls back to STUN-only inside CallSession::new.
     let ice = turn::fetch_ice_servers(state).await;
@@ -292,11 +391,12 @@ async fn start_call_session(
         peer_guid.to_string(),
         tx,
         ice,
-        // TODO: pass Some(CryptorConfig::from_vault_secret(...)) once the
-        // vault signaling path delivers the per-call 32-byte shared secret.
-        // Until then the interceptor isn't installed and desktop↔Android
-        // calls go silent (Android reports MISSINGKEY).
-        None,
+        // Deferred-key cryptor: the per-call shared_secret arrives later
+        // via the `call.accepted` push (caller) or the `call.accept`
+        // response (callee). Until set, the interceptor drops outbound
+        // frames and surfaces empty inbound payloads — matches Android's
+        // `discardFrameWhenCryptorNotReady = true`.
+        Some(crate::webrtc::cryptor::CryptorConfig::new()),
     )
         .await
         .map_err(|e| e.to_string())?;
@@ -326,11 +426,7 @@ async fn accept_call_session(
         peer_guid.to_string(),
         tx,
         ice,
-        // TODO: pass Some(CryptorConfig::from_vault_secret(...)) once the
-        // vault signaling path delivers the per-call 32-byte shared secret.
-        // Until then the interceptor isn't installed and desktop↔Android
-        // calls go silent (Android reports MISSINGKEY).
-        None,
+        Some(crate::webrtc::cryptor::CryptorConfig::new()),
     )
         .await
         .map_err(|e| e.to_string())?;
@@ -349,7 +445,8 @@ async fn accept_call_session(
 /// Drain the SessionEvent channel forever (until the channel closes when
 /// the session drops). For each event:
 ///
-/// - `LocalIceCandidate` → publish `call.candidate` to the peer's vault.
+/// - `LocalIceCandidate` → publish via `call.signal` (signal_type=
+///   "candidate") to OWN vault, which encrypts and forwards to peer.
 /// - `ConnectionState` → emit `vault:call-state` to the UI.
 #[cfg(feature = "webrtc")]
 fn spawn_session_event_loop(
@@ -366,15 +463,11 @@ fn spawn_session_event_loop(
                 SessionEvent::LocalIceCandidate(candidate) => {
                     use tauri::Manager;
                     let state: tauri::State<'_, AppState> = app_handle.state();
-                    let payload = serde_json::json!({
-                        "call_id": session.call_id,
-                        "candidate": candidate,
-                    });
-                    if let Err(e) = publish_signal(
+                    if let Err(e) = send_signal(
                         &state,
-                        &session.peer_guid,
-                        "call.candidate",
-                        payload,
+                        &session.call_id,
+                        "candidate",
+                        candidate,
                     )
                     .await
                     {
@@ -384,7 +477,7 @@ fn spawn_session_event_loop(
                 SessionEvent::ConnectionState(label) => {
                     let _ = app_handle.emit(
                         "vault:call-state",
-                        &serde_json::json!({
+                        &json!({
                             "call_id": session.call_id,
                             "state": label,
                         }),
@@ -396,33 +489,18 @@ fn spawn_session_event_loop(
     });
 }
 
+/// Frontend-callable shim used by the older direct-publish path. Kept for
+/// the case where the WebRTC session has already negotiated ICE elsewhere
+/// and just wants to push a candidate; new code should use the
+/// `LocalIceCandidate` event loop above.
 #[tauri::command]
 pub async fn send_ice_candidate(
     state: State<'_, AppState>,
     call_id: String,
-    peer_guid: String,
     candidate: serde_json::Value,
 ) -> Result<CallSignalResponse, String> {
-    let payload = serde_json::json!({ "call_id": call_id, "candidate": candidate });
-    match publish_signal(&state, &peer_guid, "call.candidate", payload).await {
-        Ok(_) => Ok(CallSignalResponse::ok(call_id)),
+    match send_signal(&state, &call_id, "candidate", candidate).await {
+        Ok(()) => Ok(CallSignalResponse::ok(call_id)),
         Err(e) => Ok(CallSignalResponse::err(e)),
     }
-}
-
-/// Quick UUID v4 generator without pulling in another dep — random 128 bits
-/// formatted to the 8-4-4-4-12 layout. Good enough for client-generated call
-/// ids; the vault doesn't trust these for anything beyond correlation.
-fn uuid_v4() -> String {
-    let bytes = crate::crypto::keys::generate_random_bytes(16);
-    let mut b = [0u8; 16];
-    b.copy_from_slice(&bytes);
-    // Set version (4) and variant (RFC 4122) bits.
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
-    )
 }
