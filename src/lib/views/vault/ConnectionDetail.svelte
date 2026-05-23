@@ -10,9 +10,12 @@
         // returns to the conversation view; defaults to clearing the
         // selection (→ list) when used standalone.
         onBack?: () => void;
+        /** Hide the local identity header when embedded in
+         *  ConnectionWorkspace, which owns the workspace header. */
+        compact?: boolean;
     }
 
-    let { connection, onBack }: Props = $props();
+    let { connection, onBack, compact = false }: Props = $props();
     const handleBack = (): void => (onBack ?? clearSelectedConnection)();
 
     // svelte-ignore state_referenced_locally
@@ -84,11 +87,13 @@
 </script>
 
 <div class="detail">
-    <header class="bar">
-        <button class="back" onclick={handleBack} aria-label="Back">←</button>
-        <h3>{peerName(detail)}</h3>
-        <span class="status-badge {detail.status}">{detail.status}</span>
-    </header>
+    {#if !compact}
+        <header class="bar">
+            <button class="back" onclick={handleBack} aria-label="Back">←</button>
+            <h3>{peerName(detail)}</h3>
+            <span class="status-badge {detail.status}">{detail.status}</span>
+        </header>
+    {/if}
 
     {#if loading}
         <div class="status">Loading…</div>

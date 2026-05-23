@@ -11,9 +11,12 @@
     interface Props {
         connection: Connection;
         onShowProfile: () => void;
+        /** Hide the local identity header when embedded in
+         *  ConnectionWorkspace, which owns the workspace header. */
+        compact?: boolean;
     }
 
-    let { connection, onShowProfile }: Props = $props();
+    let { connection, onShowProfile, compact = false }: Props = $props();
 
     let messages = $state<Message[]>([]);
     let composeText = $state('');
@@ -191,16 +194,18 @@
 </script>
 
 <div class="conversation">
-    <header class="bar">
-        <button class="back" onclick={clearSelectedConnection} aria-label="Back">←</button>
-        <button class="header-name" onclick={onShowProfile}>
-            <span class="name">{peerName(connection)}</span>
-            <span class="profile-hint">view profile</span>
-        </button>
-        <button class="call-btn" onclick={() => startCall('audio')} aria-label="Voice call" title="Voice call">📞</button>
-        <button class="call-btn" onclick={() => startCall('video')} aria-label="Video call" title="Video call">🎥</button>
-        <span class="status-dot {connection.status}" aria-label={connection.status}></span>
-    </header>
+    {#if !compact}
+        <header class="bar">
+            <button class="back" onclick={clearSelectedConnection} aria-label="Back">←</button>
+            <button class="header-name" onclick={onShowProfile}>
+                <span class="name">{peerName(connection)}</span>
+                <span class="profile-hint">view profile</span>
+            </button>
+            <button class="call-btn" onclick={() => startCall('audio')} aria-label="Voice call" title="Voice call">📞</button>
+            <button class="call-btn" onclick={() => startCall('video')} aria-label="Video call" title="Video call">🎥</button>
+            <span class="status-dot {connection.status}" aria-label={connection.status}></span>
+        </header>
+    {/if}
 
     {#if loading && messages.length === 0}
         <div class="status">Loading…</div>
