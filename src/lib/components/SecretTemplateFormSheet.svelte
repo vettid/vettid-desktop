@@ -39,11 +39,20 @@
       case 'EMAIL': return 'email';
       case 'PHONE': return 'tel';
       case 'URL':   return 'url';
-      case 'NUMBER': return 'number';
+      // NUMBER intentionally stays as `text` with inputmode="numeric"
+      // below — `type=number` coerces bind:value to JS Number, which
+      // truncates 16-digit card numbers (precision loss above
+      // 9_007_199_254_740_991) and silently drops user spaces. text +
+      // inputmode keeps the digit-only keypad on mobile without
+      // touching the string value.
       case 'DATE':  return 'date';
       case 'EXPIRY_DATE': return 'month';
       default: return 'text';
     }
+  }
+
+  function inputMode(hint: FieldHint): 'numeric' | undefined {
+    return hint === 'NUMBER' ? 'numeric' : undefined;
   }
 
   async function save() {
@@ -128,7 +137,11 @@
           </button>
         </div>
       {:else}
-        <input type={inputType(f.hint)} bind:value={values[f.name]} />
+        <input
+          type={inputType(f.hint)}
+          inputmode={inputMode(f.hint)}
+          bind:value={values[f.name]}
+        />
       {/if}
     </label>
   {/each}

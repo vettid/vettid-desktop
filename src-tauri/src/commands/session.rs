@@ -4,6 +4,22 @@ use tauri::State;
 use crate::session::manager::SessionState;
 use crate::state::AppState;
 
+/// True if the NATS client is currently connected — the desktop's
+/// link to the vault. We surface this as `phone_reachable` because
+/// the only way the phone can hear from us is via NATS; a disconnected
+/// NATS means the phone cannot respond to approval prompts.
+///
+/// This is a proxy, not a direct heartbeat — until the vault sends a
+/// per-device phone-heartbeat push, link liveness is the best signal
+/// we have.
+async fn phone_reachable(state: &AppState) -> bool {
+    let client = state.nats.lock().await;
+    matches!(
+        client.connection_state(),
+        Some(async_nats::connection::State::Connected),
+    )
+}
+
 #[derive(Debug, Serialize)]
 pub struct SessionStatus {
     pub state: String,
@@ -26,22 +42,29 @@ pub struct SessionTimer {
 /// Get current session status from the SessionManager.
 #[tauri::command]
 pub async fn get_session_status(state: State<'_, AppState>) -> Result<SessionStatus, String> {
+    // Take the link-reachability snapshot first so we hold the NATS
+    // lock briefly and don't tangle it with the session read lock.
+    let reachable = phone_reachable(&state).await;
+
     let session_mgr = state.session.read().await;
     let current = session_mgr.state();
 
     match current {
         SessionState::Active { expires_at, session_id } => {
             let remaining = session_mgr.seconds_remaining().unwrap_or(0);
-            let info = session_mgr.session_info();
-
+            // extended_count: the vault doesn't track per-session
+            // extensions in DeviceSessionInfo today, so we report 0
+            // honestly rather than the misleading ttl_hours (which is
+            // a duration, not a count). When the vault grows an
+            // extensions counter this becomes `info.extensions`.
             Ok(SessionStatus {
                 state: "active".to_string(),
                 session_id: Some(session_id),
                 expires_at: Some(expires_at),
                 seconds_remaining: Some(remaining),
-                extended_count: info.map(|i| i.ttl_hours), // TODO: track extensions
+                extended_count: Some(0),
                 max_extensions: Some(3),
-                phone_reachable: true, // TODO: track from heartbeat
+                phone_reachable: reachable,
             })
         }
         SessionState::Suspended => Ok(SessionStatus {
@@ -51,7 +74,7 @@ pub async fn get_session_status(state: State<'_, AppState>) -> Result<SessionSta
             seconds_remaining: None,
             extended_count: None,
             max_extensions: None,
-            phone_reachable: false,
+            phone_reachable: reachable,
         }),
         SessionState::Expired => Ok(SessionStatus {
             state: "expired".to_string(),

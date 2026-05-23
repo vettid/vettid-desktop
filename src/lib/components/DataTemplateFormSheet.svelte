@@ -27,11 +27,17 @@
       case 'EMAIL': return 'email';
       case 'PHONE': return 'tel';
       case 'URL':   return 'url';
-      case 'NUMBER': return 'number';
+      // NUMBER stays as `text` with inputmode="numeric" — see
+      // SecretTemplateFormSheet for the rationale (precision loss
+      // on 16-digit values with bind:value over type=number).
       case 'DATE':  return 'date';
       case 'EXPIRY_DATE': return 'month';
       default: return 'text';
     }
+  }
+
+  function inputMode(hint: FieldHint): 'numeric' | undefined {
+    return hint === 'NUMBER' ? 'numeric' : undefined;
   }
 
   async function save() {
@@ -88,7 +94,11 @@
       {#if f.hint === 'NOTE'}
         <textarea bind:value={values[f.namespace]} rows="2"></textarea>
       {:else}
-        <input type={inputType(f.hint)} bind:value={values[f.namespace]} />
+        <input
+          type={inputType(f.hint)}
+          inputmode={inputMode(f.hint)}
+          bind:value={values[f.namespace]}
+        />
       {/if}
     </label>
   {/each}
