@@ -160,11 +160,22 @@ export interface ConnectedDevice {
 
 export interface CallHistoryEntry {
     call_id: string;
-    peer_display_name?: string;
-    call_type: 'audio' | 'video';
+    caller_id?: string;
+    callee_id?: string;
+    connection_id?: string;
+    call_type?: 'voice' | 'video';
     direction: 'incoming' | 'outgoing';
-    end_reason: 'completed' | 'missed' | 'rejected' | 'failed' | 'cancelled';
-    initiated_at: string;
+    status?: 'initiated' | 'answered' | 'missed' | 'rejected' | 'blocked';
+    started_at?: number;
+    answered_at?: number;
+    ended_at?: number;
+    duration_secs?: number;
+    block_reason?: string;
+    seen_at?: number;
+    /** Compatibility fields for older shapes. */
+    peer_display_name?: string;
+    end_reason?: 'completed' | 'missed' | 'rejected' | 'failed' | 'cancelled';
+    initiated_at?: string;
     duration?: number;
 }
 

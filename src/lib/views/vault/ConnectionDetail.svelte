@@ -2,7 +2,7 @@
     import { invoke } from '@tauri-apps/api/core';
     import { listen, type UnlistenFn } from '@tauri-apps/api/event';
     import { onMount } from 'svelte';
-    import type { Connection, VaultOpResponse, PublishedCatalogItem } from '../../types';
+    import type { Connection, VaultOpResponse, PublishedCatalogItem, CallHistoryEntry } from '../../types';
     import { clearSelectedConnection } from '../../stores/navigation';
     import { peerName } from '../../connectionName';
     import {
@@ -139,6 +139,61 @@
             presenceMsg = `Failed: ${e}`;
         }
         presenceBusy = false;
+    }
+
+    // Per-connection call history. Filter the global list on this
+    // connection_id — the vault returns the full list and we narrow
+    // here so we share the cache when the user navigates between
+    // connections in the same session.
+    let callHistory = $state<CallHistoryEntry[]>([]);
+    let callHistoryLoading = $state(false);
+
+    async function refreshCallHistory() {
+        callHistoryLoading = true;
+        try {
+            const resp: VaultOpResponse = await invoke('list_call_history');
+            if (resp.success && resp.data) {
+                const data = resp.data as { calls?: CallHistoryEntry[]; entries?: CallHistoryEntry[] };
+                const all = data.calls ?? data.entries ?? [];
+                callHistory = all
+                    .filter((c) => c.connection_id === connection.connection_id)
+                    .sort((a, b) => (b.started_at ?? 0) - (a.started_at ?? 0))
+                    .slice(0, 20);
+            }
+        } catch (e) {
+            console.warn('list_call_history failed', e);
+        }
+        callHistoryLoading = false;
+    }
+
+    $effect(() => {
+        const _ = connection.connection_id;
+        void refreshCallHistory();
+    });
+
+    function fmtCallTime(unix?: number): string {
+        if (!unix) return '';
+        const date = new Date(unix * 1000);
+        const today = new Date();
+        if (date.toDateString() === today.toDateString()) {
+            return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+        }
+        return date.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    }
+
+    function fmtDuration(secs?: number): string {
+        if (!secs || secs < 1) return '';
+        const m = Math.floor(secs / 60);
+        const s = secs % 60;
+        if (m === 0) return `${s}s`;
+        return `${m}m ${s}s`;
+    }
+
+    function callIcon(c: CallHistoryEntry): string {
+        if (c.status === 'missed') return '📵';
+        if (c.status === 'rejected') return '✗';
+        if (c.direction === 'incoming') return '⬇';
+        return '⬆';
     }
 
     async function refreshDetail() {
@@ -443,6 +498,39 @@
                 </dl>
             </section>
 
+            <!-- Call history (per-connection) -->
+            {#if callHistory.length > 0 || callHistoryLoading}
+                <section class="card">
+                    <h4>Recent calls</h4>
+                    {#if callHistoryLoading && callHistory.length === 0}
+                        <div class="ch-status">Loading…</div>
+                    {:else if callHistory.length === 0}
+                        <div class="ch-status">No calls yet.</div>
+                    {:else}
+                        <ul class="ch-list">
+                            {#each callHistory as call (call.call_id)}
+                                <li class="ch-row">
+                                    <span class="ch-icon" class:missed={call.status === 'missed'}>{callIcon(call)}</span>
+                                    <div class="ch-body">
+                                        <div class="ch-head-line">
+                                            <span class="ch-type">{call.call_type === 'video' ? 'Video' : 'Voice'}</span>
+                                            {#if call.status === 'missed'}<span class="ch-status-tag missed">missed</span>
+                                            {:else if call.status === 'rejected'}<span class="ch-status-tag">declined</span>
+                                            {/if}
+                                        </div>
+                                        <div class="ch-meta">
+                                            {call.direction === 'incoming' ? 'Incoming' : 'Outgoing'}
+                                            {#if call.duration_secs}· {fmtDuration(call.duration_secs)}{/if}
+                                        </div>
+                                    </div>
+                                    <div class="ch-time">{fmtCallTime(call.started_at)}</div>
+                                </li>
+                            {/each}
+                        </ul>
+                    {/if}
+                </section>
+            {/if}
+
             <!-- Manage -->
             <section class="card">
                 <h4>Manage</h4>
@@ -661,6 +749,38 @@
     }
     .presence-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
     .presence-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .ch-status {
+        font-size: 0.85em;
+        color: var(--text-secondary);
+        padding: 6px 0;
+    }
+    .ch-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 4px; }
+    .ch-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 6px 0;
+        border-bottom: 1px solid rgba(255,255,255,0.04);
+    }
+    .ch-row:last-child { border-bottom: none; }
+    .ch-icon { font-size: 1.1em; color: var(--text-secondary); flex-shrink: 0; width: 22px; text-align: center; }
+    .ch-icon.missed { color: #ef5350; }
+    .ch-body { flex: 1; min-width: 0; }
+    .ch-head-line { display: flex; gap: 8px; align-items: baseline; }
+    .ch-type { font-size: 0.92em; }
+    .ch-status-tag {
+        font-size: 0.68em;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--text-secondary);
+        border: 1px solid var(--border);
+        border-radius: 3px;
+        padding: 1px 5px;
+    }
+    .ch-status-tag.missed { color: #ef5350; border-color: rgba(244,67,54,0.45); }
+    .ch-meta { font-size: 0.75em; color: var(--text-secondary); margin-top: 1px; }
+    .ch-time { font-size: 0.78em; color: var(--text-secondary); flex-shrink: 0; }
     .action-ghost {
         background: transparent;
         color: var(--text);
