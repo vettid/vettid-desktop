@@ -3,6 +3,10 @@
   import { onMount } from 'svelte';
   import ConfirmDialog from '../../components/ConfirmDialog.svelte';
   import { buildAliasGroups } from '../../aliasGroups';
+  import { DATA_TEMPLATES } from '../../personalDataTemplates';
+  import type { DataTemplate } from '../../personalDataTemplates';
+  import TemplateChooserSheet from '../../components/TemplateChooserSheet.svelte';
+  import DataTemplateFormSheet from '../../components/DataTemplateFormSheet.svelte';
 
   // PersonalData renders inside the Vault tab panel — the profile
   // header + tab nav sit above us, so this view stays focused on
@@ -267,12 +271,33 @@
       deleteTarget = null;
     }
   }
+
+  // --- Phase 2: template chooser + per-template form. The + Add
+  //     buttons open the chooser; picking a multi-field template
+  //     opens its dedicated form; "Custom Field" falls through to
+  //     the existing single-field add modal.
+  let chooserOpen = $state(false);
+  let selectedTemplate = $state<DataTemplate | null>(null);
+
+  function openChooser() { chooserOpen = true; }
+  function closeChooser() { chooserOpen = false; }
+  function onChooserPick(id: string) {
+    chooserOpen = false;
+    if (id === 'custom') { startAdd(); return; }
+    const t = DATA_TEMPLATES.find((x) => x.id === id);
+    if (t) selectedTemplate = t;
+  }
+  function closeTemplateForm() { selectedTemplate = null; }
+  async function onTemplateSaved() {
+    selectedTemplate = null;
+    await load();
+  }
 </script>
 
 <div class="pd-view">
   <header>
     <h1>Personal data {#if refreshing}<span class="refresh-dot" title="Refreshing"></span>{/if}</h1>
-    <button class="add-btn" onclick={startAdd}>+ Add</button>
+    <button class="add-btn" onclick={openChooser}>+ Add</button>
   </header>
 
   {#if loading}
@@ -303,7 +328,7 @@
     {#if grouped.length === 0 && !(firstName || lastName || email)}
       <div class="empty">
         <p>No personal data yet.</p>
-        <button class="add-btn-inline" onclick={startAdd}>Add your first field</button>
+        <button class="add-btn-inline" onclick={openChooser}>Add your first field</button>
       </div>
     {/if}
   {/if}
@@ -345,6 +370,23 @@
       <p class="hint" style="margin-top: 8px;">Approve on your phone to complete the change.</p>
     {/if}
   </div>
+{/if}
+
+{#if chooserOpen}
+  <TemplateChooserSheet
+    title="Add personal data"
+    templates={DATA_TEMPLATES}
+    onPick={onChooserPick}
+    onClose={closeChooser}
+  />
+{/if}
+
+{#if selectedTemplate}
+  <DataTemplateFormSheet
+    template={selectedTemplate}
+    onClose={closeTemplateForm}
+    onSaved={onTemplateSaved}
+  />
 {/if}
 
 <ConfirmDialog

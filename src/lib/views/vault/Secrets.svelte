@@ -3,6 +3,10 @@
   import { onMount } from 'svelte';
   import { secretsUnlockStore, isSecretsUnlocked } from '../../stores/secrets';
   import { buildAliasGroups } from '../../aliasGroups';
+  import { SECRET_TEMPLATES } from '../../secretTemplates';
+  import type { SecretTemplate } from '../../secretTemplates';
+  import TemplateChooserSheet from '../../components/TemplateChooserSheet.svelte';
+  import SecretTemplateFormSheet from '../../components/SecretTemplateFormSheet.svelte';
 
   // Module-level cache so navigating away + back paints from the
   // snapshot instead of re-fetching.
@@ -247,12 +251,33 @@
       addSaving = false;
     }
   }
+
+  // --- Phase 2: template chooser + per-template form. The + Add
+  //     button opens the chooser; picking a template opens its
+  //     dedicated form; "Custom Field" falls through to the existing
+  //     Phase-1 custom-secret modal.
+  let chooserOpen = $state(false);
+  let selectedTemplate = $state<SecretTemplate | null>(null);
+
+  function openChooser() { chooserOpen = true; }
+  function closeChooser() { chooserOpen = false; }
+  function onChooserPick(id: string) {
+    chooserOpen = false;
+    if (id === 'custom') { openAddSecret(); return; }
+    const t = SECRET_TEMPLATES.find((x) => x.id === id);
+    if (t) selectedTemplate = t;
+  }
+  function closeTemplateForm() { selectedTemplate = null; }
+  async function onTemplateSaved() {
+    selectedTemplate = null;
+    await load();
+  }
 </script>
 
 <div class="secrets-view">
   <header>
     <h1>Secrets {#if refreshing}<span class="refresh-dot" title="Refreshing"></span>{/if}</h1>
-    <button class="add-btn" onclick={openAddSecret}>+ Add</button>
+    <button class="add-btn" onclick={openChooser}>+ Add</button>
   </header>
 
   {#if loading}
@@ -366,6 +391,23 @@
       <p class="hint" style="margin-top: 8px;">Approve on your phone to complete the change.</p>
     {/if}
   </div>
+{/if}
+
+{#if chooserOpen}
+  <TemplateChooserSheet
+    title="Add secret"
+    templates={SECRET_TEMPLATES}
+    onPick={onChooserPick}
+    onClose={closeChooser}
+  />
+{/if}
+
+{#if selectedTemplate}
+  <SecretTemplateFormSheet
+    template={selectedTemplate}
+    onClose={closeTemplateForm}
+    onSaved={onTemplateSaved}
+  />
 {/if}
 
 <!-- One secret row. `inGroup` drops the alias from the name (the card
