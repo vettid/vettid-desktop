@@ -513,6 +513,24 @@ pub async fn authenticate_connection(
     Ok(VaultOpResponse::from_op(result))
 }
 
+/// Read cached verify-identity state for one connection. Returns the
+/// last outbound + inbound outcomes (timestamps, ok/failed, reason) so
+/// the Detail screen can render "Verified 3 minutes ago" without a
+/// fresh challenge. Vault is the source of truth — survives PIN-lock
+/// and re-seal.
+#[tauri::command]
+pub async fn get_connection_verify_state(
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(
+        &state,
+        "connection-authenticate.get",
+        serde_json::json!({ "connection_id": connection_id }),
+    ).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
 /// Delete personal-data fields by namespace (phone-required). The vault
 /// keys storage as `personal-data/<namespace>`, so for aliased fields
 /// the composite key (e.g. `contact.phone.mobile::Wife`) is passed

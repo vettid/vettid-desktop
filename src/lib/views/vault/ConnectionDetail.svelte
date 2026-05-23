@@ -1,8 +1,26 @@
 <script lang="ts">
     import { invoke } from '@tauri-apps/api/core';
+    import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+    import { onMount } from 'svelte';
     import type { Connection, VaultOpResponse } from '../../types';
     import { clearSelectedConnection } from '../../stores/navigation';
     import { peerName } from '../../connectionName';
+
+    /**
+     * Cached verify-identity state from the vault. Mirrors the
+     * `CachedVerifyState` struct in
+     * enclave/vault-manager/connection_verify_state.go. Survives PIN-lock
+     * and re-seal so the Detail row can render "Verified 3 minutes ago"
+     * without round-tripping the peer.
+     */
+    interface VerifyState {
+        last_outbound_at?: string;
+        last_outbound_ok?: boolean;
+        last_outbound_reason?: string;
+        last_inbound_at?: string;
+        last_inbound_ok?: boolean;
+        last_inbound_reason?: string;
+    }
 
     interface Props {
         connection: Connection;
@@ -23,12 +41,15 @@
     let loading = $state(false);
     let error = $state('');
 
+    let verifyState = $state<VerifyState | null>(null);
+
     // Resync local `detail` when the parent swaps to a different connection
     // (and trigger a fresh fetch). Without this the warning fires because
     // `$state` would otherwise only capture the prop's initial value.
     $effect(() => {
         detail = connection;
         refreshDetail();
+        refreshVerifyState();
     });
 
     async function refreshDetail() {
@@ -48,6 +69,70 @@
             error = String(e);
         }
         loading = false;
+    }
+
+    /**
+     * Re-fetch cached verify state from the vault. Called on screen
+     * entry and again whenever a connection-event push arrives — the
+     * `connection.authenticate-result` subject lands here once the peer
+     * has signed (or refused) the challenge.
+     */
+    async function refreshVerifyState() {
+        try {
+            const resp: VaultOpResponse = await invoke('get_connection_verify_state', {
+                connectionId: connection.connection_id,
+            });
+            if (resp.success && resp.data) {
+                const data = resp.data as { state?: VerifyState };
+                verifyState = data.state ?? null;
+            }
+        } catch {
+            // Best-effort — leave prior state in place on transient errors.
+        }
+    }
+
+    // Listen for connection.authenticate-result pushes (and any other
+    // connection lifecycle event) and refresh verify state if the event
+    // is for the currently selected connection. The Rust listener routes
+    // all `forApp.connection.*` subjects through `vault:connection-event`.
+    let unlistenConnection: UnlistenFn | null = null;
+    onMount(() => {
+        let stale = false;
+        listen<{ subject: string; payload_b64: string }>('vault:connection-event', (event) => {
+            const subject = event.payload?.subject ?? '';
+            // Only refresh on verify-relevant subjects — connection.peer-accepted,
+            // .activated, .key-exchanged, etc., never touch verify-state.
+            if (!subject.includes('authenticate')) return;
+            // The decoded payload carries the connection_id; refetch
+            // unconditionally for the current connection regardless,
+            // because the vault has the authoritative timestamp.
+            void refreshVerifyState();
+        }).then((fn) => {
+            if (stale) fn();
+            else unlistenConnection = fn;
+        });
+        return () => {
+            stale = true;
+            unlistenConnection?.();
+            unlistenConnection = null;
+        };
+    });
+
+    /** "3 minutes ago"-style relative timestamp for the verify-state row. */
+    function relativeTime(iso: string): string {
+        if (!iso) return '';
+        const then = new Date(iso).getTime();
+        if (isNaN(then)) return '';
+        const diff = Date.now() - then;
+        const sec = Math.floor(diff / 1000);
+        if (sec < 60) return 'just now';
+        const min = Math.floor(sec / 60);
+        if (min < 60) return `${min} minute${min === 1 ? '' : 's'} ago`;
+        const hr = Math.floor(min / 60);
+        if (hr < 24) return `${hr} hour${hr === 1 ? '' : 's'} ago`;
+        const day = Math.floor(hr / 24);
+        if (day < 30) return `${day} day${day === 1 ? '' : 's'} ago`;
+        return new Date(iso).toLocaleDateString();
     }
 
     function formatField(key: string, value: unknown): string {
@@ -210,16 +295,29 @@
                 <h4>Manage</h4>
 
                 <div class="action-group">
-                    <button
-                        class="action-ghost"
-                        onclick={verifyIdentity}
-                        disabled={detail.status !== 'active' || verifying}
-                    >{verifying ? 'Challenging…' : 'Verify identity'}</button>
+                    <div class="action-row">
+                        <button
+                            class="action-ghost"
+                            onclick={verifyIdentity}
+                            disabled={detail.status !== 'active' || verifying}
+                        >{verifying ? 'Challenging…' : 'Verify identity'}</button>
+                        {#if verifyState?.last_outbound_at}
+                            <span class="verify-pill {verifyState.last_outbound_ok ? 'ok' : 'failed'}">
+                                {verifyState.last_outbound_ok ? '✓ Verified' : '✗ Failed'}
+                                · {relativeTime(verifyState.last_outbound_at)}
+                            </span>
+                        {:else}
+                            <span class="verify-pill neutral">Not yet verified</span>
+                        {/if}
+                    </div>
                     <p class="hint">
                         Challenge the peer to prove they still hold the
                         private key that bound this connection. Phone
                         approval required.
                     </p>
+                    {#if verifyState?.last_outbound_at && !verifyState.last_outbound_ok && verifyState.last_outbound_reason}
+                        <p class="action-msg failed">Reason: {verifyState.last_outbound_reason}</p>
+                    {/if}
                     {#if verifyMessage}<p class="action-msg">{verifyMessage}</p>{/if}
                 </div>
 
@@ -316,6 +414,19 @@
 
     .action-group { margin-bottom: 14px; }
     .action-group:last-child { margin-bottom: 0; }
+    .action-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .verify-pill {
+        font-size: 0.75em;
+        padding: 3px 9px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        color: var(--text-secondary);
+        white-space: nowrap;
+    }
+    .verify-pill.ok { background: rgba(46, 125, 50, 0.18); color: #4caf50; border-color: rgba(46, 125, 50, 0.4); }
+    .verify-pill.failed { background: rgba(198, 40, 40, 0.18); color: #ef5350; border-color: rgba(198, 40, 40, 0.4); }
+    .verify-pill.neutral { background: transparent; }
+    .action-msg.failed { color: #ef5350; }
     .action-ghost {
         background: transparent;
         color: var(--text);

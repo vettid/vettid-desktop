@@ -103,6 +103,7 @@ pub fn run() {
             vault::delete_personal_data_fields,
             vault::rotate_connection_keys,
             vault::authenticate_connection,
+            vault::get_connection_verify_state,
             vault::cast_vote,
             vault::send_btc,
             vault::send_message,
