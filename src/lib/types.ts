@@ -54,9 +54,26 @@ export interface Connection {
 export interface PeerProfile {
     first_name?: string;
     last_name?: string;
+    full_name?: string;
     email?: string;
     photo?: string;
     fields?: Record<string, { display_name: string; value: string }>;
+    /** Items the peer has published in their data catalog — metadata
+     *  only, no values. Used by the peer-catalog surface to offer
+     *  "Request access" actions. */
+    data_catalog?: PublishedCatalogItem[];
+    /** Items the peer has published in their secret catalog — metadata
+     *  only, values never travel here. */
+    secret_catalog?: PublishedCatalogItem[];
+}
+
+export interface PublishedCatalogItem {
+    name: string;
+    display_name?: string;
+    field_type?: string;
+    type?: string;
+    category?: string;
+    alias?: string;
 }
 
 export interface Message {

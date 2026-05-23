@@ -15,9 +15,11 @@
   import Session from './lib/views/Session.svelte';
   import Vault from './lib/views/Vault.svelte';
   import Connections from './lib/views/Connections.svelte';
+  import Sharing from './lib/views/Sharing.svelte';
   import Settings from './lib/views/Settings.svelte';
   import TopBar from './lib/components/TopBar.svelte';
   import CallOverlay from './lib/components/CallOverlay.svelte';
+  import DataGrantApprovalModal from './lib/components/DataGrantApprovalModal.svelte';
 
   // Top-level destinations the user navigates between explicitly.
   // Takeover routes (`pairing`, `expired`, `session-detail`) hide the
@@ -30,6 +32,7 @@
     | 'session-detail'
     | 'vault'
     | 'connections'
+    | 'sharing'
     | 'settings';
 
   // Start on a neutral loading view, NOT pairing. On launch the
@@ -196,6 +199,12 @@
           e.preventDefault();
         }
         break;
+      case '3':
+        if (sessionState.state === 'active') {
+          currentView = 'sharing';
+          e.preventDefault();
+        }
+        break;
       case ',':
         onSettingsClick();
         e.preventDefault();
@@ -252,6 +261,20 @@
           </svg>
           <span>Vault</span>
         </button>
+        <button
+          class="rail-item"
+          class:active={currentView === 'sharing'}
+          onclick={() => currentView = 'sharing'}
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="18" cy="5" r="3" />
+            <circle cx="6" cy="12" r="3" />
+            <circle cx="18" cy="19" r="3" />
+            <line x1="8.59" y1="13.51" x2="15.42" y2="17.49" />
+            <line x1="15.41" y1="6.51" x2="8.59" y2="10.49" />
+          </svg>
+          <span>Sharing</span>
+        </button>
       </nav>
     {/if}
 
@@ -264,6 +287,8 @@
         <Vault />
       {:else if currentView === 'connections'}
         <Connections />
+      {:else if currentView === 'sharing'}
+        <Sharing />
       {:else if currentView === 'session-detail'}
         <Session />
       {:else if currentView === 'settings'}
@@ -274,6 +299,12 @@
 
   <!-- Global call overlay — present in any view -->
   <CallOverlay />
+
+  <!-- Global data-grant approval modal — auto-appears when a peer
+       sends an incoming grant request. -->
+  {#if sessionState.state === 'active'}
+    <DataGrantApprovalModal />
+  {/if}
 </div>
 {/if}
 

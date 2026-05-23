@@ -584,3 +584,208 @@ pub async fn request_payment(
     let result = operations::execute(&state, "wallet.request-payment", params).await;
     Ok(VaultOpResponse::from_op(result))
 }
+
+// ---------------------------------------------------------------------------
+// Data-sharing — grants, share policies, presence overrides, location
+// sharing. All ops in DeviceIndependentCapabilities (no phone approval
+// gate — they're metadata operations or already require an out-of-band
+// approval flow on top).
+// ---------------------------------------------------------------------------
+
+/// Request access to a single item on a peer's published catalog.
+/// `mode` ∈ {"one-shot","renewable","agent-renewable"}.
+#[tauri::command]
+pub async fn grant_request(
+    state: State<'_, AppState>,
+    connection_id: String,
+    item_kind: String,
+    item_ref: String,
+    item_label: String,
+    mode: String,
+    requested_expires_at: Option<i64>,
+    requested_max_uses: Option<i32>,
+    reason: Option<String>,
+) -> Result<VaultOpResponse, String> {
+    let mut params = serde_json::json!({
+        "connection_id": connection_id,
+        "item_kind": item_kind,
+        "item_ref": item_ref,
+        "item_label": item_label,
+        "mode": mode,
+        "deliver_to": "self",
+    });
+    if let Some(v) = requested_expires_at { params["requested_expires_at"] = serde_json::json!(v); }
+    if let Some(v) = requested_max_uses { params["requested_max_uses"] = serde_json::json!(v); }
+    if let Some(v) = reason { params["reason"] = serde_json::json!(v); }
+    let result = operations::execute(&state, "grant.request", params).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+/// Request a group of items in one approval bundle. `items` is an array
+/// of `{item_kind, item_ref, item_label}` objects.
+#[tauri::command]
+pub async fn grant_request_group(
+    state: State<'_, AppState>,
+    connection_id: String,
+    items: Vec<serde_json::Value>,
+    mode: String,
+    requested_expires_at: Option<i64>,
+    requested_max_uses: Option<i32>,
+    reason: Option<String>,
+) -> Result<VaultOpResponse, String> {
+    let mut params = serde_json::json!({
+        "connection_id": connection_id,
+        "items": items,
+        "mode": mode,
+        "deliver_to": "self",
+    });
+    if let Some(v) = requested_expires_at { params["requested_expires_at"] = serde_json::json!(v); }
+    if let Some(v) = requested_max_uses { params["requested_max_uses"] = serde_json::json!(v); }
+    if let Some(v) = reason { params["reason"] = serde_json::json!(v); }
+    let result = operations::execute(&state, "grant.request", params).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+#[tauri::command]
+pub async fn grant_approve(
+    state: State<'_, AppState>,
+    request_id: String,
+    expires_at: Option<i64>,
+    max_uses: Option<i32>,
+    mode: Option<String>,
+) -> Result<VaultOpResponse, String> {
+    let mut params = serde_json::json!({ "request_id": request_id });
+    if let Some(v) = expires_at { params["expires_at"] = serde_json::json!(v); }
+    if let Some(v) = max_uses { params["max_uses"] = serde_json::json!(v); }
+    if let Some(v) = mode { params["mode"] = serde_json::json!(v); }
+    let result = operations::execute(&state, "grant.approve", params).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+#[tauri::command]
+pub async fn grant_deny(
+    state: State<'_, AppState>,
+    request_id: String,
+    reason: Option<String>,
+) -> Result<VaultOpResponse, String> {
+    let mut params = serde_json::json!({ "request_id": request_id });
+    if let Some(v) = reason { params["reason"] = serde_json::json!(v); }
+    let result = operations::execute(&state, "grant.deny", params).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+#[tauri::command]
+pub async fn grant_revoke(
+    state: State<'_, AppState>,
+    grant_id: String,
+    reason: Option<String>,
+) -> Result<VaultOpResponse, String> {
+    let mut params = serde_json::json!({ "grant_id": grant_id });
+    if let Some(v) = reason { params["reason"] = serde_json::json!(v); }
+    let result = operations::execute(&state, "grant.revoke", params).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+#[tauri::command]
+pub async fn grant_list_pending(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(&state, "grant.list-pending", serde_json::json!({})).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+#[tauri::command]
+pub async fn grant_list_inbound(
+    state: State<'_, AppState>,
+    connection_id: Option<String>,
+) -> Result<VaultOpResponse, String> {
+    let mut params = serde_json::json!({});
+    if let Some(c) = connection_id { params["connection_id"] = serde_json::json!(c); }
+    let result = operations::execute(&state, "grant.list-inbound", params).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+#[tauri::command]
+pub async fn grant_list_outbound(
+    state: State<'_, AppState>,
+    connection_id: Option<String>,
+) -> Result<VaultOpResponse, String> {
+    let mut params = serde_json::json!({});
+    if let Some(c) = connection_id { params["connection_id"] = serde_json::json!(c); }
+    let result = operations::execute(&state, "grant.list-outbound", params).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+/// List requests *I* sent to peers — both pending and resolved.
+#[tauri::command]
+pub async fn grant_list_my_requests(
+    state: State<'_, AppState>,
+    connection_id: Option<String>,
+) -> Result<VaultOpResponse, String> {
+    let mut params = serde_json::json!({});
+    if let Some(c) = connection_id { params["connection_id"] = serde_json::json!(c); }
+    let result = operations::execute(&state, "grant.list-my-requests", params).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+/// Fetch the actual referenced value for an approved grant (one use
+/// against `max_uses`). Returns the decrypted value the peer authorized.
+#[tauri::command]
+pub async fn grant_fetch_remote(
+    state: State<'_, AppState>,
+    grant_id: String,
+) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(
+        &state,
+        "grant.fetch-remote",
+        serde_json::json!({ "grant_id": grant_id }),
+    ).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+/// Read the per-connection share policy (which catalog items this peer
+/// is allowed to fetch and under what limits).
+#[tauri::command]
+pub async fn share_policy_get(
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(
+        &state,
+        "connection.share-policy.get",
+        serde_json::json!({ "connection_id": connection_id }),
+    ).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+/// Replace the per-connection share policy. `items` is a map from
+/// `"<kind>:<id>"` keys to `{allowed, tier?, retention?,
+/// rate_limit_per_hour?, expires_at?}` objects.
+#[tauri::command]
+pub async fn share_policy_set(
+    state: State<'_, AppState>,
+    connection_id: String,
+    items: serde_json::Value,
+) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(
+        &state,
+        "connection.share-policy.set",
+        serde_json::json!({ "connection_id": connection_id, "items": items }),
+    ).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
+/// Override the user's default presence visibility for one connection.
+/// `override` of `null` clears (back to default), `true` shows online,
+/// `false` hides.
+#[tauri::command]
+pub async fn presence_override_set(
+    state: State<'_, AppState>,
+    connection_id: String,
+    r#override: Option<bool>,
+) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(
+        &state,
+        "presence.override.set",
+        serde_json::json!({ "connection_id": connection_id, "override": r#override }),
+    ).await;
+    Ok(VaultOpResponse::from_op(result))
+}

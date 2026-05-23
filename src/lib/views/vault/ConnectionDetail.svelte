@@ -2,9 +2,16 @@
     import { invoke } from '@tauri-apps/api/core';
     import { listen, type UnlistenFn } from '@tauri-apps/api/event';
     import { onMount } from 'svelte';
-    import type { Connection, VaultOpResponse } from '../../types';
+    import type { Connection, VaultOpResponse, PublishedCatalogItem } from '../../types';
     import { clearSelectedConnection } from '../../stores/navigation';
     import { peerName } from '../../connectionName';
+    import {
+        requestAccess,
+        setPresenceOverride,
+        listMyRequests,
+        type ItemKind,
+        type OutgoingRequestSummary,
+    } from '../../grants';
 
     /**
      * Cached verify-identity state from the vault. Mirrors the
@@ -43,6 +50,19 @@
 
     let verifyState = $state<VerifyState | null>(null);
 
+    // Per-catalog-item request tracking (request_id keyed by
+    // "data:<ref>" or "secret:<ref>"). Used to render Pending / Granted
+    // / Denied state on a catalog row after the user taps Request.
+    type RequestRowState = 'available' | 'pending' | 'approved' | 'denied';
+    let catalogRequestState = $state<Record<string, { status: RequestRowState; requestId?: string; grantId?: string }>>({});
+    let requestingKey = $state<string | null>(null);
+    let presenceBusy = $state(false);
+    let presenceMsg = $state('');
+
+    function catalogKey(kind: ItemKind, ref: string): string {
+        return `${kind}:${ref}`;
+    }
+
     // Resync local `detail` when the parent swaps to a different connection
     // (and trigger a fresh fetch). Without this the warning fires because
     // `$state` would otherwise only capture the prop's initial value.
@@ -50,7 +70,76 @@
         detail = connection;
         refreshDetail();
         refreshVerifyState();
+        void refreshOutgoingRequestState();
     });
+
+    /**
+     * Hydrate catalog request state from `grant.list-my-requests` so
+     * rows show the right "Pending / Approved / Denied" pill on
+     * re-entry. Filters to this connection only.
+     */
+    async function refreshOutgoingRequestState() {
+        try {
+            const reqs = await listMyRequests(connection.connection_id);
+            const next: typeof catalogRequestState = {};
+            for (const r of reqs) {
+                const key = catalogKey(r.item_kind, r.item_ref);
+                const status: RequestRowState =
+                    r.status === 'pending' ? 'pending'
+                    : r.status === 'approved' ? 'approved'
+                    : 'denied';
+                next[key] = { status, requestId: r.request_id, grantId: r.grant_id };
+            }
+            catalogRequestState = next;
+        } catch (e) {
+            console.warn('refreshOutgoingRequestState failed', e);
+        }
+    }
+
+    async function requestCatalogItem(kind: ItemKind, item: PublishedCatalogItem) {
+        const ref = item.name;
+        const label = item.display_name ?? item.name;
+        const key = catalogKey(kind, ref);
+        requestingKey = key;
+        try {
+            const res = await requestAccess({
+                connectionId: connection.connection_id,
+                itemKind: kind,
+                itemRef: ref,
+                itemLabel: label,
+                mode: 'one-shot',
+                reason: '',
+            });
+            catalogRequestState = {
+                ...catalogRequestState,
+                [key]: { status: 'pending', requestId: res.request_id },
+            };
+        } catch (e) {
+            catalogRequestState = {
+                ...catalogRequestState,
+                [key]: { status: 'available' },
+            };
+            // Surface in the page-level error spot.
+            error = `Request failed: ${e}`;
+        }
+        requestingKey = null;
+    }
+
+    async function setPresence(value: boolean | null) {
+        presenceBusy = true;
+        presenceMsg = '';
+        try {
+            await setPresenceOverride(connection.connection_id, value);
+            presenceMsg = value === null
+                ? 'Cleared — follows your default.'
+                : value
+                    ? 'Always visible to this peer.'
+                    : 'Hidden from this peer.';
+        } catch (e) {
+            presenceMsg = `Failed: ${e}`;
+        }
+        presenceBusy = false;
+    }
 
     async function refreshDetail() {
         loading = true;
@@ -273,6 +362,70 @@
                 {/if}
             </section>
 
+            <!-- Peer catalog — request access to items they've published. -->
+            {#if (detail.peer_profile?.data_catalog?.length ?? 0) > 0 || (detail.peer_profile?.secret_catalog?.length ?? 0) > 0}
+                <section class="card">
+                    <h4>What they share</h4>
+                    <p class="catalog-hint">Items {peerName(detail)} has published. Tap Request to ask for access.</p>
+                    <ul class="catalog">
+                        {#each (detail.peer_profile?.data_catalog ?? []) as item (item.name)}
+                            {@const key = catalogKey('data', item.name)}
+                            {@const state = catalogRequestState[key]?.status ?? 'available'}
+                            <li class="catalog-row">
+                                <span class="cat-kind">📇</span>
+                                <div class="cat-body">
+                                    <div class="cat-name">{item.display_name ?? item.name}</div>
+                                    <div class="cat-meta">
+                                        {item.category ?? 'Data'}
+                                        {#if item.alias} · {item.alias}{/if}
+                                    </div>
+                                </div>
+                                {#if state === 'pending'}
+                                    <span class="cat-pill pending">Pending</span>
+                                {:else if state === 'approved'}
+                                    <span class="cat-pill approved">Approved</span>
+                                {:else if state === 'denied'}
+                                    <span class="cat-pill denied">Denied</span>
+                                {:else}
+                                    <button
+                                        class="cat-btn"
+                                        onclick={() => requestCatalogItem('data', item)}
+                                        disabled={requestingKey === key}
+                                    >{requestingKey === key ? '…' : 'Request'}</button>
+                                {/if}
+                            </li>
+                        {/each}
+                        {#each (detail.peer_profile?.secret_catalog ?? []) as item (item.name)}
+                            {@const key = catalogKey('secret', item.name)}
+                            {@const state = catalogRequestState[key]?.status ?? 'available'}
+                            <li class="catalog-row">
+                                <span class="cat-kind">🔑</span>
+                                <div class="cat-body">
+                                    <div class="cat-name">{item.display_name ?? item.name}</div>
+                                    <div class="cat-meta">
+                                        {item.category ?? 'Secret'}
+                                        {#if item.alias} · {item.alias}{/if}
+                                    </div>
+                                </div>
+                                {#if state === 'pending'}
+                                    <span class="cat-pill pending">Pending</span>
+                                {:else if state === 'approved'}
+                                    <span class="cat-pill approved">Approved</span>
+                                {:else if state === 'denied'}
+                                    <span class="cat-pill denied">Denied</span>
+                                {:else}
+                                    <button
+                                        class="cat-btn"
+                                        onclick={() => requestCatalogItem('secret', item)}
+                                        disabled={requestingKey === key}
+                                    >{requestingKey === key ? '…' : 'Request'}</button>
+                                {/if}
+                            </li>
+                        {/each}
+                    </ul>
+                </section>
+            {/if}
+
             <!-- Connection metadata -->
             <section class="card">
                 <h4>Connection</h4>
@@ -332,6 +485,22 @@
                         Phone approval required.
                     </p>
                     {#if rotateMessage}<p class="action-msg">{rotateMessage}</p>{/if}
+                </div>
+
+                <div class="action-group">
+                    <div class="presence-row">
+                        <span class="presence-label">Presence to this peer:</span>
+                        <div class="presence-buttons">
+                            <button class="presence-btn" onclick={() => setPresence(null)} disabled={presenceBusy}>Default</button>
+                            <button class="presence-btn" onclick={() => setPresence(true)} disabled={presenceBusy}>Always show</button>
+                            <button class="presence-btn" onclick={() => setPresence(false)} disabled={presenceBusy}>Always hide</button>
+                        </div>
+                    </div>
+                    <p class="hint">
+                        Overrides your default visibility for this connection only.
+                        "Default" follows your global presence setting.
+                    </p>
+                    {#if presenceMsg}<p class="action-msg">{presenceMsg}</p>{/if}
                 </div>
 
                 <div class="action-group">
@@ -427,6 +596,71 @@
     .verify-pill.failed { background: rgba(198, 40, 40, 0.18); color: #ef5350; border-color: rgba(198, 40, 40, 0.4); }
     .verify-pill.neutral { background: transparent; }
     .action-msg.failed { color: #ef5350; }
+
+    .catalog-hint {
+        font-size: 0.8em;
+        color: var(--text-secondary);
+        margin: 0 0 10px;
+    }
+    .catalog {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+    }
+    .catalog-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        background: var(--bg-elevated, #1c1c1c);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 8px 12px;
+    }
+    .cat-kind { font-size: 1.1em; flex-shrink: 0; }
+    .cat-body { flex: 1; min-width: 0; }
+    .cat-name { font-size: 0.92em; }
+    .cat-meta { font-size: 0.72em; color: var(--text-secondary); margin-top: 1px; }
+    .cat-btn {
+        background: transparent;
+        border: 1px solid var(--accent);
+        color: var(--accent);
+        padding: 4px 12px;
+        border-radius: 6px;
+        cursor: pointer;
+        font: inherit;
+        font-size: 0.8em;
+    }
+    .cat-btn:hover:not(:disabled) { background: rgba(255,193,37,0.12); }
+    .cat-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .cat-pill {
+        font-size: 0.72em;
+        padding: 3px 9px;
+        border-radius: 999px;
+        background: rgba(255,152,0,0.18);
+        color: #ff9800;
+        text-transform: capitalize;
+    }
+    .cat-pill.approved { background: rgba(46,125,50,0.18); color: #4caf50; }
+    .cat-pill.denied { background: rgba(198,40,40,0.18); color: #ef5350; }
+
+    .presence-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .presence-label { font-size: 0.85em; color: var(--text-secondary); }
+    .presence-buttons { display: flex; gap: 6px; }
+    .presence-btn {
+        background: transparent;
+        color: inherit;
+        border: 1px solid var(--border);
+        padding: 5px 10px;
+        border-radius: 4px;
+        cursor: pointer;
+        font: inherit;
+        font-size: 0.8em;
+    }
+    .presence-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+    .presence-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .action-ghost {
         background: transparent;
         color: var(--text);
