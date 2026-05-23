@@ -3,6 +3,6 @@ pub mod encrypt;
 pub mod ecies;
 pub mod hkdf;
 pub mod argon2;
-pub mod call_key;
+pub mod frame_cryptor;
 
 pub use encrypt::CryptoError;

@@ -62,6 +62,14 @@ async-trait = { version = "0.1", optional = true }
 cpal = { version = "0.15", optional = true }
 opus = { version = "0.3", optional = true }
 bytes = { version = "1", optional = true }
+# Frame cryptor (interop with Android's libwebrtc FrameCryptor) — AES-128-GCM
+# over the codec payload, with the AES key derived by PBKDF2 over the
+# per-call shared secret. Kept unconditional (not gated under the `webrtc`
+# feature) so the pure functions in crypto/frame_cryptor.rs stay testable
+# without pulling in cpal/ALSA. The interceptor wiring that actually uses
+# them at runtime is webrtc-feature-gated. See crypto/frame_cryptor.rs.
+aes-gcm = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 
 # Logging
 log = "0.4"
