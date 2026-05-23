@@ -75,6 +75,11 @@ pub struct CallSession {
     pc: Arc<RTCPeerConnection>,
     pub call_id: String,
     pub peer_guid: String,
+    /// E2EE frame cryptor handle, present iff the session was built with a
+    /// cryptor config. The vault signaling path lands the per-call shared
+    /// secret here via [`CryptorConfig::set_key_from_secret`]; until it
+    /// arrives, frames are dropped.
+    cryptor: Option<CryptorConfig>,
     /// Microphone capture handle. Kept alive for the call's lifetime; drops
     /// when the session drops, which stops the cpal stream.
     _audio_capture: Mutex<Option<CaptureHandle>>,
@@ -115,7 +120,7 @@ impl CallSession {
         // is available for this call.
         let mut registry = Registry::new();
         registry = register_default_interceptors(registry, &mut media_engine)?;
-        if let Some(cfg) = cryptor_config {
+        if let Some(ref cfg) = cryptor_config {
             cfg.register(&mut registry);
         } else {
             log::warn!(
@@ -227,6 +232,7 @@ impl CallSession {
             pc,
             call_id,
             peer_guid,
+            cryptor: cryptor_config,
             _audio_capture: Mutex::new(capture),
             _audio_playback: playback_slot,
         })
@@ -258,6 +264,14 @@ impl CallSession {
     }
 
     /// Add a remote ICE candidate received via signaling.
+    /// Borrow the per-call E2EE cryptor handle, if one was installed.
+    /// The vault signaling path uses this to land the per-call shared
+    /// secret once the vault delivers it (caller's `forApp.call.accepted`
+    /// event, or callee's response to `call.accept`).
+    pub fn cryptor(&self) -> Option<&CryptorConfig> {
+        self.cryptor.as_ref()
+    }
+
     pub async fn add_remote_ice(&self, candidate: serde_json::Value) -> Result<(), SessionError> {
         // The candidate JSON shape from the peer is `{ candidate, sdpMid, sdpMLineIndex, ... }`
         // — webrtc-rs's `RTCIceCandidateInit` deserializes that directly.
