@@ -24,6 +24,32 @@
     let sending = $state(false);
     let error = $state('');
     let scrollEl: HTMLDivElement | undefined = $state();
+    // Scroll-to-bottom FAB only shows when the user has scrolled
+    // up enough that they're no longer near the latest message.
+    let nearBottom = $state(true);
+
+    interface PaymentPayload {
+        amount_sats?: number;
+        memo?: string;
+        address?: string;
+        txid?: string;
+        label?: string;
+    }
+
+    function parsePayment(content: string): PaymentPayload | null {
+        try {
+            const j = JSON.parse(content);
+            return typeof j === 'object' && j !== null ? (j as PaymentPayload) : null;
+        } catch {
+            return null;
+        }
+    }
+
+    function formatBtc(sats?: number): string {
+        if (typeof sats !== 'number' || !isFinite(sats)) return '';
+        const btc = (sats / 100_000_000).toFixed(8);
+        return btc.replace(/\.?0+$/, '') + ' BTC';
+    }
 
     async function loadMessages() {
         loading = true;
@@ -107,6 +133,11 @@
         queueMicrotask(() => {
             if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
         });
+    }
+
+    function onMessagesScroll() {
+        if (!scrollEl) return;
+        nearBottom = scrollEl.scrollTop + scrollEl.clientHeight >= scrollEl.scrollHeight - 100;
     }
 
     /**
@@ -212,20 +243,45 @@
     {:else if error}
         <div class="status error">{error}</div>
     {:else}
-        <div class="messages-scroll" bind:this={scrollEl}>
+        <div class="messages-scroll" bind:this={scrollEl} onscroll={onMessagesScroll}>
             {#each messages as msg (msg.id)}
                 {@const sent = isSent(msg)}
                 <div class="message" class:sent class:received={!sent}>
                     <div class="bubble">
-                        {#each tokenize(msg.content) as tok}
-                            {#if tok.isLink && tok.href}
-                                <button
-                                    type="button"
-                                    class="link-btn"
-                                    onclick={() => openLink(tok.href!)}
-                                >{tok.text}</button>
-                            {:else}<span>{tok.text}</span>{/if}
-                        {/each}
+                        {#if msg.content_type === 'payment_request'}
+                            {@const p = parsePayment(msg.content)}
+                            <div class="pay-head">{sent ? '📤 Payment request sent' : '📥 Payment request'}</div>
+                            {#if p?.amount_sats !== undefined}
+                                <div class="pay-amount">{formatBtc(p.amount_sats)}</div>
+                            {/if}
+                            {#if p?.memo}<div class="pay-memo">"{p.memo}"</div>{/if}
+                            {#if p?.address}<div class="pay-addr mono">{p.address.slice(0, 18)}…</div>{/if}
+                            {#if !sent}
+                                <div class="pay-hint">Pay or decline from your phone — desktop pay coming soon.</div>
+                            {/if}
+                        {:else if msg.content_type === 'btc_payment_receipt'}
+                            {@const p = parsePayment(msg.content)}
+                            <div class="pay-head">{sent ? '✅ Payment sent' : '✅ Payment received'}</div>
+                            {#if p?.amount_sats !== undefined}
+                                <div class="pay-amount">{formatBtc(p.amount_sats)}</div>
+                            {/if}
+                            {#if p?.txid}<div class="pay-addr mono">tx: {p.txid.slice(0, 16)}…</div>{/if}
+                        {:else if msg.content_type === 'btc_address'}
+                            {@const p = parsePayment(msg.content)}
+                            <div class="pay-head">📬 Shared wallet address</div>
+                            {#if p?.label}<div class="pay-label">{p.label}</div>{/if}
+                            {#if p?.address}<div class="pay-addr mono">{p.address}</div>{/if}
+                        {:else}
+                            {#each tokenize(msg.content) as tok}
+                                {#if tok.isLink && tok.href}
+                                    <button
+                                        type="button"
+                                        class="link-btn"
+                                        onclick={() => openLink(tok.href!)}
+                                    >{tok.text}</button>
+                                {:else}<span>{tok.text}</span>{/if}
+                            {/each}
+                        {/if}
                     </div>
                     <div class="msg-meta">
                         <span class="time">{new Date(msg.sent_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</span>
@@ -241,6 +297,15 @@
                     </div>
                 </div>
             {/each}
+            {#if !nearBottom}
+                <button
+                    type="button"
+                    class="scroll-fab"
+                    onclick={scrollToBottom}
+                    aria-label="Scroll to latest"
+                    title="Scroll to latest"
+                >↓</button>
+            {/if}
         </div>
 
         <form class="compose" onsubmit={(e) => { e.preventDefault(); sendMessage(); }}>
@@ -387,4 +452,51 @@
         font-weight: 500;
     }
     .compose button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* BTC message types — payment requests, receipts, address shares.
+       Inherit bubble color so sent (gold-on-black) and received
+       (black-on-gold) variants stay consistent with text messages. */
+    .pay-head { font-weight: 600; font-size: 0.95em; margin-bottom: 4px; }
+    .pay-amount {
+        font-weight: 600;
+        font-size: 1.15em;
+        font-variant-numeric: tabular-nums;
+        margin: 4px 0;
+    }
+    .pay-memo { font-style: italic; opacity: 0.88; margin: 4px 0; }
+    .pay-label { font-weight: 500; margin: 2px 0; }
+    .pay-addr {
+        font-family: 'JetBrains Mono', 'Consolas', monospace;
+        font-size: 0.85em;
+        word-break: break-all;
+        margin: 4px 0;
+        opacity: 0.92;
+    }
+    .pay-hint {
+        font-size: 0.8em;
+        margin-top: 8px;
+        padding-top: 6px;
+        border-top: 1px solid rgba(0,0,0,0.18);
+        opacity: 0.75;
+    }
+    .mono { font-family: 'JetBrains Mono', 'Consolas', monospace; }
+
+    /* Scroll-to-latest FAB — only shown when scrolled up. */
+    .messages-scroll { position: relative; }
+    .scroll-fab {
+        position: sticky;
+        bottom: 12px;
+        align-self: flex-end;
+        margin-right: 4px;
+        background: var(--accent);
+        color: #1a1a1a;
+        border: none;
+        border-radius: 50%;
+        width: 36px;
+        height: 36px;
+        font-size: 1.1rem;
+        cursor: pointer;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    }
+    .scroll-fab:hover { background: var(--accent-hover); }
 </style>
