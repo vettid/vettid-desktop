@@ -181,12 +181,14 @@
         <ul class="list">
             {#each visible as conn (conn.connection_id)}
                 {@const unread = conn.unread_count ?? 0}
+                {@const missed = conn.missed_call_count ?? 0}
                 {@const tBadge = typeBadge(conn)}
                 <li>
                     <button
                         type="button"
                         class="card"
                         class:selected={selectedId === conn.connection_id}
+                        class:needs-attention={conn.needs_attention}
                         onclick={() => openConnection(conn)}
                     >
                         <Avatar name={peerName(conn)} photo={conn.peer_profile?.photo} size={40} />
@@ -194,6 +196,11 @@
                             <div class="row1">
                                 <span class="name">{peerName(conn)}</span>
                                 {#if tBadge}<span class="type-badge">{tBadge}</span>{/if}
+                                {#if missed > 0}
+                                    <span class="missed-tag" title="{missed} missed call{missed === 1 ? '' : 's'}">
+                                        📵 {missed}
+                                    </span>
+                                {/if}
                             </div>
                             <div class="row2">{subtitle(conn)}</div>
                         </div>
@@ -287,6 +294,7 @@
         padding: 10px 12px;
         cursor: pointer;
         color: inherit;
+        position: relative;
         font: inherit;
         display: grid;
         grid-template-columns: auto 1fr auto;
@@ -324,6 +332,30 @@
         border-radius: 3px;
         padding: 1px 5px;
         flex-shrink: 0;
+    }
+    .missed-tag {
+        font-size: 0.68rem;
+        font-weight: 600;
+        color: #ef5350;
+        border: 1px solid rgba(244, 67, 54, 0.45);
+        background: rgba(244, 67, 54, 0.12);
+        border-radius: 999px;
+        padding: 1px 7px;
+        flex-shrink: 0;
+        white-space: nowrap;
+    }
+    .card.needs-attention .name {
+        font-weight: 600;
+    }
+    .card.needs-attention::before {
+        content: '';
+        position: absolute;
+        left: 0;
+        top: 6px;
+        bottom: 6px;
+        width: 3px;
+        background: var(--accent);
+        border-radius: 0 2px 2px 0;
     }
     .row2 {
         margin-top: 2px;
