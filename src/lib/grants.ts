@@ -71,6 +71,10 @@ export interface OutgoingRequestSummary {
     denial_reason: string;
     created_at: number;
     responded_at: number;
+    /** Multi-field alias bundles include every requested item here so
+     *  the requester sees what's pending as one card; single-field
+     *  requests omit it. */
+    items?: Array<{ item_kind: ItemKind; item_ref: string; item_label: string }>;
 }
 
 /** One entry in a per-connection share policy. */

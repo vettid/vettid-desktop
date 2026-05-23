@@ -312,15 +312,31 @@
             {:else}
                 <ul class="list">
                     {#each myRequests as r (r.request_id)}
+                        {@const bundleItems = r.items && r.items.length > 1 ? r.items : null}
                         <li class="card">
                             <div class="card-head">
                                 <span class="icon">{kindIcon(r.item_kind)}</span>
                                 <div class="title-block">
-                                    <div class="title">{r.item_label || r.item_ref}</div>
+                                    <div class="title">
+                                        {r.item_label || r.item_ref}
+                                        {#if bundleItems}
+                                            <span class="bundle-tag">{bundleItems.length} fields</span>
+                                        {/if}
+                                    </div>
                                     <div class="sub-line">to {peerLabel(r.connection_id)}</div>
                                 </div>
                                 <span class="status-pill {r.status}">{r.status}</span>
                             </div>
+                            {#if bundleItems}
+                                <ul class="bundle-list">
+                                    {#each bundleItems as it}
+                                        <li>
+                                            <span class="bundle-kind">{kindIcon(it.item_kind)}</span>
+                                            {it.item_label || it.item_ref}
+                                        </li>
+                                    {/each}
+                                </ul>
+                            {/if}
                             <dl class="meta">
                                 <dt>Mode</dt><dd>{r.mode}</dd>
                                 {#if r.reason}<dt>Reason</dt><dd>{r.reason}</dd>{/if}
@@ -407,6 +423,33 @@
     }
     .status-pill.revoked, .status-pill.denied { background: rgba(198,40,40,0.18); color: #ef5350; }
     .status-pill.expired, .status-pill.pending { background: rgba(255,152,0,0.18); color: #ff9800; }
+
+    .bundle-tag {
+        display: inline-block;
+        margin-left: 6px;
+        font-size: 0.7em;
+        padding: 1px 7px;
+        border-radius: 999px;
+        background: rgba(255,193,37,0.18);
+        color: var(--accent);
+        vertical-align: middle;
+    }
+    .bundle-list {
+        list-style: none;
+        margin: 0 0 10px;
+        padding: 4px 0 4px 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+    .bundle-list li {
+        font-size: 0.82em;
+        color: var(--text-secondary);
+        display: flex;
+        gap: 6px;
+        align-items: baseline;
+    }
+    .bundle-kind { opacity: 0.7; }
 
     .meta { display: grid; grid-template-columns: 110px 1fr; gap: 4px 12px; margin: 0 0 10px; font-size: 0.85rem; }
     .meta dt { color: var(--text-secondary); }
