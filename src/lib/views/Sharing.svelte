@@ -81,14 +81,62 @@
 
     onMount(() => {
         void loadAll();
-        // Live refresh on any grant lifecycle push.
+        // Live refresh on grant lifecycle pushes + fetch-response
+        // delivery. data-grant-fetch-response carries the actual
+        // value the peer authorized — needs separate handling
+        // because grant.fetch-remote returns only the request_id
+        // synchronously; the value arrives asynchronously on this
+        // push.
         listen<{ subject: string; payload_b64: string }>('vault:connection-event', (event) => {
             const subject = event.payload?.subject ?? '';
+            if (subject.includes('data-grant-fetch-response')) {
+                handleFetchResponse(event.payload?.payload_b64 ?? '');
+                return;
+            }
             if (subject.includes('data-grant') || subject.includes('data-request')) {
                 void loadAll();
             }
         }).then((fn) => { unlisten = fn; });
     });
+
+    /**
+     * Decode an incoming `connection.data-grant-fetch-response` push.
+     * Shape is set by HandleIncomingFetchResponse in grant_handler.go:
+     *   { connection_id, granter_guid, request_id, grant_id, status, value, error }
+     * Status "ok" delivers the plaintext value; otherwise `error`
+     * names the failure ("grant_revoked", "grant_expired", ...).
+     */
+    function handleFetchResponse(payloadB64: string) {
+        if (!payloadB64) return;
+        try {
+            const json = JSON.parse(atob(payloadB64)) as {
+                grant_id?: string;
+                request_id?: string;
+                status?: string;
+                value?: unknown;
+                error?: string;
+            };
+            const gid = json.grant_id;
+            if (!gid) return;
+            const key = gid;
+            if (json.status === 'ok') {
+                const v = json.value;
+                const text = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+                revealed = { ...revealed, [key]: text };
+                actionState = { ...actionState, [key]: { busy: false } };
+                inbound = inbound.map((x) =>
+                    x.grant_id === gid ? { ...x, uses_so_far: x.uses_so_far + 1, last_fetched: Math.floor(Date.now() / 1000) } : x,
+                );
+            } else {
+                actionState = {
+                    ...actionState,
+                    [key]: { busy: false, err: json.error ?? 'fetch failed' },
+                };
+            }
+        } catch (e) {
+            console.warn('handleFetchResponse decode failed', e);
+        }
+    }
 
     onDestroy(() => { unlisten?.(); });
 
@@ -111,23 +159,32 @@
     }
 
     async function doFetch(g: GrantSummary) {
+        // grant.fetch-remote is two-stage: the synchronous ack only
+        // returns the request_id; the value lands later on the
+        // connection.data-grant-fetch-response push (decoded in
+        // handleFetchResponse). Keep the busy spinner up until that
+        // push resolves; a guard timer flips it back after 15s so
+        // a dropped peer never strands the UI.
         actionState = { ...actionState, [g.grant_id]: { busy: true } };
         try {
-            const data = (await fetchRemoteValue(g.grant_id)) as Record<string, unknown>;
-            const value = (data?.value ?? data?.data ?? data?.payload) as unknown;
-            const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
-            revealed = { ...revealed, [g.grant_id]: text };
-            actionState = { ...actionState, [g.grant_id]: { busy: false } };
-            // Bump uses-so-far locally; the next push will reconcile.
-            inbound = inbound.map((x) =>
-                x.grant_id === g.grant_id ? { ...x, uses_so_far: x.uses_so_far + 1 } : x,
-            );
+            await fetchRemoteValue(g.grant_id);
         } catch (e) {
             actionState = {
                 ...actionState,
                 [g.grant_id]: { busy: false, err: String(e) },
             };
+            return;
         }
+        // Safety: if the peer never responds, surface a clear error.
+        setTimeout(() => {
+            const st = actionState[g.grant_id];
+            if (st?.busy) {
+                actionState = {
+                    ...actionState,
+                    [g.grant_id]: { busy: false, err: 'No response from peer (timeout)' },
+                };
+            }
+        }, 15_000);
     }
 
     async function doRevoke(g: GrantSummary) {
