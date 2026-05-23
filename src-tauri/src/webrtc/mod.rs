@@ -20,12 +20,14 @@
 //!
 //! ## E2EE frame encryption
 //!
-//! Not yet implemented. The Android `CallFrameCryptor` derives a per-call
-//! shared secret from the X25519 connection key + HKDF and AES-128-GCMs each
-//! media frame. Plumbing the equivalent through webrtc-rs requires hooking
-//! `RTCRtpSender::insertable_streams` (or its equivalent on this version of
-//! the crate) — placeholder wired in [`session::CallSession::new`] so it's
-//! the obvious next addition.
+//! Implemented as a webrtc-rs `Interceptor` — see [`cryptor`]. Encrypts +
+//! decrypts every RTP audio payload using AES-128-GCM in the LiveKit
+//! `FrameCryptor` wire format that Android's libwebrtc emits. The
+//! interceptor is registered on the API builder iff
+//! [`session::CallSession::new`] gets a `Some(CryptorConfig)`; the vault
+//! signaling path that delivers the per-call 32-byte shared secret to the
+//! desktop is still TODO, so today's callers pass `None` and calls go
+//! over transport SRTP only (Android-side reports MISSINGKEY).
 
 #![cfg(feature = "webrtc")]
 

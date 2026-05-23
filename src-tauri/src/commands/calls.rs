@@ -287,7 +287,17 @@ async fn start_call_session(
     // Empty vec falls back to STUN-only inside CallSession::new.
     let ice = turn::fetch_ice_servers(state).await;
     let (tx, rx) = mpsc::unbounded_channel();
-    let session = CallSession::new(call_id.to_string(), peer_guid.to_string(), tx, ice)
+    let session = CallSession::new(
+        call_id.to_string(),
+        peer_guid.to_string(),
+        tx,
+        ice,
+        // TODO: pass Some(CryptorConfig::from_vault_secret(...)) once the
+        // vault signaling path delivers the per-call 32-byte shared secret.
+        // Until then the interceptor isn't installed and desktop↔Android
+        // calls go silent (Android reports MISSINGKEY).
+        None,
+    )
         .await
         .map_err(|e| e.to_string())?;
     let offer = session.create_offer().await.map_err(|e| e.to_string())?;
@@ -311,7 +321,17 @@ async fn accept_call_session(
 ) -> Result<String, String> {
     let ice = turn::fetch_ice_servers(state).await;
     let (tx, rx) = mpsc::unbounded_channel();
-    let session = CallSession::new(call_id.to_string(), peer_guid.to_string(), tx, ice)
+    let session = CallSession::new(
+        call_id.to_string(),
+        peer_guid.to_string(),
+        tx,
+        ice,
+        // TODO: pass Some(CryptorConfig::from_vault_secret(...)) once the
+        // vault signaling path delivers the per-call 32-byte shared secret.
+        // Until then the interceptor isn't installed and desktop↔Android
+        // calls go silent (Android reports MISSINGKEY).
+        None,
+    )
         .await
         .map_err(|e| e.to_string())?;
     let answer = session

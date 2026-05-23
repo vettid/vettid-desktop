@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
+use webrtc::api::interceptor_registry::register_default_interceptors;
+use webrtc::interceptor::registry::Registry;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_OPUS};
 use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
@@ -16,6 +18,7 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 use webrtc::track::track_remote::TrackRemote;
 
 use super::audio::{self, CaptureHandle, PlaybackHandle};
+use super::cryptor::CryptorConfig;
 
 /// Outbound event from a call session — published to the peer's vault by the
 /// signaling layer.
@@ -84,21 +87,48 @@ pub struct CallSession {
 
 impl CallSession {
     /// Create a new peer connection and wire the ICE / state callbacks to
-    /// the supplied event channel. `ice_servers` should come from
-    /// `call.turn-credentials` for production; empty falls back to
-    /// Google STUN for dev convenience.
+    /// the supplied event channel.
+    ///
+    /// - `ice_servers` should come from `call.turn-credentials` for
+    ///   production; empty falls back to Google STUN for dev convenience.
+    /// - `cryptor_config` plumbs the per-call E2EE frame cryptor through
+    ///   the webrtc-rs `Interceptor` registry. Pass `Some(...)` once the
+    ///   vault has handed the desktop the 32-byte shared secret for this
+    ///   call (mirroring Android's `event.sharedSecret` path). Pass
+    ///   `None` for dev or while the vault signaling path is still being
+    ///   built — media will flow but desktop↔Android calls will be
+    ///   silent (Android side reports MISSINGKEY).
     pub async fn new(
         call_id: String,
         peer_guid: String,
         events_tx: mpsc::UnboundedSender<SessionEvent>,
         ice_servers: Vec<RTCIceServer>,
+        cryptor_config: Option<CryptorConfig>,
     ) -> Result<Self, SessionError> {
         let mut media_engine = MediaEngine::default();
         // Audio codecs (Opus) are registered by `register_default_codecs`
         // — that's also where video codecs would land when we add them.
         media_engine.register_default_codecs()?;
 
-        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        // Build the interceptor registry: webrtc-rs's defaults (NACK +
+        // RTCP reports + TWCC) plus the VettID frame cryptor when a key
+        // is available for this call.
+        let mut registry = Registry::new();
+        registry = register_default_interceptors(registry, &mut media_engine)?;
+        if let Some(cfg) = cryptor_config {
+            cfg.register(&mut registry);
+        } else {
+            log::warn!(
+                "call {}: no cryptor config — media will NOT be E2EE-encrypted; \
+                 desktop↔Android calls will fail silently",
+                call_id,
+            );
+        }
+
+        let api = APIBuilder::new()
+            .with_media_engine(media_engine)
+            .with_interceptor_registry(registry)
+            .build();
 
         let servers = if ice_servers.is_empty() { fallback_ice_servers() } else { ice_servers };
         let config = RTCConfiguration {
@@ -192,9 +222,6 @@ impl CallSession {
                 }
             })
         }));
-
-        // TODO: install RTP frame cryptor for E2EE matching Android's
-        //       `CallFrameCryptor` (X25519-derived shared secret + AES-128-GCM).
 
         Ok(Self {
             pc,
