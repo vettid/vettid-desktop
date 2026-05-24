@@ -107,11 +107,12 @@
     color: #1a1a1a;
   }
   .avatar.tile.agent {
-    /* Gold matches the device tile (brand-consistent) but the glyph
-       flips to white instead of dark — distinguishes "agent" from
-       "your own desktop" at a glance while staying on-brand. */
+    /* Gold + dark glyph, matching the device tile — both read as one
+       brand family. The icon (robot vs. monitor) is enough to tell
+       them apart; the white glyph we tried first looked washed out on
+       the lighter gold backgrounds. */
     background: var(--accent);
-    color: #ffffff;
+    color: #1a1a1a;
   }
   img {
     width: 100%;
