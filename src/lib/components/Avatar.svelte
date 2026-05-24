@@ -107,8 +107,11 @@
     color: #1a1a1a;
   }
   .avatar.tile.agent {
-    background: rgba(120, 160, 240, 0.18);
-    color: #b9d0ff;
+    /* Gold matches the device tile (brand-consistent) but the glyph
+       flips to white instead of dark — distinguishes "agent" from
+       "your own desktop" at a glance while staying on-brand. */
+    background: var(--accent);
+    color: #ffffff;
   }
   img {
     width: 100%;
