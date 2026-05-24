@@ -114,7 +114,7 @@
       aria-selected={mode === 'profile'}
       class:active={mode === 'profile'}
       onclick={() => (mode = 'profile')}
-    >History</button>
+    >Details</button>
   </nav>
 
   <div class="ws-body">

@@ -53,6 +53,16 @@ pub async fn get_connection(state: State<'_, AppState>, connection_id: String) -
     Ok(VaultOpResponse::from_op(result))
 }
 
+/// List paired agents with their Contract (scope / approval mode /
+/// rate limit) — independent op. The History tab for an agent uses
+/// this to surface "what is this agent allowed to do" alongside the
+/// audit log. See docs/AGENT-PAIRED-CONTRACT-MODEL.md.
+#[tauri::command]
+pub async fn list_agents(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(&state, "agent.list", serde_json::json!({})).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
 /// List feed events.
 #[tauri::command]
 pub async fn list_feed(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {

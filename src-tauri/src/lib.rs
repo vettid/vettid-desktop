@@ -77,6 +77,7 @@ pub fn run() {
             // Vault commands — independent
             vault::list_connections,
             vault::get_connection,
+            vault::list_agents,
             vault::list_feed,
             vault::query_audit,
             vault::list_connection_audit,
