@@ -10,6 +10,7 @@
   import StatusChip from '../../components/StatusChip.svelte';
   import { peerName } from '../../connectionName';
   import { placeCall, type CallType } from '../../stores/calls';
+  import { CALLS_ENABLED } from '../../config/features';
   import Conversation from './Conversation.svelte';
   import ConnectionDetail from './ConnectionDetail.svelte';
 
@@ -45,7 +46,12 @@
 </script>
 
 <header class="ws-head">
-  <Avatar name={peerName(connection)} photo={connection.peer_profile?.photo} size={40} />
+  <Avatar
+    name={peerName(connection)}
+    photo={connection.peer_profile?.photo}
+    connectionType={connection.connection_type}
+    size={40}
+  />
   <div class="ws-text">
     <div class="ws-name">{peerName(connection)}</div>
     <div class="ws-meta">
@@ -57,10 +63,12 @@
       {/if}
     </div>
   </div>
-  <div class="ws-actions">
-    <button class="ha" onclick={() => startCall('audio')} title="Voice call" aria-label="Voice call">📞</button>
-    <button class="ha" onclick={() => startCall('video')} title="Video call" aria-label="Video call">🎥</button>
-  </div>
+  {#if CALLS_ENABLED}
+    <div class="ws-actions">
+      <button class="ha" onclick={() => startCall('audio')} title="Voice call" aria-label="Voice call">📞</button>
+      <button class="ha" onclick={() => startCall('video')} title="Video call" aria-label="Video call">🎥</button>
+    </div>
+  {/if}
 </header>
 
 {#if callError}<div class="cerr">{callError}</div>{/if}

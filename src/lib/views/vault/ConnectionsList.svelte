@@ -191,7 +191,12 @@
                         class:needs-attention={conn.needs_attention}
                         onclick={() => openConnection(conn)}
                     >
-                        <Avatar name={peerName(conn)} photo={conn.peer_profile?.photo} size={40} />
+                        <Avatar
+                            name={peerName(conn)}
+                            photo={conn.peer_profile?.photo}
+                            connectionType={conn.connection_type}
+                            size={40}
+                        />
                         <div class="card-text">
                             <div class="row1">
                                 <span class="name">{peerName(conn)}</span>

@@ -20,6 +20,7 @@
   import TopBar from './lib/components/TopBar.svelte';
   import CallOverlay from './lib/components/CallOverlay.svelte';
   import DataGrantApprovalModal from './lib/components/DataGrantApprovalModal.svelte';
+  import { CALLS_ENABLED } from './lib/config/features';
 
   // Top-level destinations the user navigates between explicitly.
   // Takeover routes (`pairing`, `expired`, `session-detail`) hide the
@@ -309,8 +310,12 @@
     </main>
   </div>
 
-  <!-- Global call overlay — present in any view -->
-  <CallOverlay />
+  <!-- Global call overlay — gated behind CALLS_ENABLED until SFrame
+       interop with Android is verified end-to-end. Until then, no
+       UI surfaces for incoming or outgoing calls. -->
+  {#if CALLS_ENABLED}
+    <CallOverlay />
+  {/if}
 
   <!-- Global data-grant approval modal — auto-appears when a peer
        sends an incoming grant request. -->

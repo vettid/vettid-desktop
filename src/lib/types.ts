@@ -14,8 +14,9 @@ export interface Connection {
     peer_alias?: string;
     /** @deprecated `connection.list` sends `peer_alias`; this is never populated. */
     label?: string;
-    /** Kind of connection — "peer" by default, also "agent" or "device". */
-    connection_type?: 'peer' | 'agent' | 'device';
+    /** Kind of connection — "peer" by default, plus "agent", "device",
+     *  and "system" (the auto-created VettID system connection). */
+    connection_type?: 'peer' | 'agent' | 'device' | 'system';
     status: 'pending' | 'active' | 'revoked' | 'expired';
     /** Not returned by `connection.list` — optional until the vault sends it. */
     direction?: 'outbound' | 'inbound';

@@ -131,7 +131,7 @@
   .subtitle { color: var(--text-muted); margin-bottom: 20px; line-height: 1.5; }
   .btn { width: 100%; padding: 12px; border: none; border-radius: 6px;
          font-size: 1rem; cursor: pointer; margin-bottom: 8px; }
-  .btn.primary { background: var(--accent); color: white; }
+  .btn.primary { background: var(--accent); color: #1a1a1a; font-weight: 500; }
   .btn.primary:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn.ghost { background: transparent; color: var(--text-muted);
                border: 1px solid rgba(255,255,255,0.1); }

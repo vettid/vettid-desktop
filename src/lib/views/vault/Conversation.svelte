@@ -6,6 +6,7 @@
     import { clearSelectedConnection } from '../../stores/navigation';
     import { markConversationRead } from '../../stores/vault';
     import { placeCall, type CallType } from '../../stores/calls';
+    import { CALLS_ENABLED } from '../../config/features';
     import { peerName } from '../../connectionName';
     import SendBtcSheet from './wallet/SendBtcSheet.svelte';
     import RequestPaymentSheet from './wallet/RequestPaymentSheet.svelte';
@@ -444,8 +445,10 @@
                 <span class="name">{peerName(connection)}</span>
                 <span class="profile-hint">view profile</span>
             </button>
-            <button class="call-btn" onclick={() => startCall('audio')} aria-label="Voice call" title="Voice call">📞</button>
-            <button class="call-btn" onclick={() => startCall('video')} aria-label="Video call" title="Video call">🎥</button>
+            {#if CALLS_ENABLED}
+                <button class="call-btn" onclick={() => startCall('audio')} aria-label="Voice call" title="Voice call">📞</button>
+                <button class="call-btn" onclick={() => startCall('video')} aria-label="Video call" title="Video call">🎥</button>
+            {/if}
             <span class="status-dot {connection.status}" aria-label={connection.status}></span>
         </header>
     {/if}

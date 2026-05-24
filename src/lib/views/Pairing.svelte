@@ -196,7 +196,7 @@
   .pw-toggle:hover { color: var(--text); }
   .btn { width: 100%; padding: 12px; border: none; border-radius: 6px;
          font-size: 1rem; cursor: pointer; margin-bottom: 8px; }
-  .btn.primary { background: var(--accent); color: white; }
+  .btn.primary { background: var(--accent); color: #1a1a1a; font-weight: 500; }
   .btn.primary:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn.secondary { background: rgba(255,255,255,0.05); color: var(--text-muted); }
   .qr { display: block; margin: 0 auto 16px; background: white; padding: 10px; border-radius: 8px; }
