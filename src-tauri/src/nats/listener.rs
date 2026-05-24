@@ -282,8 +282,10 @@ async fn handle_app_event(app_handle: &AppHandle, state: &AppState, subject: &st
     // is in the platform crypto layer, no other component needs to
     // see it (matches Android's "secret stays in CallFrameCryptor"
     // property).
+    let tag = event_suffix(subject);
+
     #[cfg(feature = "webrtc")]
-    if subject.contains(".forApp.call.accepted") {
+    if tag == "call.accepted" {
         if let Ok(event) = serde_json::from_slice::<serde_json::Value>(payload) {
             if let Some(secret_b64) = event.get("shared_secret").and_then(|v| v.as_str()) {
                 if let Err(e) = crate::commands::calls::bind_shared_secret_to_active_call(
@@ -305,48 +307,81 @@ async fn handle_app_event(app_handle: &AppHandle, state: &AppState, subject: &st
         "payload_b64": base64_encode(payload),
     });
 
-    // Match in priority order — more specific patterns first (e.g.,
-    // `connection.peer-accepted` before generic `connection.*`).
-    let tauri_event = if subject.contains(".forApp.new-message") {
+    // Match on the event suffix (the part after `.forApp.` or
+    // `.forApp.device.{conn}.`). The previous `subject.contains()`
+    // pattern only matched the broad `OwnerSpace.{}.forApp.{event}`
+    // shape, but the desktop only subscribes to the per-device
+    // `MessageSpace.{}.forApp.device.{conn}.>` channel — so every push
+    // event silently fell through to `vault:app-event` and the
+    // frontend never heard about it. (Symptom: live incoming messages
+    // never appeared on the desktop; only the phone got the
+    // notification.) Match in priority order — more specific suffixes
+    // before generic namespace prefixes.
+    let tauri_event = if tag == "new-message" {
         "vault:message-received"
-    } else if subject.contains(".forApp.read-receipt")
-        && !subject.contains(".forApp.message.read-receipt")
-    {
-        // Push receipt from peer (request-response replies are skipped — they
-        // come back on the device-specific response channel via JetStream).
+    } else if tag == "read-receipt" {
+        // Push receipt from peer. The request/response reply variant
+        // arrives under tag "message.read-receipt" and is not matched
+        // here — naturally distinguished by the exact-suffix compare
+        // (the old contains()-with-negation was working around the
+        // same ambiguity).
         "vault:read-receipt"
-    } else if subject.contains(".forApp.connection-revoked") {
+    } else if tag == "connection-revoked" {
         "vault:connection-revoked"
-    } else if subject.contains(".forApp.connection.") {
+    } else if tag.starts_with("connection.") {
         "vault:connection-event"
-    } else if subject.contains(".forApp.profile-update")
-        || subject.contains(".forApp.profile.public")
-    {
+    } else if tag == "profile-update" || tag.starts_with("profile.") {
         "vault:profile-update"
-    } else if subject.contains(".forApp.credentials.rotate") {
+    } else if tag == "credentials.rotate" {
         "vault:credentials-rotate"
-    } else if subject.contains(".forApp.call.") {
+    } else if tag.starts_with("call.") {
         "vault:call-event"
-    } else if subject.contains(".forApp.recovery.") {
+    } else if tag.starts_with("recovery.") {
         "vault:recovery-event"
-    } else if subject.contains(".forApp.transfer.") {
+    } else if tag.starts_with("transfer.") {
         "vault:transfer-event"
-    } else if subject.contains(".forApp.security.") {
+    } else if tag.starts_with("security.") {
         "vault:security-event"
-    } else if subject.contains(".forApp.location-update") {
+    } else if tag == "location-update" {
         "vault:location-update"
-    } else if subject.contains(".forApp.feed.new") || subject.contains(".forApp.feed.updated") {
+    } else if tag.starts_with("feed.") {
         "vault:feed-event"
-    } else if subject.contains(".forApp.agent.") {
+    } else if tag.starts_with("agent.") {
         "vault:agent-event"
     } else {
         // Unknown forApp event — forward as generic so frontend can opt-in
         // to handling it without backend changes.
-        log::debug!("Unmapped forApp subject: {}", subject);
+        log::debug!("Unmapped forApp subject: {} (tag: {})", subject, tag);
         "vault:app-event"
     };
 
     let _ = app_handle.emit(tauri_event, &event_payload);
+}
+
+/// Extract the event-name suffix from a forApp subject, normalizing
+/// across the two shapes the vault publishes:
+///
+/// * `OwnerSpace.{owner}.forApp.{tag}` — broad fan-out (phone listens).
+/// * `MessageSpace.{owner}.forApp.device.{conn}.{tag}` — per-device
+///   fan-out (desktop listens).
+///
+/// Returning the tag directly lets matchers compare on a single
+/// canonical form instead of having to enumerate both subject shapes.
+fn event_suffix(subject: &str) -> &str {
+    let after_for_app = match subject.find(".forApp.") {
+        Some(idx) => &subject[idx + ".forApp.".len()..],
+        None => return subject,
+    };
+    // Per-device subjects insert a `device.{conn}.` segment between
+    // `.forApp.` and the event tag. Strip the prefix and skip one
+    // dot-delimited token (the connection_id) to land on the tag.
+    if let Some(rest) = after_for_app.strip_prefix("device.") {
+        if let Some(dot) = rest.find('.') {
+            return &rest[dot + 1..];
+        }
+        return "";
+    }
+    after_for_app
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +440,45 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    // Subject-routing logic is exercised through integration testing against a
-    // running vault. The match arms above are simple enough that unit testing
-    // each pattern would just duplicate the source.
+    use super::event_suffix;
+
+    // The desktop subscribes to the per-device fan-out shape, so the
+    // suffix extractor MUST normalize both subject shapes to the same
+    // tag — otherwise push events fall through to the catch-all and
+    // the UI never sees them (this regressed for new-message and
+    // read-receipt and went unnoticed until messages stopped landing
+    // in the conversation pane).
+    #[test]
+    fn event_suffix_handles_both_subject_shapes() {
+        // OwnerSpace shape (phone subscription path).
+        assert_eq!(
+            event_suffix("OwnerSpace.user-1.forApp.new-message"),
+            "new-message",
+        );
+        // MessageSpace per-device shape (desktop subscription path).
+        assert_eq!(
+            event_suffix("MessageSpace.user-1.forApp.device.conn-9.new-message"),
+            "new-message",
+        );
+        // Namespaced events keep the sub-path so `starts_with("call.")`
+        // etc. still routes correctly.
+        assert_eq!(
+            event_suffix("MessageSpace.user-1.forApp.device.conn-9.call.accepted"),
+            "call.accepted",
+        );
+        assert_eq!(
+            event_suffix("OwnerSpace.user-1.forApp.connection.peer-accepted"),
+            "connection.peer-accepted",
+        );
+        // Read-receipt push vs request/response reply — disambiguated
+        // by suffix alone instead of the old contains()+negation.
+        assert_eq!(
+            event_suffix("OwnerSpace.user-1.forApp.read-receipt"),
+            "read-receipt",
+        );
+        assert_eq!(
+            event_suffix("MessageSpace.user-1.forApp.device.conn-9.message.read-receipt"),
+            "message.read-receipt",
+        );
+    }
 }

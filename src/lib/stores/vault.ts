@@ -7,13 +7,7 @@ import {
     sendNotification,
 } from '@tauri-apps/plugin-notification';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import type {
-    Connection,
-    FeedEvent,
-    Message,
-    SecretEntry,
-    VaultOpResponse,
-} from '../types';
+import type { Connection, VaultOpResponse } from '../types';
 import { decodeEventPayload } from '../events';
 
 // ---------------------------------------------------------------------------
@@ -38,9 +32,10 @@ export interface PendingApproval {
 
 /**
  * Raw payload envelope from the Rust listener for any `vault:*` push event
- * coming off the `OwnerSpace.{guid}.forApp.>` channel. The listener forwards
- * the NATS subject and a base64-encoded payload — per-feature consumers
- * decode/decrypt as appropriate.
+ * coming off the per-device `MessageSpace.{owner}.forApp.device.{conn}.>`
+ * channel (see nats/listener.rs::event_suffix for the subject routing).
+ * The listener forwards the NATS subject and a base64-encoded payload —
+ * per-feature consumers decode/decrypt as appropriate.
  */
 export interface AppEventEnvelope {
     subject: string;
@@ -52,9 +47,6 @@ export interface AppEventEnvelope {
 // ---------------------------------------------------------------------------
 
 export const connectionsStore: Writable<Connection[]> = writable([]);
-export const feedStore: Writable<FeedEvent[]> = writable([]);
-export const messagesStore: Writable<Message[]> = writable([]);
-export const secretsCatalogStore: Writable<SecretEntry[]> = writable([]);
 export const pendingApprovalsStore: Writable<PendingApproval[]> = writable([]);
 export const natsStateStore: Writable<NatsState> = writable('unknown');
 
@@ -87,14 +79,6 @@ export async function loadConnections(): Promise<void> {
     }
 }
 
-export async function loadFeed(): Promise<void> {
-    const resp: VaultOpResponse = await invoke('list_feed');
-    if (resp.success && resp.data) {
-        const data = resp.data as { events?: FeedEvent[] };
-        feedStore.set(data.events ?? []);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Real-time event listeners (called once on app init)
 // ---------------------------------------------------------------------------
@@ -119,7 +103,6 @@ export function initVaultListeners(): void {
             // Refresh the data the user can see when the link comes back up;
             // missed push events are replaced with the authoritative list.
             void loadConnections();
-            void loadFeed();
         }
     });
 
@@ -128,7 +111,6 @@ export function initVaultListeners(): void {
     // delta-application path until the dataset gets large.
     listen<AppEventEnvelope>('vault:connection-event', () => {
         void loadConnections();
-        void loadFeed();
     });
 
     listen<AppEventEnvelope>('vault:connection-revoked', () => {
@@ -138,13 +120,6 @@ export function initVaultListeners(): void {
     // Profile changes — peer's published profile updated.
     listen<AppEventEnvelope>('vault:profile-update', () => {
         void loadConnections();
-    });
-
-    // Feed events — the Rust listener emits this both for the legacy
-    // device-channel "feed_event" type and for `OwnerSpace.*.forApp.feed.*`
-    // push subjects. Either way: just re-list.
-    listen<unknown>('vault:feed-event', () => {
-        void loadFeed();
     });
 
     // New message — bump unread count and (when window isn't focused) fire an
@@ -165,7 +140,6 @@ export function initVaultListeners(): void {
                 [connectionId]: (m[connectionId] ?? 0) + 1,
             }));
         }
-        void loadFeed();
         await maybeNotifyMessage(connectionId);
     });
 
@@ -253,7 +227,7 @@ async function maybeNotifyMessage(connectionId: string): Promise<void> {
     if (conn) {
         const p = conn.peer_profile;
         const name = `${p?.first_name ?? ''} ${p?.last_name ?? ''}`.trim();
-        title = name || conn.peer_alias || conn.label || title;
+        title = name || conn.peer_alias || title;
     }
 
     sendNotification({

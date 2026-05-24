@@ -17,13 +17,12 @@ import type { Connection } from './types';
  * Preference order:
  *   1. peer's profile name (first + last)
  *   2. peer_alias — the vault's user-facing connection label
- *   3. label — legacy field, kept only as a fallback
- *   4. first 8 chars of peer_guid, when present
- *   5. "Connection" — final fallback
+ *   3. first 8 chars of peer_guid, when present
+ *   4. "Connection" — final fallback
  */
 export function peerName(c: Connection): string {
     const p = c.peer_profile;
     const full = `${p?.first_name ?? ''} ${p?.last_name ?? ''}`.trim();
     const guidShort = c.peer_guid ? c.peer_guid.slice(0, 8) : '';
-    return full || c.peer_alias || c.label || guidShort || 'Connection';
+    return full || c.peer_alias || guidShort || 'Connection';
 }

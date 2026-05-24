@@ -787,8 +787,6 @@
                 <dl class="fields">
                     <dt>ID</dt>
                     <dd class="mono">{detail.connection_id}</dd>
-                    <dt>Direction</dt>
-                    <dd>{detail.direction}</dd>
                     <dt>Created</dt>
                     <dd>{new Date(detail.created_at).toLocaleString()}</dd>
                     {#if detail.e2e_public_key}

@@ -1,5 +1,14 @@
 // ---------------------------------------------------------------------------
 // Shared TypeScript types for the desktop app
+//
+// SCOPE: every interface in this file is a wire-format contract — it
+// must match exactly what the vault emits over NATS. If the vault
+// renames a field or removes one, fix it here in the same change.
+//
+// We deliberately do NOT keep "view convenience" or "future scaffold"
+// types here — those drift silently and have already bitten us four
+// times (params/payload, peer_alias/label, message_id/id, sender_guid/
+// sender_id). View-local response shapes belong in the view file.
 // ---------------------------------------------------------------------------
 
 export interface Connection {
@@ -12,14 +21,10 @@ export interface Connection {
     peer_guid?: string;
     /** The vault's `peer_alias` — the user-facing name for this connection. */
     peer_alias?: string;
-    /** @deprecated `connection.list` sends `peer_alias`; this is never populated. */
-    label?: string;
     /** Kind of connection — "peer" by default, plus "agent", "device",
      *  and "system" (the auto-created VettID system connection). */
     connection_type?: 'peer' | 'agent' | 'device' | 'system';
     status: 'pending' | 'active' | 'revoked' | 'expired';
-    /** Not returned by `connection.list` — optional until the vault sends it. */
-    direction?: 'outbound' | 'inbound';
     created_at: string;
     e2e_public_key?: string;
     peer_profile?: PeerProfile;
@@ -77,114 +82,57 @@ export interface PublishedCatalogItem {
     alias?: string;
 }
 
+/**
+ * One row from `message.list`. Field names mirror the vault's response
+ * struct in enclave/vault-manager/messaging.go (HandleList's messageItem)
+ * — when the two drift, the bug is silent until something assumes a
+ * field is present (e.g. Svelte's keyed each on `message_id`). Keep this
+ * in lockstep with the Go struct.
+ *
+ * Note: the vault does NOT echo `connection_id` in each row — the list
+ * response carries one top-level `connection_id` and the messages
+ * inherit it. So no per-message `connection_id` field here.
+ */
 export interface Message {
-    id: string;
-    connection_id: string;
-    sender_id: string;
+    message_id: string;
+    /** "incoming" (peer → us) or "outgoing" (us → peer). Authoritative
+     *  for sent-vs-received attribution; prefer over inferring from
+     *  sender_guid. */
+    direction: 'incoming' | 'outgoing';
+    /** Sender's GUID — the peer's GUID for incoming, our ownerSpace
+     *  for outgoing. Kept for downstream attribution (e.g. multi-party
+     *  rooms one day) but not used for the sent/received decision. */
+    sender_guid: string;
     content: string;
     content_type: 'text' | 'image' | 'file' | 'btc_address' | 'payment_request' | 'btc_payment_receipt' | 'btc_payment_decline';
     sent_at: string;
     status: 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
 }
 
-export interface FeedEvent {
-    event_id: string;
-    event_type: string;
-    title?: string;
-    message?: string;
-    timestamp: string;
-    is_read: boolean;
-    connection_id?: string;
-}
-
-export interface SecretEntry {
-    id: string;
-    name: string;
-    category: string;
-    created_at: string;
-    last_accessed?: string;
-}
-
-export interface Proposal {
-    id: string;
-    title: string;
-    description: string;
-    status: 'upcoming' | 'open' | 'closed';
-    created_at: string;
-    closes_at?: string;
-    vote_count?: number;
-    my_vote?: 'yes' | 'no' | 'abstain';
-}
-
-export interface PersonalDataItem {
-    field_id: string;
-    display_name: string;
-    value: string;
-    category: string;
-    updated_at?: string;
-}
-
-export interface WalletInfo {
-    wallet_id: string;
-    label: string;
-    address: string;
-    network: 'mainnet' | 'testnet';
-    cached_balance_sats: number;
-    is_public: boolean;
-}
-
-export interface TxHistoryEntry {
-    txid: string;
-    direction: 'sent' | 'received';
-    amount_sats: number;
-    fee_sats: number;
-    confirmed: boolean;
-    block_time?: string;
-}
-
-export interface AuditLogEntry {
-    id: string;
-    event_type: string;
-    timestamp: string;
-    details?: string;
-    actor?: string;
-}
-
-export interface ConnectedDevice {
-    device_id: string;
-    hostname: string;
-    platform: string;
-    status: 'active' | 'suspended' | 'expired' | 'revoked';
-    connected_at: string;
-    last_heartbeat?: string;
-}
-
+/**
+ * One row from `call.history`. Mirrors `CallRecord` in
+ * enclave/vault-manager/calls.go — keep these in lockstep when the Go
+ * struct changes.
+ */
 export interface CallHistoryEntry {
     call_id: string;
     caller_id?: string;
     callee_id?: string;
+    /** Set when the vault has a matching local connection. */
     connection_id?: string;
     call_type?: 'voice' | 'video';
     direction: 'incoming' | 'outgoing';
     status?: 'initiated' | 'answered' | 'missed' | 'rejected' | 'blocked';
+    /** Unix-epoch seconds (vault emits int64). */
     started_at?: number;
     answered_at?: number;
     ended_at?: number;
     duration_secs?: number;
     block_reason?: string;
+    /** Unix-epoch seconds — set when the user has acknowledged this
+     *  call (opened Call History, or completed a follow-up call with
+     *  the same peer). Used to clear the "Missed" badge. */
     seen_at?: number;
-    /** Compatibility fields for older shapes. */
-    peer_display_name?: string;
-    end_reason?: 'completed' | 'missed' | 'rejected' | 'failed' | 'cancelled';
-    initiated_at?: string;
-    duration?: number;
-}
-
-export interface Profile {
-    guid: string;
-    display_name: string;
-    email?: string;
-    photo_data?: string;
 }
 
 // Vault operation response from Tauri

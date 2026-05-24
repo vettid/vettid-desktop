@@ -86,13 +86,56 @@
     }
 
     function paymentKey(msg: Message, payload: PaymentPayload | null): string {
-        return payload?.request_id || msg.id;
+        return payload?.request_id || msg.message_id;
     }
 
     function formatBtc(sats?: number): string {
         if (typeof sats !== 'number' || !isFinite(sats)) return '';
         const btc = (sats / 100_000_000).toFixed(8);
         return btc.replace(/\.?0+$/, '') + ' BTC';
+    }
+
+    /**
+     * Sanitize a page of vault-returned messages before handing them to
+     * the keyed {#each} render. Three checks, each catches a wire-drift
+     * mode we've actually been bitten by:
+     *
+     *  1. Missing `message_id` — Svelte's keyed each throws
+     *     `each_key_duplicate` on the second `undefined` key and aborts
+     *     the render, leaving the pane stuck on "Loading…" (the
+     *     2026-05-24 wedge).
+     *  2. Duplicate `message_id` — same error mode if the vault ever
+     *     returns the same row twice (e.g. inclusive `before` cursor).
+     *  3. Missing/unknown `direction` — `isSent` would mis-attribute
+     *     the bubble (right-aligned vs left-aligned + color swap).
+     *
+     * Each failure is logged and the row is skipped. Surfacing the
+     * count makes a future regression visible instead of silent.
+     */
+    function sanitizeMessages(rows: Message[]): Message[] {
+        const seen = new Set<string>();
+        const out: Message[] = [];
+        let missingId = 0;
+        let duplicateId = 0;
+        let badDirection = 0;
+        for (const m of rows) {
+            const id = m?.message_id;
+            if (!id) { missingId++; continue; }
+            if (seen.has(id)) { duplicateId++; continue; }
+            if (m.direction !== 'incoming' && m.direction !== 'outgoing') {
+                badDirection++;
+                continue;
+            }
+            seen.add(id);
+            out.push(m);
+        }
+        const total = missingId + duplicateId + badDirection;
+        if (total > 0) {
+            console.warn(
+                `Conversation: dropped ${total} message row(s) — missing_id=${missingId}, duplicate_id=${duplicateId}, bad_direction=${badDirection}`,
+            );
+        }
+        return out;
     }
 
     async function loadMessages() {
@@ -106,7 +149,7 @@
             });
             if (resp.success && resp.data) {
                 const data = resp.data as { messages?: Message[] };
-                messages = (data.messages ?? []).sort((a, b) => {
+                messages = sanitizeMessages(data.messages ?? []).sort((a, b) => {
                     // Date.parse on undefined → NaN; NaN-NaN sort is
                     // undefined behaviour in V8 and at minimum drops
                     // stability. Coerce missing timestamps to 0 so the
@@ -146,17 +189,19 @@
             const resp: VaultOpResponse = await invoke('get_conversation', {
                 peerConnectionId: connection.connection_id,
                 limit: PAGE_SIZE,
-                before: oldest.id,
+                before: oldest.message_id,
             });
             if (resp.success && resp.data) {
                 const data = resp.data as { messages?: Message[] };
-                const older = (data.messages ?? []).sort(
-                    (a, b) => Date.parse(a.sent_at) - Date.parse(b.sent_at),
-                );
+                const older = sanitizeMessages(data.messages ?? []).sort((a, b) => {
+                    const at = a.sent_at ? Date.parse(a.sent_at) : 0;
+                    const bt = b.sent_at ? Date.parse(b.sent_at) : 0;
+                    return (Number.isNaN(at) ? 0 : at) - (Number.isNaN(bt) ? 0 : bt);
+                });
                 // De-dupe by id in case the vault's `before` semantics
                 // are inclusive on either side.
-                const have = new Set(messages.map((m) => m.id));
-                const fresh = older.filter((m) => !have.has(m.id));
+                const have = new Set(messages.map((m) => m.message_id));
+                const fresh = older.filter((m) => !have.has(m.message_id));
                 if (fresh.length === 0) {
                     hasMoreOlder = false;
                 } else {
@@ -191,7 +236,7 @@
             try {
                 await invoke('mark_message_read', {
                     connectionId: connection.connection_id,
-                    messageId: msg.id,
+                    messageId: msg.message_id,
                 });
                 msg.status = 'read';
             } catch (e) {
@@ -288,7 +333,7 @@
         paymentActionState = { ...paymentActionState, [key]: { busy: true } };
         try {
             const body = JSON.stringify({
-                request_id: payload?.request_id ?? msg.id,
+                request_id: payload?.request_id ?? msg.message_id,
                 reason,
             });
             const resp: VaultOpResponse = await invoke('send_message', {
@@ -408,8 +453,12 @@
      * the peer connection id as outbound.
      */
     function isSent(msg: Message): boolean {
-        return msg.sender_id !== connection.connection_id
-            && msg.sender_id !== connection.peer_guid;
+        // The vault stamps `direction` authoritatively when the message
+        // is recorded (MessageRecord.Direction in messaging.go); trust
+        // it over any heuristic on sender_guid / peer_guid (those break
+        // for system / device / agent connections where peer_guid is
+        // absent).
+        return msg.direction === 'outgoing';
     }
 
     async function startCall(type: CallType) {
@@ -492,7 +541,7 @@
             {:else if !hasMoreOlder && messages.length >= PAGE_SIZE}
                 <div class="older-status muted">— Start of conversation —</div>
             {/if}
-            {#each messages as msg (msg.id)}
+            {#each messages as msg (msg.message_id)}
                 {@const sent = isSent(msg)}
                 <div class="message" class:sent class:received={!sent}>
                     <div class="bubble">
