@@ -37,6 +37,14 @@
     connection.connection_type === 'device'
   );
 
+  // Agent connections get a simplified two-tab shape: Messages (for
+  // texting the agent — same wire format as a peer conversation, the
+  // agent just happens to be the addressee) and History (the audit
+  // trail of agent activity). No Profile/Sharing tabs since the agent
+  // has no peer-style profile and grant management for agents goes
+  // through scope, not the data-sharing surface.
+  let isAgent = $derived(connection.connection_type === 'agent');
+
   // Drop back to Messages whenever the selected connection changes —
   // a new conversation is the most useful default.
   $effect(() => {
@@ -90,6 +98,31 @@
 {#if isHistoryOnly}
   <div class="ws-body">
     <ConnectionHistory {connection} />
+  </div>
+{:else if isAgent}
+  <nav class="tabs" role="tablist" aria-label="Connection sections">
+    <button
+      type="button"
+      role="tab"
+      aria-selected={mode === 'messages'}
+      class:active={mode === 'messages'}
+      onclick={() => (mode = 'messages')}
+    >Messages</button>
+    <button
+      type="button"
+      role="tab"
+      aria-selected={mode === 'profile'}
+      class:active={mode === 'profile'}
+      onclick={() => (mode = 'profile')}
+    >History</button>
+  </nav>
+
+  <div class="ws-body">
+    {#if mode === 'messages'}
+      <Conversation {connection} compact onShowProfile={() => (mode = 'profile')} />
+    {:else}
+      <ConnectionHistory {connection} />
+    {/if}
   </div>
 {:else}
   <nav class="tabs" role="tablist" aria-label="Connection sections">
