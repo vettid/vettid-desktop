@@ -8,6 +8,7 @@
     import { placeCall, type CallType } from '../../stores/calls';
     import { CALLS_ENABLED } from '../../config/features';
     import { peerName } from '../../connectionName';
+    import { decodeEventPayload } from '../../events';
     import SendBtcSheet from './wallet/SendBtcSheet.svelte';
     import RequestPaymentSheet from './wallet/RequestPaymentSheet.svelte';
 
@@ -420,20 +421,35 @@
         loadMessages();
     });
 
-    // Real-time message handler — only consume events for this conversation.
+    // Real-time message + read-receipt handlers. Both arrive on the
+    // per-device fan-out subject `MessageSpace.{owner}.forApp.device
+    // .{conn}.{event}` — the conversation's connection_id lives inside
+    // the payload (set by messaging.go's handleIncomingPeerMessage and
+    // handleIncomingReadReceipt), so we decode and filter on that.
+    // Both responses reload the conversation since vault.message.list
+    // is the authoritative source for both content and per-message
+    // status.
     $effect(() => {
-        const unlisten = listen<{ subject: string; payload_b64: string }>(
+        const unlistenMsg = listen<{ subject: string; payload_b64: string }>(
             'vault:message-received',
             (event) => {
-                const subject = event.payload?.subject ?? '';
-                if (!subject.includes(connection.connection_id)) return;
-                // Reload to pick up the new message rather than trying to
-                // decrypt the payload here — the vault's `message.list` is
-                // authoritative and avoids drift.
+                const body = decodeEventPayload<{ connection_id?: string }>(event.payload);
+                if (body?.connection_id !== connection.connection_id) return;
                 loadMessages();
             },
         );
-        return () => { unlisten.then((fn) => fn()); };
+        const unlistenReceipt = listen<{ subject: string; payload_b64: string }>(
+            'vault:read-receipt',
+            (event) => {
+                const body = decodeEventPayload<{ connection_id?: string }>(event.payload);
+                if (body?.connection_id !== connection.connection_id) return;
+                loadMessages();
+            },
+        );
+        return () => {
+            unlistenMsg.then((fn) => fn());
+            unlistenReceipt.then((fn) => fn());
+        };
     });
 </script>
 

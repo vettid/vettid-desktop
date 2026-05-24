@@ -14,6 +14,7 @@ import type {
     SecretEntry,
     VaultOpResponse,
 } from '../types';
+import { decodeEventPayload } from '../events';
 
 // ---------------------------------------------------------------------------
 // Store-local types
@@ -150,9 +151,14 @@ export function initVaultListeners(): void {
     // OS notification. Per-conversation views reset their own count via
     // `markConversationRead`.
     listen<AppEventEnvelope>('vault:message-received', async (event) => {
-        const subject = event.payload?.subject ?? '';
-        // Subject pattern: `OwnerSpace.{guid}.forApp.new-message.{connectionId}`
-        const connectionId = subject.split('.').pop() ?? '';
+        // Subject is now `MessageSpace.{owner}.forApp.device.{conn}.new-message`
+        // (the per-device fan-out target), so the connection_id of the
+        // conversation lives inside the payload, not the subject. The
+        // vault publishes the full appNotification (see messaging.go
+        // handleIncomingPeerMessage) which carries `connection_id` for
+        // the peer conversation the message belongs to.
+        const body = decodeEventPayload<{ connection_id?: string }>(event.payload);
+        const connectionId = body?.connection_id ?? '';
         if (connectionId) {
             unreadByConnectionStore.update((m) => ({
                 ...m,
