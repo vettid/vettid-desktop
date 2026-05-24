@@ -60,8 +60,11 @@
     aria-label="Agent"
     title="Agent"
   >
-    <svg viewBox="0 0 24 24" width={Math.round(size * 0.55)} height={Math.round(size * 0.55)} aria-hidden="true">
-      <path fill="currentColor" d="M2 4h20v14H2zm2 2v10h16V6zM4 18h16v2H4z" />
+    <!-- Material smart_toy ("robot toy"). Visually reads as a robot
+         at every size from the 40px Connections row up to the 64px
+         profile header. Mirrors Android's Icons.Default.SmartToy. -->
+    <svg viewBox="0 0 24 24" width={Math.round(size * 0.6)} height={Math.round(size * 0.6)} aria-hidden="true">
+      <path fill="currentColor" d="M20 9V7c0-1.1-.9-2-2-2h-3c0-1.66-1.34-3-3-3S9 3.34 9 5H6c-1.1 0-2 .9-2 2v2c-1.66 0-3 1.34-3 3s1.34 3 3 3v4c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2v-4c1.66 0 3-1.34 3-3s-1.34-3-3-3zm-2 10H6V7h12v12zm-9-6c-.83 0-1.5-.67-1.5-1.5S8.17 10 9 10s1.5.67 1.5 1.5S9.83 13 9 13zm6 0c-.83 0-1.5-.67-1.5-1.5S14.17 10 15 10s1.5.67 1.5 1.5S15.83 13 15 13zm-3 4c-1.39 0-2.6-.87-3.07-2h6.14c-.47 1.13-1.68 2-3.07 2z" />
     </svg>
   </span>
 {:else}
