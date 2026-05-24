@@ -92,8 +92,8 @@ on top + tiles/sections underneath for the four data domains.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ [photo] Al Liebl                                                  │
-│         al@liebl.me                                               │
+│ [photo] <owner name>                                              │
+│         <owner email>                                             │
 │         Linux desktop · paired since 2026-05-17                   │
 ├──────────────────────────────────────────────────────────────────┤
 │ Personal data  >    │  Secrets  >        │  Wallets  >           │
