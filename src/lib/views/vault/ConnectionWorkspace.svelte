@@ -1,10 +1,11 @@
 <script lang="ts">
   // Right pane of the two-pane Connections layout. Owns the identity
-  // header (avatar, name, status, call buttons) and a Messages/Profile
-  // toggle that swaps the body between the existing Conversation and
-  // ConnectionDetail views. Conversation + Detail each get a `compact`
-  // flag so their own headers stay out of the way and the workspace
-  // header is the single source of identity on screen.
+  // header (avatar, name, status, call buttons) and a Messages /
+  // Profile / Sharing tab strip that swaps the body between the
+  // Conversation, ConnectionDetail, and ConnectionSharing views.
+  // Conversation + Detail each get a `compact` flag so their own
+  // headers stay out of the way and the workspace header is the
+  // single source of identity on screen.
   import type { Connection } from '../../types';
   import Avatar from '../../components/Avatar.svelte';
   import StatusChip from '../../components/StatusChip.svelte';
@@ -13,13 +14,14 @@
   import { CALLS_ENABLED } from '../../config/features';
   import Conversation from './Conversation.svelte';
   import ConnectionDetail from './ConnectionDetail.svelte';
+  import ConnectionSharing from './ConnectionSharing.svelte';
 
   interface Props {
     connection: Connection;
   }
   let { connection }: Props = $props();
 
-  type Mode = 'messages' | 'profile';
+  type Mode = 'messages' | 'profile' | 'sharing';
   let mode = $state<Mode>('messages');
   let callError = $state('');
 
@@ -88,13 +90,22 @@
     class:active={mode === 'profile'}
     onclick={() => (mode = 'profile')}
   >Profile</button>
+  <button
+    type="button"
+    role="tab"
+    aria-selected={mode === 'sharing'}
+    class:active={mode === 'sharing'}
+    onclick={() => (mode = 'sharing')}
+  >Sharing</button>
 </nav>
 
 <div class="ws-body">
   {#if mode === 'messages'}
     <Conversation {connection} compact onShowProfile={() => (mode = 'profile')} />
-  {:else}
+  {:else if mode === 'profile'}
     <ConnectionDetail {connection} compact onBack={() => (mode = 'messages')} />
+  {:else}
+    <ConnectionSharing {connection} />
   {/if}
 </div>
 
