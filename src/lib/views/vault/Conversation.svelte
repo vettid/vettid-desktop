@@ -106,9 +106,15 @@
             });
             if (resp.success && resp.data) {
                 const data = resp.data as { messages?: Message[] };
-                messages = (data.messages ?? []).sort(
-                    (a, b) => Date.parse(a.sent_at) - Date.parse(b.sent_at),
-                );
+                messages = (data.messages ?? []).sort((a, b) => {
+                    // Date.parse on undefined → NaN; NaN-NaN sort is
+                    // undefined behaviour in V8 and at minimum drops
+                    // stability. Coerce missing timestamps to 0 so the
+                    // sort is total.
+                    const at = a.sent_at ? Date.parse(a.sent_at) : 0;
+                    const bt = b.sent_at ? Date.parse(b.sent_at) : 0;
+                    return (Number.isNaN(at) ? 0 : at) - (Number.isNaN(bt) ? 0 : bt);
+                });
                 // If the vault returned fewer than the page size, we
                 // already have every message — disable further fetches.
                 if (messages.length < PAGE_SIZE) hasMoreOlder = false;
@@ -362,21 +368,27 @@
     const URL_PATTERN = /(https?:\/\/[^\s]+|www\.[^\s]+)/g;
     interface Token { text: string; isLink: boolean; href?: string; }
 
-    function tokenize(text: string): Token[] {
+    function tokenize(text: string | null | undefined): Token[] {
+        // The vault SHOULD always set content to a string, but a single
+        // null/undefined field in the response would otherwise abort the
+        // whole {#each messages} render — and that takes the conversation
+        // pane with it (Svelte 5 propagates the error up the reactive
+        // graph). Coerce to "" so the worst case is an empty bubble.
+        const safe = typeof text === 'string' ? text : '';
         const tokens: Token[] = [];
         let lastIndex = 0;
-        for (const match of text.matchAll(URL_PATTERN)) {
+        for (const match of safe.matchAll(URL_PATTERN)) {
             const start = match.index ?? 0;
             if (start > lastIndex) {
-                tokens.push({ text: text.slice(lastIndex, start), isLink: false });
+                tokens.push({ text: safe.slice(lastIndex, start), isLink: false });
             }
             const url = match[0];
             const href = url.startsWith('http') ? url : `https://${url}`;
             tokens.push({ text: url, isLink: true, href });
             lastIndex = start + url.length;
         }
-        if (lastIndex < text.length) {
-            tokens.push({ text: text.slice(lastIndex), isLink: false });
+        if (lastIndex < safe.length) {
+            tokens.push({ text: safe.slice(lastIndex), isLink: false });
         }
         return tokens;
     }
