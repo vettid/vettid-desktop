@@ -67,6 +67,24 @@ pub async fn query_audit(state: State<'_, AppState>) -> Result<VaultOpResponse, 
     Ok(VaultOpResponse::from_op(result))
 }
 
+/// List audit entries for one connection (independent). Used by the
+/// simplified system/device-connection workspace to show history
+/// without the messaging / sharing / profile surface a peer would
+/// have. Newest entries first; pages via cursor_created_at / cursor_entry_id.
+#[tauri::command]
+pub async fn list_connection_audit(
+    state: State<'_, AppState>,
+    connection_id: String,
+    limit: Option<i32>,
+) -> Result<VaultOpResponse, String> {
+    let mut params = serde_json::json!({ "connection_id": connection_id });
+    if let Some(l) = limit {
+        params["limit"] = serde_json::json!(l);
+    }
+    let result = operations::execute(&state, "connection.audit.list", params).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
 /// List messages.
 #[tauri::command]
 pub async fn list_messages(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {

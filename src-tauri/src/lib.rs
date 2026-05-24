@@ -79,6 +79,7 @@ pub fn run() {
             vault::get_connection,
             vault::list_feed,
             vault::query_audit,
+            vault::list_connection_audit,
             vault::list_messages,
             vault::list_secrets_catalog,
             vault::list_proposals,

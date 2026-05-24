@@ -5,6 +5,7 @@
     import type { Connection, VaultOpResponse, PublishedCatalogItem, CallHistoryEntry } from '../../types';
     import { clearSelectedConnection } from '../../stores/navigation';
     import { peerName } from '../../connectionName';
+    import Avatar from '../../components/Avatar.svelte';
     import {
         requestAccess,
         requestAccessGroup,
@@ -658,13 +659,12 @@
             <section class="card">
                 <h4>Profile</h4>
                 <div class="profile-head">
-                    <div class="avatar-large">
-                        {#if detail.peer_profile?.photo}
-                            <img src={`data:image/png;base64,${detail.peer_profile.photo}`} alt="" />
-                        {:else}
-                            <span class="initials-large">{peerName(detail).slice(0, 1).toUpperCase()}</span>
-                        {/if}
-                    </div>
+                    <Avatar
+                        name={peerName(detail)}
+                        photo={detail.peer_profile?.photo}
+                        connectionType={detail.connection_type}
+                        size={64}
+                    />
                     <div class="profile-id">
                         <div class="full-name">{peerName(detail)}</div>
                         {#if detail.peer_profile?.email}

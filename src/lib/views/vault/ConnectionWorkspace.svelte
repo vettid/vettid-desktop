@@ -15,6 +15,7 @@
   import Conversation from './Conversation.svelte';
   import ConnectionDetail from './ConnectionDetail.svelte';
   import ConnectionSharing from './ConnectionSharing.svelte';
+  import ConnectionHistory from './ConnectionHistory.svelte';
 
   interface Props {
     connection: Connection;
@@ -24,6 +25,17 @@
   type Mode = 'messages' | 'profile' | 'sharing';
   let mode = $state<Mode>('messages');
   let callError = $state('');
+
+  // System + device connections collapse to a history-only view.
+  // There's no peer to text/call (system) and no peer-style profile
+  // to inspect (device); the mobile app owns the rich actions for
+  // both (voting on the system connection, end-session/revoke on
+  // the device connection). Hiding the tabs keeps the desktop from
+  // promising surfaces that don't actually apply.
+  let isHistoryOnly = $derived(
+    connection.connection_type === 'system' ||
+    connection.connection_type === 'device'
+  );
 
   // Drop back to Messages whenever the selected connection changes —
   // a new conversation is the most useful default.
@@ -75,39 +87,45 @@
 
 {#if callError}<div class="cerr">{callError}</div>{/if}
 
-<nav class="tabs" role="tablist" aria-label="Connection sections">
-  <button
-    type="button"
-    role="tab"
-    aria-selected={mode === 'messages'}
-    class:active={mode === 'messages'}
-    onclick={() => (mode = 'messages')}
-  >Messages</button>
-  <button
-    type="button"
-    role="tab"
-    aria-selected={mode === 'profile'}
-    class:active={mode === 'profile'}
-    onclick={() => (mode = 'profile')}
-  >Profile</button>
-  <button
-    type="button"
-    role="tab"
-    aria-selected={mode === 'sharing'}
-    class:active={mode === 'sharing'}
-    onclick={() => (mode = 'sharing')}
-  >Sharing</button>
-</nav>
+{#if isHistoryOnly}
+  <div class="ws-body">
+    <ConnectionHistory {connection} />
+  </div>
+{:else}
+  <nav class="tabs" role="tablist" aria-label="Connection sections">
+    <button
+      type="button"
+      role="tab"
+      aria-selected={mode === 'messages'}
+      class:active={mode === 'messages'}
+      onclick={() => (mode = 'messages')}
+    >Messages</button>
+    <button
+      type="button"
+      role="tab"
+      aria-selected={mode === 'profile'}
+      class:active={mode === 'profile'}
+      onclick={() => (mode = 'profile')}
+    >Profile</button>
+    <button
+      type="button"
+      role="tab"
+      aria-selected={mode === 'sharing'}
+      class:active={mode === 'sharing'}
+      onclick={() => (mode = 'sharing')}
+    >Sharing</button>
+  </nav>
 
-<div class="ws-body">
-  {#if mode === 'messages'}
-    <Conversation {connection} compact onShowProfile={() => (mode = 'profile')} />
-  {:else if mode === 'profile'}
-    <ConnectionDetail {connection} compact onBack={() => (mode = 'messages')} />
-  {:else}
-    <ConnectionSharing {connection} />
-  {/if}
-</div>
+  <div class="ws-body">
+    {#if mode === 'messages'}
+      <Conversation {connection} compact onShowProfile={() => (mode = 'profile')} />
+    {:else if mode === 'profile'}
+      <ConnectionDetail {connection} compact onBack={() => (mode = 'messages')} />
+    {:else}
+      <ConnectionSharing {connection} />
+    {/if}
+  </div>
+{/if}
 
 <style>
   .ws-head {
