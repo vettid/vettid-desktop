@@ -346,14 +346,19 @@ async fn handle_app_event(app_handle: &AppHandle, state: &AppState, subject: &st
         "vault:location-update"
     } else if tag.starts_with("feed.") {
         "vault:feed-event"
-    } else if tag == "agent.message.received" {
-        // Agent→owner chat message, sealed under the AgentSession
-        // key and emitted by the vault's handleAgentMessage after
-        // store + audit. Conversation.svelte listens for this on
-        // agent conversations and reloads via get_conversation; same
-        // pattern as vault:message-received for peer messages. Must
-        // come before the generic agent.* arm so the dedicated event
-        // wins.
+    } else if tag.starts_with("agent.message.") {
+        // Both directions of agent chat:
+        //   .received — agent→owner (emitted by handleAgentMessage)
+        //   .sent     — owner→agent (emitted by HandleAgentMessageReply)
+        // Either way the conversation thread on this surface needs
+        // a refresh; Conversation.svelte listens for vault:agent-message
+        // and reloads via get_conversation. The `.sent` direction
+        // matters specifically for the surface that did NOT originate
+        // the send (e.g. desktop viewing a conversation while the
+        // user types from their phone) — without it that surface
+        // shows stale state until the user manually refreshes.
+        // Must come before the generic agent.* arm so the dedicated
+        // event wins.
         "vault:agent-message"
     } else if tag.starts_with("agent.") {
         "vault:agent-event"
@@ -489,8 +494,10 @@ mod tests {
             event_suffix("MessageSpace.user-1.forApp.device.conn-9.message.read-receipt"),
             "message.read-receipt",
         );
-        // Agent chat: dedicated suffix so the cascade can route it to
-        // vault:agent-message ahead of the generic agent.* arm.
+        // Agent chat: both directions surface the suffix verbatim so
+        // the cascade's starts_with("agent.message.") prefix-match
+        // routes both to vault:agent-message ahead of the generic
+        // agent.* arm.
         assert_eq!(
             event_suffix("MessageSpace.user-1.forApp.device.conn-9.agent.message.received"),
             "agent.message.received",
@@ -498,6 +505,10 @@ mod tests {
         assert_eq!(
             event_suffix("OwnerSpace.user-1.forApp.agent.message.received"),
             "agent.message.received",
+        );
+        assert_eq!(
+            event_suffix("MessageSpace.user-1.forApp.device.conn-9.agent.message.sent"),
+            "agent.message.sent",
         );
     }
 }
