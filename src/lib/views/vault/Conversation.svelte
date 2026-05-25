@@ -252,10 +252,25 @@
         if (!text || sending) return;
         sending = true;
         try {
-            const resp: VaultOpResponse = await invoke('send_message', {
-                peerConnectionId: connection.connection_id,
-                content: text,
-            });
+            // Agent connections route through a different vault op
+            // (agent.message-reply) because the agent crypto path uses
+            // the AgentSession key, not the peer SharedSecret that
+            // message.send/HandleSend assumes. Mirrors the Android
+            // ConversationViewModel branch — keeps the failure mode
+            // ("Send failed" with no detail) from coming back the
+            // moment the user tries to message an agent. Vault-side
+            // handler shipped in v5; see vettid-dev's
+            // HandleAgentMessageReply.
+            const isAgent = connection.connection_type === 'agent';
+            const resp: VaultOpResponse = isAgent
+                ? await invoke('send_agent_message', {
+                    connectionId: connection.connection_id,
+                    content: text,
+                })
+                : await invoke('send_message', {
+                    peerConnectionId: connection.connection_id,
+                    content: text,
+                });
             if (resp.success) {
                 composeText = '';
                 await loadMessages();
@@ -507,9 +522,24 @@
                 loadMessages();
             },
         );
+        // Agent connections: the vault emits agent.message.received
+        // (not new-message) for agent→owner messages because the
+        // payload comes from the agent's encrypted channel rather
+        // than a peer's. Listener.rs routes this to a dedicated
+        // vault:agent-message event so we don't have to disambiguate
+        // by subject on the JS side.
+        const unlistenAgentMsg = listen<{ subject: string; payload_b64: string }>(
+            'vault:agent-message',
+            (event) => {
+                const body = decodeEventPayload<{ connection_id?: string }>(event.payload);
+                if (body?.connection_id !== connection.connection_id) return;
+                loadMessages();
+            },
+        );
         return () => {
             unlistenMsg.then((fn) => fn());
             unlistenReceipt.then((fn) => fn());
+            unlistenAgentMsg.then((fn) => fn());
         };
     });
 </script>
@@ -620,7 +650,7 @@
                     </div>
                     <div class="msg-meta">
                         <span class="time">{new Date(msg.sent_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</span>
-                        {#if sent}
+                        {#if sent && connection.connection_type !== 'agent'}
                             <span class="receipt" class:read={msg.status === 'read'}>
                                 {#if msg.status === 'read'}✓✓
                                 {:else if msg.status === 'delivered'}✓✓

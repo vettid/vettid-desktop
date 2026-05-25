@@ -125,6 +125,7 @@ pub fn run() {
             vault::cast_vote,
             vault::send_btc,
             vault::send_message,
+            vault::send_agent_message,
             vault::create_wallet,
             vault::get_wallet_address,
             vault::get_fee_estimates,

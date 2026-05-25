@@ -408,6 +408,34 @@ pub async fn send_message(
     Ok(VaultOpResponse::from_op(result))
 }
 
+/// Send a chat message to an agent connection.
+///
+/// Routes through the vault's `agent.message-reply` op (same handler
+/// the phone uses) instead of `message.send`. The two paths can't be
+/// unified because peer messages encrypt under a SharedSecret that
+/// agent connections lack — they have an AgentSession key instead,
+/// and the vault dispatches to a different encryption codepath
+/// based on which op was called. Front-end branches on
+/// `connection.connection_type === 'agent'` before deciding which
+/// command to invoke. See vettid-dev/enclave/vault-manager/
+/// agent_handler.go HandleAgentMessageReply (live as of v5).
+#[tauri::command]
+pub async fn send_agent_message(
+    state: State<'_, AppState>,
+    connection_id: String,
+    content: String,
+) -> Result<VaultOpResponse, String> {
+    let result = operations::execute(
+        &state,
+        "agent.message-reply",
+        serde_json::json!({
+            "connection_id": connection_id,
+            "content": content,
+        }),
+    ).await;
+    Ok(VaultOpResponse::from_op(result))
+}
+
 /// Get conversation messages for a connection. Vault returns the latest
 /// `limit` messages (default 50, max 100); `before` pages backwards
 /// using a message_id from the oldest currently-visible row.
