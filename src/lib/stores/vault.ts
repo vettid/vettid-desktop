@@ -149,6 +149,36 @@ export function initVaultListeners(): void {
         // No-op at the store level; the conversation view subscribes directly.
     });
 
+    // Agent message — vault emits agent.message.received (agent→owner)
+    // and agent.message.sent (owner→agent, e.g. from the phone) on the
+    // forApp bus; listener.rs routes both to vault:agent-message.
+    // Bump the per-connection unread count for received messages and
+    // fire an OS notification, mirroring vault:message-received's
+    // behavior. The .sent direction (when this desktop did NOT
+    // originate the send — e.g. user typed on the phone) also surfaces
+    // here, so we filter to only count "incoming" so the user's own
+    // outbound chat from another surface doesn't pop a notification at
+    // them on this surface.
+    listen<AppEventEnvelope>('vault:agent-message', async (event) => {
+        const body = decodeEventPayload<{
+            connection_id?: string;
+            direction?: string;
+        }>(event.payload);
+        const connectionId = body?.connection_id ?? '';
+        const direction = body?.direction ?? '';
+        if (!connectionId) return;
+        // Only count + notify for messages we DIDN'T send. Outbound
+        // mirroring from another surface (phone) reaches us via
+        // agent.message.sent; refresh Conversation.svelte if it's open,
+        // but don't badge or notify — the user knows they just sent it.
+        if (direction === 'outgoing') return;
+        unreadByConnectionStore.update((m) => ({
+            ...m,
+            [connectionId]: (m[connectionId] ?? 0) + 1,
+        }));
+        await maybeNotifyMessage(connectionId);
+    });
+
     // Phone approval result — drop from pending list.
     listen<{ request_id?: string; requestId?: string }>(
         'vault:phone-approval-result',
