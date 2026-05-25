@@ -83,7 +83,18 @@ export function initNotifications(): void {
   // The push payload is connection-encrypted and not decoded here, so the
   // toast is intentionally content-free — which is also the right call
   // for privacy (no message text on the lock screen).
+  //
+  // Both peer messages (vault:message-received) and agent messages
+  // (vault:agent-message) route here so the OS notification path is one
+  // place — notify() owns icon resolution + focused-window suppression.
+  // stores/vault.ts handles the in-app unread-count bump separately.
+  // Previously stores/vault.ts ALSO fired sendNotification for both
+  // event types, producing duplicate toasts (and without an icon),
+  // observed during 2026-05-25 testing.
   listen('vault:message-received', () => {
+    void notify('New message', 'You have a new message in VettID.');
+  });
+  listen('vault:agent-message', () => {
     void notify('New message', 'You have a new message in VettID.');
   });
 

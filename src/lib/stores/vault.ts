@@ -1,12 +1,6 @@
 import { writable, derived, type Writable, type Readable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
-import {
-    isPermissionGranted,
-    requestPermission,
-    sendNotification,
-} from '@tauri-apps/plugin-notification';
-import { getCurrentWindow } from '@tauri-apps/api/window';
 import type { Connection, VaultOpResponse } from '../types';
 import { decodeEventPayload } from '../events';
 
@@ -122,25 +116,19 @@ export function initVaultListeners(): void {
         void loadConnections();
     });
 
-    // New message — bump unread count and (when window isn't focused) fire an
-    // OS notification. Per-conversation views reset their own count via
-    // `markConversationRead`.
-    listen<AppEventEnvelope>('vault:message-received', async (event) => {
-        // Subject is now `MessageSpace.{owner}.forApp.device.{conn}.new-message`
-        // (the per-device fan-out target), so the connection_id of the
-        // conversation lives inside the payload, not the subject. The
-        // vault publishes the full appNotification (see messaging.go
-        // handleIncomingPeerMessage) which carries `connection_id` for
-        // the peer conversation the message belongs to.
+    // New message — bump per-connection unread count for the in-app
+    // badge. The OS notification is fired from notifications.ts
+    // (which has the icon path + focused-window suppression); keeping
+    // that here too produced duplicate toasts. Per-conversation views
+    // reset their own count via `markConversationRead`.
+    listen<AppEventEnvelope>('vault:message-received', (event) => {
         const body = decodeEventPayload<{ connection_id?: string }>(event.payload);
         const connectionId = body?.connection_id ?? '';
-        if (connectionId) {
-            unreadByConnectionStore.update((m) => ({
-                ...m,
-                [connectionId]: (m[connectionId] ?? 0) + 1,
-            }));
-        }
-        await maybeNotifyMessage(connectionId);
+        if (!connectionId) return;
+        unreadByConnectionStore.update((m) => ({
+            ...m,
+            [connectionId]: (m[connectionId] ?? 0) + 1,
+        }));
     });
 
     // Read receipt from peer — clears the "delivered/read" badges on sent
@@ -149,34 +137,23 @@ export function initVaultListeners(): void {
         // No-op at the store level; the conversation view subscribes directly.
     });
 
-    // Agent message — vault emits agent.message.received (agent→owner)
-    // and agent.message.sent (owner→agent, e.g. from the phone) on the
-    // forApp bus; listener.rs routes both to vault:agent-message.
-    // Bump the per-connection unread count for received messages and
-    // fire an OS notification, mirroring vault:message-received's
-    // behavior. The .sent direction (when this desktop did NOT
-    // originate the send — e.g. user typed on the phone) also surfaces
-    // here, so we filter to only count "incoming" so the user's own
-    // outbound chat from another surface doesn't pop a notification at
-    // them on this surface.
-    listen<AppEventEnvelope>('vault:agent-message', async (event) => {
+    // Agent message — bump per-connection unread count for received.
+    // OS notification fires from notifications.ts (single source).
+    // Filter to direction !== 'outgoing' so an agent.message.sent
+    // mirror from another surface (phone) doesn't badge a message
+    // the user just sent themselves.
+    listen<AppEventEnvelope>('vault:agent-message', (event) => {
         const body = decodeEventPayload<{
             connection_id?: string;
             direction?: string;
         }>(event.payload);
         const connectionId = body?.connection_id ?? '';
-        const direction = body?.direction ?? '';
         if (!connectionId) return;
-        // Only count + notify for messages we DIDN'T send. Outbound
-        // mirroring from another surface (phone) reaches us via
-        // agent.message.sent; refresh Conversation.svelte if it's open,
-        // but don't badge or notify — the user knows they just sent it.
-        if (direction === 'outgoing') return;
+        if (body?.direction === 'outgoing') return;
         unreadByConnectionStore.update((m) => ({
             ...m,
             [connectionId]: (m[connectionId] ?? 0) + 1,
         }));
-        await maybeNotifyMessage(connectionId);
     });
 
     // Phone approval result — drop from pending list.
@@ -211,64 +188,5 @@ export function markConversationRead(connectionId: string): void {
     });
 }
 
-// ---------------------------------------------------------------------------
-// OS notifications
-// ---------------------------------------------------------------------------
-
-let notificationsEnabled: boolean | null = null;
-
-async function ensureNotificationPermission(): Promise<boolean> {
-    if (notificationsEnabled !== null) return notificationsEnabled;
-    try {
-        let granted = await isPermissionGranted();
-        if (!granted) {
-            const result = await requestPermission();
-            granted = result === 'granted';
-        }
-        notificationsEnabled = granted;
-    } catch {
-        notificationsEnabled = false;
-    }
-    return notificationsEnabled;
-}
-
-/**
- * Fire an OS notification for an incoming message — but only when the app
- * window is *not* focused. If the user is already looking at the app, the UI
- * update is sufficient and a duplicate notification is just noise.
- */
-async function maybeNotifyMessage(connectionId: string): Promise<void> {
-    try {
-        const win = getCurrentWindow();
-        const focused = await win.isFocused();
-        if (focused) return;
-    } catch {
-        // If we can't query focus state, err on the side of notifying.
-    }
-
-    const granted = await ensureNotificationPermission();
-    if (!granted) return;
-
-    // Look up the peer name from the current connections list. Falls back to
-    // a generic title rather than leaking the raw connection id.
-    let title = 'New message';
-    const connections = getCurrentConnections();
-    const conn = connections.find((c) => c.connection_id === connectionId);
-    if (conn) {
-        const p = conn.peer_profile;
-        const name = `${p?.first_name ?? ''} ${p?.last_name ?? ''}`.trim();
-        title = name || conn.peer_alias || title;
-    }
-
-    sendNotification({
-        title,
-        body: 'Tap to open the conversation.',
-    });
-}
-
-function getCurrentConnections(): Connection[] {
-    let snapshot: Connection[] = [];
-    const unsub = connectionsStore.subscribe((v) => { snapshot = v; });
-    unsub();
-    return snapshot;
-}
+// (OS-notification helpers consolidated into notifications.ts —
+// this module now only owns the in-app unread-count store.)
