@@ -9,7 +9,16 @@ license = "AGPL-3.0-or-later"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png", "devtools"] }
+# SECURITY: `devtools` is INTENTIONALLY not in this list. Enabling the
+# Tauri `devtools` Cargo feature exposes the WebView inspector in every
+# build of the binary — including release — regardless of
+# debug_assertions. A local-process attacker with the WebView open can
+# hook the JS↔Rust invoke bridge and call any Tauri command after the
+# auto-unlock has loaded the connection key. Enable explicitly with
+# `--features devtools` (already wired in scripts/install-local.sh for
+# --debug builds). Never add it back to default.
+# See SECURITY-REVIEW-2026-05-25.md D-HIGH-1.
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-shell = "2"
 tauri-plugin-notification = "2"
 # Single-instance: a second launch of the binary doesn't open a new
@@ -96,6 +105,10 @@ tempfile = "3"
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# Enable the WebView devtools (Inspect Element). SECURITY: opt-in only,
+# never include in `default` and never in a release build. See the note
+# on the tauri dependency above and SECURITY-REVIEW-2026-05-25.md D-HIGH-1.
+devtools = ["tauri/devtools"]
 # Enable real WebRTC media. Without this, call signaling still works but no
 # audio/video flows — useful for testing the call UX without paying the
 # webrtc-rs compile cost (~5–10 min on a clean build).

@@ -56,8 +56,19 @@ if [[ "$PROFILE" == "debug" ]]; then
     build_args+=(--debug)
 fi
 build_args+=(--target aarch64-apple-darwin --bundles app)
+# Build a comma-separated --features list so we don't repeat the flag.
+features=()
 if [[ "$WITH_CALLS" -eq 1 ]]; then
-    build_args+=(--features webrtc)
+    features+=(webrtc)
+fi
+# SECURITY: only enable the WebView devtools (`devtools` Cargo feature)
+# in debug builds. Release bundles must NOT carry it — see
+# SECURITY-REVIEW-2026-05-25.md D-HIGH-1.
+if [[ "$PROFILE" == "debug" ]]; then
+    features+=(devtools)
+fi
+if [[ ${#features[@]} -gt 0 ]]; then
+    build_args+=(--features "$(IFS=, ; echo "${features[*]}")")
 fi
 
 if [[ "$REBUILD" -eq 1 || ! -d "$APP_DIR" ]]; then
