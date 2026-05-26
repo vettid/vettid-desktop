@@ -22,7 +22,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use chacha20poly1305::aead::Aead;
+use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -30,17 +30,29 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 use crate::credential::keystore::{self, BindingMode, KeystoreError};
+use crate::fingerprint::platform_key;
 use crate::fingerprint::platform_linux::FingerprintError;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Current version of the encrypted store format. v2 dropped the
-/// Argon2id-over-passphrase step in favor of a 32-byte master key
-/// sourced via [`crate::credential::keystore`]. v1 stores are
-/// rejected outright (no migration — see DESKTOP-REWORK-PLAN.md §7).
-const STORE_VERSION: i32 = 2;
+/// Current version of the encrypted store format.
+///
+/// - v1: legacy passphrase + Argon2id. Rejected outright (see
+///   DESKTOP-REWORK-PLAN.md §7).
+/// - v2: 32-byte master key from [`crate::credential::keystore`], no
+///   AEAD associated data. Decryptable for backwards-compat but a
+///   v2 read triggers an automatic re-seal to v3 on next save.
+/// - v3: same master key, but the AEAD now binds the ciphertext to
+///   the local machine via [`compute_blob_aad`]. A blob copied to a
+///   different machine — even with the original keyring entry — no
+///   longer decrypts. See SECURITY-REVIEW-2026-05-25.md D-HIGH-3.
+const STORE_VERSION: i32 = 3;
+const LEGACY_STORE_VERSION_V2: i32 = 2;
+
+/// Domain-separation label baked into the AEAD AAD.
+const AAD_LABEL: &[u8] = b"vettid-desktop-credential-v3";
 
 /// Credential file name within the config directory.
 const CREDENTIAL_FILE: &str = "connection.enc";
@@ -191,7 +203,8 @@ pub fn save(config_dir: &Path, creds: &ConnectionCredentials) -> Result<BindingM
     let mut plaintext = serde_json::to_vec(creds)
         .map_err(|e| CredentialError::SerializationError(format!("marshal credentials: {}", e)))?;
 
-    let (nonce, ciphertext) = encrypt_xchacha20(&master.key, &plaintext)?;
+    let aad = compute_blob_aad(binding.as_str())?;
+    let (nonce, ciphertext) = encrypt_xchacha20(&master.key, &plaintext, &aad)?;
     plaintext.zeroize();
     // `master` zeroizes on drop.
 
@@ -276,11 +289,30 @@ fn read_store(config_dir: &Path) -> Result<EncryptedStore, CredentialError> {
     let store: EncryptedStore = serde_json::from_slice(&data)
         .map_err(|e| CredentialError::SerializationError(format!("parse store: {}", e)))?;
 
-    if store.version != STORE_VERSION {
+    if store.version != STORE_VERSION && store.version != LEGACY_STORE_VERSION_V2 {
         return Err(CredentialError::UnsupportedVersion(store.version));
     }
 
     Ok(store)
+}
+
+/// Compute the AEAD associated-data used to bind a v3 credential blob
+/// to its origin machine. The 32-byte platform key (HMAC of machine
+/// attributes) is mixed in along with the binding mode and a version
+/// label. A blob whose AAD doesn't match the current machine will
+/// fail to decrypt even when the master key is correct — closing the
+/// "copied the file + the keyring entry to my own laptop" path.
+/// See SECURITY-REVIEW-2026-05-25.md D-HIGH-3.
+fn compute_blob_aad(binding: &str) -> Result<Vec<u8>, CredentialError> {
+    let platform_key = platform_key::derive_platform_key()
+        .map_err(CredentialError::FingerprintError)?;
+    let mut aad = Vec::with_capacity(AAD_LABEL.len() + 1 + binding.len() + 1 + platform_key.len());
+    aad.extend_from_slice(AAD_LABEL);
+    aad.push(b'|');
+    aad.extend_from_slice(binding.as_bytes());
+    aad.push(b'|');
+    aad.extend_from_slice(&platform_key);
+    Ok(aad)
 }
 
 /// Decrypt the store with the given 32-byte master key.
@@ -298,9 +330,24 @@ fn decrypt_store(
     let nonce = XNonce::from_slice(&store.nonce);
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| CredentialError::CryptoError(format!("cipher: {}", e)))?;
-    let mut plaintext = cipher
-        .decrypt(nonce, store.ciphertext.as_slice())
-        .map_err(|e| CredentialError::CryptoError(format!("decrypt: {}", e)))?;
+    let mut plaintext = if store.version >= STORE_VERSION {
+        let aad = compute_blob_aad(&store.binding)?;
+        cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: store.ciphertext.as_slice(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|e| CredentialError::CryptoError(format!("decrypt v3: {}", e)))?
+    } else {
+        // v2 legacy path — no AAD. Subsequent save() rewrites this
+        // blob as v3 with current-machine AAD.
+        cipher
+            .decrypt(nonce, store.ciphertext.as_slice())
+            .map_err(|e| CredentialError::CryptoError(format!("decrypt v2: {}", e)))?
+    };
 
     let creds: ConnectionCredentials = serde_json::from_slice(&plaintext)
         .map_err(|e| CredentialError::SerializationError(format!("parse credentials: {}", e)))?;
@@ -309,10 +356,13 @@ fn decrypt_store(
     Ok(creds)
 }
 
-/// Encrypt plaintext with XChaCha20-Poly1305. Returns `(nonce, ciphertext)`.
+/// Encrypt plaintext with XChaCha20-Poly1305, binding the ciphertext
+/// to `aad` (machine-derived AAD — see [`compute_blob_aad`]). Returns
+/// `(nonce, ciphertext)`.
 fn encrypt_xchacha20(
     key: &[u8; 32],
     plaintext: &[u8],
+    aad: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), CredentialError> {
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| CredentialError::CryptoError(format!("cipher: {}", e)))?;
@@ -321,7 +371,7 @@ fn encrypt_xchacha20(
     let nonce = XNonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(nonce, Payload { msg: plaintext, aad })
         .map_err(|e| CredentialError::CryptoError(format!("encrypt: {}", e)))?;
 
     Ok((nonce_bytes.to_vec(), ciphertext))
@@ -334,8 +384,9 @@ mod tests {
     #[test]
     fn xchacha20_roundtrip() {
         let key = [0x42u8; 32];
+        let aad = b"test-aad";
         let plaintext = b"hello, VettID desktop!";
-        let (nonce, ct) = encrypt_xchacha20(&key, plaintext).expect("encrypt");
+        let (nonce, ct) = encrypt_xchacha20(&key, plaintext, aad).expect("encrypt");
         assert_eq!(nonce.len(), NONCE_SIZE);
 
         // Re-decrypt by hand (the public `decrypt_store` requires a
@@ -343,16 +394,32 @@ mod tests {
         // exercise without a real Secret Service).
         let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
         let pt = cipher
-            .decrypt(XNonce::from_slice(&nonce), ct.as_slice())
+            .decrypt(
+                XNonce::from_slice(&nonce),
+                Payload { msg: ct.as_slice(), aad },
+            )
             .expect("decrypt");
         assert_eq!(&pt, plaintext);
+    }
+
+    #[test]
+    fn aad_mismatch_fails_decrypt() {
+        let key = [0x42u8; 32];
+        let (nonce, ct) = encrypt_xchacha20(&key, b"secret", b"aad-A").expect("encrypt");
+        let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
+        // Same key, same nonce, different AAD → AEAD must reject.
+        let result = cipher.decrypt(
+            XNonce::from_slice(&nonce),
+            Payload { msg: ct.as_slice(), aad: b"aad-B" },
+        );
+        assert!(result.is_err(), "AEAD must reject mismatched AAD");
     }
 
     #[test]
     fn wrong_key_fails_decrypt() {
         let key = [0x42u8; 32];
         let bad = [0x43u8; 32];
-        let (nonce, ct) = encrypt_xchacha20(&key, b"secret").expect("encrypt");
+        let (nonce, ct) = encrypt_xchacha20(&key, b"secret", b"aad").expect("encrypt");
         let cipher = XChaCha20Poly1305::new_from_slice(&bad).unwrap();
         let result = cipher.decrypt(XNonce::from_slice(&nonce), ct.as_slice());
         assert!(result.is_err());

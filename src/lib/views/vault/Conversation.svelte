@@ -454,6 +454,15 @@
     }
 
     async function openLink(href: string) {
+        // SECURITY: `open()` is gated by the plugin-shell scope regex
+        // in tauri.conf.json. The scope was previously too permissive
+        // (`^https://(vett.id|api.vettid.dev|vettid.org)/.*`), which
+        // accepted ANY path/query on those hosts — letting a peer
+        // message URL drive the user's default browser to any
+        // open-redirect or attacker-influenced URL on a vetted host.
+        // Scope is now restricted to known marketing paths; the API
+        // host (api.vettid.dev) is intentionally NOT a click target.
+        // See SECURITY-REVIEW-2026-05-25.md D-HIGH-2.
         try {
             await open(href);
         } catch (e) {
