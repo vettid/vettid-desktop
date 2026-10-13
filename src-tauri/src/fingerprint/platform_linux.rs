@@ -454,6 +454,13 @@ mod tests {
         assert_ne!(key, compute_machine_fingerprint(&attrs));
         assert_eq!(key, compute_machine_bound_key(&attrs));
 
+        // Known answer for these test inputs: changing the label or the
+        // canonical format would orphan every machine-bound store.
+        assert_eq!(
+            hex::encode(key),
+            "a2f09ada1d061c08ff14a447c3a24c31b47096f208d3e49b67dcc7418ef85efe"
+        );
+
         let mut other = attrs.clone();
         other.hostname = "otherhost".to_string();
         assert_ne!(key, compute_machine_bound_key(&other));
