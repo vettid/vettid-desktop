@@ -19,6 +19,14 @@ use std::process::Command;
 /// credential store cannot be opened by the desktop app and vice versa.
 const PLATFORM_KEY_LABEL: &str = "vettid-desktop-platform-v1";
 
+/// HMAC domain label for the machine-bound storage key (the credential
+/// store's fallback when the OS keyring is unavailable).
+///
+/// SECURITY: must differ from `PLATFORM_KEY_LABEL`. The fingerprint computed
+/// under that label is public: it is shown in Settings and sent to the vault
+/// at pairing. A key computed under the same label would be that same value.
+const MACHINE_BOUND_KEY_LABEL: &str = "vettid-desktop-machine-bound-key-v1";
+
 /// Virtual network interface prefixes to skip when collecting MAC addresses.
 /// These are created by container runtimes and virtualization tools and are
 /// not stable machine identifiers.
@@ -146,6 +154,16 @@ pub fn compute_machine_fingerprint_hex(attrs: &MachineAttributes) -> String {
     hex::encode(compute_machine_fingerprint(attrs))
 }
 
+/// Compute the machine-bound storage key from machine attributes.
+///
+/// Same canonical input as [`compute_machine_fingerprint`], under a different
+/// HMAC label, so the key cannot be computed from the fingerprint.
+///
+/// SECURITY: the result is key material. Never display, log or send it.
+pub fn compute_machine_bound_key(attrs: &MachineAttributes) -> [u8; 32] {
+    hmac_fields(MACHINE_BOUND_KEY_LABEL, &attrs.fields())
+}
+
 /// Generate all 5 possible 4-of-5 attribute combinations.
 ///
 /// Each combination omits one attribute (set to empty string).
@@ -208,6 +226,10 @@ pub fn four_of_five_combinations(attrs: &MachineAttributes) -> Vec<MachineAttrib
 // --- Internal helpers ---
 
 fn compute_fingerprint_from_fields(fields: &BTreeMap<&str, &str>) -> [u8; 32] {
+    hmac_fields(PLATFORM_KEY_LABEL, fields)
+}
+
+fn hmac_fields(label: &str, fields: &BTreeMap<&str, &str>) -> [u8; 32] {
     // BTreeMap iterates in sorted key order, matching Go's sort.Strings
     let parts: Vec<String> = fields
         .iter()
@@ -217,7 +239,7 @@ fn compute_fingerprint_from_fields(fields: &BTreeMap<&str, &str>) -> [u8; 32] {
 
     type HmacSha256 = Hmac<Sha256>;
     let mut mac =
-        HmacSha256::new_from_slice(PLATFORM_KEY_LABEL.as_bytes()).expect("HMAC accepts any key size");
+        HmacSha256::new_from_slice(label.as_bytes()).expect("HMAC accepts any key size");
     mac.update(data.as_bytes());
     let result = mac.finalize();
     result.into_bytes().into()
@@ -417,6 +439,31 @@ mod tests {
         let fp1 = compute_machine_fingerprint(&attrs1);
         let fp2 = compute_machine_fingerprint(&attrs2);
         assert_ne!(fp1, fp2);
+    }
+
+    #[test]
+    fn test_machine_bound_key_differs_from_fingerprint() {
+        let attrs = MachineAttributes {
+            hostname: "testhost".to_string(),
+            machine_id: "test-machine-id".to_string(),
+            cpu: "Test CPU".to_string(),
+            disk_serial: "TEST-SERIAL".to_string(),
+            mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+        };
+        let key = compute_machine_bound_key(&attrs);
+        assert_ne!(key, compute_machine_fingerprint(&attrs));
+        assert_eq!(key, compute_machine_bound_key(&attrs));
+
+        // Known answer for these test inputs: changing the label or the
+        // canonical format would orphan every machine-bound store.
+        assert_eq!(
+            hex::encode(key),
+            "a2f09ada1d061c08ff14a447c3a24c31b47096f208d3e49b67dcc7418ef85efe"
+        );
+
+        let mut other = attrs.clone();
+        other.hostname = "otherhost".to_string();
+        assert_ne!(key, compute_machine_bound_key(&other));
     }
 
     #[test]

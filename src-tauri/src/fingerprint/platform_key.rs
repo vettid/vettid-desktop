@@ -10,13 +10,14 @@
 
 #[cfg(target_os = "linux")]
 use super::platform_linux::{
-    collect_machine_attributes, compute_machine_fingerprint, FingerprintError, MachineAttributes,
+    collect_machine_attributes, compute_machine_bound_key, compute_machine_fingerprint,
+    FingerprintError, MachineAttributes,
 };
 
 #[cfg(target_os = "macos")]
 use super::platform_macos::{
-    collect_machine_attributes_macos as collect_machine_attributes, compute_machine_fingerprint,
-    FingerprintError, MachineAttributes,
+    collect_machine_attributes_macos as collect_machine_attributes, compute_machine_bound_key,
+    compute_machine_fingerprint, FingerprintError, MachineAttributes,
 };
 
 /// Minimum number of non-empty machine attributes required for key derivation.
@@ -41,6 +42,28 @@ pub fn derive_platform_key() -> Result<[u8; 32], FingerprintError> {
     }
 
     Ok(compute_machine_fingerprint(&attrs))
+}
+
+/// Derive the machine-bound storage key: the credential store's master key
+/// when the OS keyring is unavailable.
+///
+/// Uses this platform's collector and the same 3-attribute minimum as
+/// [`derive_platform_key`], but a different HMAC label.
+///
+/// SECURITY: [`derive_platform_key`] returns a value that is displayed and
+/// sent to the vault, so it must never be used as this key.
+pub fn derive_machine_bound_key() -> Result<[u8; 32], FingerprintError> {
+    let attrs = collect_machine_attributes()?;
+
+    let count = attrs.attribute_count();
+    if count < MIN_ATTRIBUTES {
+        return Err(FingerprintError::InsufficientAttributes {
+            found: count,
+            required: MIN_ATTRIBUTES,
+        });
+    }
+
+    Ok(compute_machine_bound_key(&attrs))
 }
 
 /// Derive the platform key and also return the collected machine attributes.
@@ -99,6 +122,24 @@ mod tests {
                 // Acceptable in minimal test environments
             }
             Err(e) => panic!("unexpected error: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_machine_bound_key_is_not_the_platform_key() {
+        match (derive_platform_key(), derive_machine_bound_key()) {
+            (Ok(platform), Ok(bound)) => {
+                assert_ne!(platform, bound);
+                assert_eq!(bound, derive_machine_bound_key().expect("second derivation"));
+            }
+            (Err(FingerprintError::InsufficientAttributes { .. }), Err(_)) => {
+                // Acceptable in minimal test environments
+            }
+            (p, b) => panic!(
+                "derivations disagree: platform ok={}, machine-bound ok={}",
+                p.is_ok(),
+                b.is_ok()
+            ),
         }
     }
 
