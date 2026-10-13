@@ -14,7 +14,9 @@
 //! 2. **Machine-bound fallback** (`platform_key`). If the keyring
 //!    isn't available (kiosk Linux, missing Secret Service daemon,
 //!    locked Keychain on macOS first launch), we derive a key from
-//!    machine attributes via the existing `compute_machine_fingerprint`.
+//!    machine attributes via `derive_machine_bound_key`. It uses its
+//!    own HMAC label, so it is not the machine fingerprint that is
+//!    displayed and sent at pairing.
 //!    A binding mode marker lands on the encrypted store so callers
 //!    can show the user a "we couldn't reach your keyring" notice.
 //!
@@ -34,10 +36,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use zeroize::Zeroize;
 
-#[cfg(not(windows))]
-use crate::fingerprint::platform_linux::{
-    collect_machine_attributes, compute_machine_fingerprint,
-};
+use crate::fingerprint::platform_key::derive_machine_bound_key;
 
 const KEYRING_SERVICE: &str = "vettid-desktop";
 const KEYRING_ACCOUNT: &str = "master-key-v1";
@@ -137,11 +136,12 @@ pub fn fetch_or_create_master_key() -> Result<MasterKey, KeystoreError> {
         }
     }
 
-    // Fallback: derive a key from machine attributes. Same 32-byte
-    // output as compute_machine_fingerprint — that function is already
-    // used by the credential store for hardware-fingerprint binding,
-    // so reusing it keeps the binding consistent.
-    match machine_bound_key() {
+    // Fallback: derive a key from machine attributes.
+    //
+    // SECURITY: this is not the machine fingerprint. The fingerprint is
+    // shown in Settings and sent to the vault at pairing; the key is
+    // derived from the same attributes under its own label.
+    match derive_machine_bound_key() {
         Ok(key) => Ok(MasterKey {
             key,
             binding: BindingMode::MachineBound,
@@ -151,23 +151,6 @@ pub fn fetch_or_create_master_key() -> Result<MasterKey, KeystoreError> {
             e
         ))),
     }
-}
-
-/// Derive the machine-bound fallback key from machine attributes.
-#[cfg(not(windows))]
-fn machine_bound_key() -> Result<[u8; 32], String> {
-    let attrs = collect_machine_attributes().map_err(|e| e.to_string())?;
-    Ok(compute_machine_fingerprint(&attrs))
-}
-
-/// Derive the machine-bound fallback key from machine attributes.
-///
-/// SECURITY: goes through `derive_platform_key`, which uses the Windows
-/// collector and refuses to derive a key from fewer than three
-/// attributes. The Linux collector would find only the hostname here.
-#[cfg(windows)]
-fn machine_bound_key() -> Result<[u8; 32], String> {
-    crate::fingerprint::platform_key::derive_platform_key().map_err(|e| e.to_string())
 }
 
 /// Re-fetch a key for an existing store that was encrypted under a
@@ -187,7 +170,7 @@ pub fn fetch_for_binding(binding: BindingMode) -> Result<MasterKey, KeystoreErro
             Err(e) => Err(KeystoreError::NoSource(format!("keyring read: {}", e))),
         },
         BindingMode::MachineBound => {
-            let key = machine_bound_key()
+            let key = derive_machine_bound_key()
                 .map_err(|e| KeystoreError::NoSource(format!("machine attrs: {}", e)))?;
             Ok(MasterKey {
                 key,

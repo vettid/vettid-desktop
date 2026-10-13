@@ -38,7 +38,8 @@ use windows_sys::Win32::System::IO::DeviceIoControl;
 
 // Re-export shared types from platform_linux (they're platform-agnostic)
 pub use super::platform_linux::{
-    compute_machine_fingerprint, compute_machine_fingerprint_hex, four_of_five_combinations,
+    compute_machine_bound_key, compute_machine_fingerprint, compute_machine_fingerprint_hex,
+    four_of_five_combinations,
     FingerprintError, MachineAttributes,
 };
 
