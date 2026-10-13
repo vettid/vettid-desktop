@@ -218,7 +218,13 @@ pub(crate) fn warm_device_fingerprint() {
 
 fn compute_device_fingerprint() -> crate::registration::pairing::DeviceFingerprint {
     use crate::fingerprint::binary::binary_fingerprint;
+    #[cfg(not(windows))]
     use crate::fingerprint::platform_linux::{collect_machine_attributes, compute_machine_fingerprint_hex};
+    #[cfg(windows)]
+    use crate::fingerprint::platform_windows::{
+        collect_machine_attributes_windows as collect_machine_attributes,
+        compute_machine_fingerprint_hex,
+    };
     use crate::registration::pairing::DeviceFingerprint;
 
     let hostname = hostname::get()
