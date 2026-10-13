@@ -17,7 +17,8 @@ use std::ffi::c_void;
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_BUFFER_OVERFLOW, ERROR_MORE_DATA, ERROR_SUCCESS, HANDLE,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetAdaptersAddresses, GetIfEntry2Ex, MibIfEntryNormalWithoutStatistics,
@@ -309,8 +310,13 @@ fn physical_adapters() -> Vec<(String, bool)> {
                 ptr::null_mut(),
             )
         };
+        if status == ERROR_MORE_DATA {
+            // A subkey name longer than the buffer is not an adapter
+            // ("0000", "0001", ...). Skip it, do not stop.
+            continue;
+        }
         if status != ERROR_SUCCESS {
-            // ERROR_NO_MORE_ITEMS, or a subkey name we cannot hold.
+            // ERROR_NO_MORE_ITEMS.
             break;
         }
         let subkey = String::from_utf16_lossy(&name[..name_len as usize]);
@@ -326,7 +332,8 @@ fn physical_adapters() -> Vec<(String, bool)> {
 
 /// The adapter's instance GUID, and whether it is built in, if `path`
 /// describes a physical adapter. Built in means on the PCI bus: soldered or
-/// in an internal slot, as opposed to a USB or dock adapter.
+/// in an internal slot, as opposed to a USB adapter. (A Thunderbolt or USB4
+/// dock also appears on the PCI bus.)
 fn physical_adapter_at(path: &str) -> Option<(String, bool)> {
     let path_w = wide(path);
     let mut key: HKEY = ptr::null_mut();
@@ -376,7 +383,11 @@ fn collect_mac_address() -> String {
     // u64 elements keep the buffer aligned for IP_ADAPTER_ADDRESSES_LH.
     let mut buf: Vec<u64> = Vec::new();
     let mut filled = false;
-    while size != 0 && size <= 16 * 1024 * 1024 {
+    // The needed size can grow between calls if an adapter appears.
+    for _ in 0..4 {
+        if size == 0 || size > 16 * 1024 * 1024 {
+            break;
+        }
         buf = vec![0u64; (size as usize).div_ceil(8)];
         // SAFETY: `buf` holds at least `size` bytes and is 8-byte aligned.
         let status = unsafe {
@@ -444,9 +455,13 @@ fn collect_mac_address() -> String {
 /// address among the built-in adapters, or, if there is none, the lowest
 /// among the rest.
 ///
-/// Built-in adapters are preferred so that plugging in a dock or a USB
-/// Ethernet adapter does not change the result. Taking the lowest, not the
-/// first, keeps it independent of the order Windows lists adapters in.
+/// Built-in adapters are preferred so that plugging in a USB Ethernet
+/// adapter or a USB dock does not change the result. Taking the lowest, not
+/// the first, keeps it independent of the order Windows lists adapters in.
+///
+/// Known limits: a Thunderbolt or USB4 dock tunnels PCIe, so its adapter
+/// also counts as built in; and an adapter disabled in Windows is not
+/// listed at all. Either can change the result.
 fn choose_mac(candidates: &[(String, bool)]) -> String {
     let lowest = |built_in: bool| {
         candidates
