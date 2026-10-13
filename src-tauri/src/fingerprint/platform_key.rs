@@ -19,6 +19,12 @@ use super::platform_macos::{
     FingerprintError, MachineAttributes,
 };
 
+#[cfg(windows)]
+use super::platform_windows::{
+    collect_machine_attributes_windows as collect_machine_attributes, compute_machine_fingerprint,
+    FingerprintError, MachineAttributes,
+};
+
 /// Minimum number of non-empty machine attributes required for key derivation.
 const MIN_ATTRIBUTES: usize = 3;
 

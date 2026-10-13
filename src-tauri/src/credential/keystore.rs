@@ -34,6 +34,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use zeroize::Zeroize;
 
+#[cfg(not(windows))]
 use crate::fingerprint::platform_linux::{
     collect_machine_attributes, compute_machine_fingerprint,
 };
@@ -140,19 +141,33 @@ pub fn fetch_or_create_master_key() -> Result<MasterKey, KeystoreError> {
     // output as compute_machine_fingerprint — that function is already
     // used by the credential store for hardware-fingerprint binding,
     // so reusing it keeps the binding consistent.
-    match collect_machine_attributes() {
-        Ok(attrs) => {
-            let key = compute_machine_fingerprint(&attrs);
-            Ok(MasterKey {
-                key,
-                binding: BindingMode::MachineBound,
-            })
-        }
+    match machine_bound_key() {
+        Ok(key) => Ok(MasterKey {
+            key,
+            binding: BindingMode::MachineBound,
+        }),
         Err(e) => Err(KeystoreError::NoSource(format!(
             "machine attribute collection failed: {}",
             e
         ))),
     }
+}
+
+/// Derive the machine-bound fallback key from machine attributes.
+#[cfg(not(windows))]
+fn machine_bound_key() -> Result<[u8; 32], String> {
+    let attrs = collect_machine_attributes().map_err(|e| e.to_string())?;
+    Ok(compute_machine_fingerprint(&attrs))
+}
+
+/// Derive the machine-bound fallback key from machine attributes.
+///
+/// SECURITY: goes through \x60derive_platform_key\x60, which uses the Windows
+/// collector and refuses to derive a key from fewer than three
+/// attributes. The Linux collector would find only the hostname here.
+#[cfg(windows)]
+fn machine_bound_key() -> Result<[u8; 32], String> {
+    crate::fingerprint::platform_key::derive_platform_key().map_err(|e| e.to_string())
 }
 
 /// Re-fetch a key for an existing store that was encrypted under a
@@ -172,9 +187,8 @@ pub fn fetch_for_binding(binding: BindingMode) -> Result<MasterKey, KeystoreErro
             Err(e) => Err(KeystoreError::NoSource(format!("keyring read: {}", e))),
         },
         BindingMode::MachineBound => {
-            let attrs = collect_machine_attributes()
+            let key = machine_bound_key()
                 .map_err(|e| KeystoreError::NoSource(format!("machine attrs: {}", e)))?;
-            let key = compute_machine_fingerprint(&attrs);
             Ok(MasterKey {
                 key,
                 binding: BindingMode::MachineBound,

@@ -19,6 +19,7 @@
 use std::fmt;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -222,11 +223,14 @@ pub fn save(config_dir: &Path, creds: &ConnectionCredentials) -> Result<BindingM
         .map_err(|e| CredentialError::IoError(format!("create config dir: {}", e)))?;
 
     let path = config_dir.join(CREDENTIAL_FILE);
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    // Mode bits are not an access control on Windows. There the file
+    // gets the ACL it inherits from the config directory under the
+    // user's profile: the user, SYSTEM and Administrators.
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
         .open(&path)
         .map_err(|e| CredentialError::IoError(format!("open {}: {}", path.display(), e)))?;
 
