@@ -7,6 +7,11 @@
 //! SECURITY: every attribute is read through the registry or a Win32 call.
 //! Nothing is executed, so there is no helper binary (`ioreg`, `lsblk`) that
 //! a planted program earlier on PATH could impersonate.
+//!
+//! The exact text of each value is part of the machine-bound key. Changing
+//! how a value is chosen or formatted changes the key of every Windows
+//! install, so treat the rules in this file as a wire format. They match
+//! the agent connector's `machine_windows.go`.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -15,8 +20,9 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
-    GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST, IP_ADAPTER_ADDRESSES_LH,
+    GetAdaptersAddresses, GetIfEntry2Ex, MibIfEntryNormalWithoutStatistics,
+    GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+    GAA_FLAG_SKIP_UNICAST, IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -26,6 +32,7 @@ use windows_sys::Win32::System::Registry::{
     KEY_ENUMERATE_SUB_KEYS, KEY_WOW64_64KEY, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
     RRF_SUBKEY_WOW6464KEY,
 };
+use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
 // Re-export shared types from platform_linux (they're platform-agnostic)
@@ -42,8 +49,10 @@ pub use super::platform_linux::{
 ///   counterpart of `/etc/machine-id`: stable across reboots and updates,
 ///   new after a reinstall.
 /// - cpu: brand string of the first processor, from the registry
-/// - disk_serial: serial number of the disk under the system volume
-/// - mac_address: lowest MAC among the adapters Windows marks as physical
+/// - disk_serial: serial number of the disk under the Windows volume, as
+///   the storage driver reports it
+/// - mac_address: permanent address of a physical adapter, built-in ones
+///   preferred (see `choose_mac`)
 ///
 /// Each attribute is best-effort; a failure yields an empty string.
 pub fn collect_machine_attributes_windows() -> Result<MachineAttributes, FingerprintError> {
@@ -136,16 +145,31 @@ struct StoragePropertyQuery {
     additional_parameters: [u8; 1],
 }
 
-/// Serial number of the disk that holds the system volume, falling back to
+/// Drive of the Windows directory, e.g. `C:`. Asked of the OS, not read
+/// from %SystemDrive%, which the environment can change.
+fn system_drive() -> Option<String> {
+    let mut buf = [0u16; 260];
+    // SAFETY: `buf` is a live buffer of the stated length in characters.
+    let len = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if len < 2 || len > buf.len() {
+        return None;
+    }
+    let dir = String::from_utf16_lossy(&buf[..len]);
+    let b = dir.as_bytes();
+    (b[0].is_ascii_alphabetic() && b[1] == b':').then(|| dir[..2].to_string())
+}
+
+/// Serial number of the disk that holds the Windows volume, falling back to
 /// the first physical disk. Both are opened with no access rights, which is
 /// enough for the query and works for a standard user.
+///
+/// The string is whatever the storage driver reports. The inbox NVMe driver
+/// gives the drive's EUI-64, not the serial printed on the label, and a
+/// vendor driver may give a different string for the same drive.
 fn collect_disk_serial() -> String {
     let mut candidates = Vec::new();
-    if let Ok(drive) = std::env::var("SystemDrive") {
-        let b = drive.as_bytes();
-        if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
-            candidates.push(format!(r"\\.\{}", drive));
-        }
+    if let Some(drive) = system_drive() {
+        candidates.push(format!(r"\\.\{}", drive));
     }
     candidates.push(r"\\.\PhysicalDrive0".to_string());
     candidates
@@ -197,11 +221,19 @@ fn query_disk_serial(device: &str) -> String {
     // SAFETY: `handle` was returned by CreateFileW and is closed once.
     unsafe { CloseHandle(handle) };
 
-    let returned = (returned as usize).min(buf.len());
-    if ok == 0 || returned < SERIAL_NUMBER_OFFSET_FIELD + 4 {
+    if ok == 0 || returned as usize > buf.len() {
         return String::new();
     }
-    let data = &buf[..returned];
+    parse_disk_serial(&buf[..returned as usize])
+}
+
+/// Extract the serial number from a STORAGE_DEVICE_DESCRIPTOR. Returns an
+/// empty string when the device reports none, when the descriptor is
+/// truncated, or when the serial is a placeholder.
+fn parse_disk_serial(data: &[u8]) -> String {
+    if data.len() < SERIAL_NUMBER_OFFSET_FIELD + 4 {
+        return String::new();
+    }
     let offset = u32::from_le_bytes([
         data[SERIAL_NUMBER_OFFSET_FIELD],
         data[SERIAL_NUMBER_OFFSET_FIELD + 1],
@@ -212,11 +244,23 @@ fn query_disk_serial(device: &str) -> String {
     if offset == 0 || offset >= data.len() {
         return String::new();
     }
-    let end = data[offset..]
-        .iter()
-        .position(|&b| b == 0)
-        .map_or(data.len(), |n| offset + n);
-    String::from_utf8_lossy(&data[offset..end]).trim().to_string()
+    // No terminator means the string was cut off.
+    let Some(len) = data[offset..].iter().position(|&b| b == 0) else {
+        return String::new();
+    };
+    let serial = String::from_utf8_lossy(&data[offset..offset + len])
+        .trim()
+        .to_string();
+    if is_placeholder_serial(&serial) {
+        return String::new();
+    }
+    serial
+}
+
+/// A serial that carries no identity: only zeros and separators, which is
+/// what a drive without an EUI-64 reports and many units share.
+fn is_placeholder_serial(serial: &str) -> bool {
+    serial.chars().all(|c| matches!(c, '0' | '_' | '.' | '-' | ' '))
 }
 
 const NET_ADAPTER_CLASS_KEY: &str =
@@ -227,11 +271,11 @@ const IF_TYPE_ETHERNET_CSMACD: u32 = 6;
 const IF_TYPE_IEEE80211: u32 = 71;
 const AF_UNSPEC: u32 = 0;
 
-/// Instance GUIDs (upper case, with braces) of the network adapters Windows
-/// marks as physical. Virtual switches, VPN adapters and the WSL and Hyper-V
-/// adapters are not marked, and they come and go, which would change the
-/// fingerprint.
-fn physical_adapter_guids() -> Vec<String> {
+/// The network adapters Windows marks as physical: instance GUID (upper
+/// case, with braces) and whether the adapter is built in. Virtual switches,
+/// VPN adapters and the WSL and Hyper-V adapters are not marked, and they
+/// come and go, which would change the fingerprint.
+fn physical_adapters() -> Vec<(String, bool)> {
     let mut guids = Vec::new();
     let class_w = wide(NET_ADAPTER_CLASS_KEY);
     let mut class_key: HKEY = ptr::null_mut();
@@ -271,8 +315,8 @@ fn physical_adapter_guids() -> Vec<String> {
         }
         let subkey = String::from_utf16_lossy(&name[..name_len as usize]);
         let path = format!(r"{}\{}", NET_ADAPTER_CLASS_KEY, subkey);
-        if let Some(guid) = physical_adapter_guid_at(&path) {
-            guids.push(guid);
+        if let Some(adapter) = physical_adapter_at(&path) {
+            guids.push(adapter);
         }
     }
     // SAFETY: `class_key` was opened above and is closed once.
@@ -280,8 +324,10 @@ fn physical_adapter_guids() -> Vec<String> {
     guids
 }
 
-/// The adapter's instance GUID if `path` describes a physical adapter.
-fn physical_adapter_guid_at(path: &str) -> Option<String> {
+/// The adapter's instance GUID, and whether it is built in, if `path`
+/// describes a physical adapter. Built in means on the PCI bus: soldered or
+/// in an internal slot, as opposed to a USB or dock adapter.
+fn physical_adapter_at(path: &str) -> Option<(String, bool)> {
     let path_w = wide(path);
     let mut key: HKEY = ptr::null_mut();
     // SAFETY: `path_w` is NUL-terminated; `key` receives the handle.
@@ -300,20 +346,24 @@ fn physical_adapter_guid_at(path: &str) -> Option<String> {
     }
     let characteristics = read_reg_dword(key, "Characteristics");
     let guid = read_reg_string(key, None, "NetCfgInstanceId");
+    let instance = read_reg_string(key, None, "DeviceInstanceID");
     // SAFETY: `key` was opened above and is closed once.
     unsafe { RegCloseKey(key) };
 
     match characteristics {
-        Some(c) if c & NCF_PHYSICAL != 0 && !guid.is_empty() => Some(guid.to_uppercase()),
+        Some(c) if c & NCF_PHYSICAL != 0 && !guid.is_empty() => Some((
+            guid.to_uppercase(),
+            instance.to_uppercase().starts_with(r"PCI\"),
+        )),
         _ => None,
     }
 }
 
-/// Lowest MAC address among the physical Ethernet and Wi-Fi adapters,
-/// whether or not they are connected. Taking the lowest, not the first,
-/// keeps the result independent of the order Windows lists adapters in.
+/// The MAC attribute: see `choose_mac` for the rule. Reads each adapter's
+/// permanent (burned-in) address, not the one in use, so Windows' "random
+/// hardware addresses" setting and a manual override do not change it.
 fn collect_mac_address() -> String {
-    let physical = physical_adapter_guids();
+    let physical = physical_adapters();
     if physical.is_empty() {
         return String::new();
     }
@@ -326,7 +376,7 @@ fn collect_mac_address() -> String {
     // u64 elements keep the buffer aligned for IP_ADAPTER_ADDRESSES_LH.
     let mut buf: Vec<u64> = Vec::new();
     let mut filled = false;
-    for _ in 0..3 {
+    while size != 0 && size <= 16 * 1024 * 1024 {
         buf = vec![0u64; (size as usize).div_ceil(8)];
         // SAFETY: `buf` holds at least `size` bytes and is 8-byte aligned.
         let status = unsafe {
@@ -350,7 +400,7 @@ fn collect_mac_address() -> String {
         return String::new();
     }
 
-    let mut macs: Vec<String> = Vec::new();
+    let mut candidates: Vec<(String, bool)> = Vec::new();
     let mut adapter = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
     while !adapter.is_null() {
         // SAFETY: `adapter` points into `buf`, which GetAdaptersAddresses
@@ -361,24 +411,51 @@ fn collect_mac_address() -> String {
         if a.IfType != IF_TYPE_ETHERNET_CSMACD && a.IfType != IF_TYPE_IEEE80211 {
             continue;
         }
-        if a.PhysicalAddressLength != 6 || a.AdapterName.is_null() {
+        if a.AdapterName.is_null() {
             continue;
         }
         // SAFETY: AdapterName is a NUL-terminated ANSI string inside `buf`.
         let name = unsafe { std::ffi::CStr::from_ptr(a.AdapterName as *const std::ffi::c_char) }
             .to_string_lossy()
             .to_uppercase();
-        if !physical.contains(&name) {
+        let Some(&(_, built_in)) = physical.iter().find(|(guid, _)| *guid == name) else {
+            continue;
+        };
+        // SAFETY: MIB_IF_ROW2 is plain data, valid when zeroed; the call
+        // fills it for the interface named by InterfaceLuid.
+        let mut row: MIB_IF_ROW2 = unsafe { std::mem::zeroed() };
+        row.InterfaceLuid = a.Luid;
+        if unsafe { GetIfEntry2Ex(MibIfEntryNormalWithoutStatistics, &mut row) } != ERROR_SUCCESS {
             continue;
         }
-        let mac = &a.PhysicalAddress[..6];
+        if row.PhysicalAddressLength != 6 {
+            continue;
+        }
+        let mac = &row.PermanentPhysicalAddress[..6];
         if mac.iter().all(|&b| b == 0) {
             continue;
         }
-        macs.push(format_mac(mac));
+        candidates.push((format_mac(mac), built_in));
     }
-    macs.sort();
-    macs.into_iter().next().unwrap_or_default()
+    choose_mac(&candidates)
+}
+
+/// Pick the MAC attribute from `(mac, built_in)` candidates: the lowest
+/// address among the built-in adapters, or, if there is none, the lowest
+/// among the rest.
+///
+/// Built-in adapters are preferred so that plugging in a dock or a USB
+/// Ethernet adapter does not change the result. Taking the lowest, not the
+/// first, keeps it independent of the order Windows lists adapters in.
+fn choose_mac(candidates: &[(String, bool)]) -> String {
+    let lowest = |built_in: bool| {
+        candidates
+            .iter()
+            .filter(|(_, b)| *b == built_in)
+            .map(|(mac, _)| mac.clone())
+            .min()
+    };
+    lowest(true).or_else(|| lowest(false)).unwrap_or_default()
 }
 
 /// Render `aa:bb:cc:dd:ee:ff`, the form the other platforms use.
@@ -454,5 +531,77 @@ mod tests {
     #[test]
     fn test_query_disk_serial_missing_device_is_empty() {
         assert!(query_disk_serial(r"\\.\PhysicalDrive999").is_empty());
+    }
+
+    /// A STORAGE_DEVICE_DESCRIPTOR of `size` bytes whose SerialNumberOffset
+    /// field holds `offset`, with `tail` copied in at that offset.
+    fn descriptor(size: usize, offset: u32, tail: &[u8]) -> Vec<u8> {
+        let mut d = vec![0u8; size];
+        if size >= SERIAL_NUMBER_OFFSET_FIELD + 4 {
+            d[SERIAL_NUMBER_OFFSET_FIELD..SERIAL_NUMBER_OFFSET_FIELD + 4]
+                .copy_from_slice(&offset.to_le_bytes());
+        }
+        let offset = offset as usize;
+        if offset < size {
+            let n = tail.len().min(size - offset);
+            d[offset..offset + n].copy_from_slice(&tail[..n]);
+        }
+        d
+    }
+
+    #[test]
+    fn test_parse_disk_serial() {
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            ("plain", descriptor(64, 40, b"WD-ABC123\0"), "WD-ABC123"),
+            ("padded", descriptor(64, 40, b"   S4EWNX0N  \0"), "S4EWNX0N"),
+            (
+                "nvme eui-64",
+                descriptor(64, 40, b"0025_3885_91B1_23A4.\0"),
+                "0025_3885_91B1_23A4.",
+            ),
+            ("no serial (offset 0)", descriptor(64, 0, b""), ""),
+            ("offset past the end", descriptor(64, 64, b""), ""),
+            ("offset far past the end", descriptor(64, u32::MAX, b""), ""),
+            ("not terminated", descriptor(48, 40, b"ABCDEFGH"), ""),
+            ("empty string", descriptor(64, 40, b"\0"), ""),
+            ("only spaces", descriptor(64, 40, b"    \0"), ""),
+            (
+                "placeholder zeros",
+                descriptor(64, 40, b"0000_0000_0000_0000.\0"),
+                "",
+            ),
+            ("placeholder plain zeros", descriptor(64, 40, b"00000000\0"), ""),
+            (
+                "too short for the field",
+                vec![0u8; SERIAL_NUMBER_OFFSET_FIELD + 3],
+                "",
+            ),
+            ("empty", Vec::new(), ""),
+        ];
+        for (name, desc, want) in cases {
+            assert_eq!(parse_disk_serial(&desc), want, "case: {}", name);
+        }
+    }
+
+    #[test]
+    fn test_choose_mac() {
+        let c = |mac: &str, built_in: bool| (mac.to_string(), built_in);
+        assert_eq!(choose_mac(&[]), "");
+        assert_eq!(choose_mac(&[c("aa:00:00:00:00:02", true)]), "aa:00:00:00:00:02");
+        // Lowest built-in, whatever the order.
+        assert_eq!(
+            choose_mac(&[c("aa:00:00:00:00:09", true), c("aa:00:00:00:00:02", true)]),
+            "aa:00:00:00:00:02"
+        );
+        // A dock with a lower address does not win.
+        assert_eq!(
+            choose_mac(&[c("aa:00:00:00:00:09", true), c("00:00:00:00:00:01", false)]),
+            "aa:00:00:00:00:09"
+        );
+        // Only removable adapters: the lowest of them.
+        assert_eq!(
+            choose_mac(&[c("cc:00:00:00:00:05", false), c("bb:00:00:00:00:05", false)]),
+            "bb:00:00:00:00:05"
+        );
     }
 }
