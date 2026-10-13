@@ -1,0 +1,5 @@
+# One finding in the history, reviewed 2026-10-12: line 6 of the module doc comment in
+# src-tauri/src/credential/store.rs, which describes the order of the derivation and cipher
+# steps in prose. The generic-api-key rule misreads it as an assignment. It holds no secret.
+# New findings are not covered by this list.
+355287a1d96ddfeaf64430644f299482b2e9f67f:src-tauri/src/credential/store.rs:generic-api-key:6
