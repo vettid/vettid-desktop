@@ -162,7 +162,7 @@ fn machine_bound_key() -> Result<[u8; 32], String> {
 
 /// Derive the machine-bound fallback key from machine attributes.
 ///
-/// SECURITY: goes through \x60derive_platform_key\x60, which uses the Windows
+/// SECURITY: goes through `derive_platform_key`, which uses the Windows
 /// collector and refuses to derive a key from fewer than three
 /// attributes. The Linux collector would find only the hostname here.
 #[cfg(windows)]

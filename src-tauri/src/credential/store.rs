@@ -193,7 +193,8 @@ pub fn default_config_dir() -> PathBuf {
 ///
 /// The encryption key comes from the OS keyring (or the machine-bound
 /// fallback when the keyring is unavailable). No user input. The file
-/// is written with mode 0600 (owner read/write only).
+/// is written with mode 0600 (owner read/write only) on unix. On Windows
+/// it gets the ACL it inherits from the config directory.
 ///
 /// SECURITY: Intermediate key material is zeroized after use; the
 /// `MasterKey` returned by the keystore zeroizes on drop.
