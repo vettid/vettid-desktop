@@ -228,10 +228,11 @@ fn compute_device_fingerprint() -> crate::registration::pairing::DeviceFingerpri
     let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
     let binary_fp = binary_fingerprint().unwrap_or_default();
     // Hex SHA-256 over a stable set of machine attributes (hostname,
-    // CPU brand, primary MAC, OS release fingerprint). Same source the
-    // credential store's machine-bound fallback key uses — surfacing it
+    // CPU brand, primary MAC, OS release fingerprint). Surfacing it
     // here lets the phone-side authorize screen show a value the user
-    // can compare against Settings → Device on the desktop.
+    // can compare against Settings → Device on the desktop. This value
+    // is public; the credential store's machine-bound fallback key is
+    // derived separately and is never this value.
     let machine_fp = collect_machine_attributes()
         .ok()
         .map(|attrs| compute_machine_fingerprint_hex(&attrs))

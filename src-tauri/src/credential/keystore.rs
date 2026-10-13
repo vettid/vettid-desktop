@@ -14,7 +14,9 @@
 //! 2. **Machine-bound fallback** (`platform_key`). If the keyring
 //!    isn't available (kiosk Linux, missing Secret Service daemon,
 //!    locked Keychain on macOS first launch), we derive a key from
-//!    machine attributes via the existing `compute_machine_fingerprint`.
+//!    machine attributes via `derive_machine_bound_key`. It uses its
+//!    own HMAC label, so it is not the machine fingerprint that is
+//!    displayed and sent at pairing.
 //!    A binding mode marker lands on the encrypted store so callers
 //!    can show the user a "we couldn't reach your keyring" notice.
 //!
@@ -34,9 +36,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use zeroize::Zeroize;
 
-use crate::fingerprint::platform_linux::{
-    collect_machine_attributes, compute_machine_fingerprint,
-};
+use crate::fingerprint::platform_key::derive_machine_bound_key;
 
 const KEYRING_SERVICE: &str = "vettid-desktop";
 const KEYRING_ACCOUNT: &str = "master-key-v1";
@@ -136,18 +136,16 @@ pub fn fetch_or_create_master_key() -> Result<MasterKey, KeystoreError> {
         }
     }
 
-    // Fallback: derive a key from machine attributes. Same 32-byte
-    // output as compute_machine_fingerprint — that function is already
-    // used by the credential store for hardware-fingerprint binding,
-    // so reusing it keeps the binding consistent.
-    match collect_machine_attributes() {
-        Ok(attrs) => {
-            let key = compute_machine_fingerprint(&attrs);
-            Ok(MasterKey {
-                key,
-                binding: BindingMode::MachineBound,
-            })
-        }
+    // Fallback: derive a key from machine attributes.
+    //
+    // SECURITY: this is not the machine fingerprint. The fingerprint is
+    // shown in Settings and sent to the vault at pairing; the key is
+    // derived from the same attributes under its own label.
+    match derive_machine_bound_key() {
+        Ok(key) => Ok(MasterKey {
+            key,
+            binding: BindingMode::MachineBound,
+        }),
         Err(e) => Err(KeystoreError::NoSource(format!(
             "machine attribute collection failed: {}",
             e
@@ -172,9 +170,8 @@ pub fn fetch_for_binding(binding: BindingMode) -> Result<MasterKey, KeystoreErro
             Err(e) => Err(KeystoreError::NoSource(format!("keyring read: {}", e))),
         },
         BindingMode::MachineBound => {
-            let attrs = collect_machine_attributes()
+            let key = derive_machine_bound_key()
                 .map_err(|e| KeystoreError::NoSource(format!("machine attrs: {}", e)))?;
-            let key = compute_machine_fingerprint(&attrs);
             Ok(MasterKey {
                 key,
                 binding: BindingMode::MachineBound,
