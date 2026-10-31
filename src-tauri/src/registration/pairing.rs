@@ -488,8 +488,6 @@ fn load_stored_creds(
 pub async fn start_extension(
     config_dir: &PathBuf,
 ) -> Result<(InviteSession, PairingRuntime), RegistrationError> {
-    use crate::credential::store;
-
     let creds = load_stored_creds(config_dir)?;
 
     // Parse JWT+seed out of the stored creds block so we can reuse them for
@@ -554,8 +552,6 @@ pub async fn publish_end_session(
     config_dir: &PathBuf,
     reason: &str,
 ) -> Result<(), RegistrationError> {
-    use crate::credential::store;
-
     let creds = load_stored_creds(config_dir)?;
 
     let (scoped_jwt, scoped_seed) = parse_creds_block(&creds.message_space_token)
@@ -610,8 +606,6 @@ pub async fn publish_end_session(
 /// credentials may already be invalid and the caller wants to wipe local
 /// state regardless.
 pub async fn publish_revoke(config_dir: &PathBuf) -> Result<(), RegistrationError> {
-    use crate::credential::store;
-
     let creds = load_stored_creds(config_dir)?;
 
     let (scoped_jwt, scoped_seed) = parse_creds_block(&creds.message_space_token)

@@ -20,13 +20,13 @@ use zeroize::Zeroizing;
 #[cfg(target_os = "linux")]
 use super::platform_linux::{
     collect_machine_attributes, compute_machine_bound_key, compute_machine_fingerprint,
-    FingerprintError, MachineAttributes,
+    FingerprintError,
 };
 
 #[cfg(target_os = "macos")]
 use super::platform_macos::{
     collect_machine_attributes_macos as collect_machine_attributes, compute_machine_bound_key,
-    compute_machine_fingerprint, FingerprintError, MachineAttributes,
+    compute_machine_fingerprint, FingerprintError,
 };
 
 /// Minimum number of non-empty machine attributes required for key derivation.
@@ -78,6 +78,7 @@ pub fn derive_machine_bound_key() -> Result<Zeroizing<[u8; 32]>, FingerprintErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fingerprint::platform_linux::MachineAttributes;
 
     #[test]
     fn test_derive_platform_key_succeeds_on_linux() {
