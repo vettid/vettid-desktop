@@ -587,6 +587,44 @@ mod tests {
         assert!(exists(dir.path()));
     }
 
+    /// No keyring, and a machine without a machine id: the machine-bound
+    /// key is refused, so the save fails and nothing is written.
+    struct NoKeyringNoMachineId;
+
+    impl KeySource for NoKeyringNoMachineId {
+        fn master_for_save(&self) -> Result<MasterKey, KeystoreError> {
+            let attrs = crate::fingerprint::platform_linux::MachineAttributes {
+                hostname: "testhost".to_string(),
+                machine_id: String::new(),
+                cpu: "Test CPU".to_string(),
+                disk_serial: "TEST-SERIAL".to_string(),
+                mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+            };
+            let key = platform_key::machine_bound_key_from(&attrs)
+                .map_err(|e| KeystoreError::NoSource(format!("machine attribute collection failed: {}", e)))?;
+            Ok(MasterKey { key: *key, binding: BindingMode::MachineBound })
+        }
+        fn master_for_load(&self, _binding: BindingMode) -> Result<MasterKey, KeystoreError> {
+            self.master_for_save()
+        }
+        fn platform_key(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+            Ok(Zeroizing::new(PLATFORM))
+        }
+    }
+
+    #[test]
+    fn missing_machine_id_fails_the_save_and_writes_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("vettid-desktop");
+        let err = save_with(&NoKeyringNoMachineId, &config_dir, &sample_creds())
+            .err()
+            .expect("save must fail");
+        assert!(matches!(err, CredentialError::KeystoreError(_)), "got {err}");
+        assert!(err.to_string().contains("no machine id"), "got {err}");
+        assert!(!exists(&config_dir));
+        assert!(!config_dir.exists(), "not even the directory is created");
+    }
+
     #[test]
     fn wrong_key_fails_decrypt() {
         let key = [0x42u8; 32];

@@ -20,13 +20,13 @@ use zeroize::Zeroizing;
 #[cfg(target_os = "linux")]
 use super::platform_linux::{
     collect_machine_attributes, compute_machine_bound_key, compute_machine_fingerprint,
-    FingerprintError,
+    FingerprintError, MachineAttributes,
 };
 
 #[cfg(target_os = "macos")]
 use super::platform_macos::{
     collect_machine_attributes_macos as collect_machine_attributes, compute_machine_bound_key,
-    compute_machine_fingerprint, FingerprintError,
+    compute_machine_fingerprint, FingerprintError, MachineAttributes,
 };
 
 /// Minimum number of non-empty machine attributes required for key derivation.
@@ -56,13 +56,29 @@ pub fn derive_platform_key() -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
 /// Derive the machine-bound storage key: the credential store's master key
 /// when the OS keyring is unavailable.
 ///
-/// Uses this platform's collector and the same 3-attribute minimum as
-/// [`derive_platform_key`], but a different HMAC label.
+/// Uses this platform's collector and a different HMAC label from
+/// [`derive_platform_key`]. See [`machine_bound_key_from`] for the rules.
 ///
 /// SECURITY: [`derive_platform_key`] returns a value that is displayed and
 /// sent to the vault, so it must never be used as this key.
 pub fn derive_machine_bound_key() -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
-    let attrs = collect_machine_attributes()?;
+    machine_bound_key_from(&collect_machine_attributes()?)
+}
+
+/// The machine-bound storage key for `attrs`.
+///
+/// Requires a non-empty machine id as well as the 3-attribute minimum
+/// (owner decision, 2026-10-31). Without the machine id, the remaining
+/// attributes can be hostname, CPU and MAC: the hostname is sent at
+/// pairing, CPU models are few and a MAC can be searched, so the key could
+/// be guessed offline. Failing here means nothing is written: with no
+/// keyring and no machine id, the desktop cannot store a pairing.
+pub(crate) fn machine_bound_key_from(
+    attrs: &MachineAttributes,
+) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+    if attrs.machine_id.trim().is_empty() {
+        return Err(FingerprintError::MissingMachineId);
+    }
 
     let count = attrs.attribute_count();
     if count < MIN_ATTRIBUTES {
@@ -72,13 +88,62 @@ pub fn derive_machine_bound_key() -> Result<Zeroizing<[u8; 32]>, FingerprintErro
         });
     }
 
-    Ok(Zeroizing::new(compute_machine_bound_key(&attrs)))
+    Ok(Zeroizing::new(compute_machine_bound_key(attrs)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fingerprint::platform_linux::MachineAttributes;
+
+    fn fixed_attrs() -> MachineAttributes {
+        MachineAttributes {
+            hostname: "testhost".to_string(),
+            machine_id: "test-machine-id".to_string(),
+            cpu: "Test CPU".to_string(),
+            disk_serial: "TEST-SERIAL".to_string(),
+            mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+        }
+    }
+
+    #[test]
+    fn machine_bound_key_requires_a_machine_id() {
+        let mut attrs = fixed_attrs();
+        attrs.machine_id = String::new();
+        // Four attributes remain, above the minimum: refused anyway.
+        assert_eq!(attrs.attribute_count(), 4);
+        assert!(matches!(
+            machine_bound_key_from(&attrs),
+            Err(FingerprintError::MissingMachineId)
+        ));
+
+        attrs.machine_id = "   ".to_string();
+        assert!(matches!(
+            machine_bound_key_from(&attrs),
+            Err(FingerprintError::MissingMachineId)
+        ));
+    }
+
+    #[test]
+    fn machine_bound_key_with_a_machine_id_still_needs_three_attributes() {
+        let attrs = MachineAttributes {
+            hostname: String::new(),
+            machine_id: "test-machine-id".to_string(),
+            cpu: "Test CPU".to_string(),
+            disk_serial: String::new(),
+            mac_address: String::new(),
+        };
+        assert!(matches!(
+            machine_bound_key_from(&attrs),
+            Err(FingerprintError::InsufficientAttributes { found: 2, required: 3 })
+        ));
+    }
+
+    #[test]
+    fn machine_bound_key_from_full_attributes() {
+        let attrs = fixed_attrs();
+        let key = machine_bound_key_from(&attrs).expect("key");
+        assert_eq!(*key, compute_machine_bound_key(&attrs));
+    }
 
     #[test]
     fn test_derive_platform_key_succeeds_on_linux() {
@@ -106,24 +171,20 @@ mod tests {
     /// skipping on a machine with too few of them.
     #[test]
     fn test_machine_bound_key_is_not_the_platform_key() {
-        let attrs = MachineAttributes {
-            hostname: "testhost".to_string(),
-            machine_id: "test-machine-id".to_string(),
-            cpu: "Test CPU".to_string(),
-            disk_serial: "TEST-SERIAL".to_string(),
-            mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
-        };
+        let attrs = fixed_attrs();
         let platform = compute_machine_fingerprint(&attrs);
         let bound = compute_machine_bound_key(&attrs);
         assert_ne!(platform, bound);
         assert_eq!(bound, compute_machine_bound_key(&attrs));
     }
 
-    /// On this machine, both derivations succeed or fail together.
+    /// On this machine, both derivations succeed or fail together, except
+    /// that the machine-bound key alone is refused without a machine id.
     #[test]
     fn test_derivations_agree_on_availability() {
         match (derive_platform_key(), derive_machine_bound_key()) {
             (Ok(platform), Ok(bound)) => assert_ne!(*platform, *bound),
+            (_, Err(FingerprintError::MissingMachineId)) => {}
             (Err(FingerprintError::InsufficientAttributes { .. }), Err(_)) => {}
             (p, b) => panic!(
                 "derivations disagree: platform ok={}, machine-bound ok={}",

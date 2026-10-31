@@ -41,6 +41,9 @@ pub enum FingerprintError {
     InsufficientAttributes { found: usize, required: usize },
     /// The binary could not be hashed.
     BinaryHashFailed(String),
+    /// The machine id is empty, so the machine-bound storage key would
+    /// rest on attributes that are public or guessable.
+    MissingMachineId,
 }
 
 impl fmt::Display for FingerprintError {
@@ -56,6 +59,9 @@ impl fmt::Display for FingerprintError {
                     found, required
                 )
             }
+            FingerprintError::MissingMachineId => f.write_str(
+                "this computer has no machine id, so the pairing can't be stored safely without the system keyring",
+            ),
             FingerprintError::BinaryHashFailed(msg) => {
                 write!(f, "binary hash failed: {}", msg)
             }
