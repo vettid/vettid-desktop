@@ -699,9 +699,9 @@ pub async fn end_session(state: State<'_, AppState>) -> Result<bool, String> {
     let config_dir = store::default_config_dir();
 
     // Tell the vault to end the session. publish_end_session flushes
-    // the NATS connection before returning, so on a clean return the
-    // end-session frame has reached the server and delivery to the
-    // vault is guaranteed; on error we still reset locally.
+    // before returning, within a deadline: on a clean return the
+    // end-session frame was written to the connection. That is not a
+    // confirmation from the vault. On error we still reset locally.
     if let Err(e) = pairing::publish_end_session(&config_dir, "user_locked").await {
         log::warn!("device.end-session publish failed (continuing with local reset): {}", e);
     }

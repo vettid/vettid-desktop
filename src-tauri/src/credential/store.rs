@@ -415,7 +415,8 @@ fn decrypt_store(
     let nonce = XNonce::from_slice(&store.nonce);
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| CredentialError::CryptoError(format!("cipher: {}", e)))?;
-    let mut plaintext = if store.version >= STORE_VERSION {
+    // Zeroized on drop, so also when parsing below fails.
+    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(if store.version >= STORE_VERSION {
         let aad = compute_blob_aad(&store.binding, platform_key);
         cipher
             .decrypt(
@@ -432,12 +433,10 @@ fn decrypt_store(
         cipher
             .decrypt(nonce, store.ciphertext.as_slice())
             .map_err(|e| CredentialError::CryptoError(format!("decrypt v2: {}", e)))?
-    };
+    });
 
     let creds: ConnectionCredentials = serde_json::from_slice(&plaintext)
         .map_err(|e| CredentialError::SerializationError(format!("parse credentials: {}", e)))?;
-
-    plaintext.zeroize();
     Ok(creds)
 }
 

@@ -140,9 +140,11 @@ impl NatsClient {
 
     /// Connect once, for a single fire-and-forget frame (revoke, end
     /// session). Unlike [`Self::connect_with_credentials`] there is no retry
-    /// on the initial connect and no reconnect: an unreachable server makes
-    /// this fail within `timeout`, instead of returning a client whose
-    /// later `flush()` waits for a connection that never comes.
+    /// on the initial connect and at most one reconnect: an unreachable
+    /// server makes this fail within `timeout`, instead of returning a
+    /// client whose later `flush()` waits for a connection that never
+    /// comes, and the connection task stops instead of reconnecting with
+    /// the device's credentials after logout.
     pub async fn connect_once_with_credentials(
         &mut self,
         url: &str,
@@ -160,7 +162,9 @@ impl NatsClient {
         let client = opts
             .tls_first()
             .ignore_discovered_servers()
-            .max_reconnects(Some(0))
+            // In async-nats 0.37 `Some(0)` means unlimited (options.rs
+            // maps it to `None`), so the smallest bound is one reconnect.
+            .max_reconnects(Some(1))
             .connection_timeout(timeout)
             .connect(url)
             .await

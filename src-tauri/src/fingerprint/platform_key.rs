@@ -154,6 +154,19 @@ mod tests {
     }
 
     #[test]
+    fn machine_id_nonzero_hex_boundary() {
+        // 15 non-zero hex digits among zeros and dashes: refused.
+        let fifteen = "11111111-1111-1110-0000-000000000000";
+        // 16: accepted.
+        let sixteen = "11111111-1111-1111-0000-000000000000";
+        let count = |s: &str| s.chars().filter(|c| c.is_ascii_hexdigit() && *c != '0').count();
+        assert_eq!(count(fifteen), 15);
+        assert_eq!(count(sixteen), 16);
+        assert!(!machine_id_is_usable(fifteen));
+        assert!(machine_id_is_usable(sixteen));
+    }
+
+    #[test]
     fn real_machine_id_shapes_are_accepted() {
         for id in [
             // systemd /etc/machine-id: 32 lowercase hex digits
