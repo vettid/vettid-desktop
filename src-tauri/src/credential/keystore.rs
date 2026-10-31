@@ -14,7 +14,7 @@
 //! 2. **Machine-bound fallback** (`platform_key`). If the keyring
 //!    isn't available (kiosk Linux, missing Secret Service daemon,
 //!    locked Keychain on macOS first launch), we derive a key from
-//!    machine attributes via `derive_machine_bound_key`. It uses its
+//!    machine attributes via `platform_key::machine_bound_key_from`. It uses its
 //!    own HMAC label, so it is not the machine fingerprint that is
 //!    displayed and sent at pairing.
 //!    A binding mode marker lands on the encrypted store so callers
@@ -34,9 +34,10 @@ use std::fmt;
 use base64::Engine;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
-use crate::fingerprint::platform_key::derive_machine_bound_key;
+use crate::fingerprint::platform_key;
+use crate::fingerprint::platform_linux::{FingerprintError, MachineAttributes};
 
 const KEYRING_SERVICE: &str = "vettid-desktop";
 const KEYRING_ACCOUNT: &str = "master-key-v1";
@@ -102,17 +103,37 @@ impl fmt::Display for KeystoreError {
 
 impl std::error::Error for KeystoreError {}
 
-/// Returned 32-byte key, sealed with `Zeroize` so callers can wipe
-/// after use. The `binding` field tells the caller which source was
-/// used.
+/// Returned 32-byte key, zeroized on drop. The `binding` field tells the
+/// caller which source was used.
 pub struct MasterKey {
-    pub key: [u8; 32],
+    pub key: Zeroizing<[u8; 32]>,
     pub binding: BindingMode,
 }
 
-impl Drop for MasterKey {
-    fn drop(&mut self) {
-        self.key.zeroize();
+/// The key sources, as a seam: production uses [`System`]; tests replace
+/// the keyring and this machine's attributes, so the real fallback logic
+/// below is what they exercise.
+pub(crate) trait Sources {
+    /// Read the keyring entry: `Ok(None)` when there is none.
+    fn keyring_read(&self) -> Result<Option<Zeroizing<[u8; 32]>>, String>;
+    /// Store a new keyring entry.
+    fn keyring_write(&self, key: &[u8; 32]) -> Result<(), String>;
+    /// This machine's attributes, for the machine-bound key.
+    fn machine_attributes(&self) -> Result<MachineAttributes, FingerprintError>;
+}
+
+/// The OS keyring and this machine's real attributes.
+pub(crate) struct System;
+
+impl Sources for System {
+    fn keyring_read(&self) -> Result<Option<Zeroizing<[u8; 32]>>, String> {
+        read_keyring_key()
+    }
+    fn keyring_write(&self, key: &[u8; 32]) -> Result<(), String> {
+        write_keyring_key(key)
+    }
+    fn machine_attributes(&self) -> Result<MachineAttributes, FingerprintError> {
+        platform_key::collect_attributes()
     }
 }
 
@@ -124,12 +145,18 @@ impl Drop for MasterKey {
 /// know which path was used unless they want to surface it; the
 /// returned `binding` field reflects the source.
 pub fn fetch_or_create_master_key() -> Result<MasterKey, KeystoreError> {
+    fetch_or_create_master_key_with(&System)
+}
+
+pub(crate) fn fetch_or_create_master_key_with(src: &dyn Sources) -> Result<MasterKey, KeystoreError> {
     // Try keyring first.
-    match fetch_or_create_keyring_key() {
-        Ok(key) => return Ok(MasterKey {
-            key,
-            binding: BindingMode::Keyring,
-        }),
+    match fetch_or_create_keyring_key(src) {
+        Ok(key) => {
+            return Ok(MasterKey {
+                key,
+                binding: BindingMode::Keyring,
+            })
+        }
         Err(e) => {
             log::warn!(
                 "Keystore: OS keyring unavailable ({}); falling back to machine-bound key",
@@ -142,17 +169,11 @@ pub fn fetch_or_create_master_key() -> Result<MasterKey, KeystoreError> {
     //
     // SECURITY: this is not the machine fingerprint. The fingerprint is
     // shown in Settings and sent to the vault at pairing; the key is
-    // derived from the same attributes under its own label.
-    match derive_machine_bound_key() {
-        Ok(key) => Ok(MasterKey {
-            key: *key,
-            binding: BindingMode::MachineBound,
-        }),
-        Err(e) => Err(KeystoreError::NoSource(format!(
-            "machine attribute collection failed: {}",
-            e
-        ))),
-    }
+    // derived from the same attributes under its own label, and is refused
+    // without a real machine id.
+    machine_bound(src).map_err(|e| {
+        KeystoreError::NoSource(format!("machine attribute collection failed: {}", e))
+    })
 }
 
 /// Re-fetch a key for an existing store that was encrypted under a
@@ -160,8 +181,15 @@ pub fn fetch_or_create_master_key() -> Result<MasterKey, KeystoreError> {
 /// store's header, so we go straight to the right source rather than
 /// retrying the keyring on a machine-bound install.
 pub fn fetch_for_binding(binding: BindingMode) -> Result<MasterKey, KeystoreError> {
+    fetch_for_binding_with(&System, binding)
+}
+
+pub(crate) fn fetch_for_binding_with(
+    src: &dyn Sources,
+    binding: BindingMode,
+) -> Result<MasterKey, KeystoreError> {
     match binding {
-        BindingMode::Keyring => match read_keyring_key() {
+        BindingMode::Keyring => match src.keyring_read() {
             Ok(Some(key)) => Ok(MasterKey {
                 key,
                 binding: BindingMode::Keyring,
@@ -171,15 +199,17 @@ pub fn fetch_for_binding(binding: BindingMode) -> Result<MasterKey, KeystoreErro
             )),
             Err(e) => Err(KeystoreError::NoSource(format!("keyring read: {}", e))),
         },
-        BindingMode::MachineBound => {
-            let key = derive_machine_bound_key()
-                .map_err(|e| KeystoreError::NoSource(format!("machine attrs: {}", e)))?;
-            Ok(MasterKey {
-                key: *key,
-                binding: BindingMode::MachineBound,
-            })
-        }
+        BindingMode::MachineBound => machine_bound(src)
+            .map_err(|e| KeystoreError::NoSource(format!("machine attrs: {}", e))),
     }
+}
+
+fn machine_bound(src: &dyn Sources) -> Result<MasterKey, FingerprintError> {
+    let attrs = src.machine_attributes()?;
+    Ok(MasterKey {
+        key: platform_key::machine_bound_key_from(&attrs)?,
+        binding: BindingMode::MachineBound,
+    })
 }
 
 /// Wipe the keyring entry. Called from `logout` so the next pairing
@@ -196,29 +226,32 @@ pub fn delete_keyring_key() {
 // Keyring helpers
 // ---------------------------------------------------------------------------
 
-fn fetch_or_create_keyring_key() -> Result<[u8; 32], String> {
-    if let Some(key) = read_keyring_key()? {
+fn fetch_or_create_keyring_key(src: &dyn Sources) -> Result<Zeroizing<[u8; 32]>, String> {
+    if let Some(key) = src.keyring_read()? {
         return Ok(key);
     }
     // No existing entry — generate + store.
-    let mut key = [0u8; 32];
-    OsRng.fill_bytes(&mut key);
-    write_keyring_key(&key)?;
+    let mut key = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(&mut key[..]);
+    src.keyring_write(&key)?;
     Ok(key)
 }
 
-fn read_keyring_key() -> Result<Option<[u8; 32]>, String> {
+fn read_keyring_key() -> Result<Option<Zeroizing<[u8; 32]>>, String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
         .map_err(|e| format!("entry: {}", e))?;
     match entry.get_password() {
         Ok(b64) => {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(b64.trim())
-                .map_err(|e| format!("decode: {}", e))?;
+            let b64 = Zeroizing::new(b64);
+            let bytes = Zeroizing::new(
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64.trim())
+                    .map_err(|e| format!("decode: {}", e))?,
+            );
             if bytes.len() != 32 {
                 return Err(format!("unexpected key length: {}", bytes.len()));
             }
-            let mut key = [0u8; 32];
+            let mut key = Zeroizing::new([0u8; 32]);
             key.copy_from_slice(&bytes);
             Ok(Some(key))
         }
@@ -230,9 +263,95 @@ fn read_keyring_key() -> Result<Option<[u8; 32]>, String> {
 fn write_keyring_key(key: &[u8; 32]) -> Result<(), String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
         .map_err(|e| format!("entry: {}", e))?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(key);
+    let b64 = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(key));
     entry
         .set_password(&b64)
         .map_err(|e| format!("set: {}", e))?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// A keyring and a set of machine attributes under the test's control.
+    pub(crate) struct TestSources {
+        /// `None`: the keyring is unavailable (every call fails).
+        pub keyring: Option<RefCell<Option<[u8; 32]>>>,
+        pub attrs: MachineAttributes,
+    }
+
+    impl TestSources {
+        pub fn no_keyring(attrs: MachineAttributes) -> Self {
+            Self { keyring: None, attrs }
+        }
+    }
+
+    impl Sources for TestSources {
+        fn keyring_read(&self) -> Result<Option<Zeroizing<[u8; 32]>>, String> {
+            match &self.keyring {
+                None => Err("keyring unavailable (test)".to_string()),
+                Some(cell) => Ok(cell.borrow().map(Zeroizing::new)),
+            }
+        }
+        fn keyring_write(&self, key: &[u8; 32]) -> Result<(), String> {
+            match &self.keyring {
+                None => Err("keyring unavailable (test)".to_string()),
+                Some(cell) => {
+                    *cell.borrow_mut() = Some(*key);
+                    Ok(())
+                }
+            }
+        }
+        fn machine_attributes(&self) -> Result<MachineAttributes, FingerprintError> {
+            Ok(self.attrs.clone())
+        }
+    }
+
+    pub(crate) fn attrs_with_machine_id(machine_id: &str) -> MachineAttributes {
+        MachineAttributes {
+            hostname: "testhost".to_string(),
+            machine_id: machine_id.to_string(),
+            cpu: "Test CPU".to_string(),
+            disk_serial: "TEST-SERIAL".to_string(),
+            mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+        }
+    }
+
+    const MACHINE_ID: &str = "4c4c4544003a3610804db7c04f4d3732";
+
+    #[test]
+    fn keyring_available_creates_one_key_and_reuses_it() {
+        let src = TestSources { keyring: Some(RefCell::new(None)), attrs: attrs_with_machine_id(MACHINE_ID) };
+        let first = fetch_or_create_master_key_with(&src).expect("key");
+        assert_eq!(first.binding, BindingMode::Keyring);
+        let second = fetch_or_create_master_key_with(&src).expect("key");
+        assert_eq!(*first.key, *second.key);
+        let loaded = fetch_for_binding_with(&src, BindingMode::Keyring).expect("load");
+        assert_eq!(*loaded.key, *first.key);
+    }
+
+    #[test]
+    fn no_keyring_falls_back_to_the_machine_bound_key() {
+        let attrs = attrs_with_machine_id(MACHINE_ID);
+        let src = TestSources::no_keyring(attrs.clone());
+        let key = fetch_or_create_master_key_with(&src).expect("key");
+        assert_eq!(key.binding, BindingMode::MachineBound);
+        assert_eq!(*key.key, *platform_key::machine_bound_key_from(&attrs).unwrap());
+    }
+
+    #[test]
+    fn no_keyring_and_no_machine_id_gives_no_key() {
+        let src = TestSources::no_keyring(attrs_with_machine_id(""));
+        let err = fetch_or_create_master_key_with(&src).err().expect("must fail");
+        assert!(err.to_string().contains("no machine id"), "got {err}");
+        assert!(fetch_for_binding_with(&src, BindingMode::MachineBound).is_err());
+    }
+
+    #[test]
+    fn missing_keyring_entry_for_a_keyring_store_is_an_error() {
+        let src = TestSources { keyring: Some(RefCell::new(None)), attrs: attrs_with_machine_id(MACHINE_ID) };
+        assert!(fetch_for_binding_with(&src, BindingMode::Keyring).is_err());
+    }
 }

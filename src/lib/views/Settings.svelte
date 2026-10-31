@@ -27,8 +27,9 @@
   let loggingOut = $state(false);
   let showLogoutPrompt = $state(false);
   let logoutMessage = $state('');
-  // Set when logout wiped this desktop but could not tell the vault: the
-  // person must read the notice, so there is no automatic reload.
+  // Set when logout could not tell the vault or could not delete the saved
+  // pairing: the person must read the notice, so there is no automatic
+  // reload.
   let logoutNeedsAck = $state(false);
 
   async function loadDeviceInfo() {
@@ -63,8 +64,8 @@
     loggingOut = true;
     logoutMessage = '';
     try {
-      const result = await invoke<{ revoke_sent: boolean; notice?: string | null }>('logout');
-      if (result?.revoke_sent) {
+      const result = await invoke<{ revoke_sent: boolean; local_wiped: boolean; notice?: string | null }>('logout');
+      if (result?.revoke_sent && result?.local_wiped && !result?.notice) {
         logoutMessage = 'Logged out. Reloading…';
         setTimeout(() => window.location.reload(), 600);
       } else {

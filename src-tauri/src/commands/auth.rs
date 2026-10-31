@@ -313,9 +313,14 @@ fn unquote(s: &str) -> String {
 pub struct UnlockResponse {
     pub unlocked: bool,
     /// Plain text to show the person when the saved pairing could not be
-    /// opened and has been removed from this desktop.
+    /// opened.
     pub notice: Option<String>,
 }
+
+/// What the person is told when the saved pairing could not be opened for
+/// any reason other than [`crate::credential::store::UNREADABLE_NOTICE`]'s (a missing keyring
+/// entry, for example). The detail goes to the log only.
+const UNLOCK_FAILED_NOTICE: &str = "This desktop couldn't open its saved pairing. If this keeps happening, remove this desktop on your phone and pair again.";
 
 /// Unlock the credential store.
 ///
@@ -325,9 +330,8 @@ pub struct UnlockResponse {
 /// gate is the security factor at the local layer.
 /// Populates AppState with credentials and connection key.
 ///
-/// A saved pairing that can't be opened on this machine is not an error
-/// here: `store::load` has deleted it, and the response carries the
-/// notice telling the person to remove this desktop on their phone.
+/// A saved pairing that can't be opened is not an error here: the response
+/// carries a plain notice for the person, and the detail goes to the log.
 #[tauri::command]
 pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<UnlockResponse, String> {
     use crate::credential::store::{self, CredentialError};
@@ -337,13 +341,25 @@ pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<Unlock
     let (creds, _binding) = match store::load(&config_dir) {
         Ok(loaded) => loaded,
         Err(e @ CredentialError::Unreadable) => {
-            *state.is_registered.write().await = false;
             return Ok(UnlockResponse {
                 unlocked: false,
                 notice: Some(e.to_string()),
             });
         }
-        Err(e) => return Err(format!("Failed to unlock: {}", e)),
+        Err(CredentialError::NotFound(_)) => {
+            // Not paired: nothing to open and nothing to say.
+            return Ok(UnlockResponse {
+                unlocked: false,
+                notice: None,
+            });
+        }
+        Err(e) => {
+            log::warn!("unlock: saved pairing could not be opened: {}", e);
+            return Ok(UnlockResponse {
+                unlocked: false,
+                notice: Some(UNLOCK_FAILED_NOTICE.to_string()),
+            });
+        }
     };
 
     // Load connection key (stored as raw bytes in ConnectionCredentials)
@@ -563,15 +579,48 @@ pub async fn extend_session(
 
 /// What the person is told when logout could not send the revoke.
 const REVOKE_NOT_SENT_NOTICE: &str = "This desktop has been logged out here, but your vault was not told. Remove this desktop on your phone.";
+/// ... when the saved pairing could not be deleted from this computer.
+const NOT_WIPED_NOTICE: &str = "This desktop's saved pairing could not be deleted from this computer. Remove this desktop on your phone, then try logging out again.";
+/// ... when neither happened.
+const NOT_WIPED_NOR_SENT_NOTICE: &str = "This desktop's saved pairing could not be deleted from this computer, and your vault was not told. Remove this desktop on your phone, then try logging out again.";
 
 /// Result of [`logout`].
 #[derive(Debug, Serialize)]
 pub struct LogoutResponse {
-    /// The revoke reached the message server. The vault does not
-    /// acknowledge it, so this does not confirm the device was removed.
+    /// The revoke was written to the message server connection. The vault
+    /// does not acknowledge it, so this does not confirm the device was
+    /// removed.
     pub revoke_sent: bool,
-    /// Plain text to show the person when `revoke_sent` is false.
+    /// The saved pairing is gone from this computer.
+    pub local_wiped: bool,
+    /// Plain text to show the person when either of the above is false.
     pub notice: Option<String>,
+}
+
+fn logout_notice(revoke_sent: bool, local_wiped: bool) -> Option<&'static str> {
+    match (revoke_sent, local_wiped) {
+        (true, true) => None,
+        (false, true) => Some(REVOKE_NOT_SENT_NOTICE),
+        (true, false) => Some(NOT_WIPED_NOTICE),
+        (false, false) => Some(NOT_WIPED_NOR_SENT_NOTICE),
+    }
+}
+
+/// Delete the desktop's config directory. Returns whether the saved
+/// pairing is gone afterwards: checked on disk, not assumed.
+fn wipe_local_pairing(config_dir: &std::path::Path) -> bool {
+    use crate::credential::store;
+
+    if config_dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(config_dir) {
+            log::warn!("Failed to remove config dir on logout: {}", e);
+            // Fall back to best-effort removal of the pairing itself.
+            if let Err(e) = store::delete(config_dir) {
+                log::error!("Failed to remove the saved pairing on logout: {}", e);
+            }
+        }
+    }
+    !store::exists(config_dir)
 }
 
 /// Log out: tell the vault to revoke this device, then wipe the on-disk
@@ -614,13 +663,7 @@ pub async fn logout(state: State<'_, AppState>) -> Result<LogoutResponse, String
     state.session.write().await.revoke();
 
     // Wipe the config directory entirely — nothing left on disk.
-    if config_dir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&config_dir) {
-            log::warn!("Failed to remove config dir on logout: {}", e);
-            // Fall back to best-effort removal of known files
-            let _ = std::fs::remove_file(config_dir.join("connection.enc"));
-        }
-    }
+    let local_wiped = wipe_local_pairing(&config_dir);
 
     // Wipe the master key from the keyring too. A future pairing on
     // this machine will mint a fresh key — a leaked disk image from
@@ -629,7 +672,8 @@ pub async fn logout(state: State<'_, AppState>) -> Result<LogoutResponse, String
 
     Ok(LogoutResponse {
         revoke_sent,
-        notice: (!revoke_sent).then(|| REVOKE_NOT_SENT_NOTICE.to_string()),
+        local_wiped,
+        notice: logout_notice(revoke_sent, local_wiped).map(str::to_string),
     })
 }
 
@@ -758,4 +802,76 @@ pub async fn get_status(state: State<'_, AppState>) -> Result<AuthStatus, String
         machine_fingerprint: fp.machine_fingerprint,
         app_version: fp.app_version,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logout_notice_never_claims_what_did_not_happen() {
+        assert_eq!(logout_notice(true, true), None);
+        let not_sent = logout_notice(false, true).unwrap();
+        assert!(not_sent.contains("not told"));
+        let not_wiped = logout_notice(true, false).unwrap();
+        assert!(not_wiped.contains("could not be deleted"));
+        let neither = logout_notice(false, false).unwrap();
+        assert!(neither.contains("could not be deleted") && neither.contains("not told"));
+    }
+
+    #[test]
+    fn wipe_local_pairing_removes_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("vettid-desktop");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("connection.enc"), b"{}").unwrap();
+        assert!(wipe_local_pairing(&config_dir));
+        assert!(!config_dir.exists());
+    }
+
+    #[test]
+    fn wipe_local_pairing_with_nothing_there_is_wiped() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(wipe_local_pairing(&dir.path().join("absent")));
+    }
+
+    /// A pairing that can't be deleted is reported, not assumed gone. On
+    /// unix the directory is made read-only, so its entries can't be
+    /// removed (root ignores that, and then the test has nothing to check).
+    #[cfg(unix)]
+    #[test]
+    fn wipe_local_pairing_reports_a_pairing_that_survives() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("vettid-desktop");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("connection.enc"), b"{}").unwrap();
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let ignores_permissions = std::fs::write(config_dir.join("probe"), b"").is_ok();
+        let wiped = wipe_local_pairing(&config_dir);
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if ignores_permissions {
+            return;
+        }
+        assert!(!wiped, "a pairing still on disk must not be reported as wiped");
+        assert!(config_dir.join("connection.enc").exists());
+    }
+
+    /// The same on Windows: the file is held open without delete sharing,
+    /// so it can't be removed while the wipe runs.
+    #[cfg(windows)]
+    #[test]
+    fn wipe_local_pairing_reports_a_pairing_that_survives() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("vettid-desktop");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let path = config_dir.join("connection.enc");
+        std::fs::write(&path, b"{}").unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+        let wiped = wipe_local_pairing(&config_dir);
+        drop(held);
+        assert!(!wiped, "a pairing still on disk must not be reported as wiped");
+        assert!(path.exists());
+    }
 }

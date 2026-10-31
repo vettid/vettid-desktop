@@ -543,38 +543,57 @@ fn extract_block(s: &str, start: &str, end: &str) -> Option<String> {
 // Revocation (logout)
 // ---------------------------------------------------------------------------
 
+/// How long a fire-and-forget frame (revoke, end session) may take in all:
+/// connect, publish and flush. Past it the frame counts as not sent, so
+/// logout and end-session always get to their local wipe.
+const DEVICE_FRAME_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Publish `device.end-session` to the vault, signalling that the user
 /// wants to end the active session now (without wiping the connection).
 /// Vault wipes the server-side session key + flips DeviceSession to
 /// expired; the desktop can immediately re-request a session without
 /// re-pairing. Caller is expected to local-zeroize afterwards.
+///
+/// Returns within [`DEVICE_FRAME_DEADLINE`]. `Ok` means the frame was
+/// written to the connection, not that the vault processed it.
 pub async fn publish_end_session(
     config_dir: &PathBuf,
     reason: &str,
 ) -> Result<(), RegistrationError> {
     let creds = load_stored_creds(config_dir)?;
+    send_device_frame(&creds, "end-session", reason, DEVICE_FRAME_DEADLINE).await
+}
 
+/// Publish `device.revoke` to the vault, signalling that this desktop is
+/// logging out. We don't wait for a response because the credentials may
+/// already be invalid and the caller wants to wipe local state regardless.
+///
+/// Returns within [`DEVICE_FRAME_DEADLINE`]. `Ok` means the frame was
+/// written to the connection. The vault does not acknowledge a revoke, so
+/// `Ok` does not mean the vault has removed this device.
+pub async fn publish_revoke(config_dir: &PathBuf) -> Result<(), RegistrationError> {
+    let creds = load_stored_creds(config_dir)?;
+    send_device_frame(&creds, "revoke", "logout", DEVICE_FRAME_DEADLINE).await
+}
+
+/// Connect once, publish `device.{kind}` and flush, all within `deadline`.
+async fn send_device_frame(
+    creds: &crate::credential::store::ConnectionCredentials,
+    kind: &str,
+    reason: &str,
+    deadline: Duration,
+) -> Result<(), RegistrationError> {
     let (scoped_jwt, scoped_seed) = parse_creds_block(&creds.message_space_token)
         .ok_or_else(|| RegistrationError::Internal("stored NATS creds malformed".to_string()))?;
 
-    let mut client = NatsClient::new();
-    client
-        .connect_with_credentials(
-            &creds.message_space_url,
-            &scoped_jwt,
-            &scoped_seed,
-            &creds.owner_guid,
-        )
-        .await?;
-
     let subject = format!(
-        "MessageSpace.{}.forOwner.device.{}.end-session",
-        creds.owner_guid, creds.connection_id,
+        "MessageSpace.{}.forOwner.device.{}.{}",
+        creds.owner_guid, creds.connection_id, kind,
     );
     let request_id = hex::encode(generate_random_bytes(16));
     let payload = serde_json::json!({
         "id": request_id,
-        "type": "device.end-session",
+        "type": format!("device.{}", kind),
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "payload": {
             "connection_id": creds.connection_id,
@@ -582,67 +601,110 @@ pub async fn publish_end_session(
         },
     });
 
-    client
-        .publish_to(&subject, payload.to_string().as_bytes())
-        .await?;
+    let send = async {
+        let mut client = NatsClient::new();
+        client
+            .connect_once_with_credentials(
+                &creds.message_space_url,
+                &scoped_jwt,
+                &scoped_seed,
+                &creds.owner_guid,
+                deadline,
+            )
+            .await?;
+        client
+            .publish_to(&subject, payload.to_string().as_bytes())
+            .await?;
+        // The caller tears everything down right after this; without the
+        // flush the frame could still be sitting in the client's buffer.
+        client.flush().await?;
+        Ok::<(), RegistrationError>(())
+    };
 
-    // Flush before returning. The caller tears the NATS connection
-    // down right after this; a bare publish is fire-and-forget, so
-    // without the flush the end-session frame can be dropped before it
-    // reaches the server and the vault never learns the session
-    // ended. flush() sends a PING and awaits the PONG — on return the
-    // server has the message and delivery to the vault is guaranteed.
-    if let Err(e) = client.flush().await {
-        log::warn!(
-            "end-session: NATS flush failed; the frame may not have reached the server: {}",
-            e
-        );
+    match timeout(deadline, send).await {
+        Ok(result) => result,
+        Err(_) => Err(RegistrationError::NatsConnectionFailed(format!(
+            "device.{} not sent within {} s",
+            kind,
+            deadline.as_secs_f32()
+        ))),
     }
-    Ok(())
 }
 
-/// Publish `device.revoke` to the vault, signalling that this desktop is
-/// logging out. Fire-and-forget — we don't block on a response because the
-/// credentials may already be invalid and the caller wants to wipe local
-/// state regardless.
-pub async fn publish_revoke(config_dir: &PathBuf) -> Result<(), RegistrationError> {
-    let creds = load_stored_creds(config_dir)?;
+#[cfg(test)]
+mod device_frame_tests {
+    use super::*;
+    use crate::credential::store::ConnectionCredentials;
 
-    let (scoped_jwt, scoped_seed) = parse_creds_block(&creds.message_space_token)
-        .ok_or_else(|| RegistrationError::Internal("stored NATS creds malformed".to_string()))?;
+    /// A listener that accepts connections and never answers: the TLS
+    /// handshake, and so the connect, never completes.
+    async fn silent_server() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("tls://{}", listener.local_addr().unwrap());
+        (listener, url)
+    }
 
-    let mut client = NatsClient::new();
-    client
-        .connect_with_credentials(
-            &creds.message_space_url,
-            &scoped_jwt,
-            &scoped_seed,
-            &creds.owner_guid,
-        )
-        .await?;
+    fn creds_for(url: &str) -> ConnectionCredentials {
+        ConnectionCredentials {
+            connection_id: "conn-1".into(),
+            connection_key: vec![0u8; 32],
+            key_id: "key-1".into(),
+            device_private_key: vec![0u8; 32],
+            device_public_key: vec![0u8; 32],
+            vault_public_key: vec![0u8; 32],
+            // A syntactically valid user seed (the NATS documentation's
+            // example key); never accepted by any real server.
+            message_space_token: "-----BEGIN NATS USER JWT-----\neyJ0eXAiOiJKV1QifQ.e30.c2ln\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\nSUAMLK2ZNL35WSMW37E7UD4VZ7ELPKW7DHC3BWBSD2GCZ7IUQQXZIORRBU\n------END USER NKEY SEED------\n".into(),
+            message_space_url: url.into(),
+            owner_guid: "owner".into(),
+            owner_name: "Owner".into(),
+            session_id: String::new(),
+            session_expires_at: 0,
+            session_duration_seconds: 0,
+        }
+    }
 
-    let subject = format!(
-        "MessageSpace.{}.forOwner.device.{}.revoke",
-        creds.owner_guid, creds.connection_id,
-    );
-    let request_id = hex::encode(generate_random_bytes(16));
-    let payload = serde_json::json!({
-        "id": request_id,
-        "type": "device.revoke",
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "payload": {
-            "connection_id": creds.connection_id,
-            "reason": "logout",
-        },
-    });
+    #[tokio::test]
+    async fn revoke_to_a_silent_server_gives_up_within_the_deadline() {
+        let (_listener, url) = silent_server().await;
+        let deadline = Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        let result = send_device_frame(&creds_for(&url), "revoke", "logout", deadline).await;
+        // It must fail by giving up on the silent server, not earlier (for
+        // example on the test credentials).
+        match &result {
+            Err(RegistrationError::NatsConnectionFailed(msg)) => {
+                assert!(!msg.contains("invalid credentials"), "failed early: {msg}")
+            }
+            other => panic!("expected a connection failure, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() >= deadline / 2,
+            "gave up after {:?}, before reaching the server's silence",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < deadline + Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
 
-    client
-        .publish_to(&subject, payload.to_string().as_bytes())
-        .await?;
-
-    // Flush, so Ok means the revoke reached the NATS server. The vault
-    // does not acknowledge it, so Ok still does not mean the vault has
-    // removed this device.
-    client.flush().await?;
-    Ok(())
+    #[tokio::test]
+    async fn revoke_to_a_closed_port_fails() {
+        // Bind, take the port, then close it: nothing listens there.
+        let url = {
+            let (listener, url) = silent_server().await;
+            drop(listener);
+            url
+        };
+        let result =
+            send_device_frame(&creds_for(&url), "revoke", "logout", Duration::from_secs(2)).await;
+        match &result {
+            Err(RegistrationError::NatsConnectionFailed(msg)) => {
+                assert!(!msg.contains("invalid credentials"), "failed early: {msg}")
+            }
+            other => panic!("expected a connection failure, got {other:?}"),
+        }
+    }
 }

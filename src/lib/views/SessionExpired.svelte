@@ -65,12 +65,12 @@
    */
   async function logoutFromHere() {
     try {
-      const result = await invoke<{ revoke_sent: boolean; notice?: string | null }>('logout');
-      if (result?.revoke_sent) {
+      const result = await invoke<{ revoke_sent: boolean; local_wiped: boolean; notice?: string | null }>('logout');
+      if (result?.revoke_sent && result?.local_wiped && !result?.notice) {
         window.location.reload();
       } else {
-        // The vault was not told: the person has to read this before
-        // the reload takes them to pairing.
+        // The vault was not told, or the pairing is still on disk: the
+        // person has to read this before the reload.
         step = 'removed-unconfirmed';
         errorMessage = '';
         removedNotice = result?.notice

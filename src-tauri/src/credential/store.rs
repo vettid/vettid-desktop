@@ -90,9 +90,10 @@ pub enum CredentialError {
     NotFound(String),
     /// The store version is not supported.
     UnsupportedVersion(i32),
-    /// A machine-bound store did not decrypt with this machine's key, for
-    /// example one sealed by a build that used the machine fingerprint as
-    /// the key. `load` has deleted the file. Displays [`UNREADABLE_NOTICE`].
+    /// A machine-bound store did not decrypt with this machine's key.
+    /// `load` deleted the file if an earlier build sealed it under the
+    /// public fingerprint, and kept it otherwise. Displays
+    /// [`UNREADABLE_NOTICE`].
     Unreadable,
 }
 
@@ -216,10 +217,11 @@ pub fn save(config_dir: &Path, creds: &ConnectionCredentials) -> Result<BindingM
 /// encrypted under (recorded in the file's `binding` header).
 /// Returns `(credentials, binding_mode)`.
 ///
-/// A machine-bound file that does not decrypt is deleted and reported as
-/// [`CredentialError::Unreadable`]: nothing can open it on this machine,
-/// and a file sealed by an earlier build used a key that was public. A
-/// keyring-bound file that does not decrypt is left in place.
+/// A machine-bound file that does not decrypt is reported as
+/// [`CredentialError::Unreadable`]. It is deleted only if it was sealed by an
+/// earlier build under the public fingerprint (it opens with that as the
+/// key); otherwise it is kept, since a changed machine attribute may change
+/// back. A keyring-bound file that does not decrypt is left in place.
 pub fn load(config_dir: &Path) -> Result<(ConnectionCredentials, BindingMode), CredentialError> {
     load_with(&SystemKeys, config_dir)
 }
@@ -264,12 +266,24 @@ fn load_with(
     match decrypt_store(&store, &master.key, &platform_key) {
         Ok(creds) => Ok((creds, binding)),
         Err(CredentialError::CryptoError(e)) if binding == BindingMode::MachineBound => {
-            log::warn!(
-                "credential store: machine-bound file does not decrypt on this machine ({}); deleting it",
-                e
-            );
-            if let Err(de) = delete(config_dir) {
-                log::error!("credential store: could not delete the unreadable file: {}", de);
+            // Delete the file only when it is positively one written by an
+            // earlier build, which used the public fingerprint as its key.
+            // Any other failure may be a machine attribute that changed and
+            // will change back (a disk enumerated in another order, a dock's
+            // MAC, a DHCP hostname), so the file is kept: pairing again or
+            // "Remove this desktop" replaces it.
+            if decrypt_store(&store, &platform_key, &platform_key).is_ok() {
+                log::warn!(
+                    "credential store: machine-bound file was sealed under the public fingerprint by an earlier build; deleting it"
+                );
+                if let Err(de) = delete(config_dir) {
+                    log::error!("credential store: could not delete the old file: {}", de);
+                }
+            } else {
+                log::warn!(
+                    "credential store: machine-bound file does not decrypt on this machine ({}); keeping it",
+                    e
+                );
             }
             Err(CredentialError::Unreadable)
         }
@@ -495,10 +509,10 @@ mod tests {
 
     impl KeySource for FixedKeys {
         fn master_for_save(&self) -> Result<MasterKey, KeystoreError> {
-            Ok(MasterKey { key: self.master, binding: self.binding })
+            Ok(MasterKey { key: Zeroizing::new(self.master), binding: self.binding })
         }
         fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError> {
-            Ok(MasterKey { key: self.master, binding })
+            Ok(MasterKey { key: Zeroizing::new(self.master), binding })
         }
         fn platform_key(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
             Ok(Zeroizing::new(self.platform))
@@ -560,17 +574,37 @@ mod tests {
         assert!(!exists(dir.path()), "the unreadable file must be deleted");
     }
 
-    /// A machine-bound file from another machine (different AAD) is
-    /// unreadable too.
+    /// A machine attribute changed (a disk serial, a MAC, a hostname): the
+    /// machine-bound key and the fingerprint both differ. The pairing is
+    /// unreadable for now but must not be deleted, since the attribute may
+    /// change back, and then it opens again.
     #[test]
-    fn machine_bound_blob_from_other_machine_is_unreadable() {
+    fn attribute_drift_keeps_the_file_and_it_opens_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: PLATFORM };
+        save_with(&before, dir.path(), &sample_creds()).expect("save");
+
+        let drifted = FixedKeys { binding: BindingMode::MachineBound, master: [0x66; 32], platform: [0x33; 32] };
+        let err = load_with(&drifted, dir.path()).err().expect("must not load");
+        assert!(matches!(err, CredentialError::Unreadable), "got {err}");
+        assert_eq!(err.to_string(), UNREADABLE_NOTICE);
+        assert!(exists(dir.path()), "a drifted pairing must be kept");
+
+        let (loaded, _) = load_with(&before, dir.path()).expect("opens once the attribute is back");
+        assert_eq!(loaded.connection_id, "conn-1");
+    }
+
+    /// Only the AAD differs (same master key, different fingerprint): also
+    /// kept.
+    #[test]
+    fn machine_bound_aad_mismatch_keeps_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let there = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: [0x33; 32] };
         save_with(&there, dir.path(), &sample_creds()).expect("save");
 
         let here = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: PLATFORM };
         assert!(matches!(load_with(&here, dir.path()), Err(CredentialError::Unreadable)));
-        assert!(!exists(dir.path()));
+        assert!(exists(dir.path()));
     }
 
     /// A keyring-bound file that does not decrypt is not deleted: the
@@ -587,42 +621,53 @@ mod tests {
         assert!(exists(dir.path()));
     }
 
-    /// No keyring, and a machine without a machine id: the machine-bound
-    /// key is refused, so the save fails and nothing is written.
-    struct NoKeyringNoMachineId;
+    /// The real keystore logic (`fetch_or_create_master_key_with`) over
+    /// test sources: the store asks the keystore exactly as in production.
+    struct ThroughKeystore(keystore::tests::TestSources);
 
-    impl KeySource for NoKeyringNoMachineId {
+    impl KeySource for ThroughKeystore {
         fn master_for_save(&self) -> Result<MasterKey, KeystoreError> {
-            let attrs = crate::fingerprint::platform_linux::MachineAttributes {
-                hostname: "testhost".to_string(),
-                machine_id: String::new(),
-                cpu: "Test CPU".to_string(),
-                disk_serial: "TEST-SERIAL".to_string(),
-                mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
-            };
-            let key = platform_key::machine_bound_key_from(&attrs)
-                .map_err(|e| KeystoreError::NoSource(format!("machine attribute collection failed: {}", e)))?;
-            Ok(MasterKey { key: *key, binding: BindingMode::MachineBound })
+            keystore::fetch_or_create_master_key_with(&self.0)
         }
-        fn master_for_load(&self, _binding: BindingMode) -> Result<MasterKey, KeystoreError> {
-            self.master_for_save()
+        fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError> {
+            keystore::fetch_for_binding_with(&self.0, binding)
         }
         fn platform_key(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
             Ok(Zeroizing::new(PLATFORM))
         }
     }
 
+    /// No keyring, and a machine without a usable machine id: the
+    /// machine-bound key is refused, so the save fails and nothing is
+    /// written, not even the directory.
     #[test]
     fn missing_machine_id_fails_the_save_and_writes_no_file() {
+        for machine_id in ["", "uninitialized", "00000000-0000-0000-0000-000000000000"] {
+            let dir = tempfile::tempdir().unwrap();
+            let config_dir = dir.path().join("vettid-desktop");
+            let keys = ThroughKeystore(keystore::tests::TestSources::no_keyring(
+                keystore::tests::attrs_with_machine_id(machine_id),
+            ));
+            let err = save_with(&keys, &config_dir, &sample_creds())
+                .err()
+                .expect("save must fail");
+            assert!(matches!(err, CredentialError::KeystoreError(_)), "got {err}");
+            assert!(err.to_string().contains("no machine id"), "got {err}");
+            assert!(!config_dir.exists(), "{machine_id:?}: nothing may be written");
+        }
+    }
+
+    /// The same path with a real machine id works end to end.
+    #[test]
+    fn no_keyring_with_a_machine_id_round_trips_through_the_keystore() {
         let dir = tempfile::tempdir().unwrap();
-        let config_dir = dir.path().join("vettid-desktop");
-        let err = save_with(&NoKeyringNoMachineId, &config_dir, &sample_creds())
-            .err()
-            .expect("save must fail");
-        assert!(matches!(err, CredentialError::KeystoreError(_)), "got {err}");
-        assert!(err.to_string().contains("no machine id"), "got {err}");
-        assert!(!exists(&config_dir));
-        assert!(!config_dir.exists(), "not even the directory is created");
+        let keys = ThroughKeystore(keystore::tests::TestSources::no_keyring(
+            keystore::tests::attrs_with_machine_id("4c4c4544003a3610804db7c04f4d3732"),
+        ));
+        assert_eq!(save_with(&keys, dir.path(), &sample_creds()).unwrap(), BindingMode::MachineBound);
+        let (loaded, binding) = load_with(&keys, dir.path()).expect("load");
+        assert_eq!(binding, BindingMode::MachineBound);
+        assert_eq!(loaded.connection_id, "conn-1");
     }
 
     #[test]

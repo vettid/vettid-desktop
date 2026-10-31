@@ -7,7 +7,7 @@
 //!   It is not secret: Settings displays it, pairing sends it to the vault,
 //!   and the credential store mixes it into its AEAD associated data so a
 //!   blob only opens on the machine that wrote it;
-//! - the **machine-bound key** ([`derive_machine_bound_key`]): the credential
+//! - the **machine-bound key** ([`machine_bound_key_from`]): the credential
 //!   store's master key when the OS keyring is unavailable. It is key
 //!   material, but anyone who can read the same attributes on this machine
 //!   can recompute it.
@@ -53,21 +53,20 @@ pub fn derive_platform_key() -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
     Ok(Zeroizing::new(compute_machine_fingerprint(&attrs)))
 }
 
-/// Derive the machine-bound storage key: the credential store's master key
-/// when the OS keyring is unavailable.
-///
-/// Uses this platform's collector and a different HMAC label from
-/// [`derive_platform_key`]. See [`machine_bound_key_from`] for the rules.
+/// This machine's attributes, from this platform's collector. The keystore
+/// derives the machine-bound key from them with [`machine_bound_key_from`].
+pub(crate) fn collect_attributes() -> Result<MachineAttributes, FingerprintError> {
+    collect_machine_attributes()
+}
+
+/// The machine-bound storage key for `attrs`: the credential store's master
+/// key when the OS keyring is unavailable. Same attributes as
+/// [`derive_platform_key`], under a different HMAC label.
 ///
 /// SECURITY: [`derive_platform_key`] returns a value that is displayed and
 /// sent to the vault, so it must never be used as this key.
-pub fn derive_machine_bound_key() -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
-    machine_bound_key_from(&collect_machine_attributes()?)
-}
-
-/// The machine-bound storage key for `attrs`.
 ///
-/// Requires a non-empty machine id as well as the 3-attribute minimum
+/// Requires a real machine id as well as the 3-attribute minimum
 /// (owner decision, 2026-10-31). Without the machine id, the remaining
 /// attributes can be hostname, CPU and MAC: the hostname is sent at
 /// pairing, CPU models are few and a MAC can be searched, so the key could
@@ -76,7 +75,7 @@ pub fn derive_machine_bound_key() -> Result<Zeroizing<[u8; 32]>, FingerprintErro
 pub(crate) fn machine_bound_key_from(
     attrs: &MachineAttributes,
 ) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
-    if attrs.machine_id.trim().is_empty() {
+    if !machine_id_is_usable(&attrs.machine_id) {
         return Err(FingerprintError::MissingMachineId);
     }
 
@@ -91,6 +90,26 @@ pub(crate) fn machine_bound_key_from(
     Ok(Zeroizing::new(compute_machine_bound_key(attrs)))
 }
 
+/// Minimum number of non-zero hex digits in a usable machine id. A real one
+/// (systemd's 32 hex digits, a Windows `MachineGuid`, a macOS
+/// `IOPlatformUUID`) has about 30.
+const MIN_MACHINE_ID_NONZERO_HEX: usize = 16;
+
+/// Whether `id` looks like a real machine id rather than a placeholder:
+/// empty, systemd's `uninitialized`, all zeros (with or without UUID
+/// dashes), or too little randomness to be one.
+fn machine_id_is_usable(id: &str) -> bool {
+    let id = id.trim();
+    if id.is_empty() || id.eq_ignore_ascii_case("uninitialized") {
+        return false;
+    }
+    let nonzero_hex = id
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit() && *c != '0')
+        .count();
+    nonzero_hex >= MIN_MACHINE_ID_NONZERO_HEX
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,7 +117,7 @@ mod tests {
     fn fixed_attrs() -> MachineAttributes {
         MachineAttributes {
             hostname: "testhost".to_string(),
-            machine_id: "test-machine-id".to_string(),
+            machine_id: "4c4c4544003a3610804db7c04f4d3732".to_string(),
             cpu: "Test CPU".to_string(),
             disk_serial: "TEST-SERIAL".to_string(),
             mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
@@ -116,18 +135,43 @@ mod tests {
             Err(FingerprintError::MissingMachineId)
         ));
 
-        attrs.machine_id = "   ".to_string();
-        assert!(matches!(
-            machine_bound_key_from(&attrs),
-            Err(FingerprintError::MissingMachineId)
-        ));
+        for placeholder in [
+            "   ",
+            "uninitialized",
+            "UNINITIALIZED\n",
+            "00000000000000000000000000000000",
+            "00000000-0000-0000-0000-000000000000",
+            "0000000000000000000000000000000a",
+            "test-machine-id",
+            "abcdef",
+        ] {
+            attrs.machine_id = placeholder.to_string();
+            assert!(
+                matches!(machine_bound_key_from(&attrs), Err(FingerprintError::MissingMachineId)),
+                "{placeholder:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn real_machine_id_shapes_are_accepted() {
+        for id in [
+            // systemd /etc/machine-id: 32 lowercase hex digits
+            "4c4c4544003a3610804db7c04f4d3732",
+            // Windows MachineGuid
+            "6f1a2b3c-4d5e-4f60-8a9b-0c1d2e3f4a5b",
+            // macOS IOPlatformUUID, upper case
+            "8E3D5C2A-1B4F-4A6E-9C7D-2F1E0A3B4C5D",
+        ] {
+            assert!(machine_id_is_usable(id), "{id} must be accepted");
+        }
     }
 
     #[test]
     fn machine_bound_key_with_a_machine_id_still_needs_three_attributes() {
         let attrs = MachineAttributes {
             hostname: String::new(),
-            machine_id: "test-machine-id".to_string(),
+            machine_id: "4c4c4544003a3610804db7c04f4d3732".to_string(),
             cpu: "Test CPU".to_string(),
             disk_serial: String::new(),
             mac_address: String::new(),
@@ -182,7 +226,8 @@ mod tests {
     /// that the machine-bound key alone is refused without a machine id.
     #[test]
     fn test_derivations_agree_on_availability() {
-        match (derive_platform_key(), derive_machine_bound_key()) {
+        let bound = collect_attributes().and_then(|attrs| machine_bound_key_from(&attrs));
+        match (derive_platform_key(), bound) {
             (Ok(platform), Ok(bound)) => assert_ne!(*platform, *bound),
             (_, Err(FingerprintError::MissingMachineId)) => {}
             (Err(FingerprintError::InsufficientAttributes { .. }), Err(_)) => {}

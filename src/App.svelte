@@ -45,8 +45,8 @@
   let stateResolved = $state(false);
   let sessionState: SessionState = $derived($sessionStore);
   let isRegistered = $state(false);
-  // Shown when the saved pairing could not be opened and was removed
-  // from this desktop (see the `unlock` command).
+  // Shown when the saved pairing could not be opened (see the `unlock`
+  // command).
   let pairingNotice = $state('');
   let pollTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -70,10 +70,12 @@
       const result = await invoke<{ unlocked: boolean; notice?: string | null }>('unlock');
       if (result?.notice) {
         pairingNotice = result.notice;
-        isRegistered = false;
+        // The file may have been deleted (an earlier build's) or kept.
+        await refreshRegistration();
       }
     } catch (e) {
       console.warn('Auto-unlock failed:', e);
+      pairingNotice = "This desktop couldn't open its saved pairing. If this keeps happening, remove this desktop on your phone and pair again.";
     }
   }
 

@@ -121,12 +121,7 @@ impl NatsClient {
         owner_guid: &str,
     ) -> Result<(), NatsError> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        // Trailing newline is load-bearing — async-nats's nkey parser
-        // requires `\r?\n` after the closing dash-line of each block.
-        let creds = format!(
-            "-----BEGIN NATS USER JWT-----\n{}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\n{}\n------END USER NKEY SEED------\n",
-            jwt, seed,
-        );
+        let creds = creds_block(jwt, seed);
 
         let opts = async_nats::ConnectOptions::with_credentials(&creds)
             .map_err(|e| NatsError::ConnectionFailed(format!("invalid credentials: {}", e)))?;
@@ -143,6 +138,39 @@ impl NatsClient {
         Ok(())
     }
 
+    /// Connect once, for a single fire-and-forget frame (revoke, end
+    /// session). Unlike [`Self::connect_with_credentials`] there is no retry
+    /// on the initial connect and no reconnect: an unreachable server makes
+    /// this fail within `timeout`, instead of returning a client whose
+    /// later `flush()` waits for a connection that never comes.
+    pub async fn connect_once_with_credentials(
+        &mut self,
+        url: &str,
+        jwt: &str,
+        seed: &str,
+        owner_guid: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), NatsError> {
+        let creds = creds_block(jwt, seed);
+        let opts = async_nats::ConnectOptions::with_credentials(&creds)
+            .map_err(|e| NatsError::ConnectionFailed(format!("invalid credentials: {}", e)))?;
+
+        // Same transport rules as `with_resilience` (TLS first, no
+        // discovered servers), without its retries.
+        let client = opts
+            .tls_first()
+            .ignore_discovered_servers()
+            .max_reconnects(Some(0))
+            .connection_timeout(timeout)
+            .connect(url)
+            .await
+            .map_err(|e| NatsError::ConnectionFailed(e.to_string()))?;
+
+        self.client = Some(client);
+        self.owner_guid = owner_guid.to_string();
+        Ok(())
+    }
+
     /// Publish a message to a specific subject.
     pub async fn publish_to(&self, subject: &str, payload: &[u8]) -> Result<(), NatsError> {
         let client = self.client.as_ref().ok_or(NatsError::NotConnected)?;
@@ -153,10 +181,13 @@ impl NatsClient {
         Ok(())
     }
 
-    /// Flush pending publishes. Sends a PING and awaits the server's
-    /// PONG, so on return every prior publish has reached the NATS
-    /// server — used before tearing the connection down so a
-    /// fire-and-forget publish can't be dropped by the disconnect.
+    /// Flush pending publishes. In async-nats 0.37 this returns once the
+    /// buffered frames have been written to the connection's socket; it
+    /// does not wait for a PONG, so it does not prove the server processed
+    /// them. Used before tearing the connection down so a fire-and-forget
+    /// publish isn't dropped by the disconnect. On a client with unlimited
+    /// reconnects it waits for as long as there is no connection, so bound
+    /// it with a timeout.
     pub async fn flush(&self) -> Result<(), NatsError> {
         let client = self.client.as_ref().ok_or(NatsError::NotConnected)?;
         client
@@ -318,6 +349,17 @@ impl NatsClient {
         let random_start = rand::random::<u32>() as u64;
         self.sequence.store(random_start, Ordering::SeqCst);
     }
+}
+
+/// The `.creds` text async-nats expects for a JWT and an nkey seed.
+///
+/// Trailing newline is load-bearing — async-nats's nkey parser requires
+/// `\r?\n` after the closing dash-line of each block.
+fn creds_block(jwt: &str, seed: &str) -> String {
+    format!(
+        "-----BEGIN NATS USER JWT-----\n{}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\n{}\n------END USER NKEY SEED------\n",
+        jwt, seed,
+    )
 }
 
 /// Apply standard resilience options: retry initial connect, unlimited
