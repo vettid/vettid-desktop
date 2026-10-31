@@ -461,6 +461,21 @@ pub struct PairingOutcome {
 // Extension flow (same connection_id, fresh session key)
 // ---------------------------------------------------------------------------
 
+/// Load the stored pairing for a request to the vault. A pairing that
+/// can't be opened on this machine becomes the plain notice, not a raw
+/// crypto error.
+fn load_stored_creds(
+    config_dir: &PathBuf,
+) -> Result<crate::credential::store::ConnectionCredentials, RegistrationError> {
+    use crate::credential::store::{self, CredentialError};
+
+    match store::load(config_dir) {
+        Ok((creds, _)) => Ok(creds),
+        Err(CredentialError::Unreadable) => Err(RegistrationError::PairingUnreadable),
+        Err(e) => Err(RegistrationError::Internal(format!("load creds: {}", e))),
+    }
+}
+
 /// Extend a session that has expired (or is about to). Reuses the stored NATS
 /// creds + connection_id from the existing credential store, but generates a
 /// fresh ephemeral X25519 keypair and approval token — matching the vault's
@@ -475,8 +490,7 @@ pub async fn start_extension(
 ) -> Result<(InviteSession, PairingRuntime), RegistrationError> {
     use crate::credential::store;
 
-    let (creds, _) = store::load(config_dir)
-        .map_err(|e| RegistrationError::Internal(format!("load creds: {}", e)))?;
+    let creds = load_stored_creds(config_dir)?;
 
     // Parse JWT+seed out of the stored creds block so we can reuse them for
     // NATS auth. Format matches what complete_pairing wrote.
@@ -542,8 +556,7 @@ pub async fn publish_end_session(
 ) -> Result<(), RegistrationError> {
     use crate::credential::store;
 
-    let (creds, _) = store::load(config_dir)
-        .map_err(|e| RegistrationError::Internal(format!("load creds: {}", e)))?;
+    let creds = load_stored_creds(config_dir)?;
 
     let (scoped_jwt, scoped_seed) = parse_creds_block(&creds.message_space_token)
         .ok_or_else(|| RegistrationError::Internal("stored NATS creds malformed".to_string()))?;
@@ -599,8 +612,7 @@ pub async fn publish_end_session(
 pub async fn publish_revoke(config_dir: &PathBuf) -> Result<(), RegistrationError> {
     use crate::credential::store;
 
-    let (creds, _) = store::load(config_dir)
-        .map_err(|e| RegistrationError::Internal(format!("load creds: {}", e)))?;
+    let creds = load_stored_creds(config_dir)?;
 
     let (scoped_jwt, scoped_seed) = parse_creds_block(&creds.message_space_token)
         .ok_or_else(|| RegistrationError::Internal("stored NATS creds malformed".to_string()))?;
@@ -634,7 +646,9 @@ pub async fn publish_revoke(config_dir: &PathBuf) -> Result<(), RegistrationErro
         .publish_to(&subject, payload.to_string().as_bytes())
         .await?;
 
-    // Give NATS a moment to flush; don't wait for an ack.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Flush, so Ok means the revoke reached the NATS server. The vault
+    // does not acknowledge it, so Ok still does not mean the vault has
+    // removed this device.
+    client.flush().await?;
     Ok(())
 }

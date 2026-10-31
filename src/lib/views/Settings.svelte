@@ -27,6 +27,9 @@
   let loggingOut = $state(false);
   let showLogoutPrompt = $state(false);
   let logoutMessage = $state('');
+  // Set when logout wiped this desktop but could not tell the vault: the
+  // person must read the notice, so there is no automatic reload.
+  let logoutNeedsAck = $state(false);
 
   async function loadDeviceInfo() {
     try {
@@ -60,9 +63,15 @@
     loggingOut = true;
     logoutMessage = '';
     try {
-      await invoke('logout');
-      logoutMessage = 'Logged out. Reloading…';
-      setTimeout(() => window.location.reload(), 600);
+      const result = await invoke<{ revoke_sent: boolean; notice?: string | null }>('logout');
+      if (result?.revoke_sent) {
+        logoutMessage = 'Logged out. Reloading…';
+        setTimeout(() => window.location.reload(), 600);
+      } else {
+        logoutMessage = result?.notice
+          || 'This desktop has been logged out here, but your vault was not told. Remove this desktop on your phone.';
+        logoutNeedsAck = true;
+      }
     } catch (e) {
       logoutMessage = `Logout failed: ${e}`;
       loggingOut = false;
@@ -177,7 +186,10 @@
           </div>
         {/if}
         {#if logoutMessage}
-          <p class="logout-msg">{logoutMessage}</p>
+          <p class="logout-msg" role={logoutNeedsAck ? 'alert' : undefined}>{logoutMessage}</p>
+          {#if logoutNeedsAck}
+            <button class="ghost-btn" onclick={() => window.location.reload()}>OK</button>
+          {/if}
         {/if}
       </div>
 

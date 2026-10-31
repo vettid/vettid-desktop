@@ -14,6 +14,9 @@ pub enum RegistrationError {
     Denied(String),
     Timeout,
     Internal(String),
+    /// The saved pairing can't be opened on this machine (see
+    /// `CredentialError::Unreadable`). Displays the plain notice.
+    PairingUnreadable,
 }
 
 impl fmt::Display for RegistrationError {
@@ -26,6 +29,9 @@ impl fmt::Display for RegistrationError {
             Self::Denied(reason) => write!(f, "connection denied: {}", reason),
             Self::Timeout => write!(f, "timed out waiting for approval"),
             Self::Internal(msg) => write!(f, "internal error: {}", msg),
+            Self::PairingUnreadable => {
+                f.write_str(crate::credential::store::UNREADABLE_NOTICE)
+            }
         }
     }
 }

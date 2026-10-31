@@ -51,9 +51,11 @@ pub enum BindingMode {
     /// OS account.
     Keyring,
     /// Key derived from machine attributes (no keyring available).
-    /// Disk-theft-without-machine-access is still safe (the
-    /// fingerprint depends on attributes the disk doesn't carry),
-    /// but disk + access to the running machine can re-derive.
+    /// Weaker than the keyring: anyone who can read this machine's
+    /// attributes can re-derive the key. That includes any local user
+    /// and anyone holding a full disk image, since the machine id and
+    /// hostname are stored on the disk itself. It only protects
+    /// `connection.enc` copied on its own, without the rest of the disk.
     MachineBound,
 }
 
@@ -143,7 +145,7 @@ pub fn fetch_or_create_master_key() -> Result<MasterKey, KeystoreError> {
     // derived from the same attributes under its own label.
     match derive_machine_bound_key() {
         Ok(key) => Ok(MasterKey {
-            key,
+            key: *key,
             binding: BindingMode::MachineBound,
         }),
         Err(e) => Err(KeystoreError::NoSource(format!(
@@ -173,7 +175,7 @@ pub fn fetch_for_binding(binding: BindingMode) -> Result<MasterKey, KeystoreErro
             let key = derive_machine_bound_key()
                 .map_err(|e| KeystoreError::NoSource(format!("machine attrs: {}", e)))?;
             Ok(MasterKey {
-                key,
+                key: *key,
                 binding: BindingMode::MachineBound,
             })
         }

@@ -5,7 +5,8 @@
   import { onDestroy } from 'svelte';
   import { activateSession } from '../stores/session';
 
-  let step = $state<'idle' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error'>('idle');
+  let step = $state<'idle' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error' | 'removed-unconfirmed'>('idle');
+  let removedNotice = $state('');
   let errorMessage = $state('');
   let qrDataUrl = $state('');
   let unlistenQr: UnlistenFn | null = null;
@@ -64,8 +65,17 @@
    */
   async function logoutFromHere() {
     try {
-      await invoke('logout');
-      window.location.reload();
+      const result = await invoke<{ revoke_sent: boolean; notice?: string | null }>('logout');
+      if (result?.revoke_sent) {
+        window.location.reload();
+      } else {
+        // The vault was not told: the person has to read this before
+        // the reload takes them to pairing.
+        step = 'removed-unconfirmed';
+        errorMessage = '';
+        removedNotice = result?.notice
+          || 'This desktop has been logged out here, but your vault was not told. Remove this desktop on your phone.';
+      }
     } catch (e: any) {
       errorMessage = `Logout failed: ${e}`;
     }
@@ -112,6 +122,10 @@
 
     {:else if step === 'success'}
       <div class="success-msg">Session started.</div>
+
+    {:else if step === 'removed-unconfirmed'}
+      <p class="error-text" role="alert">{removedNotice}</p>
+      <button class="btn primary" onclick={() => window.location.reload()}>OK</button>
 
     {:else if step === 'error'}
       <p class="error-text">{errorMessage}</p>

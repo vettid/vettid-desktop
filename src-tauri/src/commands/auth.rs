@@ -308,6 +308,15 @@ fn unquote(s: &str) -> String {
     }
 }
 
+/// Result of [`unlock`].
+#[derive(Debug, Serialize)]
+pub struct UnlockResponse {
+    pub unlocked: bool,
+    /// Plain text to show the person when the saved pairing could not be
+    /// opened and has been removed from this desktop.
+    pub notice: Option<String>,
+}
+
 /// Unlock the credential store.
 ///
 /// Loads the encrypted connection.enc file using the master key from
@@ -315,14 +324,27 @@ fn unquote(s: &str) -> String {
 /// the keyring is unlocked by the user's OS login session and that
 /// gate is the security factor at the local layer.
 /// Populates AppState with credentials and connection key.
+///
+/// A saved pairing that can't be opened on this machine is not an error
+/// here: `store::load` has deleted it, and the response carries the
+/// notice telling the person to remove this desktop on their phone.
 #[tauri::command]
-pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
-    use crate::credential::store;
+pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<UnlockResponse, String> {
+    use crate::credential::store::{self, CredentialError};
 
     let config_dir = store::default_config_dir();
 
-    let (creds, _binding) = store::load(&config_dir)
-        .map_err(|e| format!("Failed to unlock: {}", e))?;
+    let (creds, _binding) = match store::load(&config_dir) {
+        Ok(loaded) => loaded,
+        Err(e @ CredentialError::Unreadable) => {
+            *state.is_registered.write().await = false;
+            return Ok(UnlockResponse {
+                unlocked: false,
+                notice: Some(e.to_string()),
+            });
+        }
+        Err(e) => return Err(format!("Failed to unlock: {}", e)),
+    };
 
     // Load connection key (stored as raw bytes in ConnectionCredentials)
     if creds.connection_key.len() == 32 {
@@ -378,7 +400,10 @@ pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<bool, 
     // nobody's subscribed to it.
     crate::nats::listener::spawn_listener(app.clone(), connection_id).await;
 
-    Ok(true)
+    Ok(UnlockResponse {
+        unlocked: true,
+        notice: None,
+    })
 }
 
 /// Session info the frontend uses to decide which view to render
@@ -536,11 +561,25 @@ pub async fn extend_session(
     })
 }
 
+/// What the person is told when logout could not send the revoke.
+const REVOKE_NOT_SENT_NOTICE: &str = "This desktop has been logged out here, but your vault was not told. Remove this desktop on your phone.";
+
+/// Result of [`logout`].
+#[derive(Debug, Serialize)]
+pub struct LogoutResponse {
+    /// The revoke reached the message server. The vault does not
+    /// acknowledge it, so this does not confirm the device was removed.
+    pub revoke_sent: bool,
+    /// Plain text to show the person when `revoke_sent` is false.
+    pub notice: Option<String>,
+}
+
 /// Log out: tell the vault to revoke this device, then wipe the on-disk
-/// credential store and reset AppState. Returns even if the revoke publish
-/// fails — we want the local wipe to happen regardless.
+/// credential store and reset AppState. The local wipe happens even if the
+/// revoke can't be sent; the response says whether it was, so the UI never
+/// implies the vault was told when it wasn't.
 #[tauri::command]
-pub async fn logout(state: State<'_, AppState>) -> Result<bool, String> {
+pub async fn logout(state: State<'_, AppState>) -> Result<LogoutResponse, String> {
     use crate::credential::keystore;
     use crate::credential::store;
     use crate::registration::pairing;
@@ -548,11 +587,15 @@ pub async fn logout(state: State<'_, AppState>) -> Result<bool, String> {
 
     let config_dir = store::default_config_dir();
 
-    // Best-effort revoke. Ignore errors: the vault may be unreachable or the
-    // creds may already be invalid — local wipe still has to happen.
-    if let Err(e) = pairing::publish_revoke(&config_dir).await {
-        log::warn!("device.revoke publish failed (continuing with local wipe): {}", e);
-    }
+    // The vault may be unreachable or the creds may be unreadable: the
+    // local wipe still has to happen, and the response reports it.
+    let revoke_sent = match pairing::publish_revoke(&config_dir).await {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("device.revoke not sent (continuing with local wipe): {}", e);
+            false
+        }
+    };
 
     // Disconnect NATS
     state.nats.lock().await.disconnect().await;
@@ -584,7 +627,10 @@ pub async fn logout(state: State<'_, AppState>) -> Result<bool, String> {
     // an earlier install can't be decrypted under the new key.
     keystore::delete_keyring_key();
 
-    Ok(true)
+    Ok(LogoutResponse {
+        revoke_sent,
+        notice: (!revoke_sent).then(|| REVOKE_NOT_SENT_NOTICE.to_string()),
+    })
 }
 
 /// End the current vault session immediately, server-side AND locally.

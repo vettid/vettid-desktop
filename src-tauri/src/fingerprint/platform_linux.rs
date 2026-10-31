@@ -164,65 +164,6 @@ pub fn compute_machine_bound_key(attrs: &MachineAttributes) -> [u8; 32] {
     hmac_fields(MACHINE_BOUND_KEY_LABEL, &attrs.fields())
 }
 
-/// Generate all 5 possible 4-of-5 attribute combinations.
-///
-/// Each combination omits one attribute (set to empty string).
-/// Order: hostname, machine_id, cpu, disk, mac -- matching the Go agent connector.
-///
-/// Used for tolerance: if the full fingerprint fails decryption, each 4-of-5
-/// combination is tried. This allows credentials to survive a single hardware
-/// change (e.g., NIC replacement, hostname change).
-pub fn four_of_five_combinations(attrs: &MachineAttributes) -> Vec<MachineAttributes> {
-    let mut combos = Vec::with_capacity(5);
-
-    // Omit hostname
-    combos.push(MachineAttributes {
-        hostname: String::new(),
-        machine_id: attrs.machine_id.clone(),
-        cpu: attrs.cpu.clone(),
-        disk_serial: attrs.disk_serial.clone(),
-        mac_address: attrs.mac_address.clone(),
-    });
-
-    // Omit machine_id
-    combos.push(MachineAttributes {
-        hostname: attrs.hostname.clone(),
-        machine_id: String::new(),
-        cpu: attrs.cpu.clone(),
-        disk_serial: attrs.disk_serial.clone(),
-        mac_address: attrs.mac_address.clone(),
-    });
-
-    // Omit cpu
-    combos.push(MachineAttributes {
-        hostname: attrs.hostname.clone(),
-        machine_id: attrs.machine_id.clone(),
-        cpu: String::new(),
-        disk_serial: attrs.disk_serial.clone(),
-        mac_address: attrs.mac_address.clone(),
-    });
-
-    // Omit disk_serial
-    combos.push(MachineAttributes {
-        hostname: attrs.hostname.clone(),
-        machine_id: attrs.machine_id.clone(),
-        cpu: attrs.cpu.clone(),
-        disk_serial: String::new(),
-        mac_address: attrs.mac_address.clone(),
-    });
-
-    // Omit mac_address
-    combos.push(MachineAttributes {
-        hostname: attrs.hostname.clone(),
-        machine_id: attrs.machine_id.clone(),
-        cpu: attrs.cpu.clone(),
-        disk_serial: attrs.disk_serial.clone(),
-        mac_address: String::new(),
-    });
-
-    combos
-}
-
 // --- Internal helpers ---
 
 fn compute_fingerprint_from_fields(fields: &BTreeMap<&str, &str>) -> [u8; 32] {
@@ -464,31 +405,6 @@ mod tests {
         let mut other = attrs.clone();
         other.hostname = "otherhost".to_string();
         assert_ne!(key, compute_machine_bound_key(&other));
-    }
-
-    #[test]
-    fn test_four_of_five_generates_five_variants() {
-        let attrs = MachineAttributes {
-            hostname: "host".to_string(),
-            machine_id: "mid".to_string(),
-            cpu: "cpu".to_string(),
-            disk_serial: "disk".to_string(),
-            mac_address: "mac".to_string(),
-        };
-        let combos = four_of_five_combinations(&attrs);
-        assert_eq!(combos.len(), 5);
-
-        // Each combo should have exactly 4 non-empty attributes
-        for combo in &combos {
-            assert_eq!(combo.attribute_count(), 4);
-        }
-
-        // Verify which attribute is omitted in each
-        assert!(combos[0].hostname.is_empty());
-        assert!(combos[1].machine_id.is_empty());
-        assert!(combos[2].cpu.is_empty());
-        assert!(combos[3].disk_serial.is_empty());
-        assert!(combos[4].mac_address.is_empty());
     }
 
     #[test]

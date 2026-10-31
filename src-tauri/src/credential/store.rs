@@ -27,9 +27,9 @@ use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::credential::keystore::{self, BindingMode, KeystoreError};
+use crate::credential::keystore::{self, BindingMode, KeystoreError, MasterKey};
 use crate::fingerprint::platform_key;
 use crate::fingerprint::platform_linux::FingerprintError;
 
@@ -63,6 +63,11 @@ const CONFIG_SUBDIR: &str = "vettid-desktop";
 /// XChaCha20-Poly1305 nonce size (24 bytes).
 const NONCE_SIZE: usize = 24;
 
+/// What the person is told when a saved pairing can't be opened. Shown
+/// as is, so it must stay plain: no error codes, no crypto terms.
+pub const UNREADABLE_NOTICE: &str =
+    "This desktop's saved pairing can't be opened. Remove this desktop on your phone, then pair again.";
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -85,6 +90,10 @@ pub enum CredentialError {
     NotFound(String),
     /// The store version is not supported.
     UnsupportedVersion(i32),
+    /// A machine-bound store did not decrypt with this machine's key, for
+    /// example one sealed by a build that used the machine fingerprint as
+    /// the key. `load` has deleted the file. Displays [`UNREADABLE_NOTICE`].
+    Unreadable,
 }
 
 impl fmt::Display for CredentialError {
@@ -101,6 +110,7 @@ impl fmt::Display for CredentialError {
             CredentialError::UnsupportedVersion(v) => {
                 write!(f, "unsupported store version: {}", v)
             }
+            CredentialError::Unreadable => f.write_str(UNREADABLE_NOTICE),
         }
     }
 }
@@ -197,13 +207,89 @@ pub fn default_config_dir() -> PathBuf {
 /// SECURITY: Intermediate key material is zeroized after use; the
 /// `MasterKey` returned by the keystore zeroizes on drop.
 pub fn save(config_dir: &Path, creds: &ConnectionCredentials) -> Result<BindingMode, CredentialError> {
-    let master = keystore::fetch_or_create_master_key()?;
+    save_with(&SystemKeys, config_dir, creds)
+}
+
+/// Read and decrypt credentials from `connection.enc` in `config_dir`.
+///
+/// Uses the master key from the same keystore source the file was
+/// encrypted under (recorded in the file's `binding` header).
+/// Returns `(credentials, binding_mode)`.
+///
+/// A machine-bound file that does not decrypt is deleted and reported as
+/// [`CredentialError::Unreadable`]: nothing can open it on this machine,
+/// and a file sealed by an earlier build used a key that was public. A
+/// keyring-bound file that does not decrypt is left in place.
+pub fn load(config_dir: &Path) -> Result<(ConnectionCredentials, BindingMode), CredentialError> {
+    load_with(&SystemKeys, config_dir)
+}
+
+/// Where [`save`] and [`load`] get their keys. Production uses
+/// [`SystemKeys`]; tests pass fixed keys, so a store round trip can be
+/// tested without a keyring or real machine attributes.
+pub(crate) trait KeySource {
+    /// The master key for a new save (keyring, else machine-bound).
+    fn master_for_save(&self) -> Result<MasterKey, KeystoreError>;
+    /// The master key for a store sealed under `binding`.
+    fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError>;
+    /// This machine's platform key, mixed into the AAD.
+    fn platform_key(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError>;
+}
+
+/// The keyring and this machine's attributes.
+struct SystemKeys;
+
+impl KeySource for SystemKeys {
+    fn master_for_save(&self) -> Result<MasterKey, KeystoreError> {
+        keystore::fetch_or_create_master_key()
+    }
+    fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError> {
+        keystore::fetch_for_binding(binding)
+    }
+    fn platform_key(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+        platform_key::derive_platform_key()
+    }
+}
+
+fn load_with(
+    keys: &dyn KeySource,
+    config_dir: &Path,
+) -> Result<(ConnectionCredentials, BindingMode), CredentialError> {
+    let store = read_store(config_dir)?;
+    let binding = BindingMode::from_str(&store.binding).ok_or_else(|| {
+        CredentialError::SerializationError(format!("unknown binding mode: {}", store.binding))
+    })?;
+    let master = keys.master_for_load(binding)?;
+    let platform_key = keys.platform_key()?;
+    match decrypt_store(&store, &master.key, &platform_key) {
+        Ok(creds) => Ok((creds, binding)),
+        Err(CredentialError::CryptoError(e)) if binding == BindingMode::MachineBound => {
+            log::warn!(
+                "credential store: machine-bound file does not decrypt on this machine ({}); deleting it",
+                e
+            );
+            if let Err(de) = delete(config_dir) {
+                log::error!("credential store: could not delete the unreadable file: {}", de);
+            }
+            Err(CredentialError::Unreadable)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn save_with(
+    keys: &dyn KeySource,
+    config_dir: &Path,
+    creds: &ConnectionCredentials,
+) -> Result<BindingMode, CredentialError> {
+    let master = keys.master_for_save()?;
     let binding = master.binding;
+    let platform_key = keys.platform_key()?;
 
     let mut plaintext = serde_json::to_vec(creds)
         .map_err(|e| CredentialError::SerializationError(format!("marshal credentials: {}", e)))?;
 
-    let aad = compute_blob_aad(binding.as_str())?;
+    let aad = compute_blob_aad(binding.as_str(), &platform_key);
     let (nonce, ciphertext) = encrypt_xchacha20(&master.key, &plaintext, &aad)?;
     plaintext.zeroize();
     // `master` zeroizes on drop.
@@ -234,21 +320,6 @@ pub fn save(config_dir: &Path, creds: &ConnectionCredentials) -> Result<BindingM
         .map_err(|e| CredentialError::IoError(format!("write {}: {}", path.display(), e)))?;
 
     Ok(binding)
-}
-
-/// Read and decrypt credentials from `connection.enc` in `config_dir`.
-///
-/// Uses the master key from the same keystore source the file was
-/// encrypted under (recorded in the file's `binding` header).
-/// Returns `(credentials, binding_mode)`.
-pub fn load(config_dir: &Path) -> Result<(ConnectionCredentials, BindingMode), CredentialError> {
-    let store = read_store(config_dir)?;
-    let binding = BindingMode::from_str(&store.binding).ok_or_else(|| {
-        CredentialError::SerializationError(format!("unknown binding mode: {}", store.binding))
-    })?;
-    let master = keystore::fetch_for_binding(binding)?;
-    let creds = decrypt_store(&store, &master.key)?;
-    Ok((creds, binding))
 }
 
 /// Check whether a credential file exists in `config_dir`.
@@ -303,22 +374,22 @@ fn read_store(config_dir: &Path) -> Result<EncryptedStore, CredentialError> {
 /// fail to decrypt even when the master key is correct — closing the
 /// "copied the file + the keyring entry to my own laptop" path.
 /// See SECURITY-REVIEW-2026-05-25.md D-HIGH-3.
-fn compute_blob_aad(binding: &str) -> Result<Vec<u8>, CredentialError> {
-    let platform_key = platform_key::derive_platform_key()
-        .map_err(CredentialError::FingerprintError)?;
+fn compute_blob_aad(binding: &str, platform_key: &[u8; 32]) -> Vec<u8> {
     let mut aad = Vec::with_capacity(AAD_LABEL.len() + 1 + binding.len() + 1 + platform_key.len());
     aad.extend_from_slice(AAD_LABEL);
     aad.push(b'|');
     aad.extend_from_slice(binding.as_bytes());
     aad.push(b'|');
-    aad.extend_from_slice(&platform_key);
-    Ok(aad)
+    aad.extend_from_slice(platform_key);
+    aad
 }
 
-/// Decrypt the store with the given 32-byte master key.
+/// Decrypt the store with the given 32-byte master key. `platform_key`
+/// goes into the v3 AAD.
 fn decrypt_store(
     store: &EncryptedStore,
     key: &[u8; 32],
+    platform_key: &[u8; 32],
 ) -> Result<ConnectionCredentials, CredentialError> {
     if store.nonce.len() != NONCE_SIZE {
         return Err(CredentialError::CryptoError(format!(
@@ -331,7 +402,7 @@ fn decrypt_store(
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| CredentialError::CryptoError(format!("cipher: {}", e)))?;
     let mut plaintext = if store.version >= STORE_VERSION {
-        let aad = compute_blob_aad(&store.binding)?;
+        let aad = compute_blob_aad(&store.binding, platform_key);
         cipher
             .decrypt(
                 nonce,
@@ -413,6 +484,107 @@ mod tests {
             Payload { msg: ct.as_slice(), aad: b"aad-B" },
         );
         assert!(result.is_err(), "AEAD must reject mismatched AAD");
+    }
+
+    /// Fixed keys in place of the keyring and the machine attributes.
+    struct FixedKeys {
+        binding: BindingMode,
+        master: [u8; 32],
+        platform: [u8; 32],
+    }
+
+    impl KeySource for FixedKeys {
+        fn master_for_save(&self) -> Result<MasterKey, KeystoreError> {
+            Ok(MasterKey { key: self.master, binding: self.binding })
+        }
+        fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError> {
+            Ok(MasterKey { key: self.master, binding })
+        }
+        fn platform_key(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+            Ok(Zeroizing::new(self.platform))
+        }
+    }
+
+    fn sample_creds() -> ConnectionCredentials {
+        ConnectionCredentials {
+            connection_id: "conn-1".into(),
+            connection_key: vec![7u8; 32],
+            key_id: "key-1".into(),
+            device_private_key: vec![1u8; 32],
+            device_public_key: vec![2u8; 32],
+            vault_public_key: vec![3u8; 32],
+            message_space_token: "token".into(),
+            message_space_url: "nats://example.invalid:4222".into(),
+            owner_guid: "owner".into(),
+            owner_name: "Owner".into(),
+            session_id: "session-1".into(),
+            session_expires_at: 1_900_000_000,
+            session_duration_seconds: 3600,
+        }
+    }
+
+    const PLATFORM: [u8; 32] = [0x11; 32];
+    const BOUND_KEY: [u8; 32] = [0x22; 32];
+
+    #[test]
+    fn machine_bound_store_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: PLATFORM };
+        let creds = sample_creds();
+
+        let binding = save_with(&keys, dir.path(), &creds).expect("save");
+        assert_eq!(binding, BindingMode::MachineBound);
+        assert_eq!(read_store(dir.path()).unwrap().binding, "machine");
+
+        let (loaded, binding) = load_with(&keys, dir.path()).expect("load");
+        assert_eq!(binding, BindingMode::MachineBound);
+        assert_eq!(loaded.connection_id, creds.connection_id);
+        assert_eq!(loaded.connection_key, creds.connection_key);
+        assert_eq!(loaded.device_private_key, creds.device_private_key);
+        assert_eq!(loaded.session_expires_at, creds.session_expires_at);
+    }
+
+    /// A file sealed by an earlier build, whose machine-bound key was the
+    /// public machine fingerprint, gives the plain notice and is deleted.
+    #[test]
+    fn blob_sealed_under_the_fingerprint_is_unreadable_and_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_build = FixedKeys { binding: BindingMode::MachineBound, master: PLATFORM, platform: PLATFORM };
+        save_with(&old_build, dir.path(), &sample_creds()).expect("save");
+
+        let this_build = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: PLATFORM };
+        let err = load_with(&this_build, dir.path()).err().expect("must not load");
+        assert!(matches!(err, CredentialError::Unreadable), "got {err}");
+        assert_eq!(err.to_string(), UNREADABLE_NOTICE);
+        assert!(!err.to_string().contains("decrypt"));
+        assert!(!exists(dir.path()), "the unreadable file must be deleted");
+    }
+
+    /// A machine-bound file from another machine (different AAD) is
+    /// unreadable too.
+    #[test]
+    fn machine_bound_blob_from_other_machine_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let there = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: [0x33; 32] };
+        save_with(&there, dir.path(), &sample_creds()).expect("save");
+
+        let here = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: PLATFORM };
+        assert!(matches!(load_with(&here, dir.path()), Err(CredentialError::Unreadable)));
+        assert!(!exists(dir.path()));
+    }
+
+    /// A keyring-bound file that does not decrypt is not deleted: the
+    /// keyring entry may come back, and this change is about
+    /// machine-bound files only.
+    #[test]
+    fn keyring_bound_decrypt_failure_keeps_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+        save_with(&saved, dir.path(), &sample_creds()).expect("save");
+
+        let other = FixedKeys { binding: BindingMode::Keyring, master: [0x55; 32], platform: PLATFORM };
+        assert!(matches!(load_with(&other, dir.path()), Err(CredentialError::CryptoError(_))));
+        assert!(exists(dir.path()));
     }
 
     #[test]

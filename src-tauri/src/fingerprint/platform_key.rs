@@ -1,12 +1,21 @@
 //! Platform key derivation from machine attributes.
 //!
-//! The platform key binds encrypted credential stores to the specific machine
-//! where they were created. It is combined with the user's passphrase via Argon2id
-//! to derive the credential encryption key, ensuring credentials cannot be decrypted
-//! on a different machine even if the passphrase is known.
+//! Two values are derived from the same machine attributes, under different
+//! HMAC labels:
 //!
-//! Requires at least 3 of 5 machine attributes to be non-empty to prevent
+//! - the **platform key** ([`derive_platform_key`]): the machine fingerprint.
+//!   It is not secret: Settings displays it, pairing sends it to the vault,
+//!   and the credential store mixes it into its AEAD associated data so a
+//!   blob only opens on the machine that wrote it;
+//! - the **machine-bound key** ([`derive_machine_bound_key`]): the credential
+//!   store's master key when the OS keyring is unavailable. It is key
+//!   material, but anyone who can read the same attributes on this machine
+//!   can recompute it.
+//!
+//! Both require at least 3 of 5 machine attributes to be non-empty to prevent
 //! weak fingerprints in minimal environments (containers, early-boot, etc.).
+
+use zeroize::Zeroizing;
 
 #[cfg(target_os = "linux")]
 use super::platform_linux::{
@@ -23,14 +32,14 @@ use super::platform_macos::{
 /// Minimum number of non-empty machine attributes required for key derivation.
 const MIN_ATTRIBUTES: usize = 3;
 
-/// Derive the platform key from machine attributes.
+/// Derive the platform key (the machine fingerprint) from machine attributes.
 ///
 /// Collects machine attributes and computes the HMAC-SHA256 fingerprint.
 /// Returns an error if fewer than 3 attributes could be collected.
 ///
-/// The returned 32-byte key is used as additional input to Argon2id alongside
-/// the user's passphrase when encrypting/decrypting the credential store.
-pub fn derive_platform_key() -> Result<[u8; 32], FingerprintError> {
+/// The credential store uses it in its AEAD associated data. It is not
+/// secret; see the module documentation.
+pub fn derive_platform_key() -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
     let attrs = collect_machine_attributes()?;
 
     let count = attrs.attribute_count();
@@ -41,7 +50,7 @@ pub fn derive_platform_key() -> Result<[u8; 32], FingerprintError> {
         });
     }
 
-    Ok(compute_machine_fingerprint(&attrs))
+    Ok(Zeroizing::new(compute_machine_fingerprint(&attrs)))
 }
 
 /// Derive the machine-bound storage key: the credential store's master key
@@ -52,7 +61,7 @@ pub fn derive_platform_key() -> Result<[u8; 32], FingerprintError> {
 ///
 /// SECURITY: [`derive_platform_key`] returns a value that is displayed and
 /// sent to the vault, so it must never be used as this key.
-pub fn derive_machine_bound_key() -> Result<[u8; 32], FingerprintError> {
+pub fn derive_machine_bound_key() -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
     let attrs = collect_machine_attributes()?;
 
     let count = attrs.attribute_count();
@@ -63,27 +72,7 @@ pub fn derive_machine_bound_key() -> Result<[u8; 32], FingerprintError> {
         });
     }
 
-    Ok(compute_machine_bound_key(&attrs))
-}
-
-/// Derive the platform key and also return the collected machine attributes.
-///
-/// This variant is used during registration, where the attributes need to be
-/// sent to the vault as part of the device metadata (hostname, platform, etc.).
-pub fn derive_platform_key_with_attrs(
-) -> Result<([u8; 32], MachineAttributes), FingerprintError> {
-    let attrs = collect_machine_attributes()?;
-
-    let count = attrs.attribute_count();
-    if count < MIN_ATTRIBUTES {
-        return Err(FingerprintError::InsufficientAttributes {
-            found: count,
-            required: MIN_ATTRIBUTES,
-        });
-    }
-
-    let key = compute_machine_fingerprint(&attrs);
-    Ok((key, attrs))
+    Ok(Zeroizing::new(compute_machine_bound_key(&attrs)))
 }
 
 #[cfg(test)]
@@ -111,30 +100,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_derive_platform_key_with_attrs_returns_both() {
-        match derive_platform_key_with_attrs() {
-            Ok((key, attrs)) => {
-                assert_eq!(key.len(), 32);
-                assert!(attrs.attribute_count() >= MIN_ATTRIBUTES);
-            }
-            Err(FingerprintError::InsufficientAttributes { .. }) => {
-                // Acceptable in minimal test environments
-            }
-            Err(e) => panic!("unexpected error: {}", e),
-        }
-    }
-
+    /// The two derivations must never coincide, whatever this machine's
+    /// attributes are: checked on fixed attributes, so it cannot pass by
+    /// skipping on a machine with too few of them.
     #[test]
     fn test_machine_bound_key_is_not_the_platform_key() {
+        let attrs = MachineAttributes {
+            hostname: "testhost".to_string(),
+            machine_id: "test-machine-id".to_string(),
+            cpu: "Test CPU".to_string(),
+            disk_serial: "TEST-SERIAL".to_string(),
+            mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+        };
+        let platform = compute_machine_fingerprint(&attrs);
+        let bound = compute_machine_bound_key(&attrs);
+        assert_ne!(platform, bound);
+        assert_eq!(bound, compute_machine_bound_key(&attrs));
+    }
+
+    /// On this machine, both derivations succeed or fail together.
+    #[test]
+    fn test_derivations_agree_on_availability() {
         match (derive_platform_key(), derive_machine_bound_key()) {
-            (Ok(platform), Ok(bound)) => {
-                assert_ne!(platform, bound);
-                assert_eq!(bound, derive_machine_bound_key().expect("second derivation"));
-            }
-            (Err(FingerprintError::InsufficientAttributes { .. }), Err(_)) => {
-                // Acceptable in minimal test environments
-            }
+            (Ok(platform), Ok(bound)) => assert_ne!(*platform, *bound),
+            (Err(FingerprintError::InsufficientAttributes { .. }), Err(_)) => {}
             (p, b) => panic!(
                 "derivations disagree: platform ok={}, machine-bound ok={}",
                 p.is_ok(),
@@ -147,7 +136,7 @@ mod tests {
     fn test_derive_platform_key_deterministic() {
         // Two calls should return the same key (machine attributes don't change)
         match (derive_platform_key(), derive_platform_key()) {
-            (Ok(key1), Ok(key2)) => assert_eq!(key1, key2),
+            (Ok(key1), Ok(key2)) => assert_eq!(*key1, *key2),
             _ => {
                 // Skip if insufficient attributes
             }

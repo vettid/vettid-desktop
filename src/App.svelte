@@ -45,6 +45,9 @@
   let stateResolved = $state(false);
   let sessionState: SessionState = $derived($sessionStore);
   let isRegistered = $state(false);
+  // Shown when the saved pairing could not be opened and was removed
+  // from this desktop (see the `unlock` command).
+  let pairingNotice = $state('');
   let pollTimer: ReturnType<typeof setInterval> | null = null;
 
   async function refreshRegistration() {
@@ -64,7 +67,11 @@
   async function autoUnlockIfNeeded() {
     if (!isRegistered) return;
     try {
-      await invoke('unlock');
+      const result = await invoke<{ unlocked: boolean; notice?: string | null }>('unlock');
+      if (result?.notice) {
+        pairingNotice = result.notice;
+        isRegistered = false;
+      }
     } catch (e) {
       console.warn('Auto-unlock failed:', e);
     }
@@ -229,6 +236,13 @@
     isSettingsActive={currentView === 'settings'}
   />
 
+  {#if pairingNotice}
+    <div class="pairing-notice" role="alert">
+      <p>{pairingNotice}</p>
+      <button onclick={() => pairingNotice = ''}>Dismiss</button>
+    </div>
+  {/if}
+
   <div class="body">
     {#if railVisible}
       <nav class="rail">
@@ -317,6 +331,25 @@
   }
   @keyframes app-spin {
     to { transform: rotate(360deg); }
+  }
+  .pairing-notice {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 20px;
+    background: rgba(255, 170, 0, 0.12);
+    border-bottom: 1px solid rgba(255, 170, 0, 0.35);
+    color: var(--text, #eee);
+    font-size: 0.9rem;
+  }
+  .pairing-notice p { flex: 1; margin: 0; }
+  .pairing-notice button {
+    background: transparent;
+    color: var(--text-muted, #aaa);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    padding: 6px 12px;
+    cursor: pointer;
   }
   .body {
     flex: 1;
