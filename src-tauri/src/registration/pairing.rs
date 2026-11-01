@@ -481,6 +481,7 @@ fn load_stored_creds(
     match store::load(config_dir) {
         Ok((creds, _)) => Ok(creds),
         Err(CredentialError::Unreadable) => Err(RegistrationError::PairingUnreadable),
+        Err(CredentialError::NoMachineId) => Err(RegistrationError::NoMachineId),
         Err(e) => Err(RegistrationError::Internal(format!("load creds: {}", e))),
     }
 }

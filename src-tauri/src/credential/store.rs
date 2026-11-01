@@ -81,7 +81,7 @@ pub const KEYRING_UNAVAILABLE_NOTICE: &str =
 /// pairing is bound to it, so without one nothing can be kept or opened,
 /// keyring or not. Checked before pairing starts and at unlock.
 pub const NO_MACHINE_ID_NOTICE: &str =
-    "This computer has no machine id, so this desktop can't keep or open a saved pairing on it.";
+    "This computer has no machine id, so this desktop can't keep or open a saved pairing on it. If your phone lists this desktop, remove it there.";
 
 /// Shown when the per-user folder for the pairing can't be found.
 pub const NO_CONFIG_DIR_NOTICE: &str =
@@ -1316,17 +1316,21 @@ mod tests {
         fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError> {
             keystore::fetch_for_binding_with_policy(&self.0, binding, true)
         }
+        // From the test attributes, as production derives it from the
+        // real ones: a missing machine id fails here first.
         fn storage_binding(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
-            Ok(Zeroizing::new(PLATFORM))
+            use keystore::Sources;
+            platform_key::storage_binding_from(&self.0.machine_attributes()?)
         }
         fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
             Ok(Zeroizing::new(FINGERPRINT))
         }
     }
 
-    /// No keyring, and a machine without a usable machine id: the
-    /// machine-bound key is refused, so the save fails and nothing is
-    /// written, not even the directory.
+    /// No keyring, and a machine without a usable machine id: the storage
+    /// binding is refused before any key is fetched (#14), so the save
+    /// fails with the plain notice and nothing is written, not even the
+    /// directory.
     #[test]
     fn missing_machine_id_fails_the_save_and_writes_no_file() {
         for machine_id in ["", "uninitialized", "00000000-0000-0000-0000-000000000000"] {
@@ -1338,8 +1342,8 @@ mod tests {
             let err = save_with(&keys, &config_dir, &sample_creds())
                 .err()
                 .expect("save must fail");
-            assert!(matches!(err, CredentialError::KeystoreError(_)), "got {err}");
-            assert!(err.to_string().contains("no usable machine id"), "got {err}");
+            assert!(matches!(err, CredentialError::NoMachineId), "got {err}");
+            assert_eq!(err.to_string(), NO_MACHINE_ID_NOTICE);
             assert!(!config_dir.exists(), "{machine_id:?}: nothing may be written");
         }
     }
