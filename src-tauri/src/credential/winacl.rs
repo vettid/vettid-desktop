@@ -394,9 +394,8 @@ fn check_handle_with(handle: HANDLE, user: &[u8]) -> Result<(), AclError> {
     unsafe { judge(owner, dacl, user) }
 }
 
-/// Check an existing folder or file: see the module documentation. Used by
-/// the tests; the save path checks through `open_private_file`.
-#[cfg(test)]
+/// Check an existing folder or file: see the module documentation. Used at
+/// load to warn (#24); the save path checks through `open_private_file`.
 pub(crate) fn check_private(path: &Path) -> Result<(), AclError> {
     let user = current_user_sid()?;
     check_private_with(path, &user)

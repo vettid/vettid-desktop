@@ -85,6 +85,15 @@ pub const NO_CONFIG_DIR_NOTICE: &str =
 pub const NOT_PRIVATE_NOTICE: &str =
     "The folder this desktop keeps its pairing in (vettid-desktop, in your local app data) can be opened by another account on this computer, so nothing was saved there. Delete that folder, then pair again.";
 
+/// Shown after unlock when another account can open the saved pairing's
+/// folder or file, and the pairing is keyring-bound (#24).
+pub const NOT_PRIVATE_KEYRING_NOTICE: &str =
+    "Another account on this computer can open the folder this desktop keeps its pairing in. The pairing itself is still locked by your keyring, but to be safe: remove this desktop on your phone, delete the vettid-desktop folder, then pair again.";
+
+/// The same for a machine-bound pairing, which may have been read.
+pub const NOT_PRIVATE_MACHINE_NOTICE: &str =
+    "Another account on this computer can open this desktop's saved pairing, and it isn't locked by a keyring, so it may have been read. Remove this desktop on your phone, delete the vettid-desktop folder, then pair again.";
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -492,6 +501,66 @@ enum OnDisk {
     Unreadable,
 }
 
+/// A warning for the person when another account can open the saved
+/// pairing's folder or file (#24), worded for how the pairing is sealed.
+/// Called after a successful load; it warns and never refuses, since
+/// refusing would not undo a disclosure and would lock out the pairing.
+/// AEAD already prevents a planted or edited file from being used.
+pub fn privacy_warning(config_dir: &Path, binding: BindingMode) -> Option<&'static str> {
+    if is_private(config_dir) {
+        return None;
+    }
+    Some(match binding {
+        BindingMode::Keyring => NOT_PRIVATE_KEYRING_NOTICE,
+        BindingMode::MachineBound => NOT_PRIVATE_MACHINE_NOTICE,
+    })
+}
+
+/// Whether the folder and file are private to the current user, as far
+/// as can be told. A check that fails to run is logged and not reported
+/// as a warning: the file was just read, so this is not a refusal path.
+#[cfg(windows)]
+fn is_private(config_dir: &Path) -> bool {
+    use super::winacl::{check_private, AclError};
+    for path in [config_dir.to_path_buf(), config_dir.join(CREDENTIAL_FILE)] {
+        match check_private(&path) {
+            Ok(()) => {}
+            Err(AclError::NotPrivate(why)) => {
+                log::warn!("Credential store: {} {}", path.display(), why);
+                return false;
+            }
+            Err(AclError::Failed(what)) => {
+                log::warn!("Credential store: could not check {}: {}", path.display(), what);
+            }
+        }
+    }
+    true
+}
+
+/// Unix: the file must not grant group or other any access. The folder
+/// is not checked yet, since it is created 0755 until #12.
+#[cfg(unix)]
+fn is_private(config_dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let path = config_dir.join(CREDENTIAL_FILE);
+    match fs::metadata(&path) {
+        Ok(meta) if meta.permissions().mode() & 0o077 != 0 => {
+            log::warn!("Credential store: {} is readable by other accounts", path.display());
+            false
+        }
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!("Credential store: could not check {}: {}", path.display(), e);
+            true
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_private(_config_dir: &Path) -> bool {
+    true
+}
+
 /// Which key protects the saved pairing, for the person to see (#11):
 /// "keyring", "machine", "none" (no file) or "unknown".
 ///
@@ -862,6 +931,53 @@ mod tests {
         let after = fs::read(dir.path().join(CREDENTIAL_FILE)).unwrap();
         assert_eq!(before, after, "the keyring-bound file must be left as it was");
         assert_eq!(read_store(dir.path()).unwrap().binding, "keyring");
+    }
+
+    /// A pairing saved normally is private: no warning.
+    #[test]
+    fn privately_saved_pairing_gives_no_warning() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        save_with(&ThroughKeystore(with_keyring()), &config_dir, &sample_creds()).unwrap();
+        assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), None);
+        assert_eq!(privacy_warning(&config_dir, BindingMode::MachineBound), None);
+    }
+
+    /// Windows: a folder or file another account can open gives the
+    /// warning for the binding, and nothing is changed.
+    #[cfg(windows)]
+    #[test]
+    fn windows_shared_pairing_gives_the_warning() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        save_with(&ThroughKeystore(with_keyring()), &config_dir, &sample_creds()).unwrap();
+        let file = config_dir.join(CREDENTIAL_FILE);
+        let before = fs::read(&file).unwrap();
+        super::super::winacl::test_share_with_everyone(&file);
+        assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), Some(NOT_PRIVATE_KEYRING_NOTICE));
+        assert_eq!(privacy_warning(&config_dir, BindingMode::MachineBound), Some(NOT_PRIVATE_MACHINE_NOTICE));
+        assert_eq!(fs::read(&file).unwrap(), before, "a warning changes nothing");
+
+        // A shared folder with a private file warns too.
+        let other = base.path().join("other");
+        save_with(&ThroughKeystore(with_keyring()), &other, &sample_creds()).unwrap();
+        super::super::winacl::test_share_with_everyone(&other);
+        assert_eq!(privacy_warning(&other, BindingMode::Keyring), Some(NOT_PRIVATE_KEYRING_NOTICE));
+    }
+
+    /// Unix: a file group or others can read gives the warning.
+    #[cfg(unix)]
+    #[test]
+    fn unix_readable_file_gives_the_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        save_with(&ThroughKeystore(with_keyring()), dir.path(), &sample_creds()).unwrap();
+        let file = dir.path().join(CREDENTIAL_FILE);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(privacy_warning(dir.path(), BindingMode::Keyring), Some(NOT_PRIVATE_KEYRING_NOTICE));
+        assert_eq!(privacy_warning(dir.path(), BindingMode::MachineBound), Some(NOT_PRIVATE_MACHINE_NOTICE));
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(privacy_warning(dir.path(), BindingMode::Keyring), None);
     }
 
     /// The key protection shown in Settings follows the file's header.
