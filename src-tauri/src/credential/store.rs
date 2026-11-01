@@ -388,7 +388,7 @@ fn save_with(
     // under %LOCALAPPDATA% that is the user, SYSTEM and Administrators,
     // but a redirected or pre-made folder can grant more. An explicit
     // user-only DACL is required before a Windows release (owner
-    // decision 1a, 2026-11-01).
+    // decision 1a, 2026-11-01; #16).
     #[cfg(unix)]
     options.mode(0o600);
     let mut file = options

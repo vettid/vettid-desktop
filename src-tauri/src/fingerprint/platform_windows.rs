@@ -10,10 +10,11 @@
 //!
 //! The exact text of each value is part of the machine-bound key. Changing
 //! how a value is chosen or formatted changes the key of every Windows
-//! install, so treat the rules in this file as a wire format. They match
-//! the agent connector's `machine_windows.go`, except that the disk serial
-//! falls back to `PhysicalDrive0` only when the Windows drive is unknown
-//! (see `collect_disk_serial`).
+//! install, so treat the rules in this file as a wire format. They follow
+//! the agent connector's Windows collector as proposed in vettid-agent#6
+//! (closed, not merged), except that the disk serial falls back to
+//! `PhysicalDrive0` only when the Windows drive is unknown (see
+//! `collect_disk_serial`).
 //!
 //! Requires Windows 10 version 1703 or later (`GetIfEntry2Ex`).
 
