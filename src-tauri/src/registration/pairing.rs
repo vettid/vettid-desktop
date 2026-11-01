@@ -367,8 +367,10 @@ pub async fn complete_pairing(
     // Save encrypted credentials
     use crate::credential::store::{self, ConnectionCredentials};
 
-    std::fs::create_dir_all(config_dir)
-        .map_err(|e| RegistrationError::Internal(format!("create config dir: {}", e)))?;
+    store::ensure_config_dir(config_dir).map_err(|e| match e {
+        store::CredentialError::NotPrivate => RegistrationError::NotPrivate,
+        e => RegistrationError::Internal(format!("create config dir: {}", e)),
+    })?;
 
     let nats_creds = format!(
         "-----BEGIN NATS USER JWT-----\n{}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\n{}\n------END USER NKEY SEED------",
@@ -400,6 +402,7 @@ pub async fn complete_pairing(
 
     store::save(config_dir, &creds).map_err(|e| match e {
         store::CredentialError::KeyringUnavailable => RegistrationError::KeyringUnavailable,
+        store::CredentialError::NotPrivate => RegistrationError::NotPrivate,
         e => RegistrationError::Internal(format!("save credentials: {}", e)),
     })?;
 

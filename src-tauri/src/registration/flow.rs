@@ -21,6 +21,9 @@ pub enum RegistrationError {
     /// and a weaker key is not allowed (see
     /// `CredentialError::KeyringUnavailable`). Displays the plain notice.
     KeyringUnavailable,
+    /// The pairing's folder or file could be opened by another account
+    /// (see `CredentialError::NotPrivate`). Displays the plain notice.
+    NotPrivate,
 }
 
 impl fmt::Display for RegistrationError {
@@ -39,6 +42,7 @@ impl fmt::Display for RegistrationError {
             Self::KeyringUnavailable => {
                 f.write_str(crate::credential::store::KEYRING_UNAVAILABLE_NOTICE)
             }
+            Self::NotPrivate => f.write_str(crate::credential::store::NOT_PRIVATE_NOTICE),
         }
     }
 }
