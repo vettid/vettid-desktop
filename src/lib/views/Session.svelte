@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
-  import { sessionStore, refreshSessionFromBackend } from '../stores/session';
+  import { sessionStore, sessionNotice, refreshSessionFromBackend } from '../stores/session';
   import SessionTimer from '../components/SessionTimer.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
 
@@ -60,9 +60,14 @@
     busy = true;
     busyLabel = 'Ending your session…';
     statusMessage = '';
+    sessionNotice.set(null);
     try {
-      await invoke('end_session');
-      statusMessage = 'Session ended.';
+      // The session always ends in this run; `notice` says when that
+      // couldn't be recorded on this computer (#26).
+      const result = await invoke<{ notice: string | null }>('end_session');
+      statusMessage = result.notice ?? 'Session ended.';
+      // This view is replaced at once; the notice is shown on the next.
+      sessionNotice.set(result.notice);
       // Refresh the Svelte store immediately so the StatusBar pill +
       // App.svelte routing pick up the expired state right away
       // instead of waiting on the 30s poll. Without this the user

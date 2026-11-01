@@ -26,12 +26,20 @@ const initialState: SessionState = {
 
 export const sessionStore = writable<SessionState>(initialState);
 
+/**
+ * A notice about the last session end that has to outlive the view it
+ * came from (#26): ending a session routes to the Start-a-new-session
+ * screen at once. Cleared when a session starts.
+ */
+export const sessionNotice = writable<string | null>(null);
+
 export function activateSession(
   sessionId: string,
   expiresAt: number,
   connectionId?: string,
   ownerName?: string,
 ) {
+  sessionNotice.set(null);
   sessionStore.set({
     state: 'active',
     sessionId,

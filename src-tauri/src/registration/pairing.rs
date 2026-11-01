@@ -409,6 +409,15 @@ pub async fn complete_pairing(
 
     session_key.zeroize();
 
+    // #26: the session is live only if its marker was written with the
+    // save. If not, the next load treats it as ended, so don't report it
+    // as started.
+    if !store::session_is_recorded(config_dir, &activation_result.session_id) {
+        return Err(RegistrationError::Internal(
+            "the new session couldn't be recorded on this computer; start a new session".to_string(),
+        ));
+    }
+
     Ok(PairingOutcome {
         connection_id: session.connection_id,
         session_id: activation_result.session_id,

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { themeStore, setTheme, type Theme } from '../stores/theme';
+  import { sessionNotice } from '../stores/session';
 
   let theme = $derived($themeStore);
 
@@ -76,6 +77,8 @@
     if (loggingOut) return;
     loggingOut = true;
     logoutMessage = '';
+    // A notice about an earlier session end doesn't outlive the pairing.
+    sessionNotice.set(null);
     try {
       const result = await invoke<{ revoke_sent: boolean; local_wiped: boolean; notice?: string | null }>('logout');
       if (result?.revoke_sent && result?.local_wiped && !result?.notice) {

@@ -547,9 +547,17 @@ pub async fn extend_session(
     {
         Ok(o) => o,
         Err(e) => {
+            // #26: a refusal because the folder or file isn't private
+            // points at Log out; pairing again into it wouldn't help.
+            let error = match e {
+                crate::registration::flow::RegistrationError::NotPrivate => {
+                    store::not_private_extension_notice(&config_dir).to_string()
+                }
+                e => e.to_string(),
+            };
             return Ok(RegisterResponse {
                 success: false,
-                error: Some(e.to_string()),
+                error: Some(error),
                 connection_id: None,
                 session_id: None,
                 expires_at: None,
@@ -755,17 +763,12 @@ pub async fn logout(state: State<'_, AppState>) -> Result<LogoutResponse, String
 ///      so the UI routes to SessionExpired (where "Start New Session"
 ///      restarts the session without re-pair).
 #[tauri::command]
-pub async fn end_session(state: State<'_, AppState>) -> Result<bool, String> {
+pub async fn end_session(state: State<'_, AppState>) -> Result<EndSessionResponse, String> {
     use crate::credential::store;
     use zeroize::Zeroize;
 
-    // With no known folder there is no stored pairing to end or update;
-    // the in-memory reset below still happens.
-    match store::default_config_dir() {
-        Ok(config_dir) => end_session_on_disk(&config_dir).await,
-        Err(e) => log::warn!("end_session: {}; local reset only", e),
-    }
-
+    // The in-memory session ends first, so nothing reports it as live
+    // while the vault is being told (up to the frame deadline).
     state.nats.lock().await.disconnect().await;
 
     {
@@ -779,16 +782,46 @@ pub async fn end_session(state: State<'_, AppState>) -> Result<bool, String> {
     *state.is_unlocked.write().await = false;
     state.session.write().await.expire();
 
-    Ok(true)
+    // With no known folder there is no stored pairing to end or update.
+    let notice = match store::default_config_dir() {
+        Ok(config_dir) => end_session_on_disk(&config_dir).await,
+        Err(e) => {
+            log::warn!("end_session: {}; local reset only", e);
+            None
+        }
+    };
+
+    Ok(EndSessionResponse { notice })
 }
 
-/// The stored-pairing half of [`end_session`]: tell the vault, then
-/// clear the session fields in the saved pairing.
-async fn end_session_on_disk(config_dir: &std::path::Path) {
+/// What [`end_session`] tells the person. The session always ends in this
+/// run; `notice` is set when that couldn't be recorded on this computer,
+/// so the frontend shows it instead of "Session ended." (#26).
+#[derive(Debug, Serialize)]
+pub struct EndSessionResponse {
+    pub notice: Option<String>,
+}
+
+/// The stored-pairing half of [`end_session`]: record on disk that the
+/// session ended, tell the vault, then clear the session fields in the
+/// saved pairing. Returns a notice if ending it couldn't be recorded.
+async fn end_session_on_disk(config_dir: &std::path::Path) -> Option<String> {
     use crate::credential::store;
     use crate::registration::pairing;
 
     let config_dir = config_dir.to_path_buf();
+
+    // #26: first, and needing no key: without the live marker the next
+    // launch treats the session as ended, even if the save below is
+    // refused (a folder that isn't private, an unreachable keyring).
+    let marker_removed = match store::end_saved_session(&config_dir) {
+        Ok(()) => true,
+        Err(e) => {
+            log::error!("end_session: could not remove the live marker: {}", e);
+            false
+        }
+    };
+    let mut cleared_saved = false;
 
     // Tell the vault to end the session. publish_end_session flushes
     // before returning, within a deadline: on a clean return the
@@ -815,12 +848,19 @@ async fn end_session_on_disk(config_dir: &std::path::Path) {
             if let Err(e) = store::save_existing(&config_dir, &creds) {
                 log::error!("end_session: failed to persist cleared session state: {}", e);
             } else {
+                cleared_saved = true;
                 log::info!("end_session: on-disk session fields cleared (pairing preserved)");
             }
         }
         Err(e) => log::warn!(
             "end_session: could not load creds to clear on-disk session fields: {}", e
         ),
+    }
+    // The old session comes back at the next launch only if both failed.
+    if marker_removed || cleared_saved {
+        None
+    } else {
+        Some(store::SESSION_END_NOT_RECORDED_NOTICE.to_string())
     }
 }
 

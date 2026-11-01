@@ -59,6 +59,15 @@ const AAD_LABEL: &[u8] = b"vettid-desktop-credential-v3";
 /// Credential file name within the config directory.
 const CREDENTIAL_FILE: &str = "connection.enc";
 
+/// Marks the saved pairing's session as live (#26). A session is treated
+/// as live only while this file holds the tag of the saved session id: it
+/// is written, privately, with a pairing or session that has an expiry,
+/// and removed when the session ends. Removing a file works where a save
+/// is refused (a folder that isn't private, an unreachable keyring), so a
+/// session ended in that state isn't reloaded as live from the expiry the
+/// refused save couldn't clear. No key is needed to read or remove it.
+const SESSION_LIVE_FILE: &str = "session.live";
+
 /// Subdirectory name appended to the OS config dir.
 const CONFIG_SUBDIR: &str = "vettid-desktop";
 
@@ -82,6 +91,12 @@ pub const KEYRING_UNAVAILABLE_NOTICE: &str =
 /// keyring or not. Checked before pairing starts and at unlock.
 pub const NO_MACHINE_ID_NOTICE: &str =
     "This computer has no machine id, so this desktop can't keep or open a saved pairing on it. If your phone lists this desktop, remove it there.";
+
+/// Shown after End session when this desktop couldn't record on disk that
+/// the session ended (#26): the live marker couldn't be removed, so the
+/// next launch may show the old session as open.
+pub const SESSION_END_NOT_RECORDED_NOTICE: &str =
+    "The session ended, but this desktop couldn't record that on this computer, so next time it may show the old session as still open. If it does, end the session again.";
 
 /// Shown when the per-user folder for the pairing can't be found.
 pub const NO_CONFIG_DIR_NOTICE: &str =
@@ -534,7 +549,17 @@ fn load_with(
     let platform_key = keys.storage_binding().map_err(binding_error)?;
     let master = keys.master_for_load(binding)?;
     match decrypt_store(&store, &master.key, &platform_key) {
-        Ok(creds) => Ok((creds, binding)),
+        Ok(mut creds) => {
+            // #26: the expiry counts only while the live marker names this
+            // session. Only the expiry is cleared; nothing reads the id of
+            // a session that isn't live.
+            if creds.session_expires_at != 0 && !session_marked_live(config_dir, &creds.session_id) {
+                log::info!("credential store: the saved session is not marked live; treating it as ended");
+                creds.session_expires_at = 0;
+                creds.session_duration_seconds = 0;
+            }
+            Ok((creds, binding))
+        }
         Err(CredentialError::CryptoError(e)) if binding == BindingMode::MachineBound => {
             // Delete the file only when it is positively one written by an
             // earlier build, which used the public fingerprint as its key.
@@ -651,31 +676,122 @@ fn save_with_mode(
 
     ensure_config_dir(config_dir)?;
 
-    // SECURITY: written to a new temporary file in the same folder, then
-    // moved over `connection.enc`, so a crash or a full disk leaves the
-    // old pairing whole (#12). On Windows the temporary file is created
-    // with the user-only DACL, inside the folder held open (#16, #23).
-    #[cfg(windows)]
-    super::winacl::write_private_file(config_dir, CREDENTIAL_FILE, &data)
-        .map_err(|e| acl_error(&config_dir.join(CREDENTIAL_FILE), e))?;
-    #[cfg(not(windows))]
-    write_atomically(config_dir, &data)?;
+    write_private(config_dir, CREDENTIAL_FILE, &data)?;
+
+    // #26: the session is live only with the marker. If it can't be
+    // written the pairing is still saved, and the session is treated as
+    // ended: the person starts a new one.
+    if creds.session_expires_at > 0 && !creds.session_id.is_empty() {
+        if let Err(e) = write_private(config_dir, SESSION_LIVE_FILE, session_tag(&creds.session_id).as_bytes()) {
+            log::warn!("credential store: could not mark the session live ({}); it will be treated as ended", e);
+            remove_session_marker(config_dir);
+        }
+    } else {
+        remove_session_marker(config_dir);
+    }
 
     Ok(binding)
 }
 
-/// Unix: write `data` as `connection.enc` through a new `0600` temporary
+/// Write `data` as `config_dir/name`, privately and atomically.
+///
+/// SECURITY: written to a new temporary file in the same folder, then
+/// moved over `name`, so a crash or a full disk leaves the old file whole
+/// (#12). On Windows the temporary file is created with the user-only
+/// DACL, inside the folder held open (#16, #23).
+fn write_private(config_dir: &Path, name: &str, data: &[u8]) -> Result<(), CredentialError> {
+    #[cfg(windows)]
+    {
+        super::winacl::write_private_file(config_dir, name, data).map_err(|e| acl_error(&config_dir.join(name), e))
+    }
+    #[cfg(not(windows))]
+    {
+        write_atomically(config_dir, name, data)
+    }
+}
+
+/// The live marker's content for `session_id`: a hash, so the id itself
+/// isn't written outside the encrypted pairing.
+fn session_tag(session_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"vettid-desktop-session-live-v1|");
+    h.update(session_id.as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// Whether the live marker names `session_id`. Anything else is "not
+/// live": no marker, another session's, an unreadable one, a link or a
+/// folder in its place, one larger than a tag, and on Windows one that
+/// another account can open (a shared folder lets another account plant
+/// or restore it). A copy restored by an account that can write the
+/// folder can't be told apart without a key; the warning after unlock
+/// already covers that folder.
+fn session_marked_live(config_dir: &Path, session_id: &str) -> bool {
+    use std::io::Read;
+    const MAX_MARKER: u64 = 128;
+    if session_id.is_empty() {
+        return false;
+    }
+    let path = config_dir.join(SESSION_LIVE_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(m) if m.file_type().is_file() && m.len() <= MAX_MARKER => {}
+        _ => return false,
+    }
+    #[cfg(windows)]
+    if super::winacl::check_private(&path).is_err() {
+        return false;
+    }
+    let mut tag = String::new();
+    match fs::File::open(&path).and_then(|f| f.take(MAX_MARKER).read_to_string(&mut tag)) {
+        Ok(_) => tag.trim() == session_tag(session_id),
+        Err(_) => false,
+    }
+}
+
+/// Whether the saved session `session_id` is recorded as live (#26). A
+/// pairing or extension checks this after its save, so it never reports
+/// a session as started that the next load would treat as ended.
+pub fn session_is_recorded(config_dir: &Path, session_id: &str) -> bool {
+    session_marked_live(config_dir, session_id)
+}
+
+/// Best-effort removal of the live marker, for paths that report nothing.
+fn remove_session_marker(config_dir: &Path) {
+    let _ = fs::remove_file(config_dir.join(SESSION_LIVE_FILE));
+}
+
+/// End the saved session on disk (#26): remove the live marker, so the
+/// next launch treats the session as ended even if the cleared session
+/// can't be saved. Ok only if the marker is confirmed gone; the caller
+/// tells the person otherwise ([`SESSION_END_NOT_RECORDED_NOTICE`]).
+pub fn end_saved_session(config_dir: &Path) -> Result<(), CredentialError> {
+    let _one_at_a_time = writer_lock();
+    let path = config_dir.join(SESSION_LIVE_FILE);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(CredentialError::IoError(format!("remove {}: {}", path.display(), e))),
+    }
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(CredentialError::IoError(format!("{} is still there", path.display()))),
+        Err(e) => Err(CredentialError::IoError(format!("check {}: {}", path.display(), e))),
+    }
+}
+
+/// Unix: write `data` as `config_dir/name` through a new `0600` temporary
 /// file in the same folder: write, fsync, rename over the old file, fsync
 /// the folder. A failure before the rename keeps the old file and removes
 /// the temporary one. Renaming also means a file whose mode was widened
 /// is replaced by a `0600` one.
 #[cfg(not(windows))]
-fn write_atomically(config_dir: &Path, data: &[u8]) -> Result<(), CredentialError> {
-    let path = config_dir.join(CREDENTIAL_FILE);
+fn write_atomically(config_dir: &Path, name: &str, data: &[u8]) -> Result<(), CredentialError> {
+    let path = config_dir.join(name);
     let io = |what: &str, e: std::io::Error| CredentialError::IoError(format!("{} {}: {}", what, path.display(), e));
 
     // Temporary files a crashed earlier save left behind.
-    let prefix = format!("{CREDENTIAL_FILE}{TEMP_INFIX}");
+    let prefix = format!("{name}{TEMP_INFIX}");
     if let Ok(entries) = fs::read_dir(config_dir) {
         for entry in entries.flatten() {
             if entry.file_name().to_string_lossy().starts_with(&prefix) {
@@ -806,6 +922,7 @@ fn confirm_wiped(config_dir: &Path) -> Result<(), CredentialError> {
 }
 
 fn delete_locked(config_dir: &Path) -> Result<(), CredentialError> {
+    remove_session_marker(config_dir);
     let path = config_dir.join(CREDENTIAL_FILE);
     // Temporary files from an interrupted save hold the same ciphertext.
     let prefix = format!("{CREDENTIAL_FILE}.tmp-");
@@ -872,6 +989,26 @@ pub fn privacy_warning(config_dir: &Path, binding: BindingMode) -> Option<&'stat
         }
     }
     None
+}
+
+/// The notice for a session extension refused because the folder or file
+/// isn't private (#26). Pairing again into the same folder wouldn't help,
+/// so it points at Log out, as the warnings after unlock do (#24, #28):
+/// on Windows worded for how the pairing is sealed, on unix the folder
+/// notice (the only refusal there is the folder's owner).
+pub fn not_private_extension_notice(config_dir: &Path) -> &'static str {
+    #[cfg(unix)]
+    {
+        let _ = config_dir;
+        NOT_PRIVATE_FOLDER_NOTICE
+    }
+    #[cfg(not(unix))]
+    {
+        match on_disk_store(config_dir) {
+            OnDisk::Bound(BindingMode::MachineBound) => NOT_PRIVATE_MACHINE_NOTICE,
+            _ => NOT_PRIVATE_KEYRING_NOTICE,
+        }
+    }
 }
 
 /// Whether the folder and file are private to the current user, as far
@@ -1220,6 +1357,134 @@ mod tests {
         let other = FixedKeys { binding: BindingMode::Keyring, master: [0x55; 32], platform: PLATFORM };
         assert!(matches!(load_with(&other, dir.path()), Err(CredentialError::CryptoError(_))));
         assert!(exists(dir.path()));
+    }
+
+    fn creds_with_session(session_id: &str, expires_at: i64) -> ConnectionCredentials {
+        let mut c = sample_creds();
+        c.session_id = session_id.to_string();
+        c.session_expires_at = expires_at;
+        c.session_duration_seconds = 3600;
+        c
+    }
+
+    /// #26: a saved session with an expiry is live only with the marker.
+    /// Ending it removes the marker, and the next load treats it as ended
+    /// even though the expiry is still in the file, as after a refused
+    /// save. The session id is kept for telling the vault.
+    #[test]
+    fn an_ended_session_is_not_reloaded_as_live() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+        save_with(&keys, &config_dir, &creds_with_session("sess-1", 1_900_000_000)).unwrap();
+        let (live, _) = load_with(&keys, &config_dir).unwrap();
+        assert_eq!(live.session_expires_at, 1_900_000_000, "marked live");
+
+        end_saved_session(&config_dir).expect("ended");
+        assert!(!config_dir.join(SESSION_LIVE_FILE).exists());
+        let (ended, _) = load_with(&keys, &config_dir).unwrap();
+        assert_eq!(ended.session_expires_at, 0, "not live without the marker");
+        assert_eq!(ended.session_duration_seconds, 0);
+        assert_eq!(ended.session_id, "sess-1", "kept for the vault");
+        assert!(end_saved_session(&config_dir).is_ok(), "ending twice is fine");
+    }
+
+    /// #26: the marker names one session. A marker for another session,
+    /// or one that can't be parsed, is not live; a new session's save
+    /// replaces it; a save with the session cleared removes it.
+    #[test]
+    fn the_live_marker_names_one_session() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+        save_with(&keys, &config_dir, &creds_with_session("sess-1", 1_900_000_000)).unwrap();
+        let marker = fs::read_to_string(config_dir.join(SESSION_LIVE_FILE)).unwrap();
+        assert!(!marker.contains("sess-1"), "the id itself is not written");
+
+        fs::write(config_dir.join(SESSION_LIVE_FILE), session_tag("sess-other")).unwrap();
+        assert_eq!(load_with(&keys, &config_dir).unwrap().0.session_expires_at, 0);
+        fs::write(config_dir.join(SESSION_LIVE_FILE), b"garbage").unwrap();
+        assert_eq!(load_with(&keys, &config_dir).unwrap().0.session_expires_at, 0);
+
+        save_with(&keys, &config_dir, &creds_with_session("sess-2", 1_900_000_001)).unwrap();
+        assert_eq!(load_with(&keys, &config_dir).unwrap().0.session_expires_at, 1_900_000_001);
+
+        save_with(&keys, &config_dir, &creds_with_session("sess-2", 0)).unwrap();
+        assert!(!config_dir.join(SESSION_LIVE_FILE).exists(), "cleared session removes it");
+        delete(&config_dir).unwrap();
+        assert!(!config_dir.join(SESSION_LIVE_FILE).exists());
+    }
+
+    /// #26: a save that fails leaves the old marker as it was; a delete
+    /// and a wipe remove it.
+    #[test]
+    fn a_failed_save_keeps_the_marker_and_wipe_removes_it() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+        save_with(&keys, &config_dir, &creds_with_session("sess-1", 1_900_000_000)).unwrap();
+        let before = fs::read(config_dir.join(SESSION_LIVE_FILE)).unwrap();
+        struct NoBinding;
+        impl KeySource for NoBinding {
+            fn master_for_save(&self) -> Result<MasterKey, KeystoreError> {
+                unreachable!()
+            }
+            fn master_for_load(&self, _: BindingMode) -> Result<MasterKey, KeystoreError> {
+                unreachable!()
+            }
+            fn storage_binding(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+                Err(FingerprintError::MissingMachineId)
+            }
+            fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+                Ok(Zeroizing::new(FINGERPRINT))
+            }
+        }
+        assert!(save_with(&NoBinding, &config_dir, &creds_with_session("sess-2", 1)).is_err());
+        assert_eq!(fs::read(config_dir.join(SESSION_LIVE_FILE)).unwrap(), before, "unchanged");
+        assert!(session_is_recorded(&config_dir, "sess-1"));
+
+        wipe(&config_dir).unwrap();
+        assert!(!config_dir.join(SESSION_LIVE_FILE).exists());
+    }
+
+    /// #26: only a small regular file counts as the marker.
+    #[test]
+    fn a_marker_that_is_a_folder_or_too_large_is_not_live() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+        save_with(&keys, &config_dir, &creds_with_session("sess-1", 1_900_000_000)).unwrap();
+        let marker = config_dir.join(SESSION_LIVE_FILE);
+        let mut big = session_tag("sess-1");
+        big.push_str(&" ".repeat(200));
+        fs::write(&marker, big).unwrap();
+        assert!(!session_is_recorded(&config_dir, "sess-1"), "too large");
+        fs::remove_file(&marker).unwrap();
+        fs::create_dir(&marker).unwrap();
+        assert!(!session_is_recorded(&config_dir, "sess-1"), "a folder");
+        assert_eq!(load_with(&keys, &config_dir).unwrap().0.session_expires_at, 0);
+    }
+
+    /// Windows (#26): the case from the issue. The folder becomes shared,
+    /// so the save that clears the session is refused, but ending the
+    /// session still removes the marker, and the session isn't reloaded
+    /// as live.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_refused_save_still_ends_the_session() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+        save_with(&keys, &config_dir, &creds_with_session("sess-1", 1_900_000_000)).unwrap();
+        super::super::winacl::test_share_with_everyone(&config_dir);
+        assert!(matches!(
+            save_with_mode(&keys, &config_dir, &creds_with_session("sess-1", 0), Mode::UpdateExisting),
+            Err(CredentialError::NotPrivate)
+        ));
+        assert!(session_is_recorded(&config_dir, "sess-1"), "the refused save left it");
+        end_saved_session(&config_dir).expect("the marker can still be removed");
+        assert_eq!(load_with(&keys, &config_dir).unwrap().0.session_expires_at, 0);
+        assert_eq!(not_private_extension_notice(&config_dir), NOT_PRIVATE_KEYRING_NOTICE);
     }
 
     /// #14: a machine-bound file saved before #14 (the v1 key over all five
