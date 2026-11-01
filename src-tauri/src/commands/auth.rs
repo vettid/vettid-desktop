@@ -21,6 +21,10 @@ pub struct AuthStatus {
     pub binary_fingerprint: String,
     pub machine_fingerprint: String,
     pub app_version: String,
+    /// Which key protects the saved pairing, from the file's header:
+    /// "keyring", "machine", "none" (no pairing saved) or "unknown" (a
+    /// file that can't be read). Shown in Settings (#11).
+    pub key_protection: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +42,9 @@ pub struct RegisterResponse {
     pub connection_id: Option<String>,
     pub session_id: Option<String>,
     pub expires_at: Option<i64>,
+    /// On success, the key the saved pairing was sealed under: "keyring"
+    /// or "machine". The pairing screen warns once when it is "machine".
+    pub key_protection: Option<String>,
 }
 
 /// Event emitted to the frontend with the QR payload the user should scan
@@ -87,6 +94,7 @@ pub async fn register(
             connection_id: None,
             session_id: None,
             expires_at: None,
+            key_protection: None,
         });
     }
 
@@ -100,6 +108,7 @@ pub async fn register(
                 connection_id: None,
                 session_id: None,
                 expires_at: None,
+                key_protection: None,
             });
         }
     };
@@ -132,6 +141,7 @@ pub async fn register(
                 connection_id: None,
                 session_id: None,
                 expires_at: None,
+                key_protection: None,
             });
         }
     };
@@ -189,6 +199,7 @@ pub async fn register(
         connection_id: Some(outcome.connection_id),
         session_id: Some(outcome.session_id),
         expires_at: Some(outcome.expires_at),
+        key_protection: Some(outcome.binding.as_str().to_string()),
     })
 }
 
@@ -493,6 +504,7 @@ pub async fn extend_session(
                 connection_id: None,
                 session_id: None,
                 expires_at: None,
+                key_protection: None,
             });
         }
     };
@@ -506,6 +518,7 @@ pub async fn extend_session(
                 connection_id: None,
                 session_id: None,
                 expires_at: None,
+                key_protection: None,
             });
         }
     };
@@ -536,6 +549,7 @@ pub async fn extend_session(
                 connection_id: None,
                 session_id: None,
                 expires_at: None,
+                key_protection: None,
             });
         }
     };
@@ -600,6 +614,7 @@ pub async fn extend_session(
         connection_id: Some(outcome.connection_id),
         session_id: Some(outcome.session_id),
         expires_at: Some(outcome.expires_at),
+        key_protection: Some(outcome.binding.as_str().to_string()),
     })
 }
 
@@ -850,7 +865,18 @@ pub async fn get_status(state: State<'_, AppState>) -> Result<AuthStatus, String
 
     let fp = collect_device_fingerprint();
 
+    let key_protection = {
+        use crate::credential::store;
+        match store::default_config_dir() {
+            Ok(dir) => store::stored_key_protection(&dir),
+            // With no known folder nothing can have been saved.
+            Err(_) => "none",
+        }
+    }
+    .to_string();
+
     Ok(AuthStatus {
+        key_protection,
         is_registered,
         is_unlocked,
         has_active_session,

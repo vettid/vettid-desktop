@@ -9,6 +9,8 @@
   let errorMessage = $state('');
   let qrDataUrl = $state('');
   let connectionId = $state('');
+  // The key the new pairing was saved under (#11): "keyring" or "machine".
+  let keyProtection = $state('');
   let unlistenQr: UnlistenFn | null = null;
 
   onDestroy(() => {
@@ -51,6 +53,7 @@
       });
 
       if (result.success) {
+        keyProtection = result.key_protection || '';
         step = 'success';
       } else {
         step = 'error';
@@ -123,6 +126,15 @@
 
     {:else if step === 'success'}
       <div class="success-msg">Desktop paired! Session active.</div>
+      {#if keyProtection === 'machine'}
+        <p class="key-warning" role="status">
+          Your computer's keyring couldn't be reached, so this pairing is protected by a key worked
+          out from details of this computer instead. Any program you run, an administrator, or
+          anyone with a copy of this computer's disk could open it. The next time this desktop
+          saves the pairing (when you end or extend a session, or pair again) while the keyring
+          works, it moves to the keyring. Settings › Device shows which key is in use.
+        </p>
+      {/if}
       <button class="btn primary" onclick={() => window.location.reload()}>Continue</button>
 
     {:else if step === 'error'}
@@ -214,5 +226,6 @@
     color: var(--success); margin-bottom: 16px; text-align: center;
   }
   .error-text { color: var(--error); font-size: 0.9rem; margin-top: 12px; }
+  .key-warning { color: var(--warning); font-size: 0.9rem; line-height: 1.5; margin: 12px 0; }
   @keyframes spin { to { transform: rotate(360deg); } }
 </style>

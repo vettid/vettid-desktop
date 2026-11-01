@@ -492,6 +492,25 @@ enum OnDisk {
     Unreadable,
 }
 
+/// Which key protects the saved pairing, for the person to see (#11):
+/// "keyring", "machine", "none" (no file) or "unknown".
+///
+/// The file is parsed but nothing is decrypted and no key is fetched, so
+/// this says how the file is sealed, not that it opens. Editing the
+/// `binding` field doesn't let anyone in: the binding is part of the AEAD
+/// associated data, so an edited file fails to open.
+pub fn stored_key_protection(config_dir: &Path) -> &'static str {
+    match on_disk_store(config_dir) {
+        OnDisk::Absent => "none",
+        // On a platform without the machine-bound key (Windows), such a
+        // file (from an earlier development build) is refused at load, so
+        // it is shown as unreadable rather than as a binding in use.
+        OnDisk::Bound(BindingMode::MachineBound) if !keystore::MACHINE_BOUND_FALLBACK => "unknown",
+        OnDisk::Bound(binding) => binding.as_str(),
+        OnDisk::Unreadable => "unknown",
+    }
+}
+
 fn on_disk_store(config_dir: &Path) -> OnDisk {
     match read_store(config_dir) {
         Ok(store) => BindingMode::from_str(&store.binding).map_or(OnDisk::Unreadable, OnDisk::Bound),
@@ -843,6 +862,35 @@ mod tests {
         let after = fs::read(dir.path().join(CREDENTIAL_FILE)).unwrap();
         assert_eq!(before, after, "the keyring-bound file must be left as it was");
         assert_eq!(read_store(dir.path()).unwrap().binding, "keyring");
+    }
+
+    /// The key protection shown in Settings follows the file's header.
+    #[test]
+    fn stored_key_protection_reports_the_binding_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(stored_key_protection(dir.path()), "none");
+
+        save_with(&ThroughKeystore(with_keyring()), dir.path(), &sample_creds()).unwrap();
+        assert_eq!(stored_key_protection(dir.path()), "keyring");
+
+        // Machine-bound: shown as such where that key is used; on Windows,
+        // where such a file is refused at load, as unknown.
+        let bound = tempfile::tempdir().unwrap();
+        save_with(&ThroughKeystore(without_keyring()), bound.path(), &sample_creds()).unwrap();
+        let want = if keystore::MACHINE_BOUND_FALLBACK { "machine" } else { "unknown" };
+        assert_eq!(stored_key_protection(bound.path()), want);
+
+        let garbage = tempfile::tempdir().unwrap();
+        fs::write(garbage.path().join(CREDENTIAL_FILE), b"not json").unwrap();
+        assert_eq!(stored_key_protection(garbage.path()), "unknown");
+
+        let future = tempfile::tempdir().unwrap();
+        fs::write(
+            future.path().join(CREDENTIAL_FILE),
+            br#"{"version":99,"binding":"keyring","nonce":[],"ciphertext":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(stored_key_protection(future.path()), "unknown", "unsupported version");
     }
 
     /// A file that exists but can't be parsed, or names an unknown
