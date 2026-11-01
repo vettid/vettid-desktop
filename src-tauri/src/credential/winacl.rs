@@ -8,27 +8,41 @@
 //! - **New folder:** created owned by the current user, with a protected
 //!   DACL that grants only the current user and SYSTEM (inherited by what
 //!   is created inside it).
-//! - **The file:** given the same protected, user-and-SYSTEM DACL right
-//!   after it is opened and before any data is written.
+//! - **The file:** opened without truncating, given the protected
+//!   user-and-SYSTEM DACL through the open handle and checked again on that
+//!   handle; only then is it emptied and written ([`open_private_file`]).
 //! - **An existing folder or file** is checked first and refused (nothing
 //!   is changed or written) when:
 //!   - it is a reparse point (a symlink or junction could point anywhere);
 //!   - its owner is not the current user, SYSTEM or Administrators;
 //!   - it has a NULL DACL (everyone has full access);
 //!   - an allow entry grants anyone other than the current user, SYSTEM or
-//!     Administrators, or is an allow type other than a plain one (object
-//!     and callback entries are not interpreted here, so they are refused).
+//!     Administrators (inherit-only entries included, since new files
+//!     would get them; CREATOR OWNER and OWNER RIGHTS count as others), or
+//!     is an allow type other than a plain one (object, callback and
+//!     compound entries are not interpreted here, so they are refused).
 //!
 //!   Deny entries only take access away, so they are accepted.
 //!   Administrators are accepted in an existing ACL because they can take
-//!   ownership of any file on the machine anyway; the folder and file this
-//!   module creates do not grant them access.
+//!   ownership of any file on the machine anyway, and the default
+//!   `%LOCALAPPDATA%` grants them access; the folder and file this module
+//!   creates do not.
 //!
-//! The check reads security information, which needs no rights beyond
-//! READ_CONTROL; an object the user can't even read the ACL of is refused.
+//! A policy refusal is [`AclError::NotPrivate`], shown to the person as
+//! "another account can open this folder". Anything that merely failed
+//! (a security call, creating the folder, a stat error) is
+//! [`AclError::Failed`]: still a refusal, with a different message.
+//!
+//! Not covered: the parent of the folder (`%LOCALAPPDATA%` itself) is not
+//! checked. If it is redirected somewhere another account can delete or
+//! rename entries, that account could swap the folder between the check
+//! and the write.
 
 use std::ffi::c_void;
+use std::fs::File;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::ptr;
 
@@ -37,16 +51,18 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    GetNamedSecurityInfoW, GetSecurityInfo, SetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    EqualSid, GetAce, GetSecurityDescriptorDacl, GetTokenInformation,
+    EqualSid, GetAce, GetLengthSid, GetSecurityDescriptorDacl, GetTokenInformation, IsValidSid,
     IsWellKnownSid, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE,
     ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
     TOKEN_QUERY, TOKEN_USER,
 };
-use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateDirectoryW, FILE_GENERIC_WRITE, READ_CONTROL, WRITE_DAC,
+};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// ACE types (ACE_HEADER.AceType).
@@ -58,8 +74,7 @@ const ACCESS_DENIED_OBJECT_ACE_TYPE: u8 = 0x6;
 const ACCESS_DENIED_CALLBACK_ACE_TYPE: u8 = 0xA;
 const ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE: u8 = 0xC;
 
-/// Why a folder or file is not private to the current user. The detail is
-/// for the log; the person sees one plain notice.
+/// Why a folder or file is not private to the current user.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum NotPrivate {
     ReparsePoint,
@@ -67,20 +82,51 @@ pub(crate) enum NotPrivate {
     NullDacl,
     ForeignAccess,
     UnknownAllowEntry,
-    Unreadable(String),
 }
 
 impl std::fmt::Display for NotPrivate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ReparsePoint => "is a symlink or junction",
+            Self::ForeignOwner => "is owned by another account",
+            Self::NullDacl => "has no access list (everyone has access)",
+            Self::ForeignAccess => "grants access to another account",
+            Self::UnknownAllowEntry => "has an access entry this app does not check",
+        })
+    }
+}
+
+/// A refusal: either the policy said no, or something could not be done
+/// or confirmed. Both leave the folder and file as they were.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AclError {
+    NotPrivate(NotPrivate),
+    Failed(String),
+}
+
+impl std::fmt::Display for AclError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ReparsePoint => f.write_str("is a symlink or junction"),
-            Self::ForeignOwner => f.write_str("is owned by another account"),
-            Self::NullDacl => f.write_str("has no access list (everyone has access)"),
-            Self::ForeignAccess => f.write_str("grants access to another account"),
-            Self::UnknownAllowEntry => f.write_str("has an access entry this app does not check"),
-            Self::Unreadable(e) => write!(f, "its permissions could not be read ({})", e),
+            Self::NotPrivate(why) => write!(f, "{}", why),
+            Self::Failed(what) => write!(f, "could not be checked or set up ({})", what),
         }
     }
+}
+
+impl From<NotPrivate> for AclError {
+    fn from(why: NotPrivate) -> Self {
+        Self::NotPrivate(why)
+    }
+}
+
+fn failed(what: impl Into<String>) -> AclError {
+    AclError::Failed(what.into())
+}
+
+/// The calling thread's last error, read before anything else can change it.
+fn last_error() -> u32 {
+    // SAFETY: reads the calling thread's last-error value.
+    unsafe { GetLastError() }
 }
 
 fn wide_path(path: &Path) -> Vec<u16> {
@@ -106,12 +152,12 @@ impl Drop for LocalBox {
 }
 
 /// The current process user's SID, as a byte copy.
-fn current_user_sid() -> Result<Vec<u8>, String> {
+fn current_user_sid() -> Result<Vec<u8>, AclError> {
     let mut token: HANDLE = ptr::null_mut();
     // SAFETY: GetCurrentProcess returns a pseudo-handle; `token` receives a
     // real handle, closed below.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Err(format!("OpenProcessToken failed (error {})", unsafe { GetLastError() }));
+        return Err(failed(format!("OpenProcessToken error {}", last_error())));
     }
     let mut needed: u32 = 0;
     // SAFETY: a size query with no buffer.
@@ -122,10 +168,11 @@ fn current_user_sid() -> Result<Vec<u8>, String> {
     let ok = unsafe {
         GetTokenInformation(token, TokenUser, buf.as_mut_ptr() as *mut c_void, needed, &mut needed)
     };
+    let err = last_error();
     // SAFETY: `token` was opened above and is closed once.
     unsafe { CloseHandle(token) };
     if ok == 0 {
-        return Err(format!("GetTokenInformation failed (error {})", unsafe { GetLastError() }));
+        return Err(failed(format!("GetTokenInformation error {}", err)));
     }
     // SAFETY: on success `buf` holds a TOKEN_USER whose SID points inside it.
     let sid = unsafe { (*(buf.as_ptr() as *const TOKEN_USER)).User.Sid };
@@ -133,26 +180,26 @@ fn current_user_sid() -> Result<Vec<u8>, String> {
 }
 
 /// A copy of the SID at `sid`.
-fn sid_bytes(sid: PSID) -> Result<Vec<u8>, String> {
-    // SID layout: revision (1), sub-authority count (1), authority (6),
-    // then 4 bytes per sub-authority.
-    // SAFETY: `sid` points to a valid SID, whose length follows from its
-    // second byte.
+fn sid_bytes(sid: PSID) -> Result<Vec<u8>, AclError> {
+    // SAFETY: IsValidSid and GetLengthSid only read the SID they are given;
+    // `sid` points to a SID that stays alive for this call.
     unsafe {
-        let count = *(sid as *const u8).add(1) as usize;
-        let len = 8 + 4 * count;
+        if sid.is_null() || IsValidSid(sid) == 0 {
+            return Err(failed("invalid SID"));
+        }
+        let len = GetLengthSid(sid) as usize;
         Ok(std::slice::from_raw_parts(sid as *const u8, len).to_vec())
     }
 }
 
-fn sid_string(sid: &[u8]) -> Result<String, String> {
+fn sid_string(sid: &[u8]) -> Result<String, AclError> {
     let mut out: *mut u16 = ptr::null_mut();
     // SAFETY: `sid` is a valid SID; `out` receives a LocalAlloc'd string.
     if unsafe { ConvertSidToStringSidW(sid.as_ptr() as PSID, &mut out) } == 0 {
-        return Err(format!("ConvertSidToStringSidW failed (error {})", unsafe { GetLastError() }));
+        return Err(failed(format!("ConvertSidToStringSidW error {}", last_error())));
     }
     let _free = LocalBox(out as *mut c_void);
-    // SAFETY: `out` is a NUL-terminated wide string.
+    // SAFETY: `out` is a NUL-terminated wide string, freed by `_free`.
     let len = (0..).take_while(|&i| unsafe { *out.add(i) } != 0).count();
     Ok(String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(out, len) }))
 }
@@ -161,7 +208,7 @@ fn sid_string(sid: &[u8]) -> Result<String, String> {
 struct Descriptor(LocalBox);
 
 impl Descriptor {
-    fn from_sddl(sddl: &str) -> Result<Self, String> {
+    fn from_sddl(sddl: &str) -> Result<Self, AclError> {
         let sddl_w = wide_str(sddl);
         let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
         // SAFETY: `sddl_w` is NUL-terminated; `sd` receives a LocalAlloc'd
@@ -175,7 +222,7 @@ impl Descriptor {
             )
         };
         if ok == 0 {
-            return Err(format!("SDDL conversion failed (error {})", unsafe { GetLastError() }));
+            return Err(failed(format!("SDDL conversion error {}", last_error())));
         }
         Ok(Self(LocalBox(sd)))
     }
@@ -184,14 +231,14 @@ impl Descriptor {
         self.0 .0
     }
 
-    fn dacl(&self) -> Result<*mut ACL, String> {
+    fn dacl(&self) -> Result<*mut ACL, AclError> {
         let mut present = 0;
         let mut defaulted = 0;
         let mut dacl: *mut ACL = ptr::null_mut();
         // SAFETY: `self` holds a valid descriptor; the DACL points inside it.
         let ok = unsafe { GetSecurityDescriptorDacl(self.ptr(), &mut present, &mut dacl, &mut defaulted) };
         if ok == 0 || present == 0 || dacl.is_null() {
-            return Err("descriptor has no DACL".to_string());
+            return Err(failed("descriptor has no DACL"));
         }
         Ok(dacl)
     }
@@ -217,15 +264,77 @@ fn is_trusted(sid: PSID, user: &[u8]) -> bool {
     }
 }
 
-/// The owner and DACL of `path`, judged against `user`.
-fn check_private_with(path: &Path, user: &[u8]) -> Result<(), NotPrivate> {
-    let meta = std::fs::symlink_metadata(path).map_err(|e| NotPrivate::Unreadable(e.to_string()))?;
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || meta.file_type().is_symlink() {
-            return Err(NotPrivate::ReparsePoint);
+/// The SID of an ACCESS_ALLOWED_ACE: it starts at `SidStart`, so it is
+/// addressed from the ACE pointer, not through a reference to that field.
+///
+/// SAFETY: `ace` must point to a valid ACCESS_ALLOWED_ACE.
+unsafe fn allowed_ace_sid(ace: *const c_void) -> PSID {
+    ptr::addr_of!((*(ace as *const ACCESS_ALLOWED_ACE)).SidStart) as PSID
+}
+
+/// Judge an owner and DACL read from one security descriptor.
+///
+/// SAFETY: `owner` and `dacl` must be null or point into a descriptor that
+/// stays alive for this call.
+unsafe fn judge(owner: PSID, dacl: *const ACL, user: &[u8]) -> Result<(), AclError> {
+    if owner.is_null() || !is_trusted(owner, user) {
+        return Err(NotPrivate::ForeignOwner.into());
+    }
+    if dacl.is_null() {
+        return Err(NotPrivate::NullDacl.into());
+    }
+    let count = (*dacl).AceCount as u32;
+    for index in 0..count {
+        let mut ace: *mut c_void = ptr::null_mut();
+        // `index` is below the ACL's entry count.
+        if GetAce(dacl, index, &mut ace) == 0 || ace.is_null() {
+            return Err(failed("GetAce failed"));
         }
+        // Every ACE starts with a DWORD-aligned ACE_HEADER.
+        let header = *(ace as *const ACE_HEADER);
+        match header.AceType {
+            ACCESS_ALLOWED_ACE_TYPE => {
+                if !is_trusted(allowed_ace_sid(ace), user) {
+                    return Err(NotPrivate::ForeignAccess.into());
+                }
+            }
+            ACCESS_DENIED_ACE_TYPE
+            | ACCESS_DENIED_OBJECT_ACE_TYPE
+            | ACCESS_DENIED_CALLBACK_ACE_TYPE
+            | ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE
+            | SYSTEM_AUDIT_ACE_TYPE
+            | SYSTEM_ALARM_ACE_TYPE => {}
+            _ => return Err(NotPrivate::UnknownAllowEntry.into()),
+        }
+    }
+    Ok(())
+}
+
+/// What is at a path, without following it.
+enum Entry {
+    Absent,
+    Present,
+}
+
+/// Stat `path` without following it. A reparse point is a refusal; any
+/// stat error other than NotFound is a failure, never "absent".
+fn entry_at(path: &Path) -> Result<Entry, AclError> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || meta.file_type().is_symlink() => {
+            Err(NotPrivate::ReparsePoint.into())
+        }
+        Ok(_) => Ok(Entry::Present),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Entry::Absent),
+        Err(e) => Err(failed(format!("stat: {}", e))),
+    }
+}
+
+/// The owner and DACL of `path`, judged against `user`.
+fn check_private_with(path: &Path, user: &[u8]) -> Result<(), AclError> {
+    if let Entry::Absent = entry_at(path)? {
+        return Err(failed("not found"));
     }
 
     let path_w = wide_path(path);
@@ -247,63 +356,58 @@ fn check_private_with(path: &Path, user: &[u8]) -> Result<(), NotPrivate> {
         )
     };
     if status != ERROR_SUCCESS {
-        return Err(NotPrivate::Unreadable(format!("GetNamedSecurityInfoW error {}", status)));
+        return Err(failed(format!("GetNamedSecurityInfoW error {}", status)));
     }
     let _sd = LocalBox(sd);
-
-    if owner.is_null() || !is_trusted(owner, user) {
-        return Err(NotPrivate::ForeignOwner);
-    }
-    if dacl.is_null() {
-        return Err(NotPrivate::NullDacl);
-    }
-    // SAFETY: `dacl` points to a valid ACL inside `sd`.
-    let count = unsafe { (*dacl).AceCount } as u32;
-    for index in 0..count {
-        let mut ace: *mut c_void = ptr::null_mut();
-        // SAFETY: `index` is below the ACL's entry count.
-        if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
-            return Err(NotPrivate::Unreadable("GetAce failed".to_string()));
-        }
-        // SAFETY: every ACE starts with an ACE_HEADER.
-        let header = unsafe { *(ace as *const ACE_HEADER) };
-        match header.AceType {
-            ACCESS_ALLOWED_ACE_TYPE => {
-                // SAFETY: a plain allow ACE is an ACCESS_ALLOWED_ACE whose
-                // SID starts at SidStart.
-                let sid = unsafe { &(*(ace as *const ACCESS_ALLOWED_ACE)).SidStart as *const u32 as PSID };
-                if !is_trusted(sid, user) {
-                    return Err(NotPrivate::ForeignAccess);
-                }
-            }
-            ACCESS_DENIED_ACE_TYPE
-            | ACCESS_DENIED_OBJECT_ACE_TYPE
-            | ACCESS_DENIED_CALLBACK_ACE_TYPE
-            | ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE
-            | SYSTEM_AUDIT_ACE_TYPE
-            | SYSTEM_ALARM_ACE_TYPE => {}
-            _ => return Err(NotPrivate::UnknownAllowEntry),
-        }
-    }
-    Ok(())
+    // SAFETY: `owner` and `dacl` point into `sd`, alive until `_sd` drops.
+    unsafe { judge(owner, dacl, user) }
 }
 
-/// Check an existing folder or file: see the module documentation.
-pub(crate) fn check_private(path: &Path) -> Result<(), NotPrivate> {
-    let user = current_user_sid().map_err(NotPrivate::Unreadable)?;
+/// The same check on an open handle, so it is about the file that was
+/// opened, whatever the path now names.
+fn check_handle_with(handle: HANDLE, user: &[u8]) -> Result<(), AclError> {
+    let mut owner: PSID = ptr::null_mut();
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: `handle` is an open file handle with READ_CONTROL; on success
+    // `sd` is LocalAlloc'd and `owner`/`dacl` point into it.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(failed(format!("GetSecurityInfo error {}", status)));
+    }
+    let _sd = LocalBox(sd);
+    // SAFETY: `owner` and `dacl` point into `sd`, alive until `_sd` drops.
+    unsafe { judge(owner, dacl, user) }
+}
+
+/// Check an existing folder or file: see the module documentation. Used by
+/// the tests; the save path checks through `open_private_file`.
+#[cfg(test)]
+pub(crate) fn check_private(path: &Path) -> Result<(), AclError> {
+    let user = current_user_sid()?;
     check_private_with(path, &user)
 }
 
 /// Make sure `dir` exists and is private to the current user. Its parent
 /// folders are created as usual if missing. A new `dir` gets the user-only
 /// DACL; an existing one is only checked.
-pub(crate) fn ensure_private_dir(dir: &Path) -> Result<(), NotPrivate> {
+pub(crate) fn ensure_private_dir(dir: &Path) -> Result<(), AclError> {
     if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| NotPrivate::Unreadable(e.to_string()))?;
+        std::fs::create_dir_all(parent).map_err(|e| failed(format!("create parent: {}", e)))?;
     }
-    let user = current_user_sid().map_err(NotPrivate::Unreadable)?;
-    let sd = Descriptor::from_sddl(&folder_sddl(&sid_string(&user).map_err(NotPrivate::Unreadable)?))
-        .map_err(NotPrivate::Unreadable)?;
+    let user = current_user_sid()?;
+    let sd = Descriptor::from_sddl(&folder_sddl(&sid_string(&user)?))?;
     let attrs = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: sd.ptr(),
@@ -313,29 +417,33 @@ pub(crate) fn ensure_private_dir(dir: &Path) -> Result<(), NotPrivate> {
     // SAFETY: `dir_w` is NUL-terminated and `attrs` points to a valid
     // descriptor that outlives the call.
     if unsafe { CreateDirectoryW(dir_w.as_ptr(), &attrs) } == 0 {
-        // SAFETY: reads the calling thread's last-error value.
-        let err = unsafe { GetLastError() };
+        let err = last_error();
         if err != ERROR_ALREADY_EXISTS {
-            return Err(NotPrivate::Unreadable(format!("CreateDirectoryW error {}", err)));
+            return Err(failed(format!("CreateDirectoryW error {}", err)));
         }
     }
     // Checked whether it was just made or already there.
-    check_private_with(dir, &user)
+    check_private_with(dir, &user)?;
+    if !dir.is_dir() {
+        return Err(failed("not a folder"));
+    }
+    Ok(())
 }
 
-/// Give the file at `path` the protected, user-and-SYSTEM DACL, then check
-/// it. Called after the file is opened and before any data is written.
-pub(crate) fn protect_file(path: &Path) -> Result<(), NotPrivate> {
-    let user = current_user_sid().map_err(NotPrivate::Unreadable)?;
-    let sd = Descriptor::from_sddl(&file_sddl(&sid_string(&user).map_err(NotPrivate::Unreadable)?))
-        .map_err(NotPrivate::Unreadable)?;
-    let dacl = sd.dacl().map_err(NotPrivate::Unreadable)?;
-    let path_w = wide_path(path);
-    // SAFETY: `path_w` is NUL-terminated; `dacl` points into `sd`, which
-    // outlives the call.
+/// What [`open_private_file_with`] does to the open handle before it is
+/// emptied. The production step is [`protect_handle`]; tests replace it.
+type ProtectStep = fn(HANDLE, &[u8]) -> Result<(), AclError>;
+
+/// Give the open file the protected, user-and-SYSTEM DACL, then check it
+/// again on the same handle.
+fn protect_handle(handle: HANDLE, user: &[u8]) -> Result<(), AclError> {
+    let sd = Descriptor::from_sddl(&file_sddl(&sid_string(user)?))?;
+    let dacl = sd.dacl()?;
+    // SAFETY: `handle` is open with WRITE_DAC; `dacl` points into `sd`,
+    // which outlives the call.
     let status = unsafe {
-        SetNamedSecurityInfoW(
-            path_w.as_ptr(),
+        SetSecurityInfo(
+            handle,
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
@@ -345,9 +453,36 @@ pub(crate) fn protect_file(path: &Path) -> Result<(), NotPrivate> {
         )
     };
     if status != ERROR_SUCCESS {
-        return Err(NotPrivate::Unreadable(format!("SetNamedSecurityInfoW error {}", status)));
+        return Err(failed(format!("SetSecurityInfo error {}", status)));
     }
-    check_private_with(path, &user)
+    check_handle_with(handle, user)
+}
+
+/// Open `path` for writing the pairing, private to the current user.
+///
+/// SECURITY: an existing file is checked first (a stat error other than
+/// NotFound is a refusal). The file is opened without truncating, with
+/// WRITE_DAC and READ_CONTROL, given the user-only DACL on that handle and
+/// checked again; only then is it emptied. Any failure leaves an existing
+/// file's contents as they were.
+pub(crate) fn open_private_file(path: &Path) -> Result<File, AclError> {
+    open_private_file_with(path, protect_handle)
+}
+
+fn open_private_file_with(path: &Path, protect: ProtectStep) -> Result<File, AclError> {
+    let user = current_user_sid()?;
+    if let Entry::Present = entry_at(path)? {
+        check_private_with(path, &user)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .access_mode(FILE_GENERIC_WRITE | WRITE_DAC | READ_CONTROL)
+        .create(true)
+        .open(path)
+        .map_err(|e| failed(format!("open: {}", e)))?;
+    protect(file.as_raw_handle() as HANDLE, &user)?;
+    file.set_len(0).map_err(|e| failed(format!("truncate: {}", e)))?;
+    Ok(file)
 }
 
 /// Whether `path`'s DACL is protected (does not inherit). For tests.
@@ -403,14 +538,14 @@ fn allowed_sids(path: &Path) -> Vec<String> {
     assert_eq!(status, ERROR_SUCCESS);
     let _sd = LocalBox(sd);
     let mut out = Vec::new();
-    // SAFETY: as in check_private_with.
+    // SAFETY: as in judge.
     let count = unsafe { (*dacl).AceCount } as u32;
     for index in 0..count {
         let mut ace: *mut c_void = ptr::null_mut();
         unsafe { GetAce(dacl, index, &mut ace) };
         let header = unsafe { *(ace as *const ACE_HEADER) };
         if header.AceType == ACCESS_ALLOWED_ACE_TYPE {
-            let sid = unsafe { &(*(ace as *const ACCESS_ALLOWED_ACE)).SidStart as *const u32 as PSID };
+            let sid = unsafe { allowed_ace_sid(ace) };
             out.push(sid_string(&sid_bytes(sid).unwrap()).unwrap());
         }
     }
@@ -441,17 +576,22 @@ pub(crate) fn test_is_user_only(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
 
-    /// Replace `path`'s DACL with one from `dacl_sddl` (e.g. "D:P(...)").
-    pub(super) fn set_dacl(path: &Path, dacl_sddl: &str) {
-        let sd = Descriptor::from_sddl(dacl_sddl).expect("sddl");
+    /// Replace `path`'s DACL with one from `sddl` ("D:P(...)" or "D:(...)").
+    /// A "D:P" DACL is protected; a "D:" one keeps inheriting.
+    pub(super) fn set_dacl(path: &Path, sddl: &str) {
+        let sd = Descriptor::from_sddl(sddl).expect("sddl");
         let dacl = sd.dacl().expect("dacl");
+        let protect = if sddl.starts_with("D:P") { PROTECTED_DACL_SECURITY_INFORMATION } else { 0 };
         let path_w = wide_path(path);
+        // SAFETY: `path_w` is NUL-terminated; `dacl` points into `sd`.
         let status = unsafe {
             SetNamedSecurityInfoW(
                 path_w.as_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                DACL_SECURITY_INFORMATION | protect,
                 ptr::null_mut(),
                 ptr::null_mut(),
                 dacl,
@@ -461,8 +601,31 @@ mod tests {
         assert_eq!(status, ERROR_SUCCESS, "SetNamedSecurityInfoW");
     }
 
+    /// Give `path` a NULL DACL (everyone has full access).
+    fn set_null_dacl(path: &Path) {
+        let path_w = wide_path(path);
+        // SAFETY: a NULL DACL pointer with DACL_SECURITY_INFORMATION sets a
+        // NULL DACL.
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                path_w.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null(),
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+    }
+
     fn me() -> String {
         sid_string(&current_user_sid().unwrap()).unwrap()
+    }
+
+    fn refused(why: NotPrivate) -> Result<(), AclError> {
+        Err(AclError::NotPrivate(why))
     }
 
     #[test]
@@ -471,31 +634,40 @@ mod tests {
         let dir = base.path().join("vettid-desktop");
         ensure_private_dir(&dir).expect("private dir");
         assert!(dir.is_dir());
-        assert!(dacl_is_protected(&dir), "the DACL must not inherit");
-        let mut sids = allowed_sids(&dir);
-        sids.sort();
-        sids.dedup();
-        let mut want = vec![me(), "S-1-5-18".to_string()];
-        want.sort();
-        assert_eq!(sids, want);
+        assert!(test_is_user_only(&dir));
         // Calling it again on the existing folder passes the check.
         ensure_private_dir(&dir).expect("existing private dir");
     }
 
     #[test]
-    fn file_gets_the_user_only_dacl() {
+    fn private_file_gets_the_user_only_dacl_and_is_emptied() {
         let base = tempfile::tempdir().unwrap();
         let dir = base.path().join("vettid-desktop");
         ensure_private_dir(&dir).unwrap();
-        let file = dir.join("connection.enc");
-        std::fs::write(&file, b"").unwrap();
-        protect_file(&file).expect("protect");
-        assert!(dacl_is_protected(&file));
-        let mut sids = allowed_sids(&file);
-        sids.sort();
-        let mut want = vec![me(), "S-1-5-18".to_string()];
-        want.sort();
-        assert_eq!(sids, want);
+        let path = dir.join("connection.enc");
+        std::fs::write(&path, b"old contents").unwrap();
+        let mut file = open_private_file(&path).expect("open");
+        assert!(test_is_user_only(&path));
+        assert_eq!(std::fs::read(&path).unwrap(), b"", "emptied after protecting");
+        file.write_all(b"new").unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    /// B1: if protecting the open file fails, the existing contents are
+    /// kept (the file is not truncated before it is protected).
+    #[test]
+    fn a_failed_protect_step_leaves_the_file_as_it_was() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        ensure_private_dir(&dir).unwrap();
+        let path = dir.join("connection.enc");
+        std::fs::write(&path, b"the old pairing").unwrap();
+        fn fail(_: HANDLE, _: &[u8]) -> Result<(), AclError> {
+            Err(failed("injected"))
+        }
+        assert_eq!(open_private_file_with(&path, fail).err(), Some(failed("injected")));
+        assert_eq!(std::fs::read(&path).unwrap(), b"the old pairing");
     }
 
     #[test]
@@ -503,30 +675,74 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let dir = base.path().join("vettid-desktop");
         std::fs::create_dir(&dir).unwrap();
-        // Everyone (WD) and Authenticated Users (AU) may read.
-        for extra in ["(A;OICI;FR;;;WD)", "(A;OICI;FR;;;AU)", "(A;OICI;FA;;;BU)"] {
-            set_dacl(&dir, &format!("D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY){}", me(), extra));
-            assert_eq!(ensure_private_dir(&dir), Err(NotPrivate::ForeignAccess), "{extra}");
-            assert_eq!(check_private(&dir), Err(NotPrivate::ForeignAccess), "{extra}");
+        let me = me();
+        for extra in [
+            "(A;OICI;FR;;;WD)",   // Everyone
+            "(A;OICI;FR;;;AU)",   // Authenticated Users
+            "(A;OICI;FA;;;BU)",   // Users
+            "(A;OICIIO;FA;;;WD)", // inherit-only: new files would get it
+            "(A;OICIIO;FA;;;CO)", // CREATOR OWNER
+            "(A;;FA;;;OW)",       // OWNER RIGHTS
+        ] {
+            set_dacl(&dir, &format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY){extra}"));
+            assert_eq!(ensure_private_dir(&dir), refused(NotPrivate::ForeignAccess), "{extra}");
+            assert_eq!(check_private(&dir), refused(NotPrivate::ForeignAccess), "{extra}");
         }
     }
 
     #[test]
-    fn existing_file_granting_another_account_is_refused() {
+    fn existing_file_granting_another_account_is_refused_and_kept() {
         let base = tempfile::tempdir().unwrap();
-        let file = base.path().join("connection.enc");
-        std::fs::write(&file, b"x").unwrap();
-        set_dacl(&file, &format!("D:P(A;;FA;;;{})(A;;FR;;;WD)", me()));
-        assert_eq!(check_private(&file), Err(NotPrivate::ForeignAccess));
+        let path = base.path().join("connection.enc");
+        std::fs::write(&path, b"x").unwrap();
+        set_dacl(&path, &format!("D:P(A;;FA;;;{})(A;;FR;;;WD)", me()));
+        assert_eq!(check_private(&path), refused(NotPrivate::ForeignAccess));
+        assert_eq!(open_private_file(&path).err(), Some(AclError::NotPrivate(NotPrivate::ForeignAccess)));
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
+    }
+
+    #[test]
+    fn null_dacl_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        set_null_dacl(&path);
+        assert_eq!(check_private(&path), refused(NotPrivate::NullDacl));
+    }
+
+    #[test]
+    fn callback_allow_entry_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        // A conditional (callback) allow entry for the user themself: still
+        // refused, since this code does not interpret conditions.
+        set_dacl(&path, &format!("D:P(A;;FA;;;{me})(XA;;FR;;;{me};(Exists TITLE))", me = me()));
+        assert_eq!(check_private(&path), refused(NotPrivate::UnknownAllowEntry));
     }
 
     #[test]
     fn administrators_and_deny_entries_are_accepted() {
         let base = tempfile::tempdir().unwrap();
-        let file = base.path().join("f");
-        std::fs::write(&file, b"x").unwrap();
-        set_dacl(&file, &format!("D:P(D;;FW;;;WD)(A;;FA;;;{})(A;;FA;;;SY)(A;;FA;;;BA)", me()));
-        assert_eq!(check_private(&file), Ok(()));
+        let path = base.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        set_dacl(&path, &format!("D:P(D;;FW;;;WD)(A;;FA;;;{})(A;;FA;;;SY)(A;;FA;;;BA)", me()));
+        assert_eq!(check_private(&path), Ok(()));
+    }
+
+    /// A folder made by an earlier build, inheriting the default
+    /// %LOCALAPPDATA% ACL (SYSTEM, Administrators, the user; not protected):
+    /// accepted as it is, and the file written in it is user-only.
+    #[test]
+    fn inherited_local_app_data_style_folder_is_accepted() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        std::fs::create_dir(&dir).unwrap();
+        set_dacl(&dir, &format!("D:(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{})", me()));
+        ensure_private_dir(&dir).expect("accepted");
+        let path = dir.join("connection.enc");
+        drop(open_private_file(&path).expect("open"));
+        assert!(test_is_user_only(&path));
     }
 
     #[test]
@@ -543,8 +759,17 @@ mod tests {
             .output()
             .expect("mklink");
         assert!(status.status.success(), "mklink /J failed");
-        assert_eq!(check_private(&link), Err(NotPrivate::ReparsePoint));
-        assert_eq!(ensure_private_dir(&link), Err(NotPrivate::ReparsePoint));
+        assert_eq!(check_private(&link), refused(NotPrivate::ReparsePoint));
+        assert_eq!(ensure_private_dir(&link), refused(NotPrivate::ReparsePoint));
+    }
+
+    /// A file where the folder should be is not taken for the folder.
+    #[test]
+    fn a_file_named_like_the_folder_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join("vettid-desktop");
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(ensure_private_dir(&path), Err(failed("not a folder")));
     }
 
     #[test]

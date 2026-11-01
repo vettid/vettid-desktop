@@ -272,7 +272,7 @@ fn config_dir_under(base: Option<PathBuf>) -> Result<PathBuf, CredentialError> {
 pub fn ensure_config_dir(config_dir: &Path) -> Result<(), CredentialError> {
     #[cfg(windows)]
     {
-        super::winacl::ensure_private_dir(config_dir).map_err(|e| not_private(config_dir, e))
+        super::winacl::ensure_private_dir(config_dir).map_err(|e| acl_error(config_dir, e))
     }
     #[cfg(not(windows))]
     {
@@ -281,11 +281,18 @@ pub fn ensure_config_dir(config_dir: &Path) -> Result<(), CredentialError> {
     }
 }
 
-/// Log the detail of a failed privacy check; the person gets the notice.
+/// Log the detail of a refused folder or file. A policy refusal gives the
+/// person the "another account can open it" notice; a failure to check or
+/// set it up is reported as an I/O error, since the folder may well be
+/// private. Both leave it unchanged.
 #[cfg(windows)]
-fn not_private(path: &Path, why: super::winacl::NotPrivate) -> CredentialError {
-    log::error!("Credential store: {} {}; refusing to use it", path.display(), why);
-    CredentialError::NotPrivate
+fn acl_error(path: &Path, e: super::winacl::AclError) -> CredentialError {
+    use super::winacl::AclError;
+    log::error!("Credential store: {} {}; refusing to use it", path.display(), e);
+    match e {
+        AclError::NotPrivate(_) => CredentialError::NotPrivate,
+        AclError::Failed(what) => CredentialError::IoError(format!("folder or file permissions: {}", what)),
+    }
 }
 
 /// Encrypt credentials and write them to `connection.enc` in `config_dir`.
@@ -426,22 +433,23 @@ fn save_with(
     ensure_config_dir(config_dir)?;
 
     let path = config_dir.join(CREDENTIAL_FILE);
-    // SECURITY (Windows): an existing file is checked before it is
-    // truncated, and the file gets the user-only DACL before any data is
-    // written. Mode bits are not an access control there (#16).
+    // SECURITY (Windows, #16): mode bits are not an access control there.
+    // An existing file is checked before anything changes; the file is
+    // opened without truncating, given the user-only DACL on its handle,
+    // checked again, and only then emptied. A failure at any step leaves
+    // an existing file's contents as they were.
     #[cfg(windows)]
-    if path.exists() {
-        super::winacl::check_private(&path).map_err(|e| not_private(&path, e))?;
-    }
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(&path)
-        .map_err(|e| CredentialError::IoError(format!("open {}: {}", path.display(), e)))?;
-    #[cfg(windows)]
-    super::winacl::protect_file(&path).map_err(|e| not_private(&path, e))?;
+    let mut file = super::winacl::open_private_file(&path).map_err(|e| acl_error(&path, e))?;
+    #[cfg(not(windows))]
+    let mut file = {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        options
+            .open(&path)
+            .map_err(|e| CredentialError::IoError(format!("open {}: {}", path.display(), e)))?
+    };
 
     file.write_all(&data)
         .map_err(|e| CredentialError::IoError(format!("write {}: {}", path.display(), e)))?;

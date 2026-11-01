@@ -369,7 +369,7 @@ pub async fn complete_pairing(
 
     store::ensure_config_dir(config_dir).map_err(|e| match e {
         store::CredentialError::NotPrivate => RegistrationError::NotPrivate,
-        e => RegistrationError::Internal(format!("create config dir: {}", e)),
+        e => RegistrationError::Internal(e.to_string()),
     })?;
 
     let nats_creds = format!(
