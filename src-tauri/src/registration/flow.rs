@@ -17,6 +17,10 @@ pub enum RegistrationError {
     /// The saved pairing can't be opened on this machine (see
     /// `CredentialError::Unreadable`). Displays the plain notice.
     PairingUnreadable,
+    /// The pairing can't be saved: the system keyring can't be reached
+    /// and a weaker key is not allowed (see
+    /// `CredentialError::KeyringUnavailable`). Displays the plain notice.
+    KeyringUnavailable,
 }
 
 impl fmt::Display for RegistrationError {
@@ -31,6 +35,9 @@ impl fmt::Display for RegistrationError {
             Self::Internal(msg) => write!(f, "internal error: {}", msg),
             Self::PairingUnreadable => {
                 f.write_str(crate::credential::store::UNREADABLE_NOTICE)
+            }
+            Self::KeyringUnavailable => {
+                f.write_str(crate::credential::store::KEYRING_UNAVAILABLE_NOTICE)
             }
         }
     }

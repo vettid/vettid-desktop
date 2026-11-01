@@ -398,8 +398,10 @@ pub async fn complete_pairing(
         session_duration_seconds: activation_result.duration_s,
     };
 
-    store::save(config_dir, &creds)
-        .map_err(|e| RegistrationError::Internal(format!("save credentials: {}", e)))?;
+    store::save(config_dir, &creds).map_err(|e| match e {
+        store::CredentialError::KeyringUnavailable => RegistrationError::KeyringUnavailable,
+        e => RegistrationError::Internal(format!("save credentials: {}", e)),
+    })?;
 
     session_key.zeroize();
 

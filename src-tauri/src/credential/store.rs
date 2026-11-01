@@ -19,6 +19,7 @@
 use std::fmt;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -68,6 +69,17 @@ const NONCE_SIZE: usize = 24;
 pub const UNREADABLE_NOTICE: &str =
     "This desktop's saved pairing can't be opened. Remove this desktop on your phone, then pair again.";
 
+/// Shown when the pairing can't be saved because the system keyring
+/// (Credential Manager on Windows) can't be reached and a weaker key is
+/// not allowed. Nothing on disk has changed. At pairing, the vault may
+/// already list the desktop, hence the phone step.
+pub const KEYRING_UNAVAILABLE_NOTICE: &str =
+    "This desktop can't reach your computer's keyring, so it couldn't save the pairing safely, and nothing was saved. If your phone lists this desktop, remove it there. Then sign out of your computer and back in, and pair again.";
+
+/// Shown when the per-user folder for the pairing can't be found.
+pub const NO_CONFIG_DIR_NOTICE: &str =
+    "This desktop can't find your user folder, so it can't keep a pairing on this computer. Nothing was saved.";
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -95,6 +107,15 @@ pub enum CredentialError {
     /// public fingerprint, and kept it otherwise. Displays
     /// [`UNREADABLE_NOTICE`].
     Unreadable,
+    /// The keyring failed and the save may not fall back to the
+    /// machine-bound key: on Windows, or because the store on disk is
+    /// keyring-bound. Nothing was written. Displays
+    /// [`KEYRING_UNAVAILABLE_NOTICE`].
+    KeyringUnavailable,
+    /// The platform's per-user folder is unknown or not absolute, so
+    /// there is nowhere safe to keep a pairing. Displays
+    /// [`NO_CONFIG_DIR_NOTICE`].
+    NoConfigDir,
 }
 
 impl fmt::Display for CredentialError {
@@ -112,6 +133,8 @@ impl fmt::Display for CredentialError {
                 write!(f, "unsupported store version: {}", v)
             }
             CredentialError::Unreadable => f.write_str(UNREADABLE_NOTICE),
+            CredentialError::KeyringUnavailable => f.write_str(KEYRING_UNAVAILABLE_NOTICE),
+            CredentialError::NoConfigDir => f.write_str(NO_CONFIG_DIR_NOTICE),
         }
     }
 }
@@ -120,7 +143,13 @@ impl std::error::Error for CredentialError {}
 
 impl From<KeystoreError> for CredentialError {
     fn from(e: KeystoreError) -> Self {
-        CredentialError::KeystoreError(e.to_string())
+        match e {
+            KeystoreError::KeyringUnavailable(_) => CredentialError::KeyringUnavailable,
+            // Shown as "can't be opened": remove on the phone, pair again.
+            // The file is kept, as for any other unreadable store.
+            KeystoreError::MachineBoundRefused => CredentialError::Unreadable,
+            other => CredentialError::KeystoreError(other.to_string()),
+        }
     }
 }
 
@@ -193,17 +222,41 @@ pub struct EncryptedStore {
 ///
 /// - Linux: `$XDG_CONFIG_HOME/vettid-desktop` (typically `~/.config/vettid-desktop`)
 /// - macOS: `~/Library/Application Support/vettid-desktop`
-pub fn default_config_dir() -> PathBuf {
+/// - Windows: `%LOCALAPPDATA%\vettid-desktop`, which stays on this machine.
+///   Not the roaming `%APPDATA%`: a machine-bound store can't open on
+///   another PC, and a roamed copy would sit on the profile server.
+///
+/// SECURITY: fails with [`CredentialError::NoConfigDir`] when the
+/// platform folder is unknown or not an absolute path. There is no
+/// fallback to the current directory, whose permissions are unknown and
+/// which `logout` would then wipe (owner decision, 2026-11-01).
+pub fn default_config_dir() -> Result<PathBuf, CredentialError> {
+    config_dir_under(platform_config_base())
+}
+
+#[cfg(windows)]
+fn platform_config_base() -> Option<PathBuf> {
+    dirs::config_local_dir()
+}
+
+#[cfg(not(windows))]
+fn platform_config_base() -> Option<PathBuf> {
     dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(CONFIG_SUBDIR)
+}
+
+fn config_dir_under(base: Option<PathBuf>) -> Result<PathBuf, CredentialError> {
+    match base {
+        Some(base) if base.is_absolute() => Ok(base.join(CONFIG_SUBDIR)),
+        _ => Err(CredentialError::NoConfigDir),
+    }
 }
 
 /// Encrypt credentials and write them to `connection.enc` in `config_dir`.
 ///
 /// The encryption key comes from the OS keyring (or the machine-bound
 /// fallback when the keyring is unavailable). No user input. The file
-/// is written with mode 0600 (owner read/write only).
+/// is written with mode 0600 (owner read/write only) on unix. On Windows
+/// it gets the ACL it inherits from the config directory.
 ///
 /// SECURITY: Intermediate key material is zeroized after use; the
 /// `MasterKey` returned by the keystore zeroizes on drop.
@@ -297,6 +350,21 @@ fn save_with(
     creds: &ConnectionCredentials,
 ) -> Result<BindingMode, CredentialError> {
     let master = keys.master_for_save()?;
+    // SECURITY: never downgrade. If the store on disk is keyring-bound
+    // and the keyring fails now, the keystore falls back to the
+    // machine-bound key; re-sealing under it would silently move the
+    // pairing to a key any local user can recompute. Fail the save and
+    // leave the file as it is. A file that exists but can't be read or
+    // parsed may be keyring-bound too, so it is not overwritten either.
+    if master.binding != BindingMode::Keyring {
+        match on_disk_store(config_dir) {
+            OnDisk::Absent | OnDisk::Bound(BindingMode::MachineBound) => {}
+            OnDisk::Bound(BindingMode::Keyring) | OnDisk::Unreadable => {
+                log::warn!("Credential store: keyring unavailable; not overwriting a keyring-bound or unreadable store under a weaker key");
+                return Err(CredentialError::KeyringUnavailable);
+            }
+        }
+    }
     let binding = master.binding;
     let platform_key = keys.platform_key()?;
 
@@ -322,11 +390,17 @@ fn save_with(
         .map_err(|e| CredentialError::IoError(format!("create config dir: {}", e)))?;
 
     let path = config_dir.join(CREDENTIAL_FILE);
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    // Mode bits are not an access control on Windows. There the file
+    // gets the ACL it inherits from its folder. In the default folder
+    // under %LOCALAPPDATA% that is the user, SYSTEM and Administrators,
+    // but a redirected or pre-made folder can grant more. An explicit
+    // user-only DACL is required before a Windows release (owner
+    // decision 1a, 2026-11-01; #16).
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
         .open(&path)
         .map_err(|e| CredentialError::IoError(format!("open {}: {}", path.display(), e)))?;
 
@@ -359,6 +433,25 @@ pub fn delete(config_dir: &Path) -> Result<(), CredentialError> {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// What is on disk where the store goes.
+#[derive(Debug, PartialEq, Eq)]
+enum OnDisk {
+    /// No credential file.
+    Absent,
+    /// A store with this binding.
+    Bound(BindingMode),
+    /// A file that exists but can't be read, parsed or understood.
+    Unreadable,
+}
+
+fn on_disk_store(config_dir: &Path) -> OnDisk {
+    match read_store(config_dir) {
+        Ok(store) => BindingMode::from_str(&store.binding).map_or(OnDisk::Unreadable, OnDisk::Bound),
+        Err(CredentialError::NotFound(_)) => OnDisk::Absent,
+        Err(_) => OnDisk::Unreadable,
+    }
+}
 
 /// Read and parse the encrypted store from disk.
 fn read_store(config_dir: &Path) -> Result<EncryptedStore, CredentialError> {
@@ -622,14 +715,17 @@ mod tests {
 
     /// The real keystore logic (`fetch_or_create_master_key_with`) over
     /// test sources: the store asks the keystore exactly as in production.
+    /// The fallback is allowed here, as on Linux and macOS, so these tests
+    /// cover the machine-bound path on every platform; the Windows policy
+    /// has its own test below.
     struct ThroughKeystore(keystore::tests::TestSources);
 
     impl KeySource for ThroughKeystore {
         fn master_for_save(&self) -> Result<MasterKey, KeystoreError> {
-            keystore::fetch_or_create_master_key_with(&self.0)
+            keystore::fetch_or_create_master_key_with_policy(&self.0, true)
         }
         fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError> {
-            keystore::fetch_for_binding_with(&self.0, binding)
+            keystore::fetch_for_binding_with_policy(&self.0, binding, true)
         }
         fn platform_key(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
             Ok(Zeroizing::new(PLATFORM))
@@ -667,6 +763,138 @@ mod tests {
         let (loaded, binding) = load_with(&keys, dir.path()).expect("load");
         assert_eq!(binding, BindingMode::MachineBound);
         assert_eq!(loaded.connection_id, "conn-1");
+    }
+
+    fn with_keyring() -> keystore::tests::TestSources {
+        keystore::tests::TestSources {
+            keyring: Some(std::cell::RefCell::new(None)),
+            attrs: keystore::tests::attrs_with_machine_id("4c4c4544003a3610804db7c04f4d3732"),
+        }
+    }
+
+    fn without_keyring() -> keystore::tests::TestSources {
+        keystore::tests::TestSources::no_keyring(keystore::tests::attrs_with_machine_id(
+            "4c4c4544003a3610804db7c04f4d3732",
+        ))
+    }
+
+    /// A keyring-bound store, then the keyring fails: the keystore would
+    /// fall back, but the save refuses to re-seal under the machine-bound
+    /// key, and the file on disk is left byte for byte as it was.
+    #[test]
+    fn keyring_store_is_never_resaved_machine_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = ThroughKeystore(with_keyring());
+        assert_eq!(save_with(&first, dir.path(), &sample_creds()).unwrap(), BindingMode::Keyring);
+        let before = fs::read(dir.path().join(CREDENTIAL_FILE)).unwrap();
+
+        let broken = ThroughKeystore(without_keyring());
+        let err = save_with(&broken, dir.path(), &sample_creds()).err().expect("save must fail");
+        assert!(matches!(err, CredentialError::KeyringUnavailable), "got {err}");
+        assert_eq!(err.to_string(), KEYRING_UNAVAILABLE_NOTICE);
+
+        let after = fs::read(dir.path().join(CREDENTIAL_FILE)).unwrap();
+        assert_eq!(before, after, "the keyring-bound file must be left as it was");
+        assert_eq!(read_store(dir.path()).unwrap().binding, "keyring");
+    }
+
+    /// A file that exists but can't be parsed, or names an unknown
+    /// binding, may be keyring-bound: a machine-bound save leaves it as it
+    /// is. With the keyring working, the save replaces it.
+    #[test]
+    fn unreadable_store_is_not_overwritten_machine_bound() {
+        let unknown_binding = br#"{"version":3,"binding":"future","nonce":[],"ciphertext":[]}"#;
+        for contents in [&b"not json"[..], &b""[..], &unknown_binding[..]] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(CREDENTIAL_FILE);
+            fs::write(&path, contents).unwrap();
+            assert_eq!(on_disk_store(dir.path()), OnDisk::Unreadable);
+
+            let broken = ThroughKeystore(without_keyring());
+            let err = save_with(&broken, dir.path(), &sample_creds()).err().expect("save must fail");
+            assert!(matches!(err, CredentialError::KeyringUnavailable), "got {err}");
+            assert_eq!(fs::read(&path).unwrap(), contents, "the file must be left as it was");
+
+            let keyring = ThroughKeystore(with_keyring());
+            assert_eq!(save_with(&keyring, dir.path(), &sample_creds()).unwrap(), BindingMode::Keyring);
+        }
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(on_disk_store(empty.path()), OnDisk::Absent);
+    }
+
+    /// The other direction is allowed: a machine-bound store is re-saved
+    /// under the keyring once the keyring works.
+    #[test]
+    fn machine_bound_store_moves_to_the_keyring_when_it_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let bound = ThroughKeystore(without_keyring());
+        assert_eq!(save_with(&bound, dir.path(), &sample_creds()).unwrap(), BindingMode::MachineBound);
+        let keyring = ThroughKeystore(with_keyring());
+        assert_eq!(save_with(&keyring, dir.path(), &sample_creds()).unwrap(), BindingMode::Keyring);
+        assert_eq!(read_store(dir.path()).unwrap().binding, "keyring");
+        let (loaded, binding) = load_with(&keyring, dir.path()).expect("load");
+        assert_eq!(binding, BindingMode::Keyring);
+        assert_eq!(loaded.connection_id, "conn-1");
+    }
+
+    /// The Windows policy: no keyring means no save at all, with the plain
+    /// notice, even with a usable machine id; nothing is written.
+    #[test]
+    fn without_the_fallback_no_keyring_fails_the_save_and_writes_nothing() {
+        struct NoFallback(keystore::tests::TestSources);
+        impl KeySource for NoFallback {
+            fn master_for_save(&self) -> Result<MasterKey, KeystoreError> {
+                keystore::fetch_or_create_master_key_with_policy(&self.0, false)
+            }
+            fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError> {
+                keystore::fetch_for_binding_with_policy(&self.0, binding, false)
+            }
+            fn platform_key(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+                Ok(Zeroizing::new(PLATFORM))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("vettid-desktop");
+        let err = save_with(&NoFallback(without_keyring()), &config_dir, &sample_creds())
+            .err()
+            .expect("save must fail");
+        assert!(matches!(err, CredentialError::KeyringUnavailable), "got {err}");
+        assert!(!config_dir.exists(), "nothing may be written");
+
+        // A machine-bound file (from an earlier build) is not opened under
+        // this policy either: it reads as unreadable, and is kept.
+        let other = tempfile::tempdir().unwrap();
+        save_with(&ThroughKeystore(without_keyring()), other.path(), &sample_creds()).unwrap();
+        let before = fs::read(other.path().join(CREDENTIAL_FILE)).unwrap();
+        let err = load_with(&NoFallback(without_keyring()), other.path()).err().expect("load must fail");
+        assert!(matches!(err, CredentialError::Unreadable), "got {err}");
+        assert_eq!(fs::read(other.path().join(CREDENTIAL_FILE)).unwrap(), before, "kept");
+    }
+
+    /// No known folder, or a relative one, is refused: never the current
+    /// directory.
+    #[test]
+    fn config_dir_requires_an_absolute_platform_folder() {
+        assert!(matches!(config_dir_under(None), Err(CredentialError::NoConfigDir)));
+        for relative in [".", "", "relative/dir", "./vettid"] {
+            assert!(
+                matches!(config_dir_under(Some(PathBuf::from(relative))), Err(CredentialError::NoConfigDir)),
+                "{relative:?} must be refused"
+            );
+        }
+        let base = tempfile::tempdir().unwrap();
+        let dir = config_dir_under(Some(base.path().to_path_buf())).expect("absolute base");
+        assert_eq!(dir, base.path().join(CONFIG_SUBDIR));
+        assert_eq!(CredentialError::NoConfigDir.to_string(), NO_CONFIG_DIR_NOTICE);
+    }
+
+    /// On Windows the folder is the local, non-roaming one.
+    #[cfg(windows)]
+    #[test]
+    fn windows_config_dir_is_local_app_data() {
+        let dir = default_config_dir().expect("config dir");
+        assert_eq!(dir, dirs::config_local_dir().unwrap().join(CONFIG_SUBDIR));
+        assert_ne!(dir.parent(), dirs::config_dir().as_deref(), "must not be the roaming folder");
     }
 
     #[test]

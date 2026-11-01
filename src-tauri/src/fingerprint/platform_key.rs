@@ -29,6 +29,12 @@ use super::platform_macos::{
     compute_machine_fingerprint, FingerprintError, MachineAttributes,
 };
 
+#[cfg(windows)]
+use super::platform_windows::{
+    collect_machine_attributes_windows as collect_machine_attributes, compute_machine_bound_key,
+    compute_machine_fingerprint, FingerprintError, MachineAttributes,
+};
+
 /// Minimum number of non-empty machine attributes required for key derivation.
 const MIN_ATTRIBUTES: usize = 3;
 
@@ -250,6 +256,22 @@ mod tests {
                 b.is_ok()
             ),
         }
+    }
+
+    /// On a real Windows machine the collector must yield a usable
+    /// MachineGuid and a machine-bound key. The availability test above
+    /// accepts `MissingMachineId`, so it would not catch a broken
+    /// MachineGuid read. Asserts only; no attribute value is printed.
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_collector_gives_a_machine_bound_key() {
+        let attrs = collect_attributes().expect("collect Windows attributes");
+        assert!(
+            machine_id_is_usable(&attrs.machine_id),
+            "the MachineGuid read is empty or a placeholder"
+        );
+        let key = machine_bound_key_from(&attrs).expect("machine-bound key");
+        assert!(key.iter().any(|&b| b != 0));
     }
 
     #[test]

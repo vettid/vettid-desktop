@@ -66,7 +66,7 @@ pub async fn register(
     use crate::credential::store;
     use crate::registration::pairing;
 
-    let config_dir = store::default_config_dir();
+    let config_dir = store::default_config_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&config_dir)
         .map_err(|e| format!("Failed to create config dir: {}", e))?;
 
@@ -218,7 +218,13 @@ pub(crate) fn warm_device_fingerprint() {
 
 fn compute_device_fingerprint() -> crate::registration::pairing::DeviceFingerprint {
     use crate::fingerprint::binary::binary_fingerprint;
+    #[cfg(not(windows))]
     use crate::fingerprint::platform_linux::{collect_machine_attributes, compute_machine_fingerprint_hex};
+    #[cfg(windows)]
+    use crate::fingerprint::platform_windows::{
+        collect_machine_attributes_windows as collect_machine_attributes,
+        compute_machine_fingerprint_hex,
+    };
     use crate::registration::pairing::DeviceFingerprint;
 
     let hostname = hostname::get()
@@ -336,7 +342,15 @@ const UNLOCK_FAILED_NOTICE: &str = "This desktop couldn't open its saved pairing
 pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<UnlockResponse, String> {
     use crate::credential::store::{self, CredentialError};
 
-    let config_dir = store::default_config_dir();
+    let config_dir = match store::default_config_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            return Ok(UnlockResponse {
+                unlocked: false,
+                notice: Some(e.to_string()),
+            });
+        }
+    };
 
     let (creds, _binding) = match store::load(&config_dir) {
         Ok(loaded) => loaded,
@@ -469,7 +483,18 @@ pub async fn extend_session(
     use crate::credential::store;
     use crate::registration::pairing;
 
-    let config_dir = store::default_config_dir();
+    let config_dir = match store::default_config_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            return Ok(RegisterResponse {
+                success: false,
+                error: Some(e.to_string()),
+                connection_id: None,
+                session_id: None,
+                expires_at: None,
+            });
+        }
+    };
 
     let (session, runtime) = match pairing::start_extension(&config_dir).await {
         Ok(v) => v,
@@ -611,6 +636,14 @@ fn logout_notice(revoke_sent: bool, local_wiped: bool) -> Option<&'static str> {
 fn wipe_local_pairing(config_dir: &std::path::Path) -> bool {
     use crate::credential::store;
 
+    // SECURITY: never remove a relative path, which would resolve against
+    // whatever the current directory is. `default_config_dir` only returns
+    // absolute paths; this guards the destructive step on its own.
+    if !config_dir.is_absolute() {
+        log::error!("Refusing to wipe a relative config path on logout");
+        return false;
+    }
+
     if config_dir.exists() {
         if let Err(e) = std::fs::remove_dir_all(config_dir) {
             log::warn!("Failed to remove config dir on logout: {}", e);
@@ -634,16 +667,24 @@ pub async fn logout(state: State<'_, AppState>) -> Result<LogoutResponse, String
     use crate::registration::pairing;
     use zeroize::Zeroize;
 
+    // With no known folder there is nothing to revoke from or wipe, and
+    // neither can be confirmed: both are reported as not done.
     let config_dir = store::default_config_dir();
+    if let Err(e) = &config_dir {
+        log::warn!("logout: {}", e);
+    }
 
     // The vault may be unreachable or the creds may be unreadable: the
     // local wipe still has to happen, and the response reports it.
-    let revoke_sent = match pairing::publish_revoke(&config_dir).await {
-        Ok(()) => true,
-        Err(e) => {
-            log::warn!("device.revoke not sent (continuing with local wipe): {}", e);
-            false
-        }
+    let revoke_sent = match &config_dir {
+        Ok(dir) => match pairing::publish_revoke(dir).await {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("device.revoke not sent (continuing with local wipe): {}", e);
+                false
+            }
+        },
+        Err(_) => false,
     };
 
     // Disconnect NATS
@@ -663,7 +704,10 @@ pub async fn logout(state: State<'_, AppState>) -> Result<LogoutResponse, String
     state.session.write().await.revoke();
 
     // Wipe the config directory entirely — nothing left on disk.
-    let local_wiped = wipe_local_pairing(&config_dir);
+    let local_wiped = match &config_dir {
+        Ok(dir) => wipe_local_pairing(dir),
+        Err(_) => false,
+    };
 
     // Wipe the master key from the keyring too. A future pairing on
     // this machine will mint a fresh key — a leaked disk image from
@@ -693,10 +737,38 @@ pub async fn logout(state: State<'_, AppState>) -> Result<LogoutResponse, String
 #[tauri::command]
 pub async fn end_session(state: State<'_, AppState>) -> Result<bool, String> {
     use crate::credential::store;
-    use crate::registration::pairing;
     use zeroize::Zeroize;
 
-    let config_dir = store::default_config_dir();
+    // With no known folder there is no stored pairing to end or update;
+    // the in-memory reset below still happens.
+    match store::default_config_dir() {
+        Ok(config_dir) => end_session_on_disk(&config_dir).await,
+        Err(e) => log::warn!("end_session: {}; local reset only", e),
+    }
+
+    state.nats.lock().await.disconnect().await;
+
+    {
+        let mut key_guard = state.connection_key.write().await;
+        if let Some(ref mut key) = *key_guard {
+            key.zeroize();
+        }
+        *key_guard = None;
+    }
+    *state.credentials.write().await = None;
+    *state.is_unlocked.write().await = false;
+    state.session.write().await.expire();
+
+    Ok(true)
+}
+
+/// The stored-pairing half of [`end_session`]: tell the vault, then
+/// clear the session fields in the saved pairing.
+async fn end_session_on_disk(config_dir: &std::path::Path) {
+    use crate::credential::store;
+    use crate::registration::pairing;
+
+    let config_dir = config_dir.to_path_buf();
 
     // Tell the vault to end the session. publish_end_session flushes
     // before returning, within a deadline: on a clean return the
@@ -728,21 +800,6 @@ pub async fn end_session(state: State<'_, AppState>) -> Result<bool, String> {
             "end_session: could not load creds to clear on-disk session fields: {}", e
         ),
     }
-
-    state.nats.lock().await.disconnect().await;
-
-    {
-        let mut key_guard = state.connection_key.write().await;
-        if let Some(ref mut key) = *key_guard {
-            key.zeroize();
-        }
-        *key_guard = None;
-    }
-    *state.credentials.write().await = None;
-    *state.is_unlocked.write().await = false;
-    state.session.write().await.expire();
-
-    Ok(true)
 }
 
 /// Lock the session — clear credentials from memory.
@@ -783,7 +840,9 @@ pub async fn get_status(state: State<'_, AppState>) -> Result<AuthStatus, String
     // Also check on disk if not yet known
     let is_registered = if !is_registered {
         use crate::credential::store;
-        store::exists(&store::default_config_dir())
+        store::default_config_dir()
+            .map(|dir| store::exists(&dir))
+            .unwrap_or(false)
     } else {
         is_registered
     };
@@ -827,6 +886,15 @@ mod tests {
         std::fs::write(config_dir.join("connection.enc"), b"{}").unwrap();
         assert!(wipe_local_pairing(&config_dir));
         assert!(!config_dir.exists());
+    }
+
+    /// A relative path is never removed, and is not reported as wiped.
+    /// Uses a name that does not exist, so nothing in the current
+    /// directory is at risk if the guard were missing.
+    #[test]
+    fn wipe_local_pairing_refuses_a_relative_path() {
+        let relative = std::path::Path::new("vettid-desktop-relative-wipe-test-does-not-exist");
+        assert!(!wipe_local_pairing(relative));
     }
 
     #[test]

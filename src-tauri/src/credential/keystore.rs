@@ -7,10 +7,14 @@
 //!
 //! ## Key sources, in order
 //!
-//! 1. **OS keyring** (Secret Service on Linux, Keychain on macOS).
+//! 1. **OS keyring** (Secret Service on Linux, Keychain on macOS,
+//!    Credential Manager on Windows).
 //!    The keyring itself is unlocked by the user's OS login session,
 //!    so we inherit the OS's "is this really you" gate without
-//!    asking the user for anything.
+//!    asking the user for anything. It protects the key from other
+//!    users and from a copied disk, not from other programs running as
+//!    the same user: a Windows generic credential (like a Secret Service
+//!    item) can be read by any process of that user.
 //! 2. **Machine-bound fallback** (`platform_key`). If the keyring
 //!    isn't available (kiosk Linux, missing Secret Service daemon,
 //!    locked Keychain on macOS first launch), we derive a key from
@@ -19,6 +23,11 @@
 //!    displayed and sent at pairing.
 //!    A binding mode marker lands on the encrypted store so callers
 //!    can show the user a "we couldn't reach your keyring" notice.
+//!
+//!    There is no fallback on Windows ([`MACHINE_BOUND_FALLBACK`]): a
+//!    Credential Manager failure fails the save. On every platform, a
+//!    store that is already keyring-bound is never re-saved machine-bound
+//!    (see `credential::store::save`).
 //!
 //! ## Why no passphrase
 //!
@@ -31,6 +40,7 @@
 
 use std::fmt;
 
+#[cfg(not(windows))]
 use base64::Engine;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -39,7 +49,9 @@ use zeroize::Zeroizing;
 use crate::fingerprint::platform_key;
 use crate::fingerprint::platform_linux::{FingerprintError, MachineAttributes};
 
+#[cfg(not(windows))]
 const KEYRING_SERVICE: &str = "vettid-desktop";
+#[cfg(not(windows))]
 const KEYRING_ACCOUNT: &str = "master-key-v1";
 
 /// How the master key was sourced. Stamped into the on-disk store so a
@@ -91,12 +103,25 @@ pub enum KeystoreError {
     /// All key sources failed. Should be rare — the machine-bound
     /// fallback typically works on any reachable filesystem.
     NoSource(String),
+    /// The OS keyring failed and no machine-bound fallback is allowed:
+    /// on a platform without one ([`MACHINE_BOUND_FALLBACK`]), or for a
+    /// store that is already keyring-bound.
+    KeyringUnavailable(String),
+    /// A machine-bound store on a platform without the machine-bound key
+    /// ([`MACHINE_BOUND_FALLBACK`]): not opened.
+    MachineBoundRefused,
 }
 
 impl fmt::Display for KeystoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             KeystoreError::NoSource(msg) => write!(f, "keystore: no usable key source ({})", msg),
+            KeystoreError::KeyringUnavailable(msg) => {
+                write!(f, "keystore: OS keyring unavailable, no fallback allowed ({})", msg)
+            }
+            KeystoreError::MachineBoundRefused => {
+                f.write_str("keystore: machine-bound stores are not opened on this platform")
+            }
         }
     }
 }
@@ -148,7 +173,28 @@ pub fn fetch_or_create_master_key() -> Result<MasterKey, KeystoreError> {
     fetch_or_create_master_key_with(&System)
 }
 
+/// Whether this platform may fall back to the machine-bound key when the
+/// OS keyring fails.
+///
+/// SECURITY: not on Windows. Every input to the machine-bound key
+/// (MachineGuid, CPU, disk serial, MAC, hostname) can be read by any
+/// standard user there (HKLM\SOFTWARE\Microsoft\Cryptography grants
+/// BUILTIN\Users read), so the key would add nothing beyond the file's
+/// ACL, while Credential Manager is DPAPI-protected and present for every
+/// interactive user. A Credential Manager failure therefore fails the
+/// save instead of silently storing the pairing under a weaker key.
+pub(crate) const MACHINE_BOUND_FALLBACK: bool = cfg!(not(windows));
+
 pub(crate) fn fetch_or_create_master_key_with(src: &dyn Sources) -> Result<MasterKey, KeystoreError> {
+    fetch_or_create_master_key_with_policy(src, MACHINE_BOUND_FALLBACK)
+}
+
+/// [`fetch_or_create_master_key_with`] with the fallback policy given, so
+/// both policies can be tested on every platform.
+pub(crate) fn fetch_or_create_master_key_with_policy(
+    src: &dyn Sources,
+    allow_machine_bound: bool,
+) -> Result<MasterKey, KeystoreError> {
     // Try keyring first.
     match fetch_or_create_keyring_key(src) {
         Ok(key) => {
@@ -156,6 +202,10 @@ pub(crate) fn fetch_or_create_master_key_with(src: &dyn Sources) -> Result<Maste
                 key,
                 binding: BindingMode::Keyring,
             })
+        }
+        Err(e) if !allow_machine_bound => {
+            log::warn!("Keystore: OS keyring unavailable ({}); no fallback on this platform", e);
+            return Err(KeystoreError::KeyringUnavailable(e));
         }
         Err(e) => {
             log::warn!(
@@ -188,6 +238,21 @@ pub(crate) fn fetch_for_binding_with(
     src: &dyn Sources,
     binding: BindingMode,
 ) -> Result<MasterKey, KeystoreError> {
+    fetch_for_binding_with_policy(src, binding, MACHINE_BOUND_FALLBACK)
+}
+
+/// [`fetch_for_binding_with`] with the fallback policy given. Where the
+/// machine-bound key is not allowed (Windows), a machine-bound store is
+/// refused on load as well as on save: such a file can only come from an
+/// earlier development build.
+pub(crate) fn fetch_for_binding_with_policy(
+    src: &dyn Sources,
+    binding: BindingMode,
+    allow_machine_bound: bool,
+) -> Result<MasterKey, KeystoreError> {
+    if binding == BindingMode::MachineBound && !allow_machine_bound {
+        return Err(KeystoreError::MachineBoundRefused);
+    }
     match binding {
         BindingMode::Keyring => match src.keyring_read() {
             Ok(Some(key)) => Ok(MasterKey {
@@ -216,9 +281,20 @@ fn machine_bound(src: &dyn Sources) -> Result<MasterKey, FingerprintError> {
 /// gets a fresh master key — a paranoid attacker who later compromises
 /// the disk image can't decrypt the previous-install blob even if
 /// `connection.enc` slipped past the local wipe.
+#[cfg(not(windows))]
 pub fn delete_keyring_key() {
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT) {
         let _ = entry.delete_credential();
+    }
+}
+
+/// On Windows the entry is written by `credential::wincred`, kept on
+/// this machine (`CRED_PERSIST_LOCAL_MACHINE`), not by the `keyring`
+/// crate, whose entries roam.
+#[cfg(windows)]
+pub fn delete_keyring_key() {
+    if let Err(e) = super::wincred::delete() {
+        log::warn!("Keystore: could not delete the Credential Manager entry: {}", e);
     }
 }
 
@@ -237,6 +313,17 @@ fn fetch_or_create_keyring_key(src: &dyn Sources) -> Result<Zeroizing<[u8; 32]>,
     Ok(key)
 }
 
+#[cfg(windows)]
+fn read_keyring_key() -> Result<Option<Zeroizing<[u8; 32]>>, String> {
+    super::wincred::read()
+}
+
+#[cfg(windows)]
+fn write_keyring_key(key: &[u8; 32]) -> Result<(), String> {
+    super::wincred::write(key)
+}
+
+#[cfg(not(windows))]
 fn read_keyring_key() -> Result<Option<Zeroizing<[u8; 32]>>, String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
         .map_err(|e| format!("entry: {}", e))?;
@@ -260,6 +347,7 @@ fn read_keyring_key() -> Result<Option<Zeroizing<[u8; 32]>>, String> {
     }
 }
 
+#[cfg(not(windows))]
 fn write_keyring_key(key: &[u8; 32]) -> Result<(), String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
         .map_err(|e| format!("entry: {}", e))?;
@@ -336,7 +424,7 @@ pub(crate) mod tests {
     fn no_keyring_falls_back_to_the_machine_bound_key() {
         let attrs = attrs_with_machine_id(MACHINE_ID);
         let src = TestSources::no_keyring(attrs.clone());
-        let key = fetch_or_create_master_key_with(&src).expect("key");
+        let key = fetch_or_create_master_key_with_policy(&src, true).expect("key");
         assert_eq!(key.binding, BindingMode::MachineBound);
         assert_eq!(*key.key, *platform_key::machine_bound_key_from(&attrs).unwrap());
     }
@@ -344,9 +432,42 @@ pub(crate) mod tests {
     #[test]
     fn no_keyring_and_no_machine_id_gives_no_key() {
         let src = TestSources::no_keyring(attrs_with_machine_id(""));
-        let err = fetch_or_create_master_key_with(&src).err().expect("must fail");
+        let err = fetch_or_create_master_key_with_policy(&src, true).err().expect("must fail");
         assert!(err.to_string().contains("no machine id"), "got {err}");
-        assert!(fetch_for_binding_with(&src, BindingMode::MachineBound).is_err());
+        assert!(fetch_for_binding_with_policy(&src, BindingMode::MachineBound, true).is_err());
+    }
+
+    /// Without the fallback (Windows), a keyring failure is an error, even
+    /// with a usable machine id, and no machine-bound key is returned.
+    #[test]
+    fn no_keyring_without_fallback_is_an_error() {
+        let src = TestSources::no_keyring(attrs_with_machine_id(MACHINE_ID));
+        let err = fetch_or_create_master_key_with_policy(&src, false).err().expect("must fail");
+        assert!(matches!(err, KeystoreError::KeyringUnavailable(_)), "got {err}");
+    }
+
+    /// Without the fallback, a machine-bound store is refused on load.
+    #[test]
+    fn machine_bound_load_refused_without_fallback() {
+        let src = TestSources::no_keyring(attrs_with_machine_id(MACHINE_ID));
+        assert!(matches!(
+            fetch_for_binding_with_policy(&src, BindingMode::MachineBound, false),
+            Err(KeystoreError::MachineBoundRefused)
+        ));
+        assert!(fetch_for_binding_with_policy(&src, BindingMode::MachineBound, true).is_ok());
+    }
+
+    /// The platform policy: no fallback on Windows, a fallback elsewhere.
+    #[test]
+    fn platform_fallback_policy() {
+        assert_eq!(MACHINE_BOUND_FALLBACK, !cfg!(windows));
+        let src = TestSources::no_keyring(attrs_with_machine_id(MACHINE_ID));
+        let result = fetch_or_create_master_key_with(&src);
+        if cfg!(windows) {
+            assert!(matches!(result, Err(KeystoreError::KeyringUnavailable(_))));
+        } else {
+            assert_eq!(result.expect("key").binding, BindingMode::MachineBound);
+        }
     }
 
     #[test]
