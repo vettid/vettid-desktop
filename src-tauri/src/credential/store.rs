@@ -87,12 +87,17 @@ pub const NOT_PRIVATE_NOTICE: &str =
 
 /// Shown after unlock when another account can open the saved pairing's
 /// folder or file, and the pairing is keyring-bound (#24).
+///
+/// Log out (Settings > Danger zone) is the way out: it sends the revoke,
+/// removes the folder and deletes the keyring key, and says if a step
+/// failed. Pairing again into the same folder would not fix it (Windows
+/// refuses the folder; on unix the file's mode is kept on rewrite).
 pub const NOT_PRIVATE_KEYRING_NOTICE: &str =
-    "Another account on this computer can open the folder this desktop keeps its pairing in. The pairing itself is still locked by your keyring, but to be safe: remove this desktop on your phone, delete the vettid-desktop folder, then pair again.";
+    "Another account on this computer can open this desktop's saved pairing. It is still locked by your keyring, but to be safe: in Settings, open Danger zone and choose Log out this desktop. Then check on your phone that this desktop is gone, and pair again.";
 
 /// The same for a machine-bound pairing, which may have been read.
 pub const NOT_PRIVATE_MACHINE_NOTICE: &str =
-    "Another account on this computer can open this desktop's saved pairing, and it isn't locked by a keyring, so it may have been read. Remove this desktop on your phone, delete the vettid-desktop folder, then pair again.";
+    "Another account on this computer can open this desktop's saved pairing, and it isn't locked by a keyring, so it may have been read. In Settings, open Danger zone and choose Log out this desktop. Then check on your phone that this desktop is gone, and pair again.";
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -519,6 +524,11 @@ pub fn privacy_warning(config_dir: &Path, binding: BindingMode) -> Option<&'stat
 /// Whether the folder and file are private to the current user, as far
 /// as can be told. A check that fails to run is logged and not reported
 /// as a warning: the file was just read, so this is not a refusal path.
+/// Nothing may present `true` to the person as "private"; it only means
+/// "no warning".
+///
+/// On Windows every winacl refusal counts, including a reparse point and
+/// an entry type the policy doesn't interpret. That errs toward warning.
 #[cfg(windows)]
 fn is_private(config_dir: &Path) -> bool {
     use super::winacl::{check_private, AclError};
