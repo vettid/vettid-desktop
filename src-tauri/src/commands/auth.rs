@@ -45,6 +45,10 @@ pub struct RegisterResponse {
     /// On success, the key the saved pairing was sealed under: "keyring"
     /// or "machine". The pairing screen warns once when it is "machine".
     pub key_protection: Option<String>,
+    /// Not a success, but the pairing is saved: the new session couldn't
+    /// be recorded (#33). The pairing screen shows `error` and continues to
+    /// Start New Session instead of offering to pair again.
+    pub paired_without_session: bool,
 }
 
 /// Event emitted to the frontend with the QR payload the user should scan
@@ -97,6 +101,7 @@ pub async fn register(
             session_id: None,
             expires_at: None,
             key_protection: None,
+            paired_without_session: false,
         });
     }
 
@@ -111,6 +116,7 @@ pub async fn register(
                 session_id: None,
                 expires_at: None,
                 key_protection: None,
+                paired_without_session: false,
             });
         }
     };
@@ -137,6 +143,13 @@ pub async fn register(
     {
         Ok(o) => o,
         Err(e) => {
+            // #33: the pairing is saved, only the session isn't. Mark this
+            // desktop registered, so the next launch goes to Start New
+            // Session rather than pairing again.
+            let paired = matches!(e, crate::registration::flow::RegistrationError::SessionNotRecorded);
+            if paired {
+                *state.is_registered.write().await = true;
+            }
             return Ok(RegisterResponse {
                 success: false,
                 error: Some(e.to_string()),
@@ -144,6 +157,7 @@ pub async fn register(
                 session_id: None,
                 expires_at: None,
                 key_protection: None,
+                paired_without_session: paired,
             });
         }
     };
@@ -202,6 +216,7 @@ pub async fn register(
         session_id: Some(outcome.session_id),
         expires_at: Some(outcome.expires_at),
         key_protection: Some(outcome.binding.as_str().to_string()),
+        paired_without_session: false,
     })
 }
 
@@ -509,6 +524,7 @@ pub async fn extend_session(
                 session_id: None,
                 expires_at: None,
                 key_protection: None,
+                paired_without_session: false,
             });
         }
     };
@@ -523,6 +539,7 @@ pub async fn extend_session(
                 session_id: None,
                 expires_at: None,
                 key_protection: None,
+                paired_without_session: false,
             });
         }
     };
@@ -562,6 +579,7 @@ pub async fn extend_session(
                 session_id: None,
                 expires_at: None,
                 key_protection: None,
+                paired_without_session: false,
             });
         }
     };
@@ -627,6 +645,7 @@ pub async fn extend_session(
         session_id: Some(outcome.session_id),
         expires_at: Some(outcome.expires_at),
         key_protection: Some(outcome.binding.as_str().to_string()),
+        paired_without_session: false,
     })
 }
 
@@ -767,6 +786,10 @@ pub async fn end_session(state: State<'_, AppState>) -> Result<EndSessionRespons
     use crate::credential::store;
     use zeroize::Zeroize;
 
+    // The session being ended, so the disk steps below leave alone one
+    // started since (#33).
+    let ending = state.credentials.read().await.as_ref().map(|c| c.session_id.clone());
+
     // The in-memory session ends first, so nothing reports it as live
     // while the vault is being told (up to the frame deadline).
     state.nats.lock().await.disconnect().await;
@@ -784,7 +807,7 @@ pub async fn end_session(state: State<'_, AppState>) -> Result<EndSessionRespons
 
     // With no known folder there is no stored pairing to end or update.
     let notice = match store::default_config_dir() {
-        Ok(config_dir) => end_session_on_disk(&config_dir).await,
+        Ok(config_dir) => end_session_on_disk(&config_dir, ending.as_deref()).await,
         Err(e) => {
             log::warn!("end_session: {}; local reset only", e);
             None
@@ -805,7 +828,7 @@ pub struct EndSessionResponse {
 /// The stored-pairing half of [`end_session`]: record on disk that the
 /// session ended, tell the vault, then clear the session fields in the
 /// saved pairing. Returns a notice if ending it couldn't be recorded.
-async fn end_session_on_disk(config_dir: &std::path::Path) -> Option<String> {
+async fn end_session_on_disk(config_dir: &std::path::Path, ending: Option<&str>) -> Option<String> {
     use crate::credential::store;
     use crate::registration::pairing;
 
@@ -814,7 +837,7 @@ async fn end_session_on_disk(config_dir: &std::path::Path) -> Option<String> {
     // #26: first, and needing no key: without the live marker the next
     // launch treats the session as ended, even if the save below is
     // refused (a folder that isn't private, an unreachable keyring).
-    let marker_removed = match store::end_saved_session(&config_dir) {
+    let marker_removed = match store::end_saved_session(&config_dir, ending) {
         Ok(()) => true,
         Err(e) => {
             log::error!("end_session: could not remove the live marker: {}", e);
@@ -839,6 +862,12 @@ async fn end_session_on_disk(config_dir: &std::path::Path) -> Option<String> {
     // relaunch reloaded a dead session: the desktop routed straight to
     // the vault and every op hung because the vault no longer had it.
     match store::load(&config_dir) {
+        Ok((creds, _)) if ending.is_some_and(|id| !id.is_empty() && creds.session_id != id) => {
+            // #33: Start New Session finished while this ran; its session
+            // is the saved one now and stays.
+            log::info!("end_session: a newer session is saved; leaving it");
+            cleared_saved = true;
+        }
         Ok((mut creds, _)) => {
             creds.session_id.clear();
             creds.session_expires_at = 0;

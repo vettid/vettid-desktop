@@ -6,7 +6,7 @@
   import { sessionNotice } from '../stores/session';
 
   let inviteCode = $state('');
-  let step = $state<'code' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error'>('code');
+  let step = $state<'code' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error' | 'paired-no-session'>('code');
   let errorMessage = $state('');
   let qrDataUrl = $state('');
   let connectionId = $state('');
@@ -57,6 +57,11 @@
         sessionNotice.set(null);
         keyProtection = result.key_protection || '';
         step = 'success';
+      } else if (result.paired_without_session) {
+        // #33: the pairing is saved, only the session isn't: continue to
+        // Start New Session, don't offer to pair again.
+        step = 'paired-no-session';
+        errorMessage = result.error || '';
       } else {
         step = 'error';
         errorMessage = result.error || 'Pairing failed';
@@ -126,6 +131,10 @@
         <p>Awaiting approval on your phone…</p>
       </div>
 
+    {:else if step === 'paired-no-session'}
+      <p class="error-text" role="alert">{errorMessage}</p>
+      <button class="btn primary" onclick={() => window.location.reload()}>Continue</button>
+
     {:else if step === 'success'}
       <div class="success-msg">Desktop paired! Session active.</div>
       {#if keyProtection === 'machine'}
@@ -144,7 +153,7 @@
       <button class="btn primary" onclick={reset}>Try Again</button>
     {/if}
 
-    {#if errorMessage && step !== 'error'}
+    {#if errorMessage && step !== 'error' && step !== 'paired-no-session'}
       <p class="error-text">{errorMessage}</p>
     {/if}
   </div>
