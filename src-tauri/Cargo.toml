@@ -96,11 +96,14 @@ serde_bytes = "0.11"
 # the master encryption key for the on-disk credential blob, so users
 # don't have to enter a passphrase at pairing time. `linux-native`
 # avoids the Secret Service D-Bus dependency mismatch some distros
-# have; on macOS the default platform store is the Keychain.
-keyring = { version = "3", default-features = false, features = ["apple-native", "linux-native", "sync-secret-service", "windows-native"] }
+# have; on macOS the default platform store is the Keychain. Windows
+# does not use it: credential/wincred.rs writes the entry itself so that
+# it stays on the machine (the crate's Windows entries roam).
+keyring ={ version = "3", default-features = false, features = ["apple-native", "linux-native", "sync-secret-service", "windows-native"] }
 
 # Win32 calls for the Windows machine fingerprint (registry, disk serial,
-# network adapters). See fingerprint/platform_windows.rs.
+# network adapters) and the Credential Manager entry. See
+# fingerprint/platform_windows.rs and credential/wincred.rs.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
@@ -108,6 +111,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     "Win32_Security",
+    "Win32_Security_Credentials",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Registry",

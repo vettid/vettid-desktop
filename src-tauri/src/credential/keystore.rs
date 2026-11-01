@@ -40,6 +40,7 @@
 
 use std::fmt;
 
+#[cfg(not(windows))]
 use base64::Engine;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -48,7 +49,9 @@ use zeroize::Zeroizing;
 use crate::fingerprint::platform_key;
 use crate::fingerprint::platform_linux::{FingerprintError, MachineAttributes};
 
+#[cfg(not(windows))]
 const KEYRING_SERVICE: &str = "vettid-desktop";
+#[cfg(not(windows))]
 const KEYRING_ACCOUNT: &str = "master-key-v1";
 
 /// How the master key was sourced. Stamped into the on-disk store so a
@@ -257,9 +260,20 @@ fn machine_bound(src: &dyn Sources) -> Result<MasterKey, FingerprintError> {
 /// gets a fresh master key — a paranoid attacker who later compromises
 /// the disk image can't decrypt the previous-install blob even if
 /// `connection.enc` slipped past the local wipe.
+#[cfg(not(windows))]
 pub fn delete_keyring_key() {
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT) {
         let _ = entry.delete_credential();
+    }
+}
+
+/// On Windows the entry is written by `credential::wincred`, kept on
+/// this machine (`CRED_PERSIST_LOCAL_MACHINE`), not by the `keyring`
+/// crate, whose entries roam.
+#[cfg(windows)]
+pub fn delete_keyring_key() {
+    if let Err(e) = super::wincred::delete() {
+        log::warn!("Keystore: could not delete the Credential Manager entry: {}", e);
     }
 }
 
@@ -278,6 +292,17 @@ fn fetch_or_create_keyring_key(src: &dyn Sources) -> Result<Zeroizing<[u8; 32]>,
     Ok(key)
 }
 
+#[cfg(windows)]
+fn read_keyring_key() -> Result<Option<Zeroizing<[u8; 32]>>, String> {
+    super::wincred::read()
+}
+
+#[cfg(windows)]
+fn write_keyring_key(key: &[u8; 32]) -> Result<(), String> {
+    super::wincred::write(key)
+}
+
+#[cfg(not(windows))]
 fn read_keyring_key() -> Result<Option<Zeroizing<[u8; 32]>>, String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
         .map_err(|e| format!("entry: {}", e))?;
@@ -301,6 +326,7 @@ fn read_keyring_key() -> Result<Option<Zeroizing<[u8; 32]>>, String> {
     }
 }
 
+#[cfg(not(windows))]
 fn write_keyring_key(key: &[u8; 32]) -> Result<(), String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
         .map_err(|e| format!("entry: {}", e))?;
