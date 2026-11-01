@@ -99,7 +99,7 @@ serde_bytes = "0.11"
 # have; on macOS the default platform store is the Keychain. Windows
 # does not use it: credential/wincred.rs writes the entry itself so that
 # it stays on the machine (the crate's Windows entries roam).
-keyring ={ version = "3", default-features = false, features = ["apple-native", "linux-native", "sync-secret-service", "windows-native"] }
+keyring = { version = "3", default-features = false, features = ["apple-native", "linux-native", "sync-secret-service"] }
 
 # Win32 calls for the Windows machine fingerprint (registry, disk serial,
 # network adapters) and the Credential Manager entry. See

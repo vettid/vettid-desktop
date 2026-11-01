@@ -145,6 +145,9 @@ impl From<KeystoreError> for CredentialError {
     fn from(e: KeystoreError) -> Self {
         match e {
             KeystoreError::KeyringUnavailable(_) => CredentialError::KeyringUnavailable,
+            // Shown as "can't be opened": remove on the phone, pair again.
+            // The file is kept, as for any other unreadable store.
+            KeystoreError::MachineBoundRefused => CredentialError::Unreadable,
             other => CredentialError::KeystoreError(other.to_string()),
         }
     }
@@ -351,10 +354,16 @@ fn save_with(
     // and the keyring fails now, the keystore falls back to the
     // machine-bound key; re-sealing under it would silently move the
     // pairing to a key any local user can recompute. Fail the save and
-    // leave the file as it is.
-    if master.binding != BindingMode::Keyring && on_disk_binding(config_dir) == Some(BindingMode::Keyring) {
-        log::warn!("Credential store: keyring unavailable; not re-saving a keyring-bound store under a weaker key");
-        return Err(CredentialError::KeyringUnavailable);
+    // leave the file as it is. A file that exists but can't be read or
+    // parsed may be keyring-bound too, so it is not overwritten either.
+    if master.binding != BindingMode::Keyring {
+        match on_disk_store(config_dir) {
+            OnDisk::Absent | OnDisk::Bound(BindingMode::MachineBound) => {}
+            OnDisk::Bound(BindingMode::Keyring) | OnDisk::Unreadable => {
+                log::warn!("Credential store: keyring unavailable; not overwriting a keyring-bound or unreadable store under a weaker key");
+                return Err(CredentialError::KeyringUnavailable);
+            }
+        }
     }
     let binding = master.binding;
     let platform_key = keys.platform_key()?;
@@ -425,14 +434,26 @@ pub fn delete(config_dir: &Path) -> Result<(), CredentialError> {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Read and parse the encrypted store from disk.
-/// The binding of the store already on disk, if there is a readable one.
-fn on_disk_binding(config_dir: &Path) -> Option<BindingMode> {
-    read_store(config_dir)
-        .ok()
-        .and_then(|store| BindingMode::from_str(&store.binding))
+/// What is on disk where the store goes.
+#[derive(Debug, PartialEq, Eq)]
+enum OnDisk {
+    /// No credential file.
+    Absent,
+    /// A store with this binding.
+    Bound(BindingMode),
+    /// A file that exists but can't be read, parsed or understood.
+    Unreadable,
 }
 
+fn on_disk_store(config_dir: &Path) -> OnDisk {
+    match read_store(config_dir) {
+        Ok(store) => BindingMode::from_str(&store.binding).map_or(OnDisk::Unreadable, OnDisk::Bound),
+        Err(CredentialError::NotFound(_)) => OnDisk::Absent,
+        Err(_) => OnDisk::Unreadable,
+    }
+}
+
+/// Read and parse the encrypted store from disk.
 fn read_store(config_dir: &Path) -> Result<EncryptedStore, CredentialError> {
     let path = config_dir.join(CREDENTIAL_FILE);
     let data = fs::read(&path).map_err(|e| {
@@ -704,7 +725,7 @@ mod tests {
             keystore::fetch_or_create_master_key_with_policy(&self.0, true)
         }
         fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError> {
-            keystore::fetch_for_binding_with(&self.0, binding)
+            keystore::fetch_for_binding_with_policy(&self.0, binding, true)
         }
         fn platform_key(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
             Ok(Zeroizing::new(PLATFORM))
@@ -777,6 +798,30 @@ mod tests {
         assert_eq!(read_store(dir.path()).unwrap().binding, "keyring");
     }
 
+    /// A file that exists but can't be parsed, or names an unknown
+    /// binding, may be keyring-bound: a machine-bound save leaves it as it
+    /// is. With the keyring working, the save replaces it.
+    #[test]
+    fn unreadable_store_is_not_overwritten_machine_bound() {
+        let unknown_binding = br#"{"version":3,"binding":"future","nonce":[],"ciphertext":[]}"#;
+        for contents in [&b"not json"[..], &b""[..], &unknown_binding[..]] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(CREDENTIAL_FILE);
+            fs::write(&path, contents).unwrap();
+            assert_eq!(on_disk_store(dir.path()), OnDisk::Unreadable);
+
+            let broken = ThroughKeystore(without_keyring());
+            let err = save_with(&broken, dir.path(), &sample_creds()).err().expect("save must fail");
+            assert!(matches!(err, CredentialError::KeyringUnavailable), "got {err}");
+            assert_eq!(fs::read(&path).unwrap(), contents, "the file must be left as it was");
+
+            let keyring = ThroughKeystore(with_keyring());
+            assert_eq!(save_with(&keyring, dir.path(), &sample_creds()).unwrap(), BindingMode::Keyring);
+        }
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(on_disk_store(empty.path()), OnDisk::Absent);
+    }
+
     /// The other direction is allowed: a machine-bound store is re-saved
     /// under the keyring once the keyring works.
     #[test]
@@ -802,7 +847,7 @@ mod tests {
                 keystore::fetch_or_create_master_key_with_policy(&self.0, false)
             }
             fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError> {
-                keystore::fetch_for_binding_with(&self.0, binding)
+                keystore::fetch_for_binding_with_policy(&self.0, binding, false)
             }
             fn platform_key(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
                 Ok(Zeroizing::new(PLATFORM))
@@ -815,6 +860,15 @@ mod tests {
             .expect("save must fail");
         assert!(matches!(err, CredentialError::KeyringUnavailable), "got {err}");
         assert!(!config_dir.exists(), "nothing may be written");
+
+        // A machine-bound file (from an earlier build) is not opened under
+        // this policy either: it reads as unreadable, and is kept.
+        let other = tempfile::tempdir().unwrap();
+        save_with(&ThroughKeystore(without_keyring()), other.path(), &sample_creds()).unwrap();
+        let before = fs::read(other.path().join(CREDENTIAL_FILE)).unwrap();
+        let err = load_with(&NoFallback(without_keyring()), other.path()).err().expect("load must fail");
+        assert!(matches!(err, CredentialError::Unreadable), "got {err}");
+        assert_eq!(fs::read(other.path().join(CREDENTIAL_FILE)).unwrap(), before, "kept");
     }
 
     /// No known folder, or a relative one, is refused: never the current

@@ -149,8 +149,20 @@ mod tests {
         }
         // SAFETY: CredReadW succeeded; `cred` is valid until CredFree.
         let persist = unsafe { (*cred).Persist };
+        // SAFETY: `cred` came from CredReadW and is freed once; it is not
+        // used afterwards.
         unsafe { CredFree(cred as *const c_void) };
         Some(persist)
+    }
+
+    /// Deletes the test entry when dropped, so a failing assertion does
+    /// not leave it in the user's Credential Manager.
+    struct Cleanup<'a>(&'a str);
+
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            let _ = delete_target(self.0);
+        }
     }
 
     /// Against the real Credential Manager of the user running the tests.
@@ -159,6 +171,7 @@ mod tests {
     fn round_trip_is_local_machine_and_delete_removes_it() {
         let target = test_target("round-trip");
         let _ = delete_target(&target);
+        let _cleanup = Cleanup(&target);
         assert!(read_target(&target).unwrap().is_none(), "no entry before the write");
 
         let key = [0x5au8; KEY_LEN];
@@ -183,6 +196,7 @@ mod tests {
     fn missing_entry_reads_as_none() {
         let target = test_target("missing");
         let _ = delete_target(&target);
+        let _cleanup = Cleanup(&target);
         assert!(read_target(&target).unwrap().is_none());
     }
 }

@@ -107,6 +107,9 @@ pub enum KeystoreError {
     /// on a platform without one ([`MACHINE_BOUND_FALLBACK`]), or for a
     /// store that is already keyring-bound.
     KeyringUnavailable(String),
+    /// A machine-bound store on a platform without the machine-bound key
+    /// ([`MACHINE_BOUND_FALLBACK`]): not opened.
+    MachineBoundRefused,
 }
 
 impl fmt::Display for KeystoreError {
@@ -115,6 +118,9 @@ impl fmt::Display for KeystoreError {
             KeystoreError::NoSource(msg) => write!(f, "keystore: no usable key source ({})", msg),
             KeystoreError::KeyringUnavailable(msg) => {
                 write!(f, "keystore: OS keyring unavailable, no fallback allowed ({})", msg)
+            }
+            KeystoreError::MachineBoundRefused => {
+                f.write_str("keystore: machine-bound stores are not opened on this platform")
             }
         }
     }
@@ -232,6 +238,21 @@ pub(crate) fn fetch_for_binding_with(
     src: &dyn Sources,
     binding: BindingMode,
 ) -> Result<MasterKey, KeystoreError> {
+    fetch_for_binding_with_policy(src, binding, MACHINE_BOUND_FALLBACK)
+}
+
+/// [`fetch_for_binding_with`] with the fallback policy given. Where the
+/// machine-bound key is not allowed (Windows), a machine-bound store is
+/// refused on load as well as on save: such a file can only come from an
+/// earlier development build.
+pub(crate) fn fetch_for_binding_with_policy(
+    src: &dyn Sources,
+    binding: BindingMode,
+    allow_machine_bound: bool,
+) -> Result<MasterKey, KeystoreError> {
+    if binding == BindingMode::MachineBound && !allow_machine_bound {
+        return Err(KeystoreError::MachineBoundRefused);
+    }
     match binding {
         BindingMode::Keyring => match src.keyring_read() {
             Ok(Some(key)) => Ok(MasterKey {
@@ -413,7 +434,7 @@ pub(crate) mod tests {
         let src = TestSources::no_keyring(attrs_with_machine_id(""));
         let err = fetch_or_create_master_key_with_policy(&src, true).err().expect("must fail");
         assert!(err.to_string().contains("no machine id"), "got {err}");
-        assert!(fetch_for_binding_with(&src, BindingMode::MachineBound).is_err());
+        assert!(fetch_for_binding_with_policy(&src, BindingMode::MachineBound, true).is_err());
     }
 
     /// Without the fallback (Windows), a keyring failure is an error, even
@@ -423,6 +444,17 @@ pub(crate) mod tests {
         let src = TestSources::no_keyring(attrs_with_machine_id(MACHINE_ID));
         let err = fetch_or_create_master_key_with_policy(&src, false).err().expect("must fail");
         assert!(matches!(err, KeystoreError::KeyringUnavailable(_)), "got {err}");
+    }
+
+    /// Without the fallback, a machine-bound store is refused on load.
+    #[test]
+    fn machine_bound_load_refused_without_fallback() {
+        let src = TestSources::no_keyring(attrs_with_machine_id(MACHINE_ID));
+        assert!(matches!(
+            fetch_for_binding_with_policy(&src, BindingMode::MachineBound, false),
+            Err(KeystoreError::MachineBoundRefused)
+        ));
+        assert!(fetch_for_binding_with_policy(&src, BindingMode::MachineBound, true).is_ok());
     }
 
     /// The platform policy: no fallback on Windows, a fallback elsewhere.
