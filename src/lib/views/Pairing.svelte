@@ -127,11 +127,12 @@
     {:else if step === 'success'}
       <div class="success-msg">Desktop paired! Session active.</div>
       {#if keyProtection === 'machine'}
-        <p class="key-warning">
+        <p class="key-warning" role="status">
           Your computer's keyring couldn't be reached, so this pairing is protected by a key worked
-          out from this computer's identity instead. Someone who can sign in as you, or read your
-          files, could open it. It moves to the keyring by itself once the keyring is available.
-          Settings › Device shows which key is in use.
+          out from details of this computer instead. Any program you run, an administrator, or
+          anyone with a copy of this computer's disk could open it. The next time this desktop
+          saves the pairing (when you end or extend a session, or pair again) while the keyring
+          works, it moves to the keyring. Settings › Device shows which key is in use.
         </p>
       {/if}
       <button class="btn primary" onclick={() => window.location.reload()}>Continue</button>

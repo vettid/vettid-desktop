@@ -868,6 +868,7 @@ pub async fn get_status(state: State<'_, AppState>) -> Result<AuthStatus, String
         use crate::credential::store;
         match store::default_config_dir() {
             Ok(dir) => store::stored_key_protection(&dir),
+            // With no known folder nothing can have been saved.
             Err(_) => "none",
         }
     }

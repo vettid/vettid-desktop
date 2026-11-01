@@ -24,11 +24,13 @@
   } | null>(null);
 
   // Which key protects the saved pairing (#11). Read from the file's
-  // header by the backend: "keyring", "machine", "none" or "unknown".
+  // header by the backend: "keyring", "machine", "none" or "unknown";
+  // "unchecked" when get_status itself failed.
   const keyProtectionText: Record<string, string> = {
     keyring: "Your computer's keyring",
     machine: 'This computer only (no keyring)',
     unknown: "Can't tell",
+    unchecked: "Couldn't check",
   };
 
   let loading = $state(true);
@@ -63,7 +65,7 @@
         binaryFingerprint: '',
         machineFingerprint: '',
         appVersion: '0.1.0',
-        keyProtection: 'unknown',
+        keyProtection: 'unchecked',
       };
     } finally {
       loading = false;
@@ -153,19 +155,26 @@
               {#if deviceInfo.keyProtection === 'keyring'}
                 <p class="hint inline">
                   The key that opens this desktop's saved pairing is kept in your computer's
-                  keyring, which other accounts on this computer can't read.
+                  keyring, tied to your account. A copy of the file or the disk doesn't open it
+                  without your sign-in. Programs you run, and an administrator of this computer,
+                  may still be able to read it.
                 </p>
               {:else if deviceInfo.keyProtection === 'machine'}
-                <p class="hint inline warn">
+                <p class="hint inline warn" role="status">
                   No keyring was available when the pairing was saved, so its key is worked out
-                  from this computer's identity. Someone who can sign in as you, or read your
-                  files, could open the saved pairing. It moves to the keyring by itself the
-                  next time the keyring is available.
+                  from details of this computer. Any program you run, an administrator, or anyone
+                  with a copy of this computer's disk could open the saved pairing. The next time
+                  this desktop saves the pairing (when you end or extend a session, or pair again)
+                  while the keyring works, it moves to the keyring.
+                </p>
+              {:else if deviceInfo.keyProtection === 'unchecked'}
+                <p class="hint inline warn" role="status">
+                  This desktop couldn't check which key protects the saved pairing.
                 </p>
               {:else}
-                <p class="hint inline warn">
-                  The saved pairing can't be read, so this desktop can't tell which key protects
-                  it.
+                <p class="hint inline warn" role="status">
+                  The saved pairing can't be read here, so this desktop can't tell which key
+                  protects it.
                 </p>
               {/if}
             </div>
