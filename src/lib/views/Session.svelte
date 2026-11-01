@@ -61,8 +61,10 @@
     busyLabel = 'Ending your session…';
     statusMessage = '';
     try {
-      await invoke('end_session');
-      statusMessage = 'Session ended.';
+      // The session always ends in this run; `notice` says when that
+      // couldn't be recorded on this computer (#26).
+      const result = await invoke<{ notice: string | null }>('end_session');
+      statusMessage = result.notice ?? 'Session ended.';
       // Refresh the Svelte store immediately so the StatusBar pill +
       // App.svelte routing pick up the expired state right away
       // instead of waiting on the 30s poll. Without this the user
