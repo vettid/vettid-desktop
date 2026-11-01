@@ -576,10 +576,13 @@ fn rename_by_handle(file: HANDLE, folder: HANDLE, name: &str) -> Result<(), AclE
     const ATTEMPTS: u32 = 5;
 
     let name_w: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().collect();
+    // A plain Win32 file name: no separator, stream, wildcard or control
+    // character, and no trailing dot or space (which NT keeps but Win32
+    // can't open).
     if name_w.is_empty()
-        || name_w.iter().any(|&c| c == u16::from(b'\\') || c == u16::from(b'/') || c == u16::from(b':') || c == 0)
-        || name == "."
-        || name == ".."
+        || name_w.iter().any(|&c| c < 0x20 || "\\/:*?\"<>|".encode_utf16().any(|bad| bad == c))
+        || name.ends_with('.')
+        || name.ends_with(' ')
     {
         return Err(failed("rename: not a plain file name"));
     }
@@ -782,8 +785,12 @@ fn write_private_file_with(
     // private; if that can't be confirmed, say so plainly rather than
     // "saved" or "failed".
     let confirm = || -> Result<(), AclError> {
-        if !is_directly_inside(&final_path(handle)?, &folder.final_path) {
+        let now = final_path(handle)?;
+        if !is_directly_inside(&now, &folder.final_path) {
             return Err(failed("not in the pairing folder"));
+        }
+        if now.rsplit_once('\\').map(|(_, n)| n) != Some(name) {
+            return Err(failed("not under the pairing's name"));
         }
         check_handle_with(handle, &user)
     };
@@ -1045,7 +1052,7 @@ mod tests {
     /// The rename takes a plain name inside the held folder, nothing else.
     #[test]
     fn rename_by_handle_takes_only_a_plain_name() {
-        for name in ["", "a\\b", "..\\x", "a/b", "a\0b", "a:b", ".", ".."] {
+        for name in ["", "a\\b", "..\\x", "a/b", "a\0b", "a:b", ".", "..", "a*", "a?", "a\"b", "a<", "a>", "a|", "a.", "a ", "a\tb"] {
             assert_eq!(
                 rename_by_handle(ptr::null_mut(), ptr::null_mut(), name).err(),
                 Some(failed("rename: not a plain file name")),

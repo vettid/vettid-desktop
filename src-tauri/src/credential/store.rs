@@ -350,15 +350,41 @@ enum FolderCheck {
 /// the pairing; it still couldn't read the `0600` file. The folder's own
 /// path is followed if it is a symlink: what matters is the folder the
 /// file goes in.
+///
+/// A folder the user owns but group or others can write to is tightened
+/// to `0700` here, and the check is made again: builds before #27 made the
+/// folder `0777 & ~umask`, which is `0775` under the common user-private-
+/// group umask `002`. Only a folder owned by another account, or one that
+/// can't be tightened, is refused.
+///
+/// Not seen by this check: a macOS extended ACL (`chmod +a`) that grants
+/// write without a mode bit. On Linux a POSIX ACL entry for another user
+/// raises the group-class bits, so it is seen.
 #[cfg(unix)]
 fn unix_folder_check(config_dir: &Path) -> Result<(), FolderCheck> {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let meta = fs::metadata(config_dir).map_err(FolderCheck::Failed)?;
     if !meta.is_dir() {
         return Err(FolderCheck::Failed(std::io::Error::other("not a folder")));
     }
     // SAFETY: geteuid has no preconditions and cannot fail.
     let me = unsafe { libc::geteuid() };
+    if meta.uid() != me {
+        return Err(FolderCheck::NotPrivate("is owned by another account"));
+    }
+    if meta.mode() & 0o022 == 0 {
+        return Ok(());
+    }
+    log::warn!(
+        "Credential store: {} could be written by other accounts (mode {:o}); setting it to 0700",
+        config_dir.display(),
+        meta.mode() & 0o7777
+    );
+    if let Err(e) = fs::set_permissions(config_dir, fs::Permissions::from_mode(0o700)) {
+        log::warn!("Credential store: could not tighten {}: {}", config_dir.display(), e);
+    }
+    // Confirm, rather than trust the chmod.
+    let meta = fs::metadata(config_dir).map_err(FolderCheck::Failed)?;
     if meta.uid() != me {
         return Err(FolderCheck::NotPrivate("is owned by another account"));
     }
@@ -393,6 +419,22 @@ fn acl_error(path: &Path, e: super::winacl::AclError) -> CredentialError {
 /// `MasterKey` returned by the keystore zeroizes on drop.
 pub fn save(config_dir: &Path, creds: &ConnectionCredentials) -> Result<BindingMode, CredentialError> {
     save_with(&SystemKeys, config_dir, creds)
+}
+
+/// Like [`save`], for updating a pairing that is already saved (clearing
+/// the session at end_session). Fails with [`CredentialError::NotFound`],
+/// writing nothing and creating no folder, if `connection.enc` isn't there
+/// when the write lock is taken: a log-out that wiped the pairing must not
+/// be undone by an update that loaded it just before (#28).
+pub fn save_existing(config_dir: &Path, creds: &ConnectionCredentials) -> Result<BindingMode, CredentialError> {
+    save_with_mode(&SystemKeys, config_dir, creds, Mode::UpdateExisting)
+}
+
+/// Whether a save may create the pairing or only update it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    CreateOrReplace,
+    UpdateExisting,
 }
 
 /// Read and decrypt credentials from `connection.enc` in `config_dir`.
@@ -475,11 +517,12 @@ fn load_with(
     }
 }
 
-/// One writer at a time in this process: a save or a delete removes
-/// temporary files a crashed earlier save left behind, and must not remove
-/// another save's while it is running (e.g. end_session racing a pairing,
-/// or a log-out racing a save, #28). The app runs as a single instance, so
-/// this covers every writer.
+/// One writer at a time in this process: a save, a delete or a wipe
+/// removes temporary files a crashed earlier save left behind, and must not
+/// remove another save's while it is running (e.g. end_session racing a
+/// pairing). A wipe holding it also can't be undone by a save that started
+/// first: [`save_existing`] fails once the file is gone (#28). The app runs
+/// as a single instance, so this covers every writer.
 fn writer_lock() -> std::sync::MutexGuard<'static, ()> {
     static WRITER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     WRITER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -490,7 +533,19 @@ fn save_with(
     config_dir: &Path,
     creds: &ConnectionCredentials,
 ) -> Result<BindingMode, CredentialError> {
+    save_with_mode(keys, config_dir, creds, Mode::CreateOrReplace)
+}
+
+fn save_with_mode(
+    keys: &dyn KeySource,
+    config_dir: &Path,
+    creds: &ConnectionCredentials,
+    mode: Mode,
+) -> Result<BindingMode, CredentialError> {
     let _one_at_a_time = writer_lock();
+    if mode == Mode::UpdateExisting && !exists(config_dir) {
+        return Err(CredentialError::NotFound(config_dir.join(CREDENTIAL_FILE).display().to_string()));
+    }
 
     let master = keys.master_for_save()?;
     // SECURITY: never downgrade. If the store on disk is keyring-bound
@@ -607,6 +662,31 @@ pub fn exists(config_dir: &Path) -> bool {
 /// Delete the credential file from `config_dir`.
 pub fn delete(config_dir: &Path) -> Result<(), CredentialError> {
     let _one_at_a_time = writer_lock();
+    delete_locked(config_dir)
+}
+
+/// Remove `config_dir` and everything in it, for log-out, holding the
+/// write lock so no save runs at the same time (#28). If the folder can't
+/// be removed, the pairing file itself is removed. Ok only if no pairing
+/// file is left; the caller must not report "removed" otherwise.
+pub fn wipe(config_dir: &Path) -> Result<(), CredentialError> {
+    let _one_at_a_time = writer_lock();
+    if config_dir.exists() {
+        if let Err(e) = fs::remove_dir_all(config_dir) {
+            log::warn!("Credential store: could not remove {}: {}", config_dir.display(), e);
+            delete_locked(config_dir)?;
+        }
+    }
+    if exists(config_dir) {
+        return Err(CredentialError::IoError(format!(
+            "{} is still there",
+            config_dir.join(CREDENTIAL_FILE).display()
+        )));
+    }
+    Ok(())
+}
+
+fn delete_locked(config_dir: &Path) -> Result<(), CredentialError> {
     let path = config_dir.join(CREDENTIAL_FILE);
     // Temporary files from an interrupted save hold the same ciphertext.
     let prefix = format!("{CREDENTIAL_FILE}.tmp-");
@@ -1186,50 +1266,75 @@ mod tests {
         assert_eq!(privacy_warning(dir.path(), BindingMode::Keyring), None);
     }
 
-    /// Unix (#28): an existing folder others can write to is refused at
-    /// save, and the pairing in it is kept as it was.
+    /// Unix (#28): the user's own folder that others can write to (as
+    /// earlier builds made it under umask 002) is tightened to 0700 and the
+    /// save goes through. The refusal is for another owner, which needs a
+    /// second account to test.
     #[cfg(unix)]
     #[test]
-    fn unix_save_refuses_a_folder_others_can_write_and_keeps_the_file() {
+    fn unix_save_tightens_the_users_own_folder_others_can_write() {
         use std::os::unix::fs::PermissionsExt;
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
         let keys = ThroughKeystore(with_keyring());
         save_with(&keys, &config_dir, &sample_creds()).unwrap();
-        let file = config_dir.join(CREDENTIAL_FILE);
-        let before = fs::read(&file).unwrap();
-        for mode in [0o720, 0o702, 0o777] {
-            fs::set_permissions(&config_dir, fs::Permissions::from_mode(mode)).unwrap();
-            let err = save_with(&keys, &config_dir, &sample_creds()).err().expect("must refuse");
-            assert!(matches!(err, CredentialError::NotPrivate), "{mode:o}: got {err}");
-            assert_eq!(err.to_string(), NOT_PRIVATE_NOTICE);
-            assert!(matches!(ensure_config_dir(&config_dir), Err(CredentialError::NotPrivate)));
-            assert_eq!(fs::read(&file).unwrap(), before, "{mode:o}: kept");
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        for wide in [0o775, 0o720, 0o702, 0o777, 0o1777] {
+            fs::set_permissions(&config_dir, fs::Permissions::from_mode(wide)).unwrap();
+            save_with(&keys, &config_dir, &sample_creds()).expect("tightened, then saved");
+            assert_eq!(mode(&config_dir), 0o700, "{wide:o}");
+            assert!(load_with(&keys, &config_dir).is_ok());
         }
-        // Read and search access for others is not a refusal: 0755 is how
-        // earlier builds made the folder, and the file is 0600.
+        // Read and search access for others is not a refusal (the file is
+        // 0600), and the folder is left as it is.
         fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o755)).unwrap();
         save_with(&keys, &config_dir, &sample_creds()).expect("0755 is accepted");
+        assert_eq!(fs::metadata(&config_dir).unwrap().permissions().mode() & 0o7777, 0o755);
     }
 
-    /// Unix (#28): a private file in a folder others can write to gives the
-    /// folder warning; a file others can read gives the stronger one.
+    /// Unix (#28): at unlock, the user's own folder that others can write
+    /// to is tightened and gives no warning; a file others can read still
+    /// gives the stronger one. (The folder warning itself is for another
+    /// owner, which needs a second account to test.)
     #[cfg(unix)]
     #[test]
-    fn unix_folder_others_can_write_gives_the_folder_warning() {
+    fn unix_own_folder_others_can_write_is_tightened_at_unlock() {
         use std::os::unix::fs::PermissionsExt;
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
         save_with(&ThroughKeystore(with_keyring()), &config_dir, &sample_creds()).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
         fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o770)).unwrap();
-        assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), Some(NOT_PRIVATE_FOLDER_NOTICE));
-        assert_eq!(privacy_warning(&config_dir, BindingMode::MachineBound), Some(NOT_PRIVATE_FOLDER_NOTICE));
+        assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), None);
+        assert_eq!(mode(&config_dir), 0o700);
         let file = config_dir.join(CREDENTIAL_FILE);
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o770)).unwrap();
         assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), Some(NOT_PRIVATE_KEYRING_NOTICE));
-        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), None);
+    }
+
+    /// An update after a wipe writes nothing and doesn't recreate the
+    /// folder (#28): log-out must not be undone by end_session.
+    #[test]
+    fn update_after_a_wipe_writes_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = ThroughKeystore(with_keyring());
+        assert!(matches!(
+            save_with_mode(&keys, &config_dir, &sample_creds(), Mode::UpdateExisting),
+            Err(CredentialError::NotFound(_))
+        ));
+        assert!(!config_dir.exists(), "no folder created");
+        save_with(&keys, &config_dir, &sample_creds()).unwrap();
+        save_with_mode(&keys, &config_dir, &sample_creds(), Mode::UpdateExisting).expect("update");
+        wipe(&config_dir).expect("wipe");
+        assert!(!config_dir.exists());
+        assert!(matches!(
+            save_with_mode(&keys, &config_dir, &sample_creds(), Mode::UpdateExisting),
+            Err(CredentialError::NotFound(_))
+        ));
+        assert!(!config_dir.exists(), "not recreated");
+        assert!(wipe(&config_dir).is_ok(), "nothing there is wiped");
     }
 
     /// The key protection shown in Settings follows the file's header.
