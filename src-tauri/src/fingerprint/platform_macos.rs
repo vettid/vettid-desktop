@@ -7,7 +7,7 @@ use std::process::Command;
 
 // Re-export shared types from platform_linux (they're platform-agnostic)
 pub use super::platform_linux::{
-    compute_machine_bound_key, compute_machine_fingerprint, compute_machine_fingerprint_hex,
+    compute_machine_bound_key, compute_machine_fingerprint, compute_storage_binding, compute_machine_fingerprint_hex,
     FingerprintError, MachineAttributes,
 };
 

@@ -3,36 +3,41 @@
 //! Two values are derived from the same machine attributes, under different
 //! HMAC labels:
 //!
-//! - the **platform key** ([`derive_platform_key`]): the machine fingerprint.
-//!   It is not secret: Settings displays it, pairing sends it to the vault,
-//!   and the credential store mixes it into its AEAD associated data so a
-//!   blob only opens on the machine that wrote it;
+//! - the **platform key** ([`derive_platform_key`]): the machine fingerprint
+//!   over all five attributes. It is not secret: Settings displays it and
+//!   pairing sends it to the vault;
+//! - the **storage binding** ([`derive_storage_binding`]): from the machine
+//!   id alone (#14). The credential store mixes it into its AEAD associated
+//!   data, so a blob only opens on the machine that wrote it, and a
+//!   rename, a dock or a new disk doesn't stop it opening;
 //! - the **machine-bound key** ([`machine_bound_key_from`]): the credential
-//!   store's master key when the OS keyring is unavailable. It is key
-//!   material, but anyone who can read the same attributes on this machine
-//!   can recompute it.
+//!   store's master key when the OS keyring is unavailable, derived from the
+//!   machine id alone (#14). It is key material, but anyone who can read the
+//!   machine id on this machine can recompute it.
 //!
-//! Both require at least 3 of 5 machine attributes to be non-empty to prevent
-//! weak fingerprints in minimal environments (containers, early-boot, etc.).
+//! The fingerprint requires at least 3 of 5 machine attributes to be
+//! non-empty to prevent weak fingerprints in minimal environments
+//! (containers, early-boot, etc.). The machine-bound key requires a real
+//! machine id instead.
 
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "linux")]
 use super::platform_linux::{
-    collect_machine_attributes, compute_machine_bound_key, compute_machine_fingerprint,
+    collect_machine_attributes, compute_machine_bound_key, compute_machine_fingerprint, compute_storage_binding,
     FingerprintError, MachineAttributes,
 };
 
 #[cfg(target_os = "macos")]
 use super::platform_macos::{
     collect_machine_attributes_macos as collect_machine_attributes, compute_machine_bound_key,
-    compute_machine_fingerprint, FingerprintError, MachineAttributes,
+    compute_machine_fingerprint, compute_storage_binding, FingerprintError, MachineAttributes,
 };
 
 #[cfg(windows)]
 use super::platform_windows::{
     collect_machine_attributes_windows as collect_machine_attributes, compute_machine_bound_key,
-    compute_machine_fingerprint, FingerprintError, MachineAttributes,
+    compute_machine_fingerprint, compute_storage_binding, FingerprintError, MachineAttributes,
 };
 
 /// Minimum number of non-empty machine attributes required for key derivation.
@@ -59,6 +64,27 @@ pub fn derive_platform_key() -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
     Ok(Zeroizing::new(compute_machine_fingerprint(&attrs)))
 }
 
+/// This machine's storage binding, for the credential store's AEAD
+/// associated data (#14, owner decision (a), 2026-11-01): derived from the
+/// machine id alone, under its own label.
+///
+/// Requires a real machine id, like the machine-bound key: a placeholder
+/// (`uninitialized`, all zeros) can be the same on many machines, and then
+/// it wouldn't bind the file to this one. Without it nothing is saved or
+/// opened, on either the keyring or the machine-bound path.
+pub fn derive_storage_binding() -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+    storage_binding_from(&collect_machine_attributes()?)
+}
+
+pub(crate) fn storage_binding_from(
+    attrs: &MachineAttributes,
+) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+    if !machine_id_is_usable(&attrs.machine_id) {
+        return Err(FingerprintError::MissingMachineId);
+    }
+    Ok(Zeroizing::new(compute_storage_binding(attrs)))
+}
+
 /// This machine's attributes, from this platform's collector. The keystore
 /// derives the machine-bound key from them with [`machine_bound_key_from`].
 pub(crate) fn collect_attributes() -> Result<MachineAttributes, FingerprintError> {
@@ -66,17 +92,16 @@ pub(crate) fn collect_attributes() -> Result<MachineAttributes, FingerprintError
 }
 
 /// The machine-bound storage key for `attrs`: the credential store's master
-/// key when the OS keyring is unavailable. Same attributes as
-/// [`derive_platform_key`], under a different HMAC label.
+/// key when the OS keyring is unavailable. It is derived from the machine
+/// id alone, under its own HMAC label (#14, owner decision (a),
+/// 2026-11-01). The hostname, CPU, disk serial and MAC are not used: they
+/// add no secrecy the machine id doesn't give, and they change.
 ///
 /// SECURITY: [`derive_platform_key`] returns a value that is displayed and
 /// sent to the vault, so it must never be used as this key.
 ///
-/// Requires a real machine id as well as the 3-attribute minimum
-/// (owner decision, 2026-10-31). Without the machine id, the remaining
-/// attributes can be hostname, CPU and MAC: the hostname is sent at
-/// pairing, CPU models are few and a MAC can be searched, so the key could
-/// be guessed offline. Failing here means nothing is written: with no
+/// Requires a real machine id (owner decision, 2026-10-31): not empty and
+/// not a placeholder. Failing here means nothing is written: with no
 /// keyring and no machine id, the desktop cannot store a pairing.
 pub(crate) fn machine_bound_key_from(
     attrs: &MachineAttributes,
@@ -84,15 +109,6 @@ pub(crate) fn machine_bound_key_from(
     if !machine_id_is_usable(&attrs.machine_id) {
         return Err(FingerprintError::MissingMachineId);
     }
-
-    let count = attrs.attribute_count();
-    if count < MIN_ATTRIBUTES {
-        return Err(FingerprintError::InsufficientAttributes {
-            found: count,
-            required: MIN_ATTRIBUTES,
-        });
-    }
-
     Ok(Zeroizing::new(compute_machine_bound_key(attrs)))
 }
 
@@ -186,19 +202,35 @@ mod tests {
         }
     }
 
+    /// The storage binding needs a real machine id, and nothing else.
     #[test]
-    fn machine_bound_key_with_a_machine_id_still_needs_three_attributes() {
-        let attrs = MachineAttributes {
+    fn storage_binding_needs_a_real_machine_id_only() {
+        let mut attrs = fixed_attrs();
+        let binding = storage_binding_from(&attrs).expect("binding");
+        attrs.hostname = String::new();
+        attrs.cpu = String::new();
+        attrs.disk_serial = String::new();
+        attrs.mac_address = String::new();
+        assert_eq!(*storage_binding_from(&attrs).unwrap(), *binding);
+        for placeholder in ["", "uninitialized", "00000000-0000-0000-0000-000000000000"] {
+            attrs.machine_id = placeholder.to_string();
+            assert!(matches!(storage_binding_from(&attrs), Err(FingerprintError::MissingMachineId)));
+        }
+    }
+
+    /// #14: a real machine id is enough; the other attributes may be
+    /// missing or change, and the key stays the same.
+    #[test]
+    fn machine_bound_key_needs_only_a_machine_id() {
+        let only_id = MachineAttributes {
             hostname: String::new(),
             machine_id: "4c4c4544003a3610804db7c04f4d3732".to_string(),
-            cpu: "Test CPU".to_string(),
+            cpu: String::new(),
             disk_serial: String::new(),
             mac_address: String::new(),
         };
-        assert!(matches!(
-            machine_bound_key_from(&attrs),
-            Err(FingerprintError::InsufficientAttributes { found: 2, required: 3 })
-        ));
+        let key = machine_bound_key_from(&only_id).expect("a machine id is enough");
+        assert_eq!(*key, *machine_bound_key_from(&fixed_attrs()).unwrap());
     }
 
     #[test]
@@ -241,15 +273,16 @@ mod tests {
         assert_eq!(bound, compute_machine_bound_key(&attrs));
     }
 
-    /// On this machine, both derivations succeed or fail together, except
-    /// that the machine-bound key alone is refused without a machine id.
+    /// On this machine the two derivations never coincide. Either may be
+    /// unavailable on its own: the fingerprint needs three attributes, the
+    /// machine-bound key a real machine id.
     #[test]
     fn test_derivations_agree_on_availability() {
         let bound = collect_attributes().and_then(|attrs| machine_bound_key_from(&attrs));
         match (derive_platform_key(), bound) {
             (Ok(platform), Ok(bound)) => assert_ne!(*platform, *bound),
             (_, Err(FingerprintError::MissingMachineId)) => {}
-            (Err(FingerprintError::InsufficientAttributes { .. }), Err(_)) => {}
+            (Err(FingerprintError::InsufficientAttributes { .. }), _) => {}
             (p, b) => panic!(
                 "derivations disagree: platform ok={}, machine-bound ok={}",
                 p.is_ok(),
@@ -272,6 +305,11 @@ mod tests {
         );
         let key = machine_bound_key_from(&attrs).expect("machine-bound key");
         assert!(key.iter().any(|&b| b != 0));
+        // Every save and load needs the storage binding (#14), keyring
+        // path included.
+        let binding = derive_storage_binding().expect("storage binding");
+        assert_ne!(*binding, *key);
+        assert_eq!(*binding, *derive_storage_binding().unwrap());
     }
 
     #[test]

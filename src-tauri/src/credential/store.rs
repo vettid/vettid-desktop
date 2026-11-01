@@ -455,8 +455,9 @@ enum Mode {
 /// A machine-bound file that does not decrypt is reported as
 /// [`CredentialError::Unreadable`]. It is deleted only if it was sealed by an
 /// earlier build under the public fingerprint (it opens with that as the
-/// key); otherwise it is kept, since a changed machine attribute may change
-/// back. A keyring-bound file that does not decrypt is left in place.
+/// key); otherwise it is kept. A keyring-bound file that does not decrypt
+/// is left in place. Files sealed before #14, when the key and the AAD
+/// covered all five machine attributes, don't open: the person pairs again.
 pub fn load(config_dir: &Path) -> Result<(ConnectionCredentials, BindingMode), CredentialError> {
     load_with(&SystemKeys, config_dir)
 }
@@ -469,8 +470,14 @@ pub(crate) trait KeySource {
     fn master_for_save(&self) -> Result<MasterKey, KeystoreError>;
     /// The master key for a store sealed under `binding`.
     fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError>;
-    /// This machine's platform key, mixed into the AAD.
+    /// This machine's storage binding, mixed into the AAD (#14).
     fn platform_key(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError>;
+    /// The public machine fingerprint. Only used to recognize a file an
+    /// earlier build sealed with the fingerprint as its key, and under it
+    /// in the AAD. Tests use the AAD value.
+    fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+        self.platform_key()
+    }
 }
 
 /// The keyring and this machine's attributes.
@@ -484,6 +491,9 @@ impl KeySource for SystemKeys {
         keystore::fetch_for_binding(binding)
     }
     fn platform_key(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+        platform_key::derive_storage_binding()
+    }
+    fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
         platform_key::derive_platform_key()
     }
 }
@@ -503,11 +513,15 @@ fn load_with(
         Err(CredentialError::CryptoError(e)) if binding == BindingMode::MachineBound => {
             // Delete the file only when it is positively one written by an
             // earlier build, which used the public fingerprint as its key.
-            // Any other failure may be a machine attribute that changed and
-            // will change back (a disk enumerated in another order, a dock's
-            // MAC, a DHCP hostname), so the file is kept: pairing again or
-            // "Remove this desktop" replaces it.
-            if decrypt_store(&store, &platform_key, &platform_key).is_ok() {
+            // Any other failure is kept: a file sealed before #14 (key and
+            // AAD over all five attributes), or a machine id that changed
+            // and may change back. Pairing again or "Remove this desktop"
+            // replaces it.
+            let sealed_by_old_build = keys
+                .legacy_fingerprint()
+                .map(|fp| decrypt_store(&store, &fp, &fp).is_ok())
+                .unwrap_or(false);
+            if sealed_by_old_build {
                 log::warn!(
                     "credential store: machine-bound file was sealed under the public fingerprint by an earlier build; deleting it"
                 );
@@ -933,8 +947,8 @@ fn read_store(config_dir: &Path) -> Result<EncryptedStore, CredentialError> {
 }
 
 /// Compute the AEAD associated-data used to bind a v3 credential blob
-/// to its origin machine. The 32-byte platform key (HMAC of machine
-/// attributes) is mixed in along with the binding mode and a version
+/// to its origin machine. The 32-byte storage binding (an HMAC of the
+/// machine id, #14) is mixed in along with the binding mode and a version
 /// label. A blob whose AAD doesn't match the current machine will
 /// fail to decrypt even when the master key is correct — closing the
 /// "copied the file + the keyring entry to my own laptop" path.

@@ -25,7 +25,16 @@ const PLATFORM_KEY_LABEL: &str = "vettid-desktop-platform-v1";
 /// SECURITY: must differ from `PLATFORM_KEY_LABEL`. The fingerprint computed
 /// under that label is public: it is shown in Settings and sent to the vault
 /// at pairing. A key computed under the same label would be that same value.
-const MACHINE_BOUND_KEY_LABEL: &str = "vettid-desktop-machine-bound-key-v1";
+///
+/// v2 (#14, owner decision (a), 2026-11-01): the key is computed from the
+/// machine id alone. v1 covered all five attributes; files sealed under it
+/// no longer open and are reported as unreadable.
+const MACHINE_BOUND_KEY_LABEL: &str = "vettid-desktop-machine-bound-key-v2";
+
+/// HMAC domain label for the storage binding: the machine value the
+/// credential store mixes into its AEAD associated data (#14, owner
+/// decision (a), 2026-11-01). Must differ from the other two labels.
+const STORAGE_BINDING_LABEL: &str = "vettid-desktop-storage-binding-v1";
 
 /// Virtual network interface prefixes to skip when collecting MAC addresses.
 /// These are created by container runtimes and virtualization tools and are
@@ -160,14 +169,35 @@ pub fn compute_machine_fingerprint_hex(attrs: &MachineAttributes) -> String {
     hex::encode(compute_machine_fingerprint(attrs))
 }
 
-/// Compute the machine-bound storage key from machine attributes.
+/// Compute the machine-bound storage key from the machine id (#14).
 ///
-/// Same canonical input as [`compute_machine_fingerprint`], under a different
-/// HMAC label, so the key cannot be computed from the fingerprint.
+/// Only the machine id goes in, trimmed, in the same canonical `name:value`
+/// form as the fingerprint, under its own HMAC label. The other attributes
+/// (hostname, CPU, disk serial, MAC) add no secrecy that the machine id
+/// doesn't already give, and they change: a hostname from DHCP, a dock's
+/// MAC, a USB disk that enumerates first. Each change used to lock the
+/// person out of the saved pairing.
 ///
 /// SECURITY: the result is key material. Never display, log or send it.
+/// The caller ([`super::platform_key::machine_bound_key_from`]) refuses an
+/// empty or placeholder machine id.
 pub fn compute_machine_bound_key(attrs: &MachineAttributes) -> [u8; 32] {
-    hmac_fields(MACHINE_BOUND_KEY_LABEL, &attrs.fields())
+    let mut fields = BTreeMap::new();
+    fields.insert("machine_id", attrs.machine_id.trim());
+    hmac_fields(MACHINE_BOUND_KEY_LABEL, &fields)
+}
+
+/// Compute the storage binding from the machine id: the value the
+/// credential store mixes into its AEAD associated data, so a saved pairing
+/// opens only on the machine that wrote it (#14).
+///
+/// Only the machine id goes in, like the machine-bound key, but under its
+/// own label: the hostname, CPU, disk serial and MAC change (a rename, a
+/// dock, a USB disk), and each change used to lock the person out.
+pub fn compute_storage_binding(attrs: &MachineAttributes) -> [u8; 32] {
+    let mut fields = BTreeMap::new();
+    fields.insert("machine_id", attrs.machine_id.trim());
+    hmac_fields(STORAGE_BINDING_LABEL, &fields)
 }
 
 // --- Internal helpers ---
@@ -403,15 +433,74 @@ mod tests {
 
         // Known answer for these test inputs: changing the label or the
         // canonical format would orphan every machine-bound store.
-        assert_eq!(
+        assert_eq!(hex::encode(key), KNOWN_MACHINE_BOUND_KEY);
+        // Not the v1 key (all five attributes), which no longer opens.
+        assert_ne!(
             hex::encode(key),
             "a2f09ada1d061c08ff14a447c3a24c31b47096f208d3e49b67dcc7418ef85efe"
         );
 
+        // A different machine id gives a different key.
         let mut other = attrs.clone();
-        other.hostname = "otherhost".to_string();
+        other.machine_id = "other-machine-id".to_string();
         assert_ne!(key, compute_machine_bound_key(&other));
     }
+
+    /// #14: only the machine id goes into the machine-bound key, so the
+    /// unstable attributes can change without locking the person out.
+    /// Surrounding whitespace in the machine id doesn't matter either.
+    #[test]
+    fn test_machine_bound_key_depends_only_on_the_machine_id() {
+        let attrs = MachineAttributes {
+            hostname: "testhost".to_string(),
+            machine_id: "test-machine-id".to_string(),
+            cpu: "Test CPU".to_string(),
+            disk_serial: "TEST-SERIAL".to_string(),
+            mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+        };
+        let key = compute_machine_bound_key(&attrs);
+        let changed = MachineAttributes {
+            hostname: "dhcp-host-17".to_string(),
+            machine_id: "  test-machine-id\n".to_string(),
+            cpu: "Other CPU".to_string(),
+            disk_serial: String::new(),
+            mac_address: "11:22:33:44:55:66".to_string(),
+        };
+        assert_eq!(key, compute_machine_bound_key(&changed));
+        // The fingerprint still covers every attribute.
+        assert_ne!(compute_machine_fingerprint(&attrs), compute_machine_fingerprint(&changed));
+    }
+
+    /// The storage binding uses the machine id alone too, under its own
+    /// label: not the fingerprint and not the machine-bound key.
+    #[test]
+    fn test_storage_binding_depends_only_on_the_machine_id_and_is_distinct() {
+        let attrs = MachineAttributes {
+            hostname: "testhost".to_string(),
+            machine_id: "test-machine-id".to_string(),
+            cpu: "Test CPU".to_string(),
+            disk_serial: "TEST-SERIAL".to_string(),
+            mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+        };
+        let binding = compute_storage_binding(&attrs);
+        assert_eq!(hex::encode(binding), KNOWN_STORAGE_BINDING);
+        assert_ne!(binding, compute_machine_bound_key(&attrs));
+        assert_ne!(binding, compute_machine_fingerprint(&attrs));
+        let mut renamed = attrs.clone();
+        renamed.hostname = "renamed-pc".to_string();
+        renamed.mac_address = "11:22:33:44:55:66".to_string();
+        assert_eq!(binding, compute_storage_binding(&renamed));
+        renamed.machine_id = "other-machine-id".to_string();
+        assert_ne!(binding, compute_storage_binding(&renamed));
+    }
+
+    /// The storage binding for the fixed test attributes (label
+    /// `vettid-desktop-storage-binding-v1`, `machine_id:test-machine-id`).
+    const KNOWN_STORAGE_BINDING: &str = "b195433bf62655ddd3f4221240424f5b367bb82ab05e5bcc9c6437b6e283cb0b";
+
+    /// The machine-bound key for the fixed test attributes above (label v2,
+    /// `machine_id:test-machine-id`).
+    const KNOWN_MACHINE_BOUND_KEY: &str = "d79ccc3b3fef7b50525c4279e4dce7c28b789623259242e739f372641efa1c85";
 
     #[test]
     fn test_hex_encoding() {

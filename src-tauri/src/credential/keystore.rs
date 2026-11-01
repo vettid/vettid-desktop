@@ -17,8 +17,8 @@
 //!    item) can be read by any process of that user.
 //! 2. **Machine-bound fallback** (`platform_key`). If the keyring
 //!    isn't available (kiosk Linux, missing Secret Service daemon,
-//!    locked Keychain on macOS first launch), we derive a key from
-//!    machine attributes via `platform_key::machine_bound_key_from`. It uses its
+//!    locked Keychain on macOS first launch), we derive a key from the
+//!    machine id via `platform_key::machine_bound_key_from` (#14). It uses its
 //!    own HMAC label, so it is not the machine fingerprint that is
 //!    displayed and sent at pairing.
 //!    A binding mode marker lands on the encrypted store so callers
@@ -63,11 +63,11 @@ pub enum BindingMode {
     /// theft alone can't decrypt; the attacker also needs the user's
     /// OS account.
     Keyring,
-    /// Key derived from machine attributes (no keyring available).
-    /// Weaker than the keyring: anyone who can read this machine's
-    /// attributes can re-derive the key. That includes any local user
-    /// and anyone holding a full disk image, since the machine id and
-    /// hostname are stored on the disk itself. It only protects
+    /// Key derived from the machine id (no keyring available, #14).
+    /// Weaker than the keyring: anyone who can read this machine's id
+    /// can re-derive the key. That includes any local user and anyone
+    /// holding a full disk image, since the machine id is stored on the
+    /// disk itself. It only protects
     /// `connection.enc` copied on its own, without the rest of the disk.
     MachineBound,
 }
