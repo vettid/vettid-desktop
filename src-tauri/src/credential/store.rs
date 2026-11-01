@@ -83,8 +83,23 @@ pub const NO_CONFIG_DIR_NOTICE: &str =
 
 /// Shown when the pairing's folder or file could be opened by another
 /// account on this computer (Windows).
+#[cfg(windows)]
 pub const NOT_PRIVATE_NOTICE: &str =
     "The folder this desktop keeps its pairing in (vettid-desktop, in your local app data) can be opened by another account on this computer, so nothing was saved there. Delete that folder, then pair again.";
+
+/// Unix: shown when the pairing's folder is owned by another account or
+/// another account can write to it (#28, owner decision (a), 2026-11-01).
+/// That account can't read the `0600` file, but it could remove or replace
+/// it (AEAD refuses a replaced one).
+#[cfg(not(windows))]
+pub const NOT_PRIVATE_NOTICE: &str =
+    "The folder this desktop keeps its pairing in (vettid-desktop, in your settings folder) can be changed by another account on this computer, so nothing was saved there. Delete that folder, then pair again.";
+
+/// Unix: shown after unlock when the saved pairing's file is private but
+/// its folder is owned by, or writable by, another account (#28).
+#[cfg(unix)]
+pub const NOT_PRIVATE_FOLDER_NOTICE: &str =
+    "Another account on this computer can change the folder this desktop keeps its pairing in. It can't read your pairing, but it could remove it. To be safe: in Settings, open Danger zone and choose Log out this desktop, then pair again.";
 
 /// Shown after unlock when another account can open the saved pairing's
 /// folder or file, and the pairing is keyring-bound (#24).
@@ -136,10 +151,10 @@ pub enum CredentialError {
     /// there is nowhere safe to keep a pairing. Displays
     /// [`NO_CONFIG_DIR_NOTICE`].
     NoConfigDir,
-    /// Windows: the folder or file for the pairing is not private to the
-    /// current user (another account owns it or can open it, or it is a
-    /// symlink or junction). Nothing was changed. Displays
-    /// [`NOT_PRIVATE_NOTICE`].
+    /// The folder or file for the pairing is not private to the current
+    /// user. Windows: another account owns it or can open it, or it is a
+    /// symlink or junction. Unix: another account owns the folder or can
+    /// write to it. Nothing was changed. Displays [`NOT_PRIVATE_NOTICE`].
     NotPrivate,
 }
 
@@ -290,8 +305,8 @@ pub fn ensure_config_dir(config_dir: &Path) -> Result<(), CredentialError> {
         super::winacl::ensure_private_dir(config_dir).map_err(|e| acl_error(config_dir, e))
     }
     // Unix: a new folder is created 0700 (#12). Its parents are created as
-    // usual, with their default modes; an existing folder's mode is left as
-    // it is (checking it is a follow-up).
+    // usual, with their default modes. An existing folder is left as it is,
+    // but refused if another account owns it or can write to it (#28).
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -300,9 +315,17 @@ pub fn ensure_config_dir(config_dir: &Path) -> Result<(), CredentialError> {
             fs::create_dir_all(parent).map_err(err)?;
         }
         match fs::DirBuilder::new().mode(0o700).create(config_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && config_dir.is_dir() => {}
+            Err(e) => return Err(err(e)),
+        }
+        match unix_folder_check(config_dir) {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && config_dir.is_dir() => Ok(()),
-            Err(e) => Err(err(e)),
+            Err(FolderCheck::NotPrivate(why)) => {
+                log::error!("Credential store: {} {}; refusing to use it", config_dir.display(), why);
+                Err(CredentialError::NotPrivate)
+            }
+            Err(FolderCheck::Failed(e)) => Err(err(e)),
         }
     }
     #[cfg(not(any(unix, windows)))]
@@ -310,6 +333,39 @@ pub fn ensure_config_dir(config_dir: &Path) -> Result<(), CredentialError> {
         fs::create_dir_all(config_dir)
             .map_err(|e| CredentialError::IoError(format!("create config dir: {}", e)))
     }
+}
+
+/// Why a unix folder check refused.
+#[cfg(unix)]
+enum FolderCheck {
+    /// Another account owns the folder or can write to it.
+    NotPrivate(&'static str),
+    /// The folder couldn't be checked.
+    Failed(std::io::Error),
+}
+
+/// Unix: the pairing folder must be owned by this process's effective
+/// user and not writable by group or others (#28), matching the Windows
+/// policy. Another account that could write to it could remove or replace
+/// the pairing; it still couldn't read the `0600` file. The folder's own
+/// path is followed if it is a symlink: what matters is the folder the
+/// file goes in.
+#[cfg(unix)]
+fn unix_folder_check(config_dir: &Path) -> Result<(), FolderCheck> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(config_dir).map_err(FolderCheck::Failed)?;
+    if !meta.is_dir() {
+        return Err(FolderCheck::Failed(std::io::Error::other("not a folder")));
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if meta.uid() != me {
+        return Err(FolderCheck::NotPrivate("is owned by another account"));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(FolderCheck::NotPrivate("can be written by other accounts"));
+    }
+    Ok(())
 }
 
 /// Log the detail of a refused folder or file. A policy refusal gives the
@@ -419,17 +475,22 @@ fn load_with(
     }
 }
 
+/// One writer at a time in this process: a save or a delete removes
+/// temporary files a crashed earlier save left behind, and must not remove
+/// another save's while it is running (e.g. end_session racing a pairing,
+/// or a log-out racing a save, #28). The app runs as a single instance, so
+/// this covers every writer.
+fn writer_lock() -> std::sync::MutexGuard<'static, ()> {
+    static WRITER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    WRITER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn save_with(
     keys: &dyn KeySource,
     config_dir: &Path,
     creds: &ConnectionCredentials,
 ) -> Result<BindingMode, CredentialError> {
-    // One save at a time in this process: a save removes temporary files
-    // a crashed earlier save left behind, and must not remove another
-    // save's while it is running (e.g. end_session racing a pairing). The
-    // app runs as a single instance, so this covers every writer.
-    static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _one_at_a_time = SAVE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _one_at_a_time = writer_lock();
 
     let master = keys.master_for_save()?;
     // SECURITY: never downgrade. If the store on disk is keyring-bound
@@ -545,6 +606,7 @@ pub fn exists(config_dir: &Path) -> bool {
 
 /// Delete the credential file from `config_dir`.
 pub fn delete(config_dir: &Path) -> Result<(), CredentialError> {
+    let _one_at_a_time = writer_lock();
     let path = config_dir.join(CREDENTIAL_FILE);
     // Temporary files from an interrupted save hold the same ciphertext.
     let prefix = format!("{CREDENTIAL_FILE}.tmp-");
@@ -586,14 +648,29 @@ enum OnDisk {
 /// Called after a successful load; it warns and never refuses, since
 /// refusing would not undo a disclosure and would lock out the pairing.
 /// AEAD already prevents a planted or edited file from being used.
+///
+/// On unix a private file in a folder another account can change gets
+/// [`NOT_PRIVATE_FOLDER_NOTICE`] (#28); a file others can read gets the
+/// stronger notice whatever the folder.
 pub fn privacy_warning(config_dir: &Path, binding: BindingMode) -> Option<&'static str> {
-    if is_private(config_dir) {
-        return None;
+    if !is_private(config_dir) {
+        return Some(match binding {
+            BindingMode::Keyring => NOT_PRIVATE_KEYRING_NOTICE,
+            BindingMode::MachineBound => NOT_PRIVATE_MACHINE_NOTICE,
+        });
     }
-    Some(match binding {
-        BindingMode::Keyring => NOT_PRIVATE_KEYRING_NOTICE,
-        BindingMode::MachineBound => NOT_PRIVATE_MACHINE_NOTICE,
-    })
+    #[cfg(unix)]
+    match unix_folder_check(config_dir) {
+        Ok(()) => {}
+        Err(FolderCheck::NotPrivate(why)) => {
+            log::warn!("Credential store: {} {}", config_dir.display(), why);
+            return Some(NOT_PRIVATE_FOLDER_NOTICE);
+        }
+        Err(FolderCheck::Failed(e)) => {
+            log::warn!("Credential store: could not check {}: {}", config_dir.display(), e);
+        }
+    }
+    None
 }
 
 /// Whether the folder and file are private to the current user, as far
@@ -623,7 +700,8 @@ fn is_private(config_dir: &Path) -> bool {
 }
 
 /// Unix: the file must not grant group or other any access. The folder
-/// is not checked yet, since it is created 0755 until #12.
+/// is checked separately in [`privacy_warning`], since it gets its own
+/// notice (#28).
 #[cfg(unix)]
 fn is_private(config_dir: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -1106,6 +1184,52 @@ mod tests {
         assert_eq!(privacy_warning(dir.path(), BindingMode::MachineBound), Some(NOT_PRIVATE_MACHINE_NOTICE));
         fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(privacy_warning(dir.path(), BindingMode::Keyring), None);
+    }
+
+    /// Unix (#28): an existing folder others can write to is refused at
+    /// save, and the pairing in it is kept as it was.
+    #[cfg(unix)]
+    #[test]
+    fn unix_save_refuses_a_folder_others_can_write_and_keeps_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = ThroughKeystore(with_keyring());
+        save_with(&keys, &config_dir, &sample_creds()).unwrap();
+        let file = config_dir.join(CREDENTIAL_FILE);
+        let before = fs::read(&file).unwrap();
+        for mode in [0o720, 0o702, 0o777] {
+            fs::set_permissions(&config_dir, fs::Permissions::from_mode(mode)).unwrap();
+            let err = save_with(&keys, &config_dir, &sample_creds()).err().expect("must refuse");
+            assert!(matches!(err, CredentialError::NotPrivate), "{mode:o}: got {err}");
+            assert_eq!(err.to_string(), NOT_PRIVATE_NOTICE);
+            assert!(matches!(ensure_config_dir(&config_dir), Err(CredentialError::NotPrivate)));
+            assert_eq!(fs::read(&file).unwrap(), before, "{mode:o}: kept");
+        }
+        // Read and search access for others is not a refusal: 0755 is how
+        // earlier builds made the folder, and the file is 0600.
+        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        save_with(&keys, &config_dir, &sample_creds()).expect("0755 is accepted");
+    }
+
+    /// Unix (#28): a private file in a folder others can write to gives the
+    /// folder warning; a file others can read gives the stronger one.
+    #[cfg(unix)]
+    #[test]
+    fn unix_folder_others_can_write_gives_the_folder_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        save_with(&ThroughKeystore(with_keyring()), &config_dir, &sample_creds()).unwrap();
+        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o770)).unwrap();
+        assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), Some(NOT_PRIVATE_FOLDER_NOTICE));
+        assert_eq!(privacy_warning(&config_dir, BindingMode::MachineBound), Some(NOT_PRIVATE_FOLDER_NOTICE));
+        let file = config_dir.join(CREDENTIAL_FILE);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), Some(NOT_PRIVATE_KEYRING_NOTICE));
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), None);
     }
 
     /// The key protection shown in Settings follows the file's header.

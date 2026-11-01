@@ -103,9 +103,12 @@ keyring = { version = "3", default-features = false, features = ["apple-native",
 
 # Win32 calls for the Windows machine fingerprint (registry, disk serial,
 # network adapters) and the Credential Manager entry. See
-# fingerprint/platform_windows.rs and credential/wincred.rs.
+# fingerprint/platform_windows.rs and credential/wincred.rs. Wdk_Storage_FileSystem
+# is for NtSetInformationFile: renaming the pairing by handle, relative to its
+# folder's handle (credential/winacl.rs, #28).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
@@ -119,6 +122,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
+
+# geteuid, for checking who owns the pairing folder (credential/store.rs, #28).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

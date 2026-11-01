@@ -6348,6 +6348,7 @@ dependencies = [
  "hmac",
  "hostname",
  "keyring",
+ "libc",
  "log",
  "opus",
  "pbkdf2",
