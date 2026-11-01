@@ -3,6 +3,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import QRCode from 'qrcode';
   import { onDestroy } from 'svelte';
+  import { sessionNotice } from '../stores/session';
 
   let inviteCode = $state('');
   let step = $state<'code' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error'>('code');
@@ -53,6 +54,7 @@
       });
 
       if (result.success) {
+        sessionNotice.set(null);
         keyProtection = result.key_protection || '';
         step = 'success';
       } else {

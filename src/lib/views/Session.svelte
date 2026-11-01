@@ -60,6 +60,7 @@
     busy = true;
     busyLabel = 'Ending your session…';
     statusMessage = '';
+    sessionNotice.set(null);
     try {
       // The session always ends in this run; `notice` says when that
       // couldn't be recorded on this computer (#26).

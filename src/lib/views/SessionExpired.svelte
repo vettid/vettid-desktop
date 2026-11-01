@@ -65,6 +65,7 @@
    */
   async function logoutFromHere() {
     try {
+      sessionNotice.set(null);
       const result = await invoke<{ revoke_sent: boolean; local_wiped: boolean; notice?: string | null }>('logout');
       if (result?.revoke_sent && result?.local_wiped && !result?.notice) {
         window.location.reload();
