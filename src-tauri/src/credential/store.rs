@@ -289,16 +289,21 @@ pub fn ensure_config_dir(config_dir: &Path) -> Result<(), CredentialError> {
     {
         super::winacl::ensure_private_dir(config_dir).map_err(|e| acl_error(config_dir, e))
     }
-    // Unix: a new folder is created 0700 (#12). Parents are created as
-    // usual; an existing folder's mode is left as it is.
+    // Unix: a new folder is created 0700 (#12). Its parents are created as
+    // usual, with their default modes; an existing folder's mode is left as
+    // it is (checking it is a follow-up).
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(config_dir)
-            .map_err(|e| CredentialError::IoError(format!("create config dir: {}", e)))
+        let err = |e: std::io::Error| CredentialError::IoError(format!("create config dir: {}", e));
+        if let Some(parent) = config_dir.parent() {
+            fs::create_dir_all(parent).map_err(err)?;
+        }
+        match fs::DirBuilder::new().mode(0o700).create(config_dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && config_dir.is_dir() => Ok(()),
+            Err(e) => Err(err(e)),
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -325,8 +330,8 @@ fn acl_error(path: &Path, e: super::winacl::AclError) -> CredentialError {
 ///
 /// The encryption key comes from the OS keyring (or the machine-bound
 /// fallback when the keyring is unavailable). No user input. The file
-/// is written with mode 0600 (owner read/write only) on unix. On Windows
-/// it gets the ACL it inherits from the config directory.
+/// is written atomically through a temporary file: mode 0600 on unix, and
+/// on Windows a protected DACL for the user and SYSTEM (see `winacl`).
 ///
 /// SECURITY: Intermediate key material is zeroized after use; the
 /// `MasterKey` returned by the keystore zeroizes on drop.
@@ -419,6 +424,13 @@ fn save_with(
     config_dir: &Path,
     creds: &ConnectionCredentials,
 ) -> Result<BindingMode, CredentialError> {
+    // One save at a time in this process: a save removes temporary files
+    // a crashed earlier save left behind, and must not remove another
+    // save's while it is running (e.g. end_session racing a pairing). The
+    // app runs as a single instance, so this covers every writer.
+    static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = SAVE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let master = keys.master_for_save()?;
     // SECURITY: never downgrade. If the store on disk is keyring-bound
     // and the keyring fails now, the keystore falls back to the
@@ -513,6 +525,7 @@ fn write_atomically(config_dir: &Path, data: &[u8]) -> Result<(), CredentialErro
         return result;
     }
     // Make the rename itself durable. Best effort: the file is in place.
+    // (On macOS fsync is not F_FULLFSYNC, so this is weaker there.)
     #[cfg(unix)]
     if let Ok(dir) = fs::File::open(config_dir) {
         let _ = dir.sync_all();
@@ -533,6 +546,15 @@ pub fn exists(config_dir: &Path) -> bool {
 /// Delete the credential file from `config_dir`.
 pub fn delete(config_dir: &Path) -> Result<(), CredentialError> {
     let path = config_dir.join(CREDENTIAL_FILE);
+    // Temporary files from an interrupted save hold the same ciphertext.
+    let prefix = format!("{CREDENTIAL_FILE}.tmp-");
+    if let Ok(entries) = fs::read_dir(config_dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -994,6 +1016,20 @@ mod tests {
         let after = fs::read(dir.path().join(CREDENTIAL_FILE)).unwrap();
         assert_eq!(before, after, "the keyring-bound file must be left as it was");
         assert_eq!(read_store(dir.path()).unwrap().binding, "keyring");
+    }
+
+    /// Deleting the pairing also removes temporary files an interrupted
+    /// save left behind.
+    #[test]
+    fn delete_removes_leftover_temporary_files() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        save_with(&ThroughKeystore(with_keyring()), &config_dir, &sample_creds()).unwrap();
+        let stale = config_dir.join(format!("{CREDENTIAL_FILE}.tmp-1-00"));
+        fs::write(&stale, b"ciphertext").unwrap();
+        delete(&config_dir).unwrap();
+        assert!(!exists(&config_dir));
+        assert!(!stale.exists());
     }
 
     /// A pairing saved normally is private: no warning.

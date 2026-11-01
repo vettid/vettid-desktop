@@ -530,14 +530,38 @@ fn final_path(handle: HANDLE) -> Result<String, AclError> {
 }
 
 /// Whether `child` names an entry directly inside `folder` (both final
-/// paths). NTFS names are case-insensitive, so the folder part is compared
-/// without case.
+/// paths). Both come from GetFinalPathNameByHandleW with
+/// FILE_NAME_NORMALIZED, so they carry the on-disk case and are compared
+/// exactly: Unicode case folding is not NTFS's and could match a
+/// different name.
 fn is_directly_inside(child: &str, folder: &str) -> bool {
     let folder = folder.trim_end_matches('\\');
     match child.rsplit_once('\\') {
-        Some((parent, name)) => !name.is_empty() && parent.to_lowercase() == folder.to_lowercase(),
+        Some((parent, name)) => !name.is_empty() && parent == folder,
         None => false,
     }
+}
+
+/// Move `from` over `to`. Another program (an antivirus scanner, the
+/// search indexer, a sync client) can hold either file open for a moment,
+/// so a sharing violation or access denial is retried a few times.
+fn replace_file(from: &[u16], to: &[u16]) -> Result<(), AclError> {
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_SHARING_VIOLATION: u32 = 32;
+    const ATTEMPTS: u32 = 5;
+    for attempt in 1..=ATTEMPTS {
+        // SAFETY: both paths are NUL-terminated.
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } != 0 {
+            return Ok(());
+        }
+        let err = last_error();
+        let busy = err == ERROR_SHARING_VIOLATION || err == ERROR_ACCESS_DENIED;
+        if !busy || attempt == ATTEMPTS {
+            return Err(failed(format!("replace: error {} after {} attempts", err, attempt)));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt)));
+    }
+    unreachable!("the loop returns")
 }
 
 /// Removes the temporary file on drop unless the write succeeded.
@@ -617,6 +641,8 @@ fn write_private_file_with(
     if let Entry::Present = entry_at(&target)? {
         check_private_with(&target, &user)?;
         let existing = open_for_check(&target)?;
+        // A rename never writes through another name for the old file, so
+        // this refusal is conservative: a second name is unexpected here.
         if handle_info(existing.as_raw_handle() as HANDLE)?.nNumberOfLinks > 1 {
             return Err(NotPrivate::HardLinked.into());
         }
@@ -675,18 +701,26 @@ fn write_private_file_with(
     before_replace(&temp_path)?;
 
     let target_w = wide_path(&target);
-    // SAFETY: both paths are NUL-terminated.
-    if unsafe { MoveFileExW(temp_w.as_ptr(), target_w.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 {
-        return Err(failed(format!("replace: error {}", last_error())));
-    }
+    replace_file(&temp_w, &target_w)?;
     temp.keep = true;
 
-    // The file now at `target` must be the one written, inside the folder.
-    let written = open_for_check(&target)?;
-    if !is_directly_inside(&final_path(written.as_raw_handle() as HANDLE)?, &folder.final_path) {
-        return Err(failed("written file is not in the pairing folder"));
+    // Detection, not prevention: the old file is already replaced. The
+    // file now at `target` must be the one written, inside the folder; if
+    // that can't be confirmed, say so plainly rather than "saved" or
+    // "failed".
+    let confirm = || -> Result<(), AclError> {
+        let written = open_for_check(&target)?;
+        if !is_directly_inside(&final_path(written.as_raw_handle() as HANDLE)?, &folder.final_path) {
+            return Err(failed("not in the pairing folder"));
+        }
+        check_handle_with(written.as_raw_handle() as HANDLE, &user)
+    };
+    if let Err(e) = confirm() {
+        return Err(failed(format!(
+            "the pairing was replaced, but the result could not be confirmed ({})",
+            e
+        )));
     }
-    check_handle_with(written.as_raw_handle() as HANDLE, &user)?;
     drop(folder);
     Ok(())
 }
@@ -913,6 +947,31 @@ mod tests {
         std::fs::rename(&dir, base.path().join("moved")).expect("rename works once released");
     }
 
+    /// Another program holding connection.enc open without delete sharing:
+    /// the replace is retried, then fails; the old pairing is kept and no
+    /// temporary file is left.
+    #[test]
+    fn a_file_held_open_elsewhere_fails_the_write_and_is_kept() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        ensure_private_dir(&dir).unwrap();
+        let path = dir.join("connection.enc");
+        write_private_file(&dir, "connection.enc", b"the old pairing").unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .unwrap();
+        let err = write_private_file(&dir, "connection.enc", b"new").err().expect("must fail");
+        assert!(matches!(&err, AclError::Failed(what) if what.starts_with("replace: error")), "got {err}");
+        drop(holder);
+        assert_eq!(std::fs::read(&path).unwrap(), b"the old pairing");
+        assert_eq!(temps_in(&dir), 0, "temporary file removed");
+        // Once released, the write goes through.
+        write_private_file(&dir, "connection.enc", b"new").expect("write");
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
     /// Temporary files from a crashed save are removed by the next save.
     #[test]
     fn stale_temporary_files_are_removed() {
@@ -925,8 +984,13 @@ mod tests {
     }
 
     #[test]
-    fn is_directly_inside_compares_the_parent_without_case() {
-        assert!(is_directly_inside(r"\\?\C:\Users\a\AppData\Local\vettid-desktop\f", r"\\?\C:\Users\A\appdata\local\vettid-desktop"));
+    fn is_directly_inside_compares_the_parent_exactly() {
+        assert!(is_directly_inside(r"\\?\C:\Users\a\AppData\Local\vettid-desktop\f", r"\\?\C:\Users\a\AppData\Local\vettid-desktop"));
+        // Both sides are normalized final paths, so a case difference is a
+        // different name, not the same one.
+        assert!(!is_directly_inside(r"\\?\C:\Users\a\AppData\Local\vettid-desktop\f", r"\\?\C:\Users\A\appdata\local\vettid-desktop"));
+        // KELVIN SIGN lowercases to "k" in Unicode but is a different NTFS name.
+        assert!(!is_directly_inside("\\\\?\\C:\\\u{212A}\\f", r"\\?\C:\k"));
         assert!(is_directly_inside(r"\\?\C:\x\f", r"\\?\C:\x\"));
         assert!(!is_directly_inside(r"\\?\C:\x\y\f", r"\\?\C:\x"));
         assert!(!is_directly_inside(r"\\?\D:\x\f", r"\\?\C:\x"));
