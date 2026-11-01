@@ -7,10 +7,14 @@
 //!
 //! ## Key sources, in order
 //!
-//! 1. **OS keyring** (Secret Service on Linux, Keychain on macOS).
+//! 1. **OS keyring** (Secret Service on Linux, Keychain on macOS,
+//!    Credential Manager on Windows).
 //!    The keyring itself is unlocked by the user's OS login session,
 //!    so we inherit the OS's "is this really you" gate without
-//!    asking the user for anything.
+//!    asking the user for anything. It protects the key from other
+//!    users and from a copied disk, not from other programs running as
+//!    the same user: a Windows generic credential (like a Secret Service
+//!    item) can be read by any process of that user.
 //! 2. **Machine-bound fallback** (`platform_key`). If the keyring
 //!    isn't available (kiosk Linux, missing Secret Service daemon,
 //!    locked Keychain on macOS first launch), we derive a key from

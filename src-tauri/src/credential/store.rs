@@ -384,8 +384,11 @@ fn save_with(
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     // Mode bits are not an access control on Windows. There the file
-    // gets the ACL it inherits from the config directory under the
-    // user's profile: the user, SYSTEM and Administrators.
+    // gets the ACL it inherits from its folder. In the default folder
+    // under %LOCALAPPDATA% that is the user, SYSTEM and Administrators,
+    // but a redirected or pre-made folder can grant more. An explicit
+    // user-only DACL is required before a Windows release (owner
+    // decision 1a, 2026-11-01).
     #[cfg(unix)]
     options.mode(0o600);
     let mut file = options

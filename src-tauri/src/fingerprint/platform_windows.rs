@@ -11,7 +11,11 @@
 //! The exact text of each value is part of the machine-bound key. Changing
 //! how a value is chosen or formatted changes the key of every Windows
 //! install, so treat the rules in this file as a wire format. They match
-//! the agent connector's `machine_windows.go`.
+//! the agent connector's `machine_windows.go`, except that the disk serial
+//! falls back to `PhysicalDrive0` only when the Windows drive is unknown
+//! (see `collect_disk_serial`).
+//!
+//! Requires Windows 10 version 1703 or later (`GetIfEntry2Ex`).
 
 use std::ffi::c_void;
 use std::ptr;
@@ -160,24 +164,29 @@ fn system_drive() -> Option<String> {
     (b[0].is_ascii_alphabetic() && b[1] == b':').then(|| dir[..2].to_string())
 }
 
-/// Serial number of the disk that holds the Windows volume, falling back to
-/// the first physical disk. Both are opened with no access rights, which is
-/// enough for the query and works for a standard user.
+/// Serial number of the disk that holds the Windows volume. The volume is
+/// opened with no access rights, which is enough for the query and works
+/// for a standard user.
+///
+/// `PhysicalDrive0` is asked only when the Windows drive itself is unknown.
+/// When the Windows volume answers with no serial, the result is empty:
+/// physical drive numbers move when a dock, USB disk or second internal
+/// disk is attached, and a different disk's serial would change the key.
 ///
 /// The string is whatever the storage driver reports. The inbox NVMe driver
 /// gives the drive's EUI-64, not the serial printed on the label, and a
 /// vendor driver may give a different string for the same drive.
 fn collect_disk_serial() -> String {
-    let mut candidates = Vec::new();
-    if let Some(drive) = system_drive() {
-        candidates.push(format!(r"\\.\{}", drive));
+    query_disk_serial(&disk_serial_device(system_drive()))
+}
+
+/// The device to ask for the disk serial: the Windows volume, or the first
+/// physical disk when the Windows drive is unknown.
+fn disk_serial_device(system_drive: Option<String>) -> String {
+    match system_drive {
+        Some(drive) => format!(r"\\.\{}", drive),
+        None => r"\\.\PhysicalDrive0".to_string(),
     }
-    candidates.push(r"\\.\PhysicalDrive0".to_string());
-    candidates
-        .iter()
-        .map(|device| query_disk_serial(device))
-        .find(|serial| !serial.is_empty())
-        .unwrap_or_default()
 }
 
 fn query_disk_serial(device: &str) -> String {
@@ -198,34 +207,65 @@ fn query_disk_serial(device: &str) -> String {
         return String::new();
     }
 
+    let serial = storage_device_descriptor(handle)
+        .map(|descriptor| parse_disk_serial(&descriptor))
+        .unwrap_or_default();
+    // SAFETY: `handle` was returned by CreateFileW and is closed once.
+    unsafe { CloseHandle(handle) };
+    serial
+}
+
+/// Length of STORAGE_DESCRIPTOR_HEADER (Version, Size).
+const DESCRIPTOR_HEADER_LEN: usize = 8;
+/// Upper bound on the descriptor size a driver may ask for.
+const MAX_DESCRIPTOR_LEN: usize = 64 * 1024;
+
+/// The whole STORAGE_DEVICE_DESCRIPTOR: first the header, which gives the
+/// size the descriptor needs, then the descriptor in a buffer of that size.
+/// A fixed buffer would fail for a drive with large raw properties.
+fn storage_device_descriptor(handle: HANDLE) -> Option<Vec<u8>> {
+    let mut header = [0u8; DESCRIPTOR_HEADER_LEN];
+    if storage_property_query(handle, &mut header)? < DESCRIPTOR_HEADER_LEN {
+        return None;
+    }
+    let size = descriptor_size(&header)?;
+    let mut descriptor = vec![0u8; size];
+    let returned = storage_property_query(handle, &mut descriptor)?;
+    descriptor.truncate(returned);
+    Some(descriptor)
+}
+
+/// The `Size` a STORAGE_DESCRIPTOR_HEADER reports, if it is plausible.
+fn descriptor_size(header: &[u8; DESCRIPTOR_HEADER_LEN]) -> Option<usize> {
+    let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+    (DESCRIPTOR_HEADER_LEN..=MAX_DESCRIPTOR_LEN).contains(&size).then_some(size)
+}
+
+/// IOCTL_STORAGE_QUERY_PROPERTY for the device descriptor into `out`.
+/// Returns the number of bytes written.
+fn storage_property_query(handle: HANDLE, out: &mut [u8]) -> Option<usize> {
     let query = StoragePropertyQuery {
         property_id: 0,
         query_type: 0,
         additional_parameters: [0],
     };
-    let mut buf = [0u8; 1024];
     let mut returned: u32 = 0;
-    // SAFETY: input and output pointers are live local buffers of the
-    // stated sizes; the handle is valid until CloseHandle below.
+    // SAFETY: input and output pointers are live buffers of the stated
+    // sizes; the caller keeps the handle open for the call.
     let ok = unsafe {
         DeviceIoControl(
             handle,
             IOCTL_STORAGE_QUERY_PROPERTY,
             &query as *const StoragePropertyQuery as *const c_void,
             std::mem::size_of::<StoragePropertyQuery>() as u32,
-            buf.as_mut_ptr() as *mut c_void,
-            buf.len() as u32,
+            out.as_mut_ptr() as *mut c_void,
+            out.len() as u32,
             &mut returned,
             ptr::null_mut(),
         )
     };
-    // SAFETY: `handle` was returned by CreateFileW and is closed once.
-    unsafe { CloseHandle(handle) };
-
-    if ok == 0 || returned as usize > buf.len() {
-        return String::new();
-    }
-    parse_disk_serial(&buf[..returned as usize])
+    let returned = returned as usize;
+    (ok != 0 && returned <= out.len()).then_some(returned)
 }
 
 /// Extract the serial number from a STORAGE_DEVICE_DESCRIPTOR. Returns an
@@ -357,6 +397,18 @@ fn physical_adapter_at(path: &str) -> Option<(String, bool)> {
     // SAFETY: `key` was opened above and is closed once.
     unsafe { RegCloseKey(key) };
 
+    classify_adapter(characteristics, &guid, &instance)
+}
+
+/// The adapter rule, from an adapter's registry values: `Some((guid,
+/// built_in))` for a physical adapter (NCF_PHYSICAL set and an instance
+/// GUID present), with the GUID upper-cased and built in meaning a
+/// `PCI\` device instance; `None` for anything else.
+fn classify_adapter(
+    characteristics: Option<u32>,
+    guid: &str,
+    instance: &str,
+) -> Option<(String, bool)> {
     match characteristics {
         Some(c) if c & NCF_PHYSICAL != 0 && !guid.is_empty() => Some((
             guid.to_uppercase(),
@@ -439,16 +491,24 @@ fn collect_mac_address() -> String {
         if unsafe { GetIfEntry2Ex(MibIfEntryNormalWithoutStatistics, &mut row) } != ERROR_SUCCESS {
             continue;
         }
-        if row.PhysicalAddressLength != 6 {
-            continue;
+        if let Some(mac) = usable_mac(row.PhysicalAddressLength, &row.PermanentPhysicalAddress) {
+            candidates.push((mac, built_in));
         }
-        let mac = &row.PermanentPhysicalAddress[..6];
-        if mac.iter().all(|&b| b == 0) {
-            continue;
-        }
-        candidates.push((format_mac(mac), built_in));
     }
     choose_mac(&candidates)
+}
+
+/// The permanent address as `aa:bb:cc:dd:ee:ff`, if it is a usable
+/// 6-byte address: not another length, and not all zeros.
+fn usable_mac(length: u32, permanent: &[u8]) -> Option<String> {
+    if length != 6 || permanent.len() < 6 {
+        return None;
+    }
+    let mac = &permanent[..6];
+    if mac.iter().all(|&b| b == 0) {
+        return None;
+    }
+    Some(format_mac(mac))
 }
 
 /// Pick the MAC attribute from `(mac, built_in)` candidates: the lowest
@@ -596,6 +656,76 @@ mod tests {
         for (name, desc, want) in cases {
             assert_eq!(parse_disk_serial(&desc), want, "case: {}", name);
         }
+    }
+
+    #[test]
+    fn test_disk_serial_device() {
+        assert_eq!(disk_serial_device(Some("C:".to_string())), r"\\.\C:");
+        assert_eq!(disk_serial_device(Some("D:".to_string())), r"\\.\D:");
+        // PhysicalDrive0 only when the Windows drive is unknown.
+        assert_eq!(disk_serial_device(None), r"\\.\PhysicalDrive0");
+    }
+
+    #[test]
+    fn test_descriptor_size() {
+        let header = |size: u32| {
+            let mut h = [0u8; DESCRIPTOR_HEADER_LEN];
+            h[4..8].copy_from_slice(&size.to_le_bytes());
+            h
+        };
+        assert_eq!(descriptor_size(&header(1024)), Some(1024));
+        assert_eq!(descriptor_size(&header(8)), Some(8));
+        assert_eq!(descriptor_size(&header(64 * 1024)), Some(64 * 1024));
+        assert_eq!(descriptor_size(&header(7)), None);
+        assert_eq!(descriptor_size(&header(0)), None);
+        assert_eq!(descriptor_size(&header(64 * 1024 + 1)), None);
+        assert_eq!(descriptor_size(&header(u32::MAX)), None);
+    }
+
+    #[test]
+    fn test_classify_adapter() {
+        let guid = "{1a2b3c4d-0000-1111-2222-333344445555}";
+        let upper = "{1A2B3C4D-0000-1111-2222-333344445555}";
+        // Physical, on the PCI bus: built in.
+        assert_eq!(
+            classify_adapter(Some(NCF_PHYSICAL), guid, r"PCI\VEN_8086&DEV_15F3\3&11583659&0&FE"),
+            Some((upper.to_string(), true))
+        );
+        // Other flags alongside NCF_PHYSICAL; lower-case instance prefix.
+        assert_eq!(
+            classify_adapter(Some(NCF_PHYSICAL | 0x80), guid, r"pci\ven_10ec&dev_8168\01"),
+            Some((upper.to_string(), true))
+        );
+        // Physical, on USB: not built in.
+        assert_eq!(
+            classify_adapter(Some(NCF_PHYSICAL), guid, r"USB\VID_0BDA&PID_8153\000001"),
+            Some((upper.to_string(), false))
+        );
+        // No device instance: physical, not built in.
+        assert_eq!(classify_adapter(Some(NCF_PHYSICAL), guid, ""), Some((upper.to_string(), false)));
+        // Virtual (no NCF_PHYSICAL), no Characteristics, or no GUID: none.
+        assert_eq!(classify_adapter(Some(0x1), guid, r"ROOT\VMS_MP\0000"), None);
+        assert_eq!(classify_adapter(Some(0), guid, r"PCI\VEN_8086"), None);
+        assert_eq!(classify_adapter(None, guid, r"PCI\VEN_8086"), None);
+        assert_eq!(classify_adapter(Some(NCF_PHYSICAL), "", r"PCI\VEN_8086"), None);
+    }
+
+    #[test]
+    fn test_usable_mac() {
+        let mut addr = [0u8; 32];
+        addr[..6].copy_from_slice(&[0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0xff]);
+        assert_eq!(usable_mac(6, &addr).as_deref(), Some("00:1a:2b:3c:4d:ff"));
+        // Not a 6-byte address.
+        assert_eq!(usable_mac(0, &addr), None);
+        assert_eq!(usable_mac(8, &addr), None);
+        // All zeros.
+        assert_eq!(usable_mac(6, &[0u8; 32]), None);
+        // Shorter than 6 bytes available.
+        assert_eq!(usable_mac(6, &addr[..5]), None);
+        // Only the first 6 bytes count.
+        let mut trailing = addr;
+        trailing[6] = 0xee;
+        assert_eq!(usable_mac(6, &trailing).as_deref(), Some("00:1a:2b:3c:4d:ff"));
     }
 
     #[test]
