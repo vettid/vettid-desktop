@@ -357,18 +357,27 @@ enum FolderCheck {
 /// group umask `002`. Only a folder owned by another account, or one that
 /// can't be tightened, is refused.
 ///
+/// If `config_dir` is a symlink, the link itself must also be the user's:
+/// another account could otherwise plant `vettid-desktop` pointing at a
+/// folder of the user's (say `~/public_html`), and this check would pass
+/// on it, chmod it and put the pairing there.
+///
 /// Not seen by this check: a macOS extended ACL (`chmod +a`) that grants
 /// write without a mode bit. On Linux a POSIX ACL entry for another user
 /// raises the group-class bits, so it is seen.
 #[cfg(unix)]
 fn unix_folder_check(config_dir: &Path) -> Result<(), FolderCheck> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let link = fs::symlink_metadata(config_dir).map_err(FolderCheck::Failed)?;
+    if link.file_type().is_symlink() && link.uid() != me {
+        return Err(FolderCheck::NotPrivate("is a link made by another account"));
+    }
     let meta = fs::metadata(config_dir).map_err(FolderCheck::Failed)?;
     if !meta.is_dir() {
         return Err(FolderCheck::Failed(std::io::Error::other("not a folder")));
     }
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let me = unsafe { libc::geteuid() };
     if meta.uid() != me {
         return Err(FolderCheck::NotPrivate("is owned by another account"));
     }
@@ -523,6 +532,9 @@ fn load_with(
 /// pairing). A wipe holding it also can't be undone by a save that started
 /// first: [`save_existing`] fails once the file is gone (#28). The app runs
 /// as a single instance, so this covers every writer.
+///
+/// A save holds it while it fetches the master key, which may wait on a
+/// keyring prompt; a log-out started meanwhile waits for that save.
 fn writer_lock() -> std::sync::MutexGuard<'static, ()> {
     static WRITER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     WRITER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -543,8 +555,20 @@ fn save_with_mode(
     mode: Mode,
 ) -> Result<BindingMode, CredentialError> {
     let _one_at_a_time = writer_lock();
-    if mode == Mode::UpdateExisting && !exists(config_dir) {
-        return Err(CredentialError::NotFound(config_dir.join(CREDENTIAL_FILE).display().to_string()));
+    if mode == Mode::UpdateExisting {
+        match pairing_present(config_dir) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(CredentialError::NotFound(config_dir.join(CREDENTIAL_FILE).display().to_string()))
+            }
+            Err(e) => {
+                return Err(CredentialError::IoError(format!(
+                    "check {}: {}",
+                    config_dir.join(CREDENTIAL_FILE).display(),
+                    e
+                )))
+            }
+        }
     }
 
     let master = keys.master_for_save()?;
@@ -653,10 +677,22 @@ fn write_atomically(config_dir: &Path, data: &[u8]) -> Result<(), CredentialErro
 #[cfg(not(windows))]
 const TEMP_INFIX: &str = ".tmp-";
 
-/// Check whether a credential file exists in `config_dir`.
+/// Whether a credential file may be in `config_dir`. True when it is,
+/// and also when that can't be ruled out (a stat error other than "not
+/// found"): nothing may treat the pairing as gone on a guess (#28).
 pub fn exists(config_dir: &Path) -> bool {
-    let path = config_dir.join(CREDENTIAL_FILE);
-    path.exists()
+    !matches!(pairing_present(config_dir), Ok(false))
+}
+
+/// Whether `connection.enc` is in `config_dir`: Ok(false) only when the
+/// file system says it isn't there. The file itself is not followed if it
+/// is a link: a link is present too.
+fn pairing_present(config_dir: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(config_dir.join(CREDENTIAL_FILE)) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Delete the credential file from `config_dir`.
@@ -696,18 +732,34 @@ pub fn wipe(config_dir: &Path) -> Result<(), CredentialError> {
     confirm_wiped(config_dir)
 }
 
-/// Fails if the pairing file or a temporary copy of it is still in
-/// `config_dir`.
+/// Ok only if the file system confirms that neither the pairing file nor
+/// a temporary copy of it is in `config_dir`. Anything that can't be
+/// checked (a stat or listing error other than "not found") is an error:
+/// the pairing is not reported gone on a guess.
 fn confirm_wiped(config_dir: &Path) -> Result<(), CredentialError> {
+    let not_confirmed = |what: String| {
+        Err(CredentialError::IoError(format!("the pairing in {} {}", config_dir.display(), what)))
+    };
+    match pairing_present(config_dir) {
+        Ok(false) => {}
+        Ok(true) => return not_confirmed("is still there".into()),
+        Err(e) => return not_confirmed(format!("could not be checked: {}", e)),
+    }
     let prefix = format!("{CREDENTIAL_FILE}.tmp-");
-    let temp_left = fs::read_dir(config_dir)
-        .map(|entries| entries.flatten().any(|e| e.file_name().to_string_lossy().starts_with(&prefix)))
-        .unwrap_or(false);
-    if exists(config_dir) || temp_left {
-        return Err(CredentialError::IoError(format!(
-            "the pairing in {} is still there",
-            config_dir.display()
-        )));
+    match fs::read_dir(config_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(e) if e.file_name().to_string_lossy().starts_with(&prefix) => {
+                        return not_confirmed("still has a temporary copy".into())
+                    }
+                    Ok(_) => {}
+                    Err(e) => return not_confirmed(format!("could not be listed: {}", e)),
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return not_confirmed(format!("could not be listed: {}", e)),
     }
     Ok(())
 }
@@ -757,7 +809,9 @@ enum OnDisk {
 ///
 /// On unix a private file in a folder another account can change gets
 /// [`NOT_PRIVATE_FOLDER_NOTICE`] (#28); a file others can read gets the
-/// stronger notice whatever the folder.
+/// stronger notice whatever the folder. Not read-only on unix: the user's
+/// own folder that others can write to is set to `0700` here (see
+/// `unix_folder_check`).
 pub fn privacy_warning(config_dir: &Path, binding: BindingMode) -> Option<&'static str> {
     if !is_private(config_dir) {
         return Some(match binding {
@@ -1337,6 +1391,73 @@ mod tests {
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
         fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o770)).unwrap();
         assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), Some(NOT_PRIVATE_KEYRING_NOTICE));
+    }
+
+    /// Unix (#28): a folder owned by another account (root's `/usr`) is
+    /// refused before anything is changed, directly and through the
+    /// user's own link to it; the user's own link to the user's own folder
+    /// is accepted. (A link made by another account needs a second account
+    /// to test.)
+    #[cfg(unix)]
+    #[test]
+    fn unix_folder_check_refuses_another_owner_and_checks_links() {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: as in unix_folder_check.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root owns /usr: nothing to check
+        }
+        let usr = Path::new("/usr");
+        let before = fs::metadata(usr).unwrap().mode();
+        assert!(matches!(unix_folder_check(usr), Err(FolderCheck::NotPrivate("is owned by another account"))));
+        assert!(matches!(ensure_config_dir(usr), Err(CredentialError::NotPrivate)));
+        assert_eq!(privacy_warning_folder_only(usr), Some(NOT_PRIVATE_FOLDER_NOTICE));
+        assert_eq!(fs::metadata(usr).unwrap().mode(), before, "not changed");
+
+        let base = tempfile::tempdir().unwrap();
+        let to_usr = base.path().join("to-usr");
+        std::os::unix::fs::symlink(usr, &to_usr).unwrap();
+        assert!(matches!(unix_folder_check(&to_usr), Err(FolderCheck::NotPrivate(_))));
+        let mine = base.path().join("mine");
+        fs::create_dir(&mine).unwrap();
+        let to_mine = base.path().join("to-mine");
+        std::os::unix::fs::symlink(&mine, &to_mine).unwrap();
+        assert!(unix_folder_check(&to_mine).is_ok());
+    }
+
+    /// The folder part of [`privacy_warning`], for a folder with no
+    /// pairing file in it.
+    #[cfg(unix)]
+    fn privacy_warning_folder_only(dir: &Path) -> Option<&'static str> {
+        match unix_folder_check(dir) {
+            Err(FolderCheck::NotPrivate(_)) => Some(NOT_PRIVATE_FOLDER_NOTICE),
+            _ => None,
+        }
+    }
+
+    /// Unix (#28): when the folder can't be read, the pairing is not
+    /// reported gone: exists() says it may be there, an update refuses,
+    /// and a wipe is not confirmed. (Root ignores the mode, and then the
+    /// test has nothing to check.)
+    #[cfg(unix)]
+    #[test]
+    fn unix_an_unreadable_folder_is_not_reported_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = ThroughKeystore(with_keyring());
+        save_with(&keys, &config_dir, &sample_creds()).unwrap();
+        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let root_ignores_modes = fs::read_dir(&config_dir).is_ok();
+        let present = exists(&config_dir);
+        let update = save_with_mode(&keys, &config_dir, &sample_creds(), Mode::UpdateExisting);
+        let confirmed = confirm_wiped(&config_dir);
+        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        if root_ignores_modes {
+            return;
+        }
+        assert!(present, "can't be ruled out, so it may be there");
+        assert!(matches!(update, Err(CredentialError::IoError(_))), "no update on a guess");
+        assert!(confirmed.is_err(), "not confirmed gone");
     }
 
     /// Unix (#28): a symlinked pairing folder is wiped through the link:

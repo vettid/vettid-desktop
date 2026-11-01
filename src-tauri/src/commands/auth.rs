@@ -663,11 +663,15 @@ fn wipe_local_pairing(config_dir: &std::path::Path) -> bool {
     }
 
     // Holds the store's write lock, so a save running at the same time
-    // can't put the pairing back after this reports it gone (#28).
-    if let Err(e) = store::wipe(config_dir) {
-        log::error!("Failed to remove the saved pairing on logout: {}", e);
+    // can't put the pairing back after this reports it gone, and is Ok
+    // only when the file system confirms it is gone (#28).
+    match store::wipe(config_dir) {
+        Ok(()) => true,
+        Err(e) => {
+            log::error!("Failed to remove the saved pairing on logout: {}", e);
+            false
+        }
     }
-    !store::exists(config_dir)
 }
 
 /// Log out: tell the vault to revoke this device, then wipe the on-disk
