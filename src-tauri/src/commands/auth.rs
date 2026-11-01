@@ -67,8 +67,9 @@ pub async fn register(
     use crate::registration::pairing;
 
     let config_dir = store::default_config_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&config_dir)
-        .map_err(|e| format!("Failed to create config dir: {}", e))?;
+    // Checked before pairing starts, so a folder another account can open
+    // is refused before the vault ever lists this desktop.
+    store::ensure_config_dir(&config_dir).map_err(|e| e.to_string())?;
 
     // Strip dashes/whitespace so users can paste either the grouped
     // `ABCD-EFGH-JKLM` form they see on the phone or a flat 12-char run.

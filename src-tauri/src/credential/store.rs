@@ -80,6 +80,11 @@ pub const KEYRING_UNAVAILABLE_NOTICE: &str =
 pub const NO_CONFIG_DIR_NOTICE: &str =
     "This desktop can't find your user folder, so it can't keep a pairing on this computer. Nothing was saved.";
 
+/// Shown when the pairing's folder or file could be opened by another
+/// account on this computer (Windows).
+pub const NOT_PRIVATE_NOTICE: &str =
+    "The folder this desktop keeps its pairing in (vettid-desktop, in your local app data) can be opened by another account on this computer, so nothing was saved there. Delete that folder, then pair again.";
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -116,6 +121,11 @@ pub enum CredentialError {
     /// there is nowhere safe to keep a pairing. Displays
     /// [`NO_CONFIG_DIR_NOTICE`].
     NoConfigDir,
+    /// Windows: the folder or file for the pairing is not private to the
+    /// current user (another account owns it or can open it, or it is a
+    /// symlink or junction). Nothing was changed. Displays
+    /// [`NOT_PRIVATE_NOTICE`].
+    NotPrivate,
 }
 
 impl fmt::Display for CredentialError {
@@ -135,6 +145,7 @@ impl fmt::Display for CredentialError {
             CredentialError::Unreadable => f.write_str(UNREADABLE_NOTICE),
             CredentialError::KeyringUnavailable => f.write_str(KEYRING_UNAVAILABLE_NOTICE),
             CredentialError::NoConfigDir => f.write_str(NO_CONFIG_DIR_NOTICE),
+            CredentialError::NotPrivate => f.write_str(NOT_PRIVATE_NOTICE),
         }
     }
 }
@@ -248,6 +259,39 @@ fn config_dir_under(base: Option<PathBuf>) -> Result<PathBuf, CredentialError> {
     match base {
         Some(base) if base.is_absolute() => Ok(base.join(CONFIG_SUBDIR)),
         _ => Err(CredentialError::NoConfigDir),
+    }
+}
+
+/// Create `config_dir` if needed, for keeping a pairing in.
+///
+/// On Windows the folder is made private to the current user (a
+/// protected DACL for the user and SYSTEM), and an existing folder that
+/// another account owns or can open, or that is a symlink or junction, is
+/// refused with [`CredentialError::NotPrivate`] (#16). On unix it is
+/// created as before.
+pub fn ensure_config_dir(config_dir: &Path) -> Result<(), CredentialError> {
+    #[cfg(windows)]
+    {
+        super::winacl::ensure_private_dir(config_dir).map_err(|e| acl_error(config_dir, e))
+    }
+    #[cfg(not(windows))]
+    {
+        fs::create_dir_all(config_dir)
+            .map_err(|e| CredentialError::IoError(format!("create config dir: {}", e)))
+    }
+}
+
+/// Log the detail of a refused folder or file. A policy refusal gives the
+/// person the "another account can open it" notice; a failure to check or
+/// set it up is reported as an I/O error, since the folder may well be
+/// private. Both leave it unchanged.
+#[cfg(windows)]
+fn acl_error(path: &Path, e: super::winacl::AclError) -> CredentialError {
+    use super::winacl::AclError;
+    log::error!("Credential store: {} {}; refusing to use it", path.display(), e);
+    match e {
+        AclError::NotPrivate(_) => CredentialError::NotPrivate,
+        AclError::Failed(what) => CredentialError::IoError(format!("folder or file permissions: {}", what)),
     }
 }
 
@@ -386,23 +430,26 @@ fn save_with(
     let data = serde_json::to_vec(&store)
         .map_err(|e| CredentialError::SerializationError(format!("marshal store: {}", e)))?;
 
-    fs::create_dir_all(config_dir)
-        .map_err(|e| CredentialError::IoError(format!("create config dir: {}", e)))?;
+    ensure_config_dir(config_dir)?;
 
     let path = config_dir.join(CREDENTIAL_FILE);
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    // Mode bits are not an access control on Windows. There the file
-    // gets the ACL it inherits from its folder. In the default folder
-    // under %LOCALAPPDATA% that is the user, SYSTEM and Administrators,
-    // but a redirected or pre-made folder can grant more. An explicit
-    // user-only DACL is required before a Windows release (owner
-    // decision 1a, 2026-11-01; #16).
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(&path)
-        .map_err(|e| CredentialError::IoError(format!("open {}: {}", path.display(), e)))?;
+    // SECURITY (Windows, #16): mode bits are not an access control there.
+    // An existing file is checked before anything changes; the file is
+    // opened without truncating, given the user-only DACL on its handle,
+    // checked again, and only then emptied. A failure at any step leaves
+    // an existing file's contents as they were.
+    #[cfg(windows)]
+    let mut file = super::winacl::open_private_file(&path).map_err(|e| acl_error(&path, e))?;
+    #[cfg(not(windows))]
+    let mut file = {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        options
+            .open(&path)
+            .map_err(|e| CredentialError::IoError(format!("open {}: {}", path.display(), e)))?
+    };
 
     file.write_all(&data)
         .map_err(|e| CredentialError::IoError(format!("write {}: {}", path.display(), e)))?;
@@ -869,6 +916,54 @@ mod tests {
         let err = load_with(&NoFallback(without_keyring()), other.path()).err().expect("load must fail");
         assert!(matches!(err, CredentialError::Unreadable), "got {err}");
         assert_eq!(fs::read(other.path().join(CREDENTIAL_FILE)).unwrap(), before, "kept");
+    }
+
+    /// Windows: a save makes the folder and the file private to the user.
+    #[cfg(windows)]
+    #[test]
+    fn windows_save_makes_folder_and_file_user_only() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = ThroughKeystore(with_keyring());
+        save_with(&keys, &config_dir, &sample_creds()).expect("save");
+        assert!(super::super::winacl::test_is_user_only(&config_dir), "folder");
+        assert!(super::super::winacl::test_is_user_only(&config_dir.join(CREDENTIAL_FILE)), "file");
+        // A second save over the private file works.
+        save_with(&keys, &config_dir, &sample_creds()).expect("second save");
+    }
+
+    /// Windows: a folder another account can open is refused, and nothing
+    /// is written into it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_save_refuses_a_shared_folder() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        fs::create_dir(&config_dir).unwrap();
+        super::super::winacl::test_share_with_everyone(&config_dir);
+        let err = save_with(&ThroughKeystore(with_keyring()), &config_dir, &sample_creds())
+            .err()
+            .expect("save must fail");
+        assert!(matches!(err, CredentialError::NotPrivate), "got {err}");
+        assert_eq!(err.to_string(), NOT_PRIVATE_NOTICE);
+        assert!(!config_dir.join(CREDENTIAL_FILE).exists(), "nothing may be written");
+    }
+
+    /// Windows: an existing file another account can open is refused
+    /// before it is truncated.
+    #[cfg(windows)]
+    #[test]
+    fn windows_save_refuses_a_shared_file_and_keeps_it() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = ThroughKeystore(with_keyring());
+        save_with(&keys, &config_dir, &sample_creds()).expect("save");
+        let file = config_dir.join(CREDENTIAL_FILE);
+        let before = fs::read(&file).unwrap();
+        super::super::winacl::test_share_with_everyone(&file);
+        let err = save_with(&keys, &config_dir, &sample_creds()).err().expect("save must fail");
+        assert!(matches!(err, CredentialError::NotPrivate), "got {err}");
+        assert_eq!(fs::read(&file).unwrap(), before, "not truncated");
     }
 
     /// No known folder, or a relative one, is refused: never the current
