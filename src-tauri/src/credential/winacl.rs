@@ -8,9 +8,9 @@
 //! - **New folder:** created owned by the current user, with a protected
 //!   DACL that grants only the current user and SYSTEM (inherited by what
 //!   is created inside it).
-//! - **The file:** opened without truncating, given the protected
-//!   user-and-SYSTEM DACL through the open handle and checked again on that
-//!   handle; only then is it emptied and written ([`open_private_file`]).
+//! - **The file:** written to a new temporary file created in one step with
+//!   the protected user-and-SYSTEM DACL, inside the folder held open, then
+//!   moved over the pairing file ([`write_private_file`]).
 //! - **An existing folder or file** is checked first and refused (nothing
 //!   is changed or written) when:
 //!   - it is a reparse point (a symlink or junction could point anywhere);
@@ -33,10 +33,14 @@
 //! (a security call, creating the folder, a stat error) is
 //! [`AclError::Failed`]: still a refusal, with a different message.
 //!
-//! Not covered: the parent of the folder (`%LOCALAPPDATA%` itself) is not
-//! checked. If it is redirected somewhere another account can delete or
-//! rename entries, that account could swap the folder between the check
-//! and the write.
+//! The parent of the folder (`%LOCALAPPDATA%` itself) is not checked. A
+//! folder swap through it is closed for the duration of a write: the
+//! folder is held open with data access and no delete sharing, so it can't
+//! be renamed (tested), and the new file's final path must be inside the
+//! held folder. Whether a parent can be renamed while a child folder is
+//! held this way has not been tested. A folder swapped in before the write
+//! is checked on its own handle like any other, so it is refused unless it
+//! is private to the user (#21).
 
 use std::ffi::c_void;
 use std::fs::File;
@@ -48,22 +52,26 @@ use std::ptr;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, HLOCAL,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, GetSecurityInfo, SetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+    GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    EqualSid, GetAce, GetLengthSid, GetSecurityDescriptorDacl, GetTokenInformation, IsValidSid,
+    EqualSid, GetAce, GetLengthSid, GetTokenInformation, IsValidSid,
     IsWellKnownSid, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE,
-    ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
-    TOKEN_QUERY, TOKEN_USER,
+    ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
-    READ_CONTROL, WRITE_DAC,
+    CreateDirectoryW, CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+    MoveFileExW, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED,
+    FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    OPEN_EXISTING, READ_CONTROL, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -235,7 +243,9 @@ impl Descriptor {
         self.0 .0
     }
 
+    #[cfg(test)]
     fn dacl(&self) -> Result<*mut ACL, AclError> {
+        use windows_sys::Win32::Security::GetSecurityDescriptorDacl;
         let mut present = 0;
         let mut defaulted = 0;
         let mut dacl: *mut ACL = ptr::null_mut();
@@ -395,7 +405,7 @@ fn check_handle_with(handle: HANDLE, user: &[u8]) -> Result<(), AclError> {
 }
 
 /// Check an existing folder or file: see the module documentation. Used at
-/// load to warn (#24); the save path checks through `open_private_file`.
+/// load to warn (#24); the save path checks through `write_private_file`.
 pub(crate) fn check_private(path: &Path) -> Result<(), AclError> {
     let user = current_user_sid()?;
     check_private_with(path, &user)
@@ -432,84 +442,297 @@ pub(crate) fn ensure_private_dir(dir: &Path) -> Result<(), AclError> {
     Ok(())
 }
 
-/// What [`open_private_file_with`] does to the open handle before it is
-/// emptied. The production step is [`protect_handle`]; tests replace it.
-type ProtectStep = fn(HANDLE, &[u8]) -> Result<(), AclError>;
+/// An open handle to the pairing folder, held while the file is written.
+///
+/// It is opened without following a link and **without delete sharing**,
+/// so while it is held the folder cannot be renamed, moved or deleted, and
+/// nothing can be swapped in at its path. Its permissions are checked on
+/// this handle, and its final path is what the new file must sit in.
+struct HeldFolder {
+    handle: HANDLE,
+    final_path: String,
+}
 
-/// Give the open file the protected, user-and-SYSTEM DACL, then check it
-/// again on the same handle.
-fn protect_handle(handle: HANDLE, user: &[u8]) -> Result<(), AclError> {
-    let sd = Descriptor::from_sddl(&file_sddl(&sid_string(user)?))?;
-    let dacl = sd.dacl()?;
-    // SAFETY: `handle` is open with WRITE_DAC; `dacl` points into `sd`,
-    // which outlives the call.
-    let status = unsafe {
-        SetSecurityInfo(
-            handle,
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            dacl,
+impl Drop for HeldFolder {
+    fn drop(&mut self) {
+        // SAFETY: `handle` was returned by CreateFileW and is closed once.
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
+fn hold_folder(dir: &Path, user: &[u8]) -> Result<HeldFolder, AclError> {
+    let dir_w = wide_path(dir);
+    // SAFETY: `dir_w` is NUL-terminated. FILE_FLAG_BACKUP_SEMANTICS is
+    // needed to open a directory; FILE_FLAG_OPEN_REPARSE_POINT opens a link
+    // itself. No FILE_SHARE_DELETE: the folder can't be renamed while held.
+    let handle = unsafe {
+        CreateFileW(
+            dir_w.as_ptr(),
+            // FILE_LIST_DIRECTORY is data access: share modes are only
+            // enforced against handles that have some, so it is what makes
+            // the missing FILE_SHARE_DELETE stop a rename.
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
         )
     };
-    if status != ERROR_SUCCESS {
-        return Err(failed(format!("SetSecurityInfo error {}", status)));
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        return Err(failed(format!("open folder: error {}", last_error())));
     }
-    check_handle_with(handle, user)
-}
-
-/// Open `path` for writing the pairing, private to the current user.
-///
-/// SECURITY: an existing file is checked first (a stat error other than
-/// NotFound is a refusal). The file is opened without truncating, with
-/// WRITE_DAC and READ_CONTROL, given the user-only DACL on that handle and
-/// checked again; only then is it emptied. Any failure leaves an existing
-/// file's contents as they were.
-pub(crate) fn open_private_file(path: &Path) -> Result<File, AclError> {
-    open_private_file_with(path, protect_handle)
-}
-
-fn open_private_file_with(path: &Path, protect: ProtectStep) -> Result<File, AclError> {
-    let user = current_user_sid()?;
-    if let Entry::Present = entry_at(path)? {
-        check_private_with(path, &user)?;
-    }
-    let file = open_no_follow(path)?;
-    protect(file.as_raw_handle() as HANDLE, &user)?;
-    file.set_len(0).map_err(|e| failed(format!("truncate: {}", e)))?;
-    Ok(file)
-}
-
-/// Open (or create) `path` for writing without following a link, and
-/// refuse the handle if it is a reparse point or has more than one name.
-/// Nothing is truncated here.
-fn open_no_follow(path: &Path) -> Result<File, AclError> {
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .access_mode(FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | WRITE_DAC | READ_CONTROL)
-        .create(true)
-        // Open a link itself rather than its target, so a symlink or
-        // junction swapped in after the check is caught on the handle.
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|e| failed(format!("open: {}", e)))?;
-    // SAFETY: BY_HANDLE_FILE_INFORMATION is plain data, valid when zeroed;
-    // the handle is open with FILE_READ_ATTRIBUTES.
-    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
-        return Err(failed(format!("GetFileInformationByHandle error {}", last_error())));
-    }
+    // Owns the handle from here on, so every early return closes it once.
+    let mut held = HeldFolder { handle, final_path: String::new() };
+    let info = handle_info(held.handle)?;
     if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(NotPrivate::ReparsePoint.into());
     }
-    // A second name for the same file could sit in a folder that other
-    // accounts can list or that has other rules.
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(failed("not a folder"));
+    }
+    check_handle_with(held.handle, user)?;
+    held.final_path = final_path(held.handle)?;
+    Ok(held)
+}
+
+fn handle_info(handle: HANDLE) -> Result<BY_HANDLE_FILE_INFORMATION, AclError> {
+    // SAFETY: BY_HANDLE_FILE_INFORMATION is plain data, valid when zeroed;
+    // the handle is open with FILE_READ_ATTRIBUTES.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+        return Err(failed(format!("GetFileInformationByHandle error {}", last_error())));
+    }
+    Ok(info)
+}
+
+/// The normalized, DOS-style final path of an open handle
+/// (`\\?\C:\Users\...`), with every link resolved.
+fn final_path(handle: HANDLE) -> Result<String, AclError> {
+    let mut buf = vec![0u16; 512];
+    loop {
+        // SAFETY: `buf` holds `buf.len()` characters.
+        let len = unsafe {
+            GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), buf.len() as u32, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS)
+        } as usize;
+        if len == 0 {
+            return Err(failed(format!("GetFinalPathNameByHandleW error {}", last_error())));
+        }
+        if len < buf.len() {
+            return Ok(String::from_utf16_lossy(&buf[..len]));
+        }
+        // Too small: `len` is the size needed, including the terminator.
+        if len > 32 * 1024 {
+            return Err(failed("final path too long"));
+        }
+        buf = vec![0u16; len + 1];
+    }
+}
+
+/// Whether `child` names an entry directly inside `folder` (both final
+/// paths). Both come from GetFinalPathNameByHandleW with
+/// FILE_NAME_NORMALIZED, so they carry the on-disk case and are compared
+/// exactly: Unicode case folding is not NTFS's and could match a
+/// different name.
+fn is_directly_inside(child: &str, folder: &str) -> bool {
+    let folder = folder.trim_end_matches('\\');
+    match child.rsplit_once('\\') {
+        Some((parent, name)) => !name.is_empty() && parent == folder,
+        None => false,
+    }
+}
+
+/// Move `from` over `to`. Another program (an antivirus scanner, the
+/// search indexer, a sync client) can hold either file open for a moment,
+/// so a sharing violation or access denial is retried a few times.
+fn replace_file(from: &[u16], to: &[u16]) -> Result<(), AclError> {
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_SHARING_VIOLATION: u32 = 32;
+    const ATTEMPTS: u32 = 5;
+    for attempt in 1..=ATTEMPTS {
+        // SAFETY: both paths are NUL-terminated.
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } != 0 {
+            return Ok(());
+        }
+        let err = last_error();
+        let busy = err == ERROR_SHARING_VIOLATION || err == ERROR_ACCESS_DENIED;
+        if !busy || attempt == ATTEMPTS {
+            return Err(failed(format!("replace: error {} after {} attempts", err, attempt)));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt)));
+    }
+    unreachable!("the loop returns")
+}
+
+/// Removes the temporary file on drop unless the write succeeded.
+struct TempFile<'a> {
+    path: &'a Path,
+    keep: bool,
+}
+
+impl Drop for TempFile<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(self.path);
+        }
+    }
+}
+
+/// Remove temporary files a crashed earlier save left behind. They hold
+/// ciphertext only, in the private folder; this keeps it tidy.
+pub(crate) fn remove_stale_temps(dir: &Path, name: &str) {
+    let prefix = format!("{name}{TEMP_INFIX}");
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// Marks a temporary file next to the pairing file.
+pub(crate) const TEMP_INFIX: &str = ".tmp-";
+
+/// A test hook run after the temporary file is written and closed, just
+/// before it replaces the pairing file. Production uses [`no_hook`].
+type BeforeReplace = fn(&Path) -> Result<(), AclError>;
+
+fn no_hook(_: &Path) -> Result<(), AclError> {
+    Ok(())
+}
+
+/// Write `data` as `dir\name`, privately and atomically (#23, #12).
+///
+/// SECURITY, in order:
+/// 1. the folder is held open (no delete sharing, no link followed) and
+///    checked on that handle, so it can't be swapped during the write;
+/// 2. an existing `name` is checked, and the write is refused (and the
+///    file kept) if another account can open it;
+/// 3. a new temporary file is created in one step, `CREATE_NEW` with the
+///    protected user-and-SYSTEM DACL in its SECURITY_ATTRIBUTES, so it never
+///    exists with an inherited ACL and no existing file or link is opened;
+/// 4. its handle is checked (no reparse point, one name, the policy) and
+///    its final path must be directly inside the held folder;
+/// 5. the data is written and flushed, the handle closed, and the file
+///    moved over `name` with MOVEFILE_REPLACE_EXISTING | WRITE_THROUGH. A
+///    move keeps the file's own DACL;
+/// 6. the result's final path is checked again.
+///
+/// Any failure before the move leaves an existing `name` as it was and
+/// removes the temporary file.
+pub(crate) fn write_private_file(dir: &Path, name: &str, data: &[u8]) -> Result<(), AclError> {
+    write_private_file_with(dir, name, data, no_hook)
+}
+
+fn write_private_file_with(
+    dir: &Path,
+    name: &str,
+    data: &[u8],
+    before_replace: BeforeReplace,
+) -> Result<(), AclError> {
+    use std::io::Write;
+    use std::os::windows::io::FromRawHandle;
+
+    let user = current_user_sid()?;
+    let folder = hold_folder(dir, &user)?;
+
+    let target = dir.join(name);
+    if let Entry::Present = entry_at(&target)? {
+        check_private_with(&target, &user)?;
+        let existing = open_for_check(&target)?;
+        // A rename never writes through another name for the old file, so
+        // this refusal is conservative: a second name is unexpected here.
+        if handle_info(existing.as_raw_handle() as HANDLE)?.nNumberOfLinks > 1 {
+            return Err(NotPrivate::HardLinked.into());
+        }
+    }
+    remove_stale_temps(dir, name);
+
+    let temp_path = dir.join(format!(
+        "{name}{TEMP_INFIX}{}-{:016x}",
+        std::process::id(),
+        rand::RngCore::next_u64(&mut rand::rngs::OsRng)
+    ));
+    let sd = Descriptor::from_sddl(&file_sddl(&sid_string(&user)?))?;
+    let attrs = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.ptr(),
+        bInheritHandle: 0,
+    };
+    let temp_w = wide_path(&temp_path);
+    // SAFETY: `temp_w` is NUL-terminated and `attrs` points to a valid
+    // descriptor that outlives the call. CREATE_NEW never opens an existing
+    // file or link; no sharing while it is written.
+    let handle = unsafe {
+        CreateFileW(
+            temp_w.as_ptr(),
+            FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL,
+            0,
+            &attrs,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        return Err(failed(format!("create temporary file: error {}", last_error())));
+    }
+    let mut temp = TempFile { path: &temp_path, keep: false };
+    // SAFETY: `handle` is a valid, owned file handle; `File` closes it.
+    let mut file = unsafe { File::from_raw_handle(handle as _) };
+
+    let info = handle_info(handle)?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(NotPrivate::ReparsePoint.into());
+    }
     if info.nNumberOfLinks > 1 {
         return Err(NotPrivate::HardLinked.into());
     }
-    Ok(file)
+    check_handle_with(handle, &user)?;
+    if !is_directly_inside(&final_path(handle)?, &folder.final_path) {
+        return Err(failed("temporary file is not in the pairing folder"));
+    }
+
+    file.write_all(data).map_err(|e| failed(format!("write: {}", e)))?;
+    file.sync_all().map_err(|e| failed(format!("flush: {}", e)))?;
+    drop(file);
+
+    before_replace(&temp_path)?;
+
+    let target_w = wide_path(&target);
+    replace_file(&temp_w, &target_w)?;
+    temp.keep = true;
+
+    // Detection, not prevention: the old file is already replaced. The
+    // file now at `target` must be the one written, inside the folder; if
+    // that can't be confirmed, say so plainly rather than "saved" or
+    // "failed".
+    let confirm = || -> Result<(), AclError> {
+        let written = open_for_check(&target)?;
+        if !is_directly_inside(&final_path(written.as_raw_handle() as HANDLE)?, &folder.final_path) {
+            return Err(failed("not in the pairing folder"));
+        }
+        check_handle_with(written.as_raw_handle() as HANDLE, &user)
+    };
+    if let Err(e) = confirm() {
+        return Err(failed(format!(
+            "the pairing was replaced, but the result could not be confirmed ({})",
+            e
+        )));
+    }
+    drop(folder);
+    Ok(())
+}
+
+/// Open `path` only to check it: attributes and security, no data, no
+/// link followed.
+fn open_for_check(path: &Path) -> Result<File, AclError> {
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|e| failed(format!("open {}: {}", path.display(), e)))
 }
 
 /// Whether `path`'s DACL is protected (does not inherit). For tests.
@@ -603,8 +826,8 @@ pub(crate) fn test_is_user_only(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
+    use windows_sys::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION;
 
     /// Replace `path`'s DACL with one from `sddl` ("D:P(...)" or "D:(...)").
     /// A "D:P" DACL is protected; a "D:" one keeps inheriting.
@@ -666,35 +889,113 @@ mod tests {
         ensure_private_dir(&dir).expect("existing private dir");
     }
 
+    fn temps_in(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(TEMP_INFIX))
+            .count()
+    }
+
     #[test]
-    fn private_file_gets_the_user_only_dacl_and_is_emptied() {
+    fn written_file_is_user_only_replaces_the_old_one_and_leaves_no_temp() {
         let base = tempfile::tempdir().unwrap();
         let dir = base.path().join("vettid-desktop");
         ensure_private_dir(&dir).unwrap();
         let path = dir.join("connection.enc");
-        std::fs::write(&path, b"old contents").unwrap();
-        let mut file = open_private_file(&path).expect("open");
+        write_private_file(&dir, "connection.enc", b"first").expect("write");
         assert!(test_is_user_only(&path));
-        assert_eq!(std::fs::read(&path).unwrap(), b"", "emptied after protecting");
-        file.write_all(b"new").unwrap();
-        drop(file);
+        write_private_file(&dir, "connection.enc", b"second").expect("rewrite");
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert!(test_is_user_only(&path));
+        assert_eq!(temps_in(&dir), 0, "no temporary file left");
+    }
+
+    /// A failure after the temporary file is written but before it replaces
+    /// the pairing: the old pairing is kept and the temporary file removed.
+    #[test]
+    fn a_failure_before_the_replace_keeps_the_old_file() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        ensure_private_dir(&dir).unwrap();
+        let path = dir.join("connection.enc");
+        write_private_file(&dir, "connection.enc", b"the old pairing").unwrap();
+        fn fail(temp: &Path) -> Result<(), AclError> {
+            // The temporary file exists, private, with the new data.
+            assert!(test_is_user_only(temp));
+            assert_eq!(std::fs::read(temp).unwrap(), b"new");
+            Err(failed("injected"))
+        }
+        assert_eq!(
+            write_private_file_with(&dir, "connection.enc", b"new", fail).err(),
+            Some(failed("injected"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"the old pairing");
+        assert_eq!(temps_in(&dir), 0, "temporary file removed");
+    }
+
+    /// While the write runs, the folder is held without delete sharing, so
+    /// it can't be renamed away.
+    #[test]
+    fn the_folder_cannot_be_renamed_while_held() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        ensure_private_dir(&dir).unwrap();
+        let held = hold_folder(&dir, &current_user_sid().unwrap()).expect("hold");
+        assert!(std::fs::rename(&dir, base.path().join("moved")).is_err(), "rename must fail while held");
+        drop(held);
+        std::fs::rename(&dir, base.path().join("moved")).expect("rename works once released");
+    }
+
+    /// Another program holding connection.enc open without delete sharing:
+    /// the replace is retried, then fails; the old pairing is kept and no
+    /// temporary file is left.
+    #[test]
+    fn a_file_held_open_elsewhere_fails_the_write_and_is_kept() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        ensure_private_dir(&dir).unwrap();
+        let path = dir.join("connection.enc");
+        write_private_file(&dir, "connection.enc", b"the old pairing").unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .unwrap();
+        let err = write_private_file(&dir, "connection.enc", b"new").err().expect("must fail");
+        assert!(matches!(&err, AclError::Failed(what) if what.starts_with("replace: error")), "got {err}");
+        drop(holder);
+        assert_eq!(std::fs::read(&path).unwrap(), b"the old pairing");
+        assert_eq!(temps_in(&dir), 0, "temporary file removed");
+        // Once released, the write goes through.
+        write_private_file(&dir, "connection.enc", b"new").expect("write");
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 
-    /// B1: if protecting the open file fails, the existing contents are
-    /// kept (the file is not truncated before it is protected).
+    /// Temporary files from a crashed save are removed by the next save.
     #[test]
-    fn a_failed_protect_step_leaves_the_file_as_it_was() {
+    fn stale_temporary_files_are_removed() {
         let base = tempfile::tempdir().unwrap();
         let dir = base.path().join("vettid-desktop");
         ensure_private_dir(&dir).unwrap();
-        let path = dir.join("connection.enc");
-        std::fs::write(&path, b"the old pairing").unwrap();
-        fn fail(_: HANDLE, _: &[u8]) -> Result<(), AclError> {
-            Err(failed("injected"))
-        }
-        assert_eq!(open_private_file_with(&path, fail).err(), Some(failed("injected")));
-        assert_eq!(std::fs::read(&path).unwrap(), b"the old pairing");
+        std::fs::write(dir.join(format!("connection.enc{TEMP_INFIX}1-00")), b"old").unwrap();
+        write_private_file(&dir, "connection.enc", b"x").unwrap();
+        assert_eq!(temps_in(&dir), 0);
+    }
+
+    #[test]
+    fn is_directly_inside_compares_the_parent_exactly() {
+        assert!(is_directly_inside(r"\\?\C:\Users\a\AppData\Local\vettid-desktop\f", r"\\?\C:\Users\a\AppData\Local\vettid-desktop"));
+        // Both sides are normalized final paths, so a case difference is a
+        // different name, not the same one.
+        assert!(!is_directly_inside(r"\\?\C:\Users\a\AppData\Local\vettid-desktop\f", r"\\?\C:\Users\A\appdata\local\vettid-desktop"));
+        // KELVIN SIGN lowercases to "k" in Unicode but is a different NTFS name.
+        assert!(!is_directly_inside("\\\\?\\C:\\\u{212A}\\f", r"\\?\C:\k"));
+        assert!(is_directly_inside(r"\\?\C:\x\f", r"\\?\C:\x\"));
+        assert!(!is_directly_inside(r"\\?\C:\x\y\f", r"\\?\C:\x"));
+        assert!(!is_directly_inside(r"\\?\D:\x\f", r"\\?\C:\x"));
+        assert!(!is_directly_inside(r"\\?\C:\x\", r"\\?\C:\x"));
+        assert!(!is_directly_inside("f", r"\\?\C:\x"));
     }
 
     #[test]
@@ -724,7 +1025,10 @@ mod tests {
         std::fs::write(&path, b"x").unwrap();
         set_dacl(&path, &format!("D:P(A;;FA;;;{})(A;;FR;;;WD)", me()));
         assert_eq!(check_private(&path), refused(NotPrivate::ForeignAccess));
-        assert_eq!(open_private_file(&path).err(), Some(AclError::NotPrivate(NotPrivate::ForeignAccess)));
+        assert_eq!(
+            write_private_file(base.path(), "connection.enc", b"new").err(),
+            Some(AclError::NotPrivate(NotPrivate::ForeignAccess))
+        );
         assert_eq!(std::fs::read(&path).unwrap(), b"x");
     }
 
@@ -767,9 +1071,8 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         set_dacl(&dir, &format!("D:(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{})", me()));
         ensure_private_dir(&dir).expect("accepted");
-        let path = dir.join("connection.enc");
-        drop(open_private_file(&path).expect("open"));
-        assert!(test_is_user_only(&path));
+        write_private_file(&dir, "connection.enc", b"x").expect("write");
+        assert!(test_is_user_only(&dir.join("connection.enc")));
     }
 
     #[test]
@@ -790,14 +1093,12 @@ mod tests {
         assert_eq!(ensure_private_dir(&link), refused(NotPrivate::ReparsePoint));
     }
 
-    /// A junction at connection.enc itself, reaching the open step without
-    /// the path check that normally runs first (as if swapped in after
-    /// it): the open refuses it and nothing is written through the link.
-    /// Windows already fails the write open of a junction ("Access is
-    /// denied"); a file symlink would open and be refused by the handle
-    /// check, but creating one needs a privilege the tests don't have.
+    /// A junction where connection.enc should be: refused, and nothing is
+    /// written through it. The write never opens the target path for
+    /// writing (it creates a new temporary file and moves it), and the
+    /// existing entry is checked first.
     #[test]
-    fn junction_at_the_file_is_refused_on_the_handle() {
+    fn junction_at_the_file_is_refused() {
         let base = tempfile::tempdir().unwrap();
         let target = base.path().join("elsewhere");
         std::fs::create_dir(&target).unwrap();
@@ -809,9 +1110,35 @@ mod tests {
             .output()
             .expect("mklink");
         assert!(status.status.success(), "mklink /J failed");
-        assert!(open_no_follow(&link).is_err(), "the open step must refuse a junction");
-        // Through the normal path, the path check names it.
-        assert_eq!(open_private_file(&link).err(), Some(AclError::NotPrivate(NotPrivate::ReparsePoint)));
+        assert_eq!(
+            write_private_file(base.path(), "connection.enc", b"new").err(),
+            Some(AclError::NotPrivate(NotPrivate::ReparsePoint))
+        );
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none(), "nothing written through the link");
+    }
+
+    /// The folder itself as a junction is refused when held, on its handle.
+    #[test]
+    fn junction_as_the_folder_is_refused_when_held() {
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        let link = base.path().join("vettid-desktop");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .expect("mklink");
+        assert!(status.status.success(), "mklink /J failed");
+        assert_eq!(
+            hold_folder(&link, &current_user_sid().unwrap()).err(),
+            Some(AclError::NotPrivate(NotPrivate::ReparsePoint))
+        );
+        assert_eq!(
+            write_private_file(&link, "connection.enc", b"new").err(),
+            Some(AclError::NotPrivate(NotPrivate::ReparsePoint))
+        );
         assert!(std::fs::read_dir(&target).unwrap().next().is_none(), "nothing written through the link");
     }
 
@@ -824,7 +1151,10 @@ mod tests {
         let path = dir.join("connection.enc");
         std::fs::write(&path, b"the old pairing").unwrap();
         std::fs::hard_link(&path, base.path().join("second-name")).unwrap();
-        assert_eq!(open_private_file(&path).err(), Some(AclError::NotPrivate(NotPrivate::HardLinked)));
+        assert_eq!(
+            write_private_file(&dir, "connection.enc", b"new").err(),
+            Some(AclError::NotPrivate(NotPrivate::HardLinked))
+        );
         assert_eq!(std::fs::read(&path).unwrap(), b"the old pairing");
     }
 
