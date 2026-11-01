@@ -445,6 +445,17 @@ enum OnDisk {
     Unreadable,
 }
 
+/// Which key protects the saved pairing, for the person to see (#11).
+/// Read from the file's header only: no key is fetched and nothing is
+/// decrypted, so it says how the file is sealed, not that it opens.
+pub fn stored_key_protection(config_dir: &Path) -> &'static str {
+    match on_disk_store(config_dir) {
+        OnDisk::Absent => "none",
+        OnDisk::Bound(binding) => binding.as_str(),
+        OnDisk::Unreadable => "unknown",
+    }
+}
+
 fn on_disk_store(config_dir: &Path) -> OnDisk {
     match read_store(config_dir) {
         Ok(store) => BindingMode::from_str(&store.binding).map_or(OnDisk::Unreadable, OnDisk::Bound),
@@ -796,6 +807,24 @@ mod tests {
         let after = fs::read(dir.path().join(CREDENTIAL_FILE)).unwrap();
         assert_eq!(before, after, "the keyring-bound file must be left as it was");
         assert_eq!(read_store(dir.path()).unwrap().binding, "keyring");
+    }
+
+    /// The key protection shown in Settings follows the file's header.
+    #[test]
+    fn stored_key_protection_reports_the_binding_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(stored_key_protection(dir.path()), "none");
+
+        save_with(&ThroughKeystore(with_keyring()), dir.path(), &sample_creds()).unwrap();
+        assert_eq!(stored_key_protection(dir.path()), "keyring");
+
+        let bound = tempfile::tempdir().unwrap();
+        save_with(&ThroughKeystore(without_keyring()), bound.path(), &sample_creds()).unwrap();
+        assert_eq!(stored_key_protection(bound.path()), "machine");
+
+        let garbage = tempfile::tempdir().unwrap();
+        fs::write(garbage.path().join(CREDENTIAL_FILE), b"not json").unwrap();
+        assert_eq!(stored_key_protection(garbage.path()), "unknown");
     }
 
     /// A file that exists but can't be parsed, or names an unknown

@@ -398,7 +398,7 @@ pub async fn complete_pairing(
         session_duration_seconds: activation_result.duration_s,
     };
 
-    store::save(config_dir, &creds).map_err(|e| match e {
+    let binding = store::save(config_dir, &creds).map_err(|e| match e {
         store::CredentialError::KeyringUnavailable => RegistrationError::KeyringUnavailable,
         e => RegistrationError::Internal(format!("save credentials: {}", e)),
     })?;
@@ -409,6 +409,7 @@ pub async fn complete_pairing(
         connection_id: session.connection_id,
         session_id: activation_result.session_id,
         expires_at: activation_result.expires_at,
+        binding,
     })
 }
 
@@ -454,6 +455,8 @@ pub struct PairingRuntime {
 }
 
 pub struct PairingOutcome {
+    /// The key the saved pairing is sealed under.
+    pub binding: crate::credential::keystore::BindingMode,
     pub connection_id: String,
     pub session_id: String,
     pub expires_at: i64,
