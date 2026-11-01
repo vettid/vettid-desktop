@@ -258,6 +258,22 @@ mod tests {
         }
     }
 
+    /// On a real Windows machine the collector must yield a usable
+    /// MachineGuid and a machine-bound key. The availability test above
+    /// accepts `MissingMachineId`, so it would not catch a broken
+    /// MachineGuid read. Asserts only; no attribute value is printed.
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_collector_gives_a_machine_bound_key() {
+        let attrs = collect_attributes().expect("collect Windows attributes");
+        assert!(
+            machine_id_is_usable(&attrs.machine_id),
+            "the MachineGuid read is empty or a placeholder"
+        );
+        let key = machine_bound_key_from(&attrs).expect("machine-bound key");
+        assert!(key.iter().any(|&b| b != 0));
+    }
+
     #[test]
     fn test_derive_platform_key_deterministic() {
         // Two calls should return the same key (machine attributes don't change)

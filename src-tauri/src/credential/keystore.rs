@@ -20,6 +20,11 @@
 //!    A binding mode marker lands on the encrypted store so callers
 //!    can show the user a "we couldn't reach your keyring" notice.
 //!
+//!    There is no fallback on Windows ([`MACHINE_BOUND_FALLBACK`]): a
+//!    Credential Manager failure fails the save. On every platform, a
+//!    store that is already keyring-bound is never re-saved machine-bound
+//!    (see `credential::store::save`).
+//!
 //! ## Why no passphrase
 //!
 //! Every privileged vault operation already requires phone
@@ -91,12 +96,19 @@ pub enum KeystoreError {
     /// All key sources failed. Should be rare — the machine-bound
     /// fallback typically works on any reachable filesystem.
     NoSource(String),
+    /// The OS keyring failed and no machine-bound fallback is allowed:
+    /// on a platform without one ([`MACHINE_BOUND_FALLBACK`]), or for a
+    /// store that is already keyring-bound.
+    KeyringUnavailable(String),
 }
 
 impl fmt::Display for KeystoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             KeystoreError::NoSource(msg) => write!(f, "keystore: no usable key source ({})", msg),
+            KeystoreError::KeyringUnavailable(msg) => {
+                write!(f, "keystore: OS keyring unavailable, no fallback allowed ({})", msg)
+            }
         }
     }
 }
@@ -148,7 +160,28 @@ pub fn fetch_or_create_master_key() -> Result<MasterKey, KeystoreError> {
     fetch_or_create_master_key_with(&System)
 }
 
+/// Whether this platform may fall back to the machine-bound key when the
+/// OS keyring fails.
+///
+/// SECURITY: not on Windows. Every input to the machine-bound key
+/// (MachineGuid, CPU, disk serial, MAC, hostname) can be read by any
+/// standard user there (HKLM\SOFTWARE\Microsoft\Cryptography grants
+/// BUILTIN\Users read), so the key would add nothing beyond the file's
+/// ACL, while Credential Manager is DPAPI-protected and present for every
+/// interactive user. A Credential Manager failure therefore fails the
+/// save instead of silently storing the pairing under a weaker key.
+pub(crate) const MACHINE_BOUND_FALLBACK: bool = cfg!(not(windows));
+
 pub(crate) fn fetch_or_create_master_key_with(src: &dyn Sources) -> Result<MasterKey, KeystoreError> {
+    fetch_or_create_master_key_with_policy(src, MACHINE_BOUND_FALLBACK)
+}
+
+/// [`fetch_or_create_master_key_with`] with the fallback policy given, so
+/// both policies can be tested on every platform.
+pub(crate) fn fetch_or_create_master_key_with_policy(
+    src: &dyn Sources,
+    allow_machine_bound: bool,
+) -> Result<MasterKey, KeystoreError> {
     // Try keyring first.
     match fetch_or_create_keyring_key(src) {
         Ok(key) => {
@@ -156,6 +189,10 @@ pub(crate) fn fetch_or_create_master_key_with(src: &dyn Sources) -> Result<Maste
                 key,
                 binding: BindingMode::Keyring,
             })
+        }
+        Err(e) if !allow_machine_bound => {
+            log::warn!("Keystore: OS keyring unavailable ({}); no fallback on this platform", e);
+            return Err(KeystoreError::KeyringUnavailable(e));
         }
         Err(e) => {
             log::warn!(
@@ -336,7 +373,7 @@ pub(crate) mod tests {
     fn no_keyring_falls_back_to_the_machine_bound_key() {
         let attrs = attrs_with_machine_id(MACHINE_ID);
         let src = TestSources::no_keyring(attrs.clone());
-        let key = fetch_or_create_master_key_with(&src).expect("key");
+        let key = fetch_or_create_master_key_with_policy(&src, true).expect("key");
         assert_eq!(key.binding, BindingMode::MachineBound);
         assert_eq!(*key.key, *platform_key::machine_bound_key_from(&attrs).unwrap());
     }
@@ -344,9 +381,31 @@ pub(crate) mod tests {
     #[test]
     fn no_keyring_and_no_machine_id_gives_no_key() {
         let src = TestSources::no_keyring(attrs_with_machine_id(""));
-        let err = fetch_or_create_master_key_with(&src).err().expect("must fail");
+        let err = fetch_or_create_master_key_with_policy(&src, true).err().expect("must fail");
         assert!(err.to_string().contains("no machine id"), "got {err}");
         assert!(fetch_for_binding_with(&src, BindingMode::MachineBound).is_err());
+    }
+
+    /// Without the fallback (Windows), a keyring failure is an error, even
+    /// with a usable machine id, and no machine-bound key is returned.
+    #[test]
+    fn no_keyring_without_fallback_is_an_error() {
+        let src = TestSources::no_keyring(attrs_with_machine_id(MACHINE_ID));
+        let err = fetch_or_create_master_key_with_policy(&src, false).err().expect("must fail");
+        assert!(matches!(err, KeystoreError::KeyringUnavailable(_)), "got {err}");
+    }
+
+    /// The platform policy: no fallback on Windows, a fallback elsewhere.
+    #[test]
+    fn platform_fallback_policy() {
+        assert_eq!(MACHINE_BOUND_FALLBACK, !cfg!(windows));
+        let src = TestSources::no_keyring(attrs_with_machine_id(MACHINE_ID));
+        let result = fetch_or_create_master_key_with(&src);
+        if cfg!(windows) {
+            assert!(matches!(result, Err(KeystoreError::KeyringUnavailable(_))));
+        } else {
+            assert_eq!(result.expect("key").binding, BindingMode::MachineBound);
+        }
     }
 
     #[test]
