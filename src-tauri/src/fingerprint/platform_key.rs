@@ -1,7 +1,7 @@
 //! Platform key derivation from machine attributes.
 //!
-//! Two values are derived from the same machine attributes, under different
-//! HMAC labels:
+//! Three values are derived from the machine attributes, each under its own
+//! HMAC label:
 //!
 //! - the **platform key** ([`derive_platform_key`]): the machine fingerprint
 //!   over all five attributes. It is not secret: Settings displays it and
@@ -40,7 +40,8 @@ use super::platform_windows::{
     compute_machine_fingerprint, compute_storage_binding, FingerprintError, MachineAttributes,
 };
 
-/// Minimum number of non-empty machine attributes required for key derivation.
+/// Minimum number of non-empty machine attributes for the fingerprint. The
+/// machine-bound key and the storage binding need a real machine id instead.
 const MIN_ATTRIBUTES: usize = 3;
 
 /// Derive the platform key (the machine fingerprint) from machine attributes.
@@ -48,8 +49,9 @@ const MIN_ATTRIBUTES: usize = 3;
 /// Collects machine attributes and computes the HMAC-SHA256 fingerprint.
 /// Returns an error if fewer than 3 attributes could be collected.
 ///
-/// The credential store uses it in its AEAD associated data. It is not
-/// secret; see the module documentation.
+/// It is not secret; see the module documentation. SECURITY: it is not
+/// the credential store's AEAD value (that is [`derive_storage_binding`],
+/// #14) and never a key.
 pub fn derive_platform_key() -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
     let attrs = collect_machine_attributes()?;
 
@@ -309,6 +311,7 @@ mod tests {
         // path included.
         let binding = derive_storage_binding().expect("storage binding");
         assert_ne!(*binding, *key);
+        assert_ne!(*binding, *derive_platform_key().expect("fingerprint"));
         assert_eq!(*binding, *derive_storage_binding().unwrap());
     }
 

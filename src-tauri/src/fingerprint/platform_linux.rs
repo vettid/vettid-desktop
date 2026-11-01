@@ -1,9 +1,10 @@
 //! Linux-specific machine fingerprinting for platform binding.
 //!
 //! Collects five machine attributes (hostname, machine-id, CPU, disk serial, MAC address)
-//! and computes an HMAC-SHA256 fingerprint used to bind encrypted credentials to a
-//! specific machine. This is the desktop equivalent of the agent connector's fingerprint,
-//! using a distinct HMAC domain label ("vettid-desktop-platform-v1").
+//! and computes the HMAC-SHA256 machine fingerprint, shown in Settings and sent at pairing.
+//! This is the desktop equivalent of the agent connector's fingerprint, using a distinct
+//! HMAC domain label ("vettid-desktop-platform-v1"). The saved pairing is bound to the
+//! machine id alone (#14): see `compute_machine_bound_key` and `compute_storage_binding`.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -50,8 +51,9 @@ pub enum FingerprintError {
     InsufficientAttributes { found: usize, required: usize },
     /// The binary could not be hashed.
     BinaryHashFailed(String),
-    /// The machine id is empty, so the machine-bound storage key would
-    /// rest on attributes that are public or guessable.
+    /// The machine id is empty or a placeholder. The saved pairing is bound
+    /// to it (the storage binding and the machine-bound key, #14), so
+    /// nothing can be saved or opened without it.
     MissingMachineId,
 }
 
@@ -69,7 +71,7 @@ impl fmt::Display for FingerprintError {
                 )
             }
             FingerprintError::MissingMachineId => f.write_str(
-                "this computer has no machine id, so the pairing can't be stored safely without the system keyring",
+                "this computer has no usable machine id",
             ),
             FingerprintError::BinaryHashFailed(msg) => {
                 write!(f, "binary hash failed: {}", msg)

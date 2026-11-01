@@ -77,6 +77,12 @@ pub const UNREADABLE_NOTICE: &str =
 pub const KEYRING_UNAVAILABLE_NOTICE: &str =
     "This desktop can't reach your computer's keyring, so it couldn't save the pairing safely, and nothing was saved. If your phone lists this desktop, remove it there. Then sign out of your computer and back in, and pair again.";
 
+/// Shown when this computer has no usable machine id (#14): the saved
+/// pairing is bound to it, so without one nothing can be kept or opened,
+/// keyring or not. Checked before pairing starts and at unlock.
+pub const NO_MACHINE_ID_NOTICE: &str =
+    "This computer has no machine id, so this desktop can't keep or open a saved pairing on it.";
+
 /// Shown when the per-user folder for the pairing can't be found.
 pub const NO_CONFIG_DIR_NOTICE: &str =
     "This desktop can't find your user folder, so it can't keep a pairing on this computer. Nothing was saved.";
@@ -151,6 +157,10 @@ pub enum CredentialError {
     /// there is nowhere safe to keep a pairing. Displays
     /// [`NO_CONFIG_DIR_NOTICE`].
     NoConfigDir,
+    /// This computer has no usable machine id, which the saved pairing is
+    /// bound to (#14). Nothing was saved or opened. Displays
+    /// [`NO_MACHINE_ID_NOTICE`].
+    NoMachineId,
     /// The folder or file for the pairing is not private to the current
     /// user. Windows: another account owns it or can open it, or it is a
     /// symlink or junction. Unix: another account owns the folder or can
@@ -175,6 +185,7 @@ impl fmt::Display for CredentialError {
             CredentialError::Unreadable => f.write_str(UNREADABLE_NOTICE),
             CredentialError::KeyringUnavailable => f.write_str(KEYRING_UNAVAILABLE_NOTICE),
             CredentialError::NoConfigDir => f.write_str(NO_CONFIG_DIR_NOTICE),
+            CredentialError::NoMachineId => f.write_str(NO_MACHINE_ID_NOTICE),
             CredentialError::NotPrivate => f.write_str(NOT_PRIVATE_NOTICE),
         }
     }
@@ -471,13 +482,27 @@ pub(crate) trait KeySource {
     /// The master key for a store sealed under `binding`.
     fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError>;
     /// This machine's storage binding, mixed into the AAD (#14).
-    fn platform_key(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError>;
-    /// The public machine fingerprint. Only used to recognize a file an
-    /// earlier build sealed with the fingerprint as its key, and under it
-    /// in the AAD. Tests use the AAD value.
-    fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
-        self.platform_key()
+    fn storage_binding(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError>;
+    /// The public machine fingerprint. Only used to recognize a file a
+    /// pre-#10 build sealed with the fingerprint as both its key and its
+    /// AAD value, so it can be deleted.
+    fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError>;
+}
+
+/// The storage binding's failure as the store reports it: no machine id
+/// gets its own plain notice.
+fn binding_error(e: FingerprintError) -> CredentialError {
+    match e {
+        FingerprintError::MissingMachineId => CredentialError::NoMachineId,
+        e => CredentialError::FingerprintError(e),
     }
+}
+
+/// Whether this computer can keep a pairing at all: it needs a machine id
+/// for the storage binding (#14). Called before pairing starts, so the
+/// vault never lists a desktop that can't save its pairing.
+pub fn check_machine_binding() -> Result<(), CredentialError> {
+    SystemKeys.storage_binding().map(|_| ()).map_err(binding_error)
 }
 
 /// The keyring and this machine's attributes.
@@ -490,7 +515,7 @@ impl KeySource for SystemKeys {
     fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError> {
         keystore::fetch_for_binding(binding)
     }
-    fn platform_key(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+    fn storage_binding(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
         platform_key::derive_storage_binding()
     }
     fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
@@ -506,8 +531,8 @@ fn load_with(
     let binding = BindingMode::from_str(&store.binding).ok_or_else(|| {
         CredentialError::SerializationError(format!("unknown binding mode: {}", store.binding))
     })?;
+    let platform_key = keys.storage_binding().map_err(binding_error)?;
     let master = keys.master_for_load(binding)?;
-    let platform_key = keys.platform_key()?;
     match decrypt_store(&store, &master.key, &platform_key) {
         Ok(creds) => Ok((creds, binding)),
         Err(CredentialError::CryptoError(e)) if binding == BindingMode::MachineBound => {
@@ -585,6 +610,9 @@ fn save_with_mode(
         }
     }
 
+    // The storage binding first: without a machine id nothing can be
+    // saved, and no keyring key should be created for it (#14).
+    let platform_key = keys.storage_binding().map_err(binding_error)?;
     let master = keys.master_for_save()?;
     // SECURITY: never downgrade. If the store on disk is keyring-bound
     // and the keyring fails now, the keystore falls back to the
@@ -602,7 +630,6 @@ fn save_with_mode(
         }
     }
     let binding = master.binding;
-    let platform_key = keys.platform_key()?;
 
     let mut plaintext = serde_json::to_vec(creds)
         .map_err(|e| CredentialError::SerializationError(format!("marshal credentials: {}", e)))?;
@@ -1078,8 +1105,11 @@ mod tests {
         fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError> {
             Ok(MasterKey { key: Zeroizing::new(self.master), binding })
         }
-        fn platform_key(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+        fn storage_binding(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
             Ok(Zeroizing::new(self.platform))
+        }
+        fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+            Ok(Zeroizing::new(FINGERPRINT))
         }
     }
 
@@ -1101,8 +1131,13 @@ mod tests {
         }
     }
 
+    /// This build's storage binding (the AAD value).
     const PLATFORM: [u8; 32] = [0x11; 32];
+    /// This build's machine-bound key.
     const BOUND_KEY: [u8; 32] = [0x22; 32];
+    /// The public five-attribute fingerprint: never the binding or a key
+    /// in this build, as in production.
+    const FINGERPRINT: [u8; 32] = [0x99; 32];
 
     #[test]
     fn machine_bound_store_round_trip() {
@@ -1127,7 +1162,9 @@ mod tests {
     #[test]
     fn blob_sealed_under_the_fingerprint_is_unreadable_and_deleted() {
         let dir = tempfile::tempdir().unwrap();
-        let old_build = FixedKeys { binding: BindingMode::MachineBound, master: PLATFORM, platform: PLATFORM };
+        // Pre-#10: the public fingerprint as the key and in the AAD. Not
+        // this build's storage binding (PLATFORM), as in production.
+        let old_build = FixedKeys { binding: BindingMode::MachineBound, master: FINGERPRINT, platform: FINGERPRINT };
         save_with(&old_build, dir.path(), &sample_creds()).expect("save");
 
         let this_build = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: PLATFORM };
@@ -1138,10 +1175,10 @@ mod tests {
         assert!(!exists(dir.path()), "the unreadable file must be deleted");
     }
 
-    /// A machine attribute changed (a disk serial, a MAC, a hostname): the
-    /// machine-bound key and the fingerprint both differ. The pairing is
-    /// unreadable for now but must not be deleted, since the attribute may
-    /// change back, and then it opens again.
+    /// The machine id changed (since #14 the only input): the machine-bound
+    /// key and the storage binding both differ. The pairing is unreadable
+    /// for now but must not be deleted, since the id may change back, and
+    /// then it opens again.
     #[test]
     fn attribute_drift_keeps_the_file_and_it_opens_again() {
         let dir = tempfile::tempdir().unwrap();
@@ -1158,8 +1195,8 @@ mod tests {
         assert_eq!(loaded.connection_id, "conn-1");
     }
 
-    /// Only the AAD differs (same master key, different fingerprint): also
-    /// kept.
+    /// Only the AAD differs (same master key, different storage binding):
+    /// also kept.
     #[test]
     fn machine_bound_aad_mismatch_keeps_the_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -1185,6 +1222,86 @@ mod tests {
         assert!(exists(dir.path()));
     }
 
+    /// #14: a machine-bound file saved before #14 (the v1 key over all five
+    /// attributes, the fingerprint in the AAD) doesn't open, gets the plain
+    /// notice and is kept. It is not taken for a pre-#10 file.
+    #[test]
+    fn machine_bound_file_from_before_14_is_unreadable_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = FixedKeys { binding: BindingMode::MachineBound, master: [0x61; 32], platform: FINGERPRINT };
+        save_with(&v1, dir.path(), &sample_creds()).expect("save");
+        let now = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: PLATFORM };
+        let err = load_with(&now, dir.path()).err().expect("must not load");
+        assert!(matches!(err, CredentialError::Unreadable), "got {err}");
+        assert!(exists(dir.path()), "kept");
+    }
+
+    /// #14: a keyring-bound file saved before #14 (the fingerprint in the
+    /// AAD) doesn't open with the same keyring key, and is kept.
+    #[test]
+    fn keyring_file_from_before_14_does_not_open_and_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: FINGERPRINT };
+        save_with(&before, dir.path(), &sample_creds()).expect("save");
+        let now = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+        assert!(matches!(load_with(&now, dir.path()), Err(CredentialError::CryptoError(_))));
+        assert!(exists(dir.path()), "kept");
+    }
+
+    /// #14: without a machine id there is no storage binding: a save fails
+    /// with the plain notice before any key is fetched, writing nothing and
+    /// creating no folder; a load fails the same way and keeps the file.
+    #[test]
+    fn no_machine_id_saves_nothing_and_opens_nothing() {
+        struct NoMachineId(std::cell::Cell<bool>);
+        impl KeySource for NoMachineId {
+            fn master_for_save(&self) -> Result<MasterKey, KeystoreError> {
+                self.0.set(true);
+                Ok(MasterKey { key: Zeroizing::new([0x44; 32]), binding: BindingMode::Keyring })
+            }
+            fn master_for_load(&self, _: BindingMode) -> Result<MasterKey, KeystoreError> {
+                self.0.set(true);
+                Ok(MasterKey { key: Zeroizing::new([0x44; 32]), binding: BindingMode::Keyring })
+            }
+            fn storage_binding(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+                Err(FingerprintError::MissingMachineId)
+            }
+            fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+                Ok(Zeroizing::new(FINGERPRINT))
+            }
+        }
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = NoMachineId(std::cell::Cell::new(false));
+        let err = save_with(&keys, &config_dir, &sample_creds()).err().expect("must fail");
+        assert!(matches!(err, CredentialError::NoMachineId), "got {err}");
+        assert_eq!(err.to_string(), NO_MACHINE_ID_NOTICE);
+        assert!(!keys.0.get(), "no key fetched or created");
+        assert!(!config_dir.exists(), "nothing written");
+
+        let saved = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+        save_with(&saved, &config_dir, &sample_creds()).unwrap();
+        let err = load_with(&keys, &config_dir).err().expect("must fail");
+        assert!(matches!(err, CredentialError::NoMachineId), "got {err}");
+        assert!(exists(&config_dir), "kept");
+    }
+
+    /// Production values: the storage binding is neither the fingerprint
+    /// nor, where there is one, the machine-bound key. Skipped on a machine
+    /// without a machine id (the error is then the one the person sees).
+    #[test]
+    fn system_storage_binding_is_not_the_fingerprint() {
+        match SystemKeys.storage_binding() {
+            Ok(binding) => {
+                if let Ok(fp) = SystemKeys.legacy_fingerprint() {
+                    assert_ne!(*binding, *fp);
+                }
+                assert!(check_machine_binding().is_ok());
+            }
+            Err(e) => assert!(matches!(binding_error(e), CredentialError::NoMachineId)),
+        }
+    }
+
     /// The real keystore logic (`fetch_or_create_master_key_with`) over
     /// test sources: the store asks the keystore exactly as in production.
     /// The fallback is allowed here, as on Linux and macOS, so these tests
@@ -1199,8 +1316,11 @@ mod tests {
         fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError> {
             keystore::fetch_for_binding_with_policy(&self.0, binding, true)
         }
-        fn platform_key(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+        fn storage_binding(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
             Ok(Zeroizing::new(PLATFORM))
+        }
+        fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+            Ok(Zeroizing::new(FINGERPRINT))
         }
     }
 
@@ -1219,7 +1339,7 @@ mod tests {
                 .err()
                 .expect("save must fail");
             assert!(matches!(err, CredentialError::KeystoreError(_)), "got {err}");
-            assert!(err.to_string().contains("no machine id"), "got {err}");
+            assert!(err.to_string().contains("no usable machine id"), "got {err}");
             assert!(!config_dir.exists(), "{machine_id:?}: nothing may be written");
         }
     }
@@ -1621,8 +1741,11 @@ mod tests {
             fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError> {
                 keystore::fetch_for_binding_with_policy(&self.0, binding, false)
             }
-            fn platform_key(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+            fn storage_binding(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
                 Ok(Zeroizing::new(PLATFORM))
+            }
+            fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+                Ok(Zeroizing::new(FINGERPRINT))
             }
         }
         let dir = tempfile::tempdir().unwrap();

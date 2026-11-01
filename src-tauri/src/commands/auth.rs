@@ -74,9 +74,11 @@ pub async fn register(
     use crate::registration::pairing;
 
     let config_dir = store::default_config_dir().map_err(|e| e.to_string())?;
-    // Checked before pairing starts, so a folder another account can open
+    // Checked before pairing starts, so a folder another account can open,
+    // or a computer without the machine id the pairing is bound to (#14),
     // is refused before the vault ever lists this desktop.
     store::ensure_config_dir(&config_dir).map_err(|e| e.to_string())?;
+    store::check_machine_binding().map_err(|e| e.to_string())?;
 
     // Strip dashes/whitespace so users can paste either the grouped
     // `ABCD-EFGH-JKLM` form they see on the phone or a flat 12-char run.
@@ -366,7 +368,7 @@ pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<Unlock
 
     let (creds, binding) = match store::load(&config_dir) {
         Ok(loaded) => loaded,
-        Err(e @ CredentialError::Unreadable) => {
+        Err(e @ (CredentialError::Unreadable | CredentialError::NoMachineId)) => {
             return Ok(UnlockResponse {
                 unlocked: false,
                 notice: Some(e.to_string()),

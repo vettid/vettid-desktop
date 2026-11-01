@@ -403,6 +403,7 @@ pub async fn complete_pairing(
     let binding = store::save(config_dir, &creds).map_err(|e| match e {
         store::CredentialError::KeyringUnavailable => RegistrationError::KeyringUnavailable,
         store::CredentialError::NotPrivate => RegistrationError::NotPrivate,
+        store::CredentialError::NoMachineId => RegistrationError::NoMachineId,
         e => RegistrationError::Internal(format!("save credentials: {}", e)),
     })?;
 

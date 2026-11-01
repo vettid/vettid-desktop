@@ -45,7 +45,9 @@ fn collect_hostname() -> String {
 /// and `IOPlatformSerialNumber` (factory hardware serial, stable across OS reinstalls).
 /// The output format is one property per line: `"KeyName" = "Value"`.
 fn collect_ioreg_property(key: &str) -> String {
-    let output = match Command::new("ioreg")
+    // By full path: the saved pairing is bound to this id (#14), and a
+    // launch with a PATH lacking /usr/sbin must not lose it.
+    let output = match Command::new("/usr/sbin/ioreg")
         .args(["-rd1", "-c", "IOPlatformExpertDevice"])
         .output()
     {

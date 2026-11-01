@@ -215,12 +215,12 @@ pub(crate) fn fetch_or_create_master_key_with_policy(
         }
     }
 
-    // Fallback: derive a key from machine attributes.
+    // Fallback: derive a key from the machine id (#14).
     //
     // SECURITY: this is not the machine fingerprint. The fingerprint is
     // shown in Settings and sent to the vault at pairing; the key is
-    // derived from the same attributes under its own label, and is refused
-    // without a real machine id.
+    // derived from the machine id alone under its own label, and is
+    // refused without a real machine id.
     machine_bound(src).map_err(|e| {
         KeystoreError::NoSource(format!("machine attribute collection failed: {}", e))
     })
@@ -433,7 +433,7 @@ pub(crate) mod tests {
     fn no_keyring_and_no_machine_id_gives_no_key() {
         let src = TestSources::no_keyring(attrs_with_machine_id(""));
         let err = fetch_or_create_master_key_with_policy(&src, true).err().expect("must fail");
-        assert!(err.to_string().contains("no machine id"), "got {err}");
+        assert!(err.to_string().contains("no usable machine id"), "got {err}");
         assert!(fetch_for_binding_with_policy(&src, BindingMode::MachineBound, true).is_err());
     }
 
