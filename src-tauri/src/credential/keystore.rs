@@ -17,8 +17,8 @@
 //!    item) can be read by any process of that user.
 //! 2. **Machine-bound fallback** (`platform_key`). If the keyring
 //!    isn't available (kiosk Linux, missing Secret Service daemon,
-//!    locked Keychain on macOS first launch), we derive a key from
-//!    machine attributes via `platform_key::machine_bound_key_from`. It uses its
+//!    locked Keychain on macOS first launch), we derive a key from the
+//!    machine id via `platform_key::machine_bound_key_from` (#14). It uses its
 //!    own HMAC label, so it is not the machine fingerprint that is
 //!    displayed and sent at pairing.
 //!    A binding mode marker lands on the encrypted store so callers
@@ -63,11 +63,11 @@ pub enum BindingMode {
     /// theft alone can't decrypt; the attacker also needs the user's
     /// OS account.
     Keyring,
-    /// Key derived from machine attributes (no keyring available).
-    /// Weaker than the keyring: anyone who can read this machine's
-    /// attributes can re-derive the key. That includes any local user
-    /// and anyone holding a full disk image, since the machine id and
-    /// hostname are stored on the disk itself. It only protects
+    /// Key derived from the machine id (no keyring available, #14).
+    /// Weaker than the keyring: anyone who can read this machine's id
+    /// can re-derive the key. That includes any local user and anyone
+    /// holding a full disk image, since the machine id is stored on the
+    /// disk itself. It only protects
     /// `connection.enc` copied on its own, without the rest of the disk.
     MachineBound,
 }
@@ -215,12 +215,12 @@ pub(crate) fn fetch_or_create_master_key_with_policy(
         }
     }
 
-    // Fallback: derive a key from machine attributes.
+    // Fallback: derive a key from the machine id (#14).
     //
     // SECURITY: this is not the machine fingerprint. The fingerprint is
     // shown in Settings and sent to the vault at pairing; the key is
-    // derived from the same attributes under its own label, and is refused
-    // without a real machine id.
+    // derived from the machine id alone under its own label, and is
+    // refused without a real machine id.
     machine_bound(src).map_err(|e| {
         KeystoreError::NoSource(format!("machine attribute collection failed: {}", e))
     })
@@ -433,7 +433,7 @@ pub(crate) mod tests {
     fn no_keyring_and_no_machine_id_gives_no_key() {
         let src = TestSources::no_keyring(attrs_with_machine_id(""));
         let err = fetch_or_create_master_key_with_policy(&src, true).err().expect("must fail");
-        assert!(err.to_string().contains("no machine id"), "got {err}");
+        assert!(err.to_string().contains("no usable machine id"), "got {err}");
         assert!(fetch_for_binding_with_policy(&src, BindingMode::MachineBound, true).is_err());
     }
 
