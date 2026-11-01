@@ -10,7 +10,8 @@
 //!   is created inside it).
 //! - **The file:** written to a new temporary file created in one step with
 //!   the protected user-and-SYSTEM DACL, inside the folder held open, then
-//!   moved over the pairing file ([`write_private_file`]).
+//!   renamed over the pairing file by its handle, relative to the folder's
+//!   handle ([`write_private_file`]).
 //! - **An existing folder or file** is checked first and refused (nothing
 //!   is changed or written) when:
 //!   - it is a reparse point (a symlink or junction could point anywhere);
@@ -36,9 +37,9 @@
 //! The parent of the folder (`%LOCALAPPDATA%` itself) is not checked. A
 //! folder swap through it is closed for the duration of a write: the
 //! folder is held open with data access and no delete sharing, so it can't
-//! be renamed (tested), and the new file's final path must be inside the
-//! held folder. Whether a parent can be renamed while a child folder is
-//! held this way has not been tested. A folder swapped in before the write
+//! be renamed, nor can its parent (both tested); the new file is renamed
+//! relative to the held folder's handle, and its final path must be inside
+//! that folder before and after. A folder swapped in before the write
 //! is checked on its own handle like any other, so it is refused unless it
 //! is private to the user (#21).
 
@@ -66,13 +67,17 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
-    MoveFileExW, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_ATTRIBUTE_DIRECTORY,
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED,
-    FILE_READ_ATTRIBUTES,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    OPEN_EXISTING, READ_CONTROL, VOLUME_NAME_DOS,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
+    VOLUME_NAME_DOS,
 };
+use windows_sys::Wdk::Storage::FileSystem::{
+    FileRenameInformation, FileRenameInformationEx, NtSetInformationFile, FILE_INFORMATION_CLASS,
+    FILE_RENAME_INFORMATION,
+};
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// ACE types (ACE_HEADER.AceType).
@@ -542,26 +547,94 @@ fn is_directly_inside(child: &str, folder: &str) -> bool {
     }
 }
 
-/// Move `from` over `to`. Another program (an antivirus scanner, the
-/// search indexer, a sync client) can hold either file open for a moment,
-/// so a sharing violation or access denial is retried a few times.
-fn replace_file(from: &[u16], to: &[u16]) -> Result<(), AclError> {
-    const ERROR_ACCESS_DENIED: u32 = 5;
-    const ERROR_SHARING_VIOLATION: u32 = 32;
+/// FILE_RENAME_INFORMATION flags for FileRenameInformationEx (ntifs.h);
+/// not in windows-sys 0.59.
+const FILE_RENAME_REPLACE_IF_EXISTS: u32 = 0x1;
+const FILE_RENAME_POSIX_SEMANTICS: u32 = 0x2;
+
+/// NTSTATUS values the rename handles.
+const STATUS_ACCESS_DENIED: i32 = 0xC000_0022_u32 as i32;
+const STATUS_SHARING_VIOLATION: i32 = 0xC000_0043_u32 as i32;
+const STATUS_INVALID_INFO_CLASS: i32 = 0xC000_0003_u32 as i32;
+const STATUS_INVALID_PARAMETER: i32 = 0xC000_000D_u32 as i32;
+const STATUS_NOT_SUPPORTED: i32 = 0xC000_00BB_u32 as i32;
+
+/// Rename the open file `file` to `name` inside `folder`, replacing an
+/// existing `name` (#28). The rename is by handle, and the new name is
+/// relative to the held folder's handle, so no path is resolved: the file
+/// that was written and checked is the one that ends up at `name`, in the
+/// folder that was checked.
+///
+/// This is NtSetInformationFile: SetFileInformationByHandle refuses a
+/// RootDirectory (error 87, tested). FileRenameInformationEx with POSIX
+/// semantics is tried first; a file system or Windows version without it
+/// gets the plain FileRenameInformation with ReplaceIfExists, which is
+/// still by handle and relative. Another program (an antivirus scanner,
+/// the search indexer, a sync client) can hold the old file open for a
+/// moment, so a sharing violation or access denial is retried a few times.
+fn rename_by_handle(file: HANDLE, folder: HANDLE, name: &str) -> Result<(), AclError> {
     const ATTEMPTS: u32 = 5;
-    for attempt in 1..=ATTEMPTS {
-        // SAFETY: both paths are NUL-terminated.
-        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } != 0 {
+
+    let name_w: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().collect();
+    // A plain Win32 file name: no separator, stream, wildcard or control
+    // character, and no trailing dot or space (which NT keeps but Win32
+    // can't open).
+    if name_w.is_empty()
+        || name_w.iter().any(|&c| c < 0x20 || "\\/:*?\"<>|".encode_utf16().any(|bad| bad == c))
+        || name.ends_with('.')
+        || name.ends_with(' ')
+    {
+        return Err(failed("rename: not a plain file name"));
+    }
+    // FILE_RENAME_INFORMATION ends in a variable-length name. A u64 buffer
+    // keeps it aligned for the HANDLE field.
+    let header = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
+    let size = (header + name_w.len() * 2).max(std::mem::size_of::<FILE_RENAME_INFORMATION>());
+    let mut buf = vec![0u64; size.div_ceil(8)];
+    let info = buf.as_mut_ptr() as *mut FILE_RENAME_INFORMATION;
+
+    let try_rename = |class: FILE_INFORMATION_CLASS| -> i32 {
+        // SAFETY: `buf` is aligned and at least `size` bytes, enough for the
+        // header and `name_w`, which is copied within it. `iosb` is written
+        // by the call.
+        unsafe {
+            (*info).Anonymous.Flags = 0;
+            if class == FileRenameInformationEx {
+                (*info).Anonymous.Flags = FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;
+            } else {
+                (*info).Anonymous.ReplaceIfExists = 1;
+            }
+            (*info).RootDirectory = folder;
+            (*info).FileNameLength = (name_w.len() * 2) as u32;
+            ptr::copy_nonoverlapping(name_w.as_ptr(), ptr::addr_of_mut!((*info).FileName) as *mut u16, name_w.len());
+            let mut iosb: IO_STATUS_BLOCK = std::mem::zeroed();
+            NtSetInformationFile(file, &mut iosb, info as *const c_void, size as u32, class)
+        }
+    };
+
+    let mut class = FileRenameInformationEx;
+    let mut attempt = 1;
+    loop {
+        let status = try_rename(class);
+        if status >= 0 {
             return Ok(());
         }
-        let err = last_error();
-        let busy = err == ERROR_SHARING_VIOLATION || err == ERROR_ACCESS_DENIED;
+        if class == FileRenameInformationEx
+            && matches!(status, STATUS_INVALID_INFO_CLASS | STATUS_INVALID_PARAMETER | STATUS_NOT_SUPPORTED)
+        {
+            class = FileRenameInformation;
+            continue;
+        }
+        let busy = status == STATUS_SHARING_VIOLATION || status == STATUS_ACCESS_DENIED;
         if !busy || attempt == ATTEMPTS {
-            return Err(failed(format!("replace: error {} after {} attempts", err, attempt)));
+            return Err(failed(format!(
+                "replace: error 0x{:08X} after {} attempts",
+                status as u32, attempt
+            )));
         }
         std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt)));
+        attempt += 1;
     }
-    unreachable!("the loop returns")
 }
 
 /// Removes the temporary file on drop unless the write succeeded.
@@ -594,11 +667,12 @@ pub(crate) fn remove_stale_temps(dir: &Path, name: &str) {
 /// Marks a temporary file next to the pairing file.
 pub(crate) const TEMP_INFIX: &str = ".tmp-";
 
-/// A test hook run after the temporary file is written and closed, just
-/// before it replaces the pairing file. Production uses [`no_hook`].
-type BeforeReplace = fn(&Path) -> Result<(), AclError>;
+/// A test hook run after the temporary file is written and flushed, just
+/// before it is renamed over the pairing file; it gets the temporary
+/// file's path and its open handle. Production uses [`no_hook`].
+type BeforeReplace = fn(&Path, &File) -> Result<(), AclError>;
 
-fn no_hook(_: &Path) -> Result<(), AclError> {
+fn no_hook(_: &Path, _: &File) -> Result<(), AclError> {
     Ok(())
 }
 
@@ -614,12 +688,13 @@ fn no_hook(_: &Path) -> Result<(), AclError> {
 ///    exists with an inherited ACL and no existing file or link is opened;
 /// 4. its handle is checked (no reparse point, one name, the policy) and
 ///    its final path must be directly inside the held folder;
-/// 5. the data is written and flushed, the handle closed, and the file
-///    moved over `name` with MOVEFILE_REPLACE_EXISTING | WRITE_THROUGH. A
-///    move keeps the file's own DACL;
-/// 6. the result's final path is checked again.
+/// 5. the data is written and flushed, and the file is renamed over
+///    `name` **by its handle, relative to the held folder's handle** (#28),
+///    so no path is looked up again between the checks and the rename. A
+///    rename keeps the file's own DACL;
+/// 6. the same handle's final path and policy are checked again.
 ///
-/// Any failure before the move leaves an existing `name` as it was and
+/// Any failure before the rename leaves an existing `name` as it was and
 /// removes the temporary file.
 pub(crate) fn write_private_file(dir: &Path, name: &str, data: &[u8]) -> Result<(), AclError> {
     write_private_file_with(dir, name, data, no_hook)
@@ -663,11 +738,12 @@ fn write_private_file_with(
     let temp_w = wide_path(&temp_path);
     // SAFETY: `temp_w` is NUL-terminated and `attrs` points to a valid
     // descriptor that outlives the call. CREATE_NEW never opens an existing
-    // file or link; no sharing while it is written.
+    // file or link; no sharing while it is written. DELETE is for renaming
+    // it by handle.
     let handle = unsafe {
         CreateFileW(
             temp_w.as_ptr(),
-            FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL,
+            FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE,
             0,
             &attrs,
             CREATE_NEW,
@@ -680,6 +756,8 @@ fn write_private_file_with(
     }
     let mut temp = TempFile { path: &temp_path, keep: false };
     // SAFETY: `handle` is a valid, owned file handle; `File` closes it.
+    // Declared after `temp`, so on an early return it is closed first and
+    // the temporary file can then be removed.
     let mut file = unsafe { File::from_raw_handle(handle as _) };
 
     let info = handle_info(handle)?;
@@ -696,32 +774,35 @@ fn write_private_file_with(
 
     file.write_all(data).map_err(|e| failed(format!("write: {}", e)))?;
     file.sync_all().map_err(|e| failed(format!("flush: {}", e)))?;
-    drop(file);
 
-    before_replace(&temp_path)?;
+    before_replace(&temp_path, &file)?;
 
-    let target_w = wide_path(&target);
-    replace_file(&temp_w, &target_w)?;
+    rename_by_handle(handle, folder.handle, name)?;
     temp.keep = true;
 
     // Detection, not prevention: the old file is already replaced. The
-    // file now at `target` must be the one written, inside the folder; if
-    // that can't be confirmed, say so plainly rather than "saved" or
-    // "failed".
+    // renamed handle must now be directly inside the held folder and still
+    // private; if that can't be confirmed, say so plainly rather than
+    // "saved" or "failed".
     let confirm = || -> Result<(), AclError> {
-        let written = open_for_check(&target)?;
-        if !is_directly_inside(&final_path(written.as_raw_handle() as HANDLE)?, &folder.final_path) {
+        let now = final_path(handle)?;
+        if !is_directly_inside(&now, &folder.final_path) {
             return Err(failed("not in the pairing folder"));
         }
-        check_handle_with(written.as_raw_handle() as HANDLE, &user)
+        if now.rsplit_once('\\').map(|(_, n)| n) != Some(name) {
+            return Err(failed("not under the pairing's name"));
+        }
+        check_handle_with(handle, &user)
     };
-    if let Err(e) = confirm() {
+    let confirmed = confirm();
+    drop(file);
+    drop(folder);
+    if let Err(e) = confirmed {
         return Err(failed(format!(
             "the pairing was replaced, but the result could not be confirmed ({})",
             e
         )));
     }
-    drop(folder);
     Ok(())
 }
 
@@ -920,10 +1001,12 @@ mod tests {
         ensure_private_dir(&dir).unwrap();
         let path = dir.join("connection.enc");
         write_private_file(&dir, "connection.enc", b"the old pairing").unwrap();
-        fn fail(temp: &Path) -> Result<(), AclError> {
-            // The temporary file exists, private, with the new data.
+        fn fail(temp: &Path, file: &File) -> Result<(), AclError> {
+            // The temporary file exists, private, with the new data. It is
+            // open without sharing, so its length is read on the handle.
             assert!(test_is_user_only(temp));
-            assert_eq!(std::fs::read(temp).unwrap(), b"new");
+            assert_eq!(file.metadata().unwrap().len(), 3);
+            assert!(std::fs::read(temp).is_err(), "no one else can open it while it is written");
             Err(failed("injected"))
         }
         assert_eq!(
@@ -945,6 +1028,37 @@ mod tests {
         assert!(std::fs::rename(&dir, base.path().join("moved")).is_err(), "rename must fail while held");
         drop(held);
         std::fs::rename(&dir, base.path().join("moved")).expect("rename works once released");
+    }
+
+    /// The folder's parent can't be renamed while the folder is held either
+    /// (#28): NTFS refuses to rename a folder with an open descendant, so the
+    /// held folder can't be moved away through its parent.
+    #[test]
+    fn the_parent_cannot_be_renamed_while_the_folder_is_held() {
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("local");
+        let dir = parent.join("vettid-desktop");
+        std::fs::create_dir(&parent).unwrap();
+        ensure_private_dir(&dir).unwrap();
+        let held = hold_folder(&dir, &current_user_sid().unwrap()).expect("hold");
+        assert!(
+            std::fs::rename(&parent, base.path().join("moved")).is_err(),
+            "the parent must not be renamable while the folder is held"
+        );
+        drop(held);
+        std::fs::rename(&parent, base.path().join("moved")).expect("rename works once released");
+    }
+
+    /// The rename takes a plain name inside the held folder, nothing else.
+    #[test]
+    fn rename_by_handle_takes_only_a_plain_name() {
+        for name in ["", "a\\b", "..\\x", "a/b", "a\0b", "a:b", ".", "..", "a*", "a?", "a\"b", "a<", "a>", "a|", "a.", "a ", "a\tb"] {
+            assert_eq!(
+                rename_by_handle(ptr::null_mut(), ptr::null_mut(), name).err(),
+                Some(failed("rename: not a plain file name")),
+                "{name:?}"
+            );
+        }
     }
 
     /// Another program holding connection.enc open without delete sharing:

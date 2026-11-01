@@ -83,8 +83,23 @@ pub const NO_CONFIG_DIR_NOTICE: &str =
 
 /// Shown when the pairing's folder or file could be opened by another
 /// account on this computer (Windows).
+#[cfg(windows)]
 pub const NOT_PRIVATE_NOTICE: &str =
     "The folder this desktop keeps its pairing in (vettid-desktop, in your local app data) can be opened by another account on this computer, so nothing was saved there. Delete that folder, then pair again.";
+
+/// Unix: shown when the pairing's folder is owned by another account or
+/// another account can write to it (#28, owner decision (a), 2026-11-01).
+/// That account can't read the `0600` file, but it could remove or replace
+/// it (AEAD refuses a replaced one).
+#[cfg(not(windows))]
+pub const NOT_PRIVATE_NOTICE: &str =
+    "The folder this desktop keeps its pairing in (vettid-desktop, in your settings folder) can be changed by another account on this computer, so nothing was saved there. Delete that folder, then pair again.";
+
+/// Unix: shown after unlock when the saved pairing's file is private but
+/// its folder is owned by, or writable by, another account (#28).
+#[cfg(unix)]
+pub const NOT_PRIVATE_FOLDER_NOTICE: &str =
+    "Another account on this computer can change the folder this desktop keeps its pairing in. It can't read your pairing, but it could remove it. To be safe: in Settings, open Danger zone and choose Log out this desktop, then pair again.";
 
 /// Shown after unlock when another account can open the saved pairing's
 /// folder or file, and the pairing is keyring-bound (#24).
@@ -136,10 +151,10 @@ pub enum CredentialError {
     /// there is nowhere safe to keep a pairing. Displays
     /// [`NO_CONFIG_DIR_NOTICE`].
     NoConfigDir,
-    /// Windows: the folder or file for the pairing is not private to the
-    /// current user (another account owns it or can open it, or it is a
-    /// symlink or junction). Nothing was changed. Displays
-    /// [`NOT_PRIVATE_NOTICE`].
+    /// The folder or file for the pairing is not private to the current
+    /// user. Windows: another account owns it or can open it, or it is a
+    /// symlink or junction. Unix: another account owns the folder or can
+    /// write to it. Nothing was changed. Displays [`NOT_PRIVATE_NOTICE`].
     NotPrivate,
 }
 
@@ -290,8 +305,8 @@ pub fn ensure_config_dir(config_dir: &Path) -> Result<(), CredentialError> {
         super::winacl::ensure_private_dir(config_dir).map_err(|e| acl_error(config_dir, e))
     }
     // Unix: a new folder is created 0700 (#12). Its parents are created as
-    // usual, with their default modes; an existing folder's mode is left as
-    // it is (checking it is a follow-up).
+    // usual, with their default modes. An existing folder is left as it is,
+    // but refused if another account owns it or can write to it (#28).
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -300,9 +315,17 @@ pub fn ensure_config_dir(config_dir: &Path) -> Result<(), CredentialError> {
             fs::create_dir_all(parent).map_err(err)?;
         }
         match fs::DirBuilder::new().mode(0o700).create(config_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && config_dir.is_dir() => {}
+            Err(e) => return Err(err(e)),
+        }
+        match unix_folder_check(config_dir) {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && config_dir.is_dir() => Ok(()),
-            Err(e) => Err(err(e)),
+            Err(FolderCheck::NotPrivate(why)) => {
+                log::error!("Credential store: {} {}; refusing to use it", config_dir.display(), why);
+                Err(CredentialError::NotPrivate)
+            }
+            Err(FolderCheck::Failed(e)) => Err(err(e)),
         }
     }
     #[cfg(not(any(unix, windows)))]
@@ -310,6 +333,74 @@ pub fn ensure_config_dir(config_dir: &Path) -> Result<(), CredentialError> {
         fs::create_dir_all(config_dir)
             .map_err(|e| CredentialError::IoError(format!("create config dir: {}", e)))
     }
+}
+
+/// Why a unix folder check refused.
+#[cfg(unix)]
+enum FolderCheck {
+    /// Another account owns the folder or can write to it.
+    NotPrivate(&'static str),
+    /// The folder couldn't be checked.
+    Failed(std::io::Error),
+}
+
+/// Unix: the pairing folder must be owned by this process's effective
+/// user and not writable by group or others (#28), matching the Windows
+/// policy. Another account that could write to it could remove or replace
+/// the pairing; it still couldn't read the `0600` file. The folder's own
+/// path is followed if it is a symlink: what matters is the folder the
+/// file goes in.
+///
+/// A folder the user owns but group or others can write to is tightened
+/// to `0700` here, and the check is made again: builds before #27 made the
+/// folder `0777 & ~umask`, which is `0775` under the common user-private-
+/// group umask `002`. Only a folder owned by another account, or one that
+/// can't be tightened, is refused.
+///
+/// If `config_dir` is a symlink, the link itself must also be the user's:
+/// another account could otherwise plant `vettid-desktop` pointing at a
+/// folder of the user's (say `~/public_html`), and this check would pass
+/// on it, chmod it and put the pairing there.
+///
+/// Not seen by this check: a macOS extended ACL (`chmod +a`) that grants
+/// write without a mode bit. On Linux a POSIX ACL entry for another user
+/// raises the group-class bits, so it is seen.
+#[cfg(unix)]
+fn unix_folder_check(config_dir: &Path) -> Result<(), FolderCheck> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let link = fs::symlink_metadata(config_dir).map_err(FolderCheck::Failed)?;
+    if link.file_type().is_symlink() && link.uid() != me {
+        return Err(FolderCheck::NotPrivate("is a link made by another account"));
+    }
+    let meta = fs::metadata(config_dir).map_err(FolderCheck::Failed)?;
+    if !meta.is_dir() {
+        return Err(FolderCheck::Failed(std::io::Error::other("not a folder")));
+    }
+    if meta.uid() != me {
+        return Err(FolderCheck::NotPrivate("is owned by another account"));
+    }
+    if meta.mode() & 0o022 == 0 {
+        return Ok(());
+    }
+    log::warn!(
+        "Credential store: {} could be written by other accounts (mode {:o}); setting it to 0700",
+        config_dir.display(),
+        meta.mode() & 0o7777
+    );
+    if let Err(e) = fs::set_permissions(config_dir, fs::Permissions::from_mode(0o700)) {
+        log::warn!("Credential store: could not tighten {}: {}", config_dir.display(), e);
+    }
+    // Confirm, rather than trust the chmod.
+    let meta = fs::metadata(config_dir).map_err(FolderCheck::Failed)?;
+    if meta.uid() != me {
+        return Err(FolderCheck::NotPrivate("is owned by another account"));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(FolderCheck::NotPrivate("can be written by other accounts"));
+    }
+    Ok(())
 }
 
 /// Log the detail of a refused folder or file. A policy refusal gives the
@@ -337,6 +428,22 @@ fn acl_error(path: &Path, e: super::winacl::AclError) -> CredentialError {
 /// `MasterKey` returned by the keystore zeroizes on drop.
 pub fn save(config_dir: &Path, creds: &ConnectionCredentials) -> Result<BindingMode, CredentialError> {
     save_with(&SystemKeys, config_dir, creds)
+}
+
+/// Like [`save`], for updating a pairing that is already saved (clearing
+/// the session at end_session). Fails with [`CredentialError::NotFound`],
+/// writing nothing and creating no folder, if `connection.enc` isn't there
+/// when the write lock is taken: a log-out that wiped the pairing must not
+/// be undone by an update that loaded it just before (#28).
+pub fn save_existing(config_dir: &Path, creds: &ConnectionCredentials) -> Result<BindingMode, CredentialError> {
+    save_with_mode(&SystemKeys, config_dir, creds, Mode::UpdateExisting)
+}
+
+/// Whether a save may create the pairing or only update it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    CreateOrReplace,
+    UpdateExisting,
 }
 
 /// Read and decrypt credentials from `connection.enc` in `config_dir`.
@@ -419,17 +526,50 @@ fn load_with(
     }
 }
 
+/// One writer at a time in this process: a save, a delete or a wipe
+/// removes temporary files a crashed earlier save left behind, and must not
+/// remove another save's while it is running (e.g. end_session racing a
+/// pairing). A wipe holding it also can't be undone by a save that started
+/// first: [`save_existing`] fails once the file is gone (#28). The app runs
+/// as a single instance, so this covers every writer.
+///
+/// A save holds it while it fetches the master key, which may wait on a
+/// keyring prompt; a log-out started meanwhile waits for that save.
+fn writer_lock() -> std::sync::MutexGuard<'static, ()> {
+    static WRITER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    WRITER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn save_with(
     keys: &dyn KeySource,
     config_dir: &Path,
     creds: &ConnectionCredentials,
 ) -> Result<BindingMode, CredentialError> {
-    // One save at a time in this process: a save removes temporary files
-    // a crashed earlier save left behind, and must not remove another
-    // save's while it is running (e.g. end_session racing a pairing). The
-    // app runs as a single instance, so this covers every writer.
-    static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _one_at_a_time = SAVE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    save_with_mode(keys, config_dir, creds, Mode::CreateOrReplace)
+}
+
+fn save_with_mode(
+    keys: &dyn KeySource,
+    config_dir: &Path,
+    creds: &ConnectionCredentials,
+    mode: Mode,
+) -> Result<BindingMode, CredentialError> {
+    let _one_at_a_time = writer_lock();
+    if mode == Mode::UpdateExisting {
+        match pairing_present(config_dir) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(CredentialError::NotFound(config_dir.join(CREDENTIAL_FILE).display().to_string()))
+            }
+            Err(e) => {
+                return Err(CredentialError::IoError(format!(
+                    "check {}: {}",
+                    config_dir.join(CREDENTIAL_FILE).display(),
+                    e
+                )))
+            }
+        }
+    }
 
     let master = keys.master_for_save()?;
     // SECURITY: never downgrade. If the store on disk is keyring-bound
@@ -537,14 +677,94 @@ fn write_atomically(config_dir: &Path, data: &[u8]) -> Result<(), CredentialErro
 #[cfg(not(windows))]
 const TEMP_INFIX: &str = ".tmp-";
 
-/// Check whether a credential file exists in `config_dir`.
+/// Whether a credential file may be in `config_dir`. True when it is,
+/// and also when that can't be ruled out (a stat error other than "not
+/// found"): nothing may treat the pairing as gone on a guess (#28).
 pub fn exists(config_dir: &Path) -> bool {
-    let path = config_dir.join(CREDENTIAL_FILE);
-    path.exists()
+    !matches!(pairing_present(config_dir), Ok(false))
+}
+
+/// Whether `connection.enc` is in `config_dir`: Ok(false) only when the
+/// file system says it isn't there. The file itself is not followed if it
+/// is a link: a link is present too.
+fn pairing_present(config_dir: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(config_dir.join(CREDENTIAL_FILE)) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Delete the credential file from `config_dir`.
 pub fn delete(config_dir: &Path) -> Result<(), CredentialError> {
+    let _one_at_a_time = writer_lock();
+    delete_locked(config_dir)
+}
+
+/// Remove `config_dir` and everything in it, for log-out, holding the
+/// write lock so no save runs at the same time (#28). If the folder can't
+/// be removed, the pairing file itself is removed. Ok only if neither the
+/// pairing file nor a temporary copy of it is left; the caller must not
+/// report "removed" otherwise.
+///
+/// If `config_dir` is a symlink (a dotfile manager may link it), the
+/// pairing is removed from the folder it points to, that is confirmed,
+/// and then the link itself is removed. `remove_dir_all` would remove only
+/// the link and leave the pairing behind.
+pub fn wipe(config_dir: &Path) -> Result<(), CredentialError> {
+    let _one_at_a_time = writer_lock();
+    let is_link = fs::symlink_metadata(config_dir).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+    if is_link {
+        delete_locked(config_dir)?;
+        confirm_wiped(config_dir)?;
+        // The pairing is gone; the link is tidied up on a best-effort basis.
+        if fs::remove_file(config_dir).or_else(|_| fs::remove_dir(config_dir)).is_err() {
+            log::warn!("Credential store: could not remove the link {}", config_dir.display());
+        }
+        return Ok(());
+    }
+    if config_dir.exists() {
+        if let Err(e) = fs::remove_dir_all(config_dir) {
+            log::warn!("Credential store: could not remove {}: {}", config_dir.display(), e);
+            delete_locked(config_dir)?;
+        }
+    }
+    confirm_wiped(config_dir)
+}
+
+/// Ok only if the file system confirms that neither the pairing file nor
+/// a temporary copy of it is in `config_dir`. Anything that can't be
+/// checked (a stat or listing error other than "not found") is an error:
+/// the pairing is not reported gone on a guess.
+fn confirm_wiped(config_dir: &Path) -> Result<(), CredentialError> {
+    let not_confirmed = |what: String| {
+        Err(CredentialError::IoError(format!("the pairing in {} {}", config_dir.display(), what)))
+    };
+    match pairing_present(config_dir) {
+        Ok(false) => {}
+        Ok(true) => return not_confirmed("is still there".into()),
+        Err(e) => return not_confirmed(format!("could not be checked: {}", e)),
+    }
+    let prefix = format!("{CREDENTIAL_FILE}.tmp-");
+    match fs::read_dir(config_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(e) if e.file_name().to_string_lossy().starts_with(&prefix) => {
+                        return not_confirmed("still has a temporary copy".into())
+                    }
+                    Ok(_) => {}
+                    Err(e) => return not_confirmed(format!("could not be listed: {}", e)),
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return not_confirmed(format!("could not be listed: {}", e)),
+    }
+    Ok(())
+}
+
+fn delete_locked(config_dir: &Path) -> Result<(), CredentialError> {
     let path = config_dir.join(CREDENTIAL_FILE);
     // Temporary files from an interrupted save hold the same ciphertext.
     let prefix = format!("{CREDENTIAL_FILE}.tmp-");
@@ -586,14 +806,31 @@ enum OnDisk {
 /// Called after a successful load; it warns and never refuses, since
 /// refusing would not undo a disclosure and would lock out the pairing.
 /// AEAD already prevents a planted or edited file from being used.
+///
+/// On unix a private file in a folder another account can change gets
+/// [`NOT_PRIVATE_FOLDER_NOTICE`] (#28); a file others can read gets the
+/// stronger notice whatever the folder. Not read-only on unix: the user's
+/// own folder that others can write to is set to `0700` here (see
+/// `unix_folder_check`).
 pub fn privacy_warning(config_dir: &Path, binding: BindingMode) -> Option<&'static str> {
-    if is_private(config_dir) {
-        return None;
+    if !is_private(config_dir) {
+        return Some(match binding {
+            BindingMode::Keyring => NOT_PRIVATE_KEYRING_NOTICE,
+            BindingMode::MachineBound => NOT_PRIVATE_MACHINE_NOTICE,
+        });
     }
-    Some(match binding {
-        BindingMode::Keyring => NOT_PRIVATE_KEYRING_NOTICE,
-        BindingMode::MachineBound => NOT_PRIVATE_MACHINE_NOTICE,
-    })
+    #[cfg(unix)]
+    match unix_folder_check(config_dir) {
+        Ok(()) => {}
+        Err(FolderCheck::NotPrivate(why)) => {
+            log::warn!("Credential store: {} {}", config_dir.display(), why);
+            return Some(NOT_PRIVATE_FOLDER_NOTICE);
+        }
+        Err(FolderCheck::Failed(e)) => {
+            log::warn!("Credential store: could not check {}: {}", config_dir.display(), e);
+        }
+    }
+    None
 }
 
 /// Whether the folder and file are private to the current user, as far
@@ -623,7 +860,8 @@ fn is_private(config_dir: &Path) -> bool {
 }
 
 /// Unix: the file must not grant group or other any access. The folder
-/// is not checked yet, since it is created 0755 until #12.
+/// is checked separately in [`privacy_warning`], since it gets its own
+/// notice (#28).
 #[cfg(unix)]
 fn is_private(config_dir: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -1106,6 +1344,187 @@ mod tests {
         assert_eq!(privacy_warning(dir.path(), BindingMode::MachineBound), Some(NOT_PRIVATE_MACHINE_NOTICE));
         fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(privacy_warning(dir.path(), BindingMode::Keyring), None);
+    }
+
+    /// Unix (#28): the user's own folder that others can write to (as
+    /// earlier builds made it under umask 002) is tightened to 0700 and the
+    /// save goes through. The refusal is for another owner, which needs a
+    /// second account to test.
+    #[cfg(unix)]
+    #[test]
+    fn unix_save_tightens_the_users_own_folder_others_can_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = ThroughKeystore(with_keyring());
+        save_with(&keys, &config_dir, &sample_creds()).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        for wide in [0o775, 0o720, 0o702, 0o777, 0o1777] {
+            fs::set_permissions(&config_dir, fs::Permissions::from_mode(wide)).unwrap();
+            save_with(&keys, &config_dir, &sample_creds()).expect("tightened, then saved");
+            assert_eq!(mode(&config_dir), 0o700, "{wide:o}");
+            assert!(load_with(&keys, &config_dir).is_ok());
+        }
+        // Read and search access for others is not a refusal (the file is
+        // 0600), and the folder is left as it is.
+        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        save_with(&keys, &config_dir, &sample_creds()).expect("0755 is accepted");
+        assert_eq!(fs::metadata(&config_dir).unwrap().permissions().mode() & 0o7777, 0o755);
+    }
+
+    /// Unix (#28): at unlock, the user's own folder that others can write
+    /// to is tightened and gives no warning; a file others can read still
+    /// gives the stronger one. (The folder warning itself is for another
+    /// owner, which needs a second account to test.)
+    #[cfg(unix)]
+    #[test]
+    fn unix_own_folder_others_can_write_is_tightened_at_unlock() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        save_with(&ThroughKeystore(with_keyring()), &config_dir, &sample_creds()).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o770)).unwrap();
+        assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), None);
+        assert_eq!(mode(&config_dir), 0o700);
+        let file = config_dir.join(CREDENTIAL_FILE);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o770)).unwrap();
+        assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), Some(NOT_PRIVATE_KEYRING_NOTICE));
+    }
+
+    /// Unix (#28): a folder owned by another account (root's `/usr`) is
+    /// refused before anything is changed, directly and through the
+    /// user's own link to it; the user's own link to the user's own folder
+    /// is accepted. (A link made by another account needs a second account
+    /// to test.)
+    #[cfg(unix)]
+    #[test]
+    fn unix_folder_check_refuses_another_owner_and_checks_links() {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: as in unix_folder_check.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root owns /usr: nothing to check
+        }
+        let usr = Path::new("/usr");
+        let before = fs::metadata(usr).unwrap().mode();
+        assert!(matches!(unix_folder_check(usr), Err(FolderCheck::NotPrivate("is owned by another account"))));
+        assert!(matches!(ensure_config_dir(usr), Err(CredentialError::NotPrivate)));
+        assert_eq!(privacy_warning_folder_only(usr), Some(NOT_PRIVATE_FOLDER_NOTICE));
+        assert_eq!(fs::metadata(usr).unwrap().mode(), before, "not changed");
+
+        let base = tempfile::tempdir().unwrap();
+        let to_usr = base.path().join("to-usr");
+        std::os::unix::fs::symlink(usr, &to_usr).unwrap();
+        assert!(matches!(unix_folder_check(&to_usr), Err(FolderCheck::NotPrivate(_))));
+        let mine = base.path().join("mine");
+        fs::create_dir(&mine).unwrap();
+        let to_mine = base.path().join("to-mine");
+        std::os::unix::fs::symlink(&mine, &to_mine).unwrap();
+        assert!(unix_folder_check(&to_mine).is_ok());
+    }
+
+    /// The folder part of [`privacy_warning`], for a folder with no
+    /// pairing file in it.
+    #[cfg(unix)]
+    fn privacy_warning_folder_only(dir: &Path) -> Option<&'static str> {
+        match unix_folder_check(dir) {
+            Err(FolderCheck::NotPrivate(_)) => Some(NOT_PRIVATE_FOLDER_NOTICE),
+            _ => None,
+        }
+    }
+
+    /// Unix (#28): when the folder can't be read, the pairing is not
+    /// reported gone: exists() says it may be there, an update refuses,
+    /// and a wipe is not confirmed. (Root ignores the mode, and then the
+    /// test has nothing to check.)
+    #[cfg(unix)]
+    #[test]
+    fn unix_an_unreadable_folder_is_not_reported_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = ThroughKeystore(with_keyring());
+        save_with(&keys, &config_dir, &sample_creds()).unwrap();
+        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let root_ignores_modes = fs::read_dir(&config_dir).is_ok();
+        let present = exists(&config_dir);
+        let update = save_with_mode(&keys, &config_dir, &sample_creds(), Mode::UpdateExisting);
+        let confirmed = confirm_wiped(&config_dir);
+        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        if root_ignores_modes {
+            return;
+        }
+        assert!(present, "can't be ruled out, so it may be there");
+        assert!(matches!(update, Err(CredentialError::IoError(_))), "no update on a guess");
+        assert!(confirmed.is_err(), "not confirmed gone");
+    }
+
+    /// Unix (#28): a symlinked pairing folder is wiped through the link:
+    /// the pairing and its temporary copies are removed from the folder it
+    /// points to, then the link goes.
+    #[cfg(unix)]
+    #[test]
+    fn wipe_through_a_symlinked_folder_removes_the_pairing() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("dotfiles-vettid-desktop");
+        let link = base.path().join("vettid-desktop");
+        let keys = ThroughKeystore(with_keyring());
+        save_with(&keys, &real, &sample_creds()).unwrap();
+        fs::write(real.join(format!("{CREDENTIAL_FILE}{TEMP_INFIX}1-00")), b"stale").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(exists(&link));
+        wipe(&link).expect("wipe");
+        assert!(fs::symlink_metadata(&link).is_err(), "link removed");
+        assert!(!real.join(CREDENTIAL_FILE).exists(), "pairing removed from the target");
+        assert_eq!(fs::read_dir(&real).unwrap().count(), 0, "no temporary copy left");
+    }
+
+    /// Windows: the same through a junction.
+    #[cfg(windows)]
+    #[test]
+    fn wipe_through_a_junction_removes_the_pairing() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("elsewhere");
+        let link = base.path().join("vettid-desktop");
+        save_with(&ThroughKeystore(with_keyring()), &real, &sample_creds()).unwrap();
+        fs::write(real.join(format!("{CREDENTIAL_FILE}.tmp-1-00")), b"stale").unwrap();
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .expect("mklink");
+        assert!(out.status.success(), "mklink /J failed");
+        assert!(exists(&link));
+        wipe(&link).expect("wipe");
+        assert!(fs::symlink_metadata(&link).is_err(), "junction removed");
+        assert!(real.exists(), "the target folder itself is not removed");
+        assert_eq!(fs::read_dir(&real).unwrap().count(), 0, "pairing and temporary copy removed");
+    }
+
+    /// An update after a wipe writes nothing and doesn't recreate the
+    /// folder (#28): log-out must not be undone by end_session.
+    #[test]
+    fn update_after_a_wipe_writes_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = ThroughKeystore(with_keyring());
+        assert!(matches!(
+            save_with_mode(&keys, &config_dir, &sample_creds(), Mode::UpdateExisting),
+            Err(CredentialError::NotFound(_))
+        ));
+        assert!(!config_dir.exists(), "no folder created");
+        save_with(&keys, &config_dir, &sample_creds()).unwrap();
+        save_with_mode(&keys, &config_dir, &sample_creds(), Mode::UpdateExisting).expect("update");
+        wipe(&config_dir).expect("wipe");
+        assert!(!config_dir.exists());
+        assert!(matches!(
+            save_with_mode(&keys, &config_dir, &sample_creds(), Mode::UpdateExisting),
+            Err(CredentialError::NotFound(_))
+        ));
+        assert!(!config_dir.exists(), "not recreated");
+        assert!(wipe(&config_dir).is_ok(), "nothing there is wiped");
     }
 
     /// The key protection shown in Settings follows the file's header.

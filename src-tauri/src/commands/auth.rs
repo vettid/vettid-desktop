@@ -662,16 +662,16 @@ fn wipe_local_pairing(config_dir: &std::path::Path) -> bool {
         return false;
     }
 
-    if config_dir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(config_dir) {
-            log::warn!("Failed to remove config dir on logout: {}", e);
-            // Fall back to best-effort removal of the pairing itself.
-            if let Err(e) = store::delete(config_dir) {
-                log::error!("Failed to remove the saved pairing on logout: {}", e);
-            }
+    // Holds the store's write lock, so a save running at the same time
+    // can't put the pairing back after this reports it gone, and is Ok
+    // only when the file system confirms it is gone (#28).
+    match store::wipe(config_dir) {
+        Ok(()) => true,
+        Err(e) => {
+            log::error!("Failed to remove the saved pairing on logout: {}", e);
+            false
         }
     }
-    !store::exists(config_dir)
 }
 
 /// Log out: tell the vault to revoke this device, then wipe the on-disk
@@ -808,7 +808,9 @@ async fn end_session_on_disk(config_dir: &std::path::Path) {
             creds.session_id.clear();
             creds.session_expires_at = 0;
             creds.session_duration_seconds = 0;
-            if let Err(e) = store::save(&config_dir, &creds) {
+            // Update only: if a log-out wiped the pairing since it was
+            // loaded, nothing is written back (#28).
+            if let Err(e) = store::save_existing(&config_dir, &creds) {
                 log::error!("end_session: failed to persist cleared session state: {}", e);
             } else {
                 log::info!("end_session: on-disk session fields cleared (pairing preserved)");
