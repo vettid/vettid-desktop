@@ -364,7 +364,7 @@ pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<Unlock
         }
     };
 
-    let (creds, _binding) = match store::load(&config_dir) {
+    let (creds, binding) = match store::load(&config_dir) {
         Ok(loaded) => loaded,
         Err(e @ CredentialError::Unreadable) => {
             return Ok(UnlockResponse {
@@ -442,9 +442,11 @@ pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<Unlock
     // nobody's subscribed to it.
     crate::nats::listener::spawn_listener(app.clone(), connection_id).await;
 
+    // Warn (never refuse) when another account can open the saved
+    // pairing's folder or file (#24).
     Ok(UnlockResponse {
         unlocked: true,
-        notice: None,
+        notice: store::privacy_warning(&config_dir, binding).map(str::to_string),
     })
 }
 

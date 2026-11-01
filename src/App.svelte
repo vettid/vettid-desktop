@@ -45,8 +45,8 @@
   let stateResolved = $state(false);
   let sessionState: SessionState = $derived($sessionStore);
   let isRegistered = $state(false);
-  // Shown when the saved pairing could not be opened (see the `unlock`
-  // command).
+  // The `unlock` command's notice: the saved pairing could not be opened,
+  // or it opened but another account can open it too (#24).
   let pairingNotice = $state('');
   let pollTimer: ReturnType<typeof setInterval> | null = null;
 
