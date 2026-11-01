@@ -3,7 +3,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import QRCode from 'qrcode';
   import { onDestroy } from 'svelte';
-  import { activateSession } from '../stores/session';
+  import { activateSession, sessionNotice } from '../stores/session';
 
   let step = $state<'idle' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error' | 'removed-unconfirmed'>('idle');
   let removedNotice = $state('');
@@ -98,6 +98,10 @@
       desktop again. You'll see a QR here that your phone will scan to approve.
       Your data stays hidden until the phone approves.
     </p>
+
+    {#if $sessionNotice}
+      <p class="error-text" role="status">{$sessionNotice}</p>
+    {/if}
 
     {#if step === 'idle'}
       <button class="btn primary" onclick={start}>
