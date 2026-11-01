@@ -667,20 +667,46 @@ pub fn delete(config_dir: &Path) -> Result<(), CredentialError> {
 
 /// Remove `config_dir` and everything in it, for log-out, holding the
 /// write lock so no save runs at the same time (#28). If the folder can't
-/// be removed, the pairing file itself is removed. Ok only if no pairing
-/// file is left; the caller must not report "removed" otherwise.
+/// be removed, the pairing file itself is removed. Ok only if neither the
+/// pairing file nor a temporary copy of it is left; the caller must not
+/// report "removed" otherwise.
+///
+/// If `config_dir` is a symlink (a dotfile manager may link it), the
+/// pairing is removed from the folder it points to, that is confirmed,
+/// and then the link itself is removed. `remove_dir_all` would remove only
+/// the link and leave the pairing behind.
 pub fn wipe(config_dir: &Path) -> Result<(), CredentialError> {
     let _one_at_a_time = writer_lock();
+    let is_link = fs::symlink_metadata(config_dir).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+    if is_link {
+        delete_locked(config_dir)?;
+        confirm_wiped(config_dir)?;
+        // The pairing is gone; the link is tidied up on a best-effort basis.
+        if fs::remove_file(config_dir).or_else(|_| fs::remove_dir(config_dir)).is_err() {
+            log::warn!("Credential store: could not remove the link {}", config_dir.display());
+        }
+        return Ok(());
+    }
     if config_dir.exists() {
         if let Err(e) = fs::remove_dir_all(config_dir) {
             log::warn!("Credential store: could not remove {}: {}", config_dir.display(), e);
             delete_locked(config_dir)?;
         }
     }
-    if exists(config_dir) {
+    confirm_wiped(config_dir)
+}
+
+/// Fails if the pairing file or a temporary copy of it is still in
+/// `config_dir`.
+fn confirm_wiped(config_dir: &Path) -> Result<(), CredentialError> {
+    let prefix = format!("{CREDENTIAL_FILE}.tmp-");
+    let temp_left = fs::read_dir(config_dir)
+        .map(|entries| entries.flatten().any(|e| e.file_name().to_string_lossy().starts_with(&prefix)))
+        .unwrap_or(false);
+    if exists(config_dir) || temp_left {
         return Err(CredentialError::IoError(format!(
-            "{} is still there",
-            config_dir.join(CREDENTIAL_FILE).display()
+            "the pairing in {} is still there",
+            config_dir.display()
         )));
     }
     Ok(())
@@ -1311,6 +1337,49 @@ mod tests {
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
         fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o770)).unwrap();
         assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), Some(NOT_PRIVATE_KEYRING_NOTICE));
+    }
+
+    /// Unix (#28): a symlinked pairing folder is wiped through the link:
+    /// the pairing and its temporary copies are removed from the folder it
+    /// points to, then the link goes.
+    #[cfg(unix)]
+    #[test]
+    fn wipe_through_a_symlinked_folder_removes_the_pairing() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("dotfiles-vettid-desktop");
+        let link = base.path().join("vettid-desktop");
+        let keys = ThroughKeystore(with_keyring());
+        save_with(&keys, &real, &sample_creds()).unwrap();
+        fs::write(real.join(format!("{CREDENTIAL_FILE}{TEMP_INFIX}1-00")), b"stale").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(exists(&link));
+        wipe(&link).expect("wipe");
+        assert!(fs::symlink_metadata(&link).is_err(), "link removed");
+        assert!(!real.join(CREDENTIAL_FILE).exists(), "pairing removed from the target");
+        assert_eq!(fs::read_dir(&real).unwrap().count(), 0, "no temporary copy left");
+    }
+
+    /// Windows: the same through a junction.
+    #[cfg(windows)]
+    #[test]
+    fn wipe_through_a_junction_removes_the_pairing() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("elsewhere");
+        let link = base.path().join("vettid-desktop");
+        save_with(&ThroughKeystore(with_keyring()), &real, &sample_creds()).unwrap();
+        fs::write(real.join(format!("{CREDENTIAL_FILE}.tmp-1-00")), b"stale").unwrap();
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .expect("mklink");
+        assert!(out.status.success(), "mklink /J failed");
+        assert!(exists(&link));
+        wipe(&link).expect("wipe");
+        assert!(fs::symlink_metadata(&link).is_err(), "junction removed");
+        assert!(real.exists(), "the target folder itself is not removed");
+        assert_eq!(fs::read_dir(&real).unwrap().count(), 0, "pairing and temporary copy removed");
     }
 
     /// An update after a wipe writes nothing and doesn't recreate the
