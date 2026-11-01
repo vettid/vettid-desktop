@@ -61,7 +61,8 @@ use windows_sys::Win32::Security::{
     TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, FILE_GENERIC_WRITE, READ_CONTROL, WRITE_DAC,
+    CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
+    READ_CONTROL, WRITE_DAC,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -320,7 +321,6 @@ enum Entry {
 /// stat error other than NotFound is a failure, never "absent".
 fn entry_at(path: &Path) -> Result<Entry, AclError> {
     use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || meta.file_type().is_symlink() => {
             Err(NotPrivate::ReparsePoint.into())
@@ -478,8 +478,18 @@ fn open_private_file_with(path: &Path, protect: ProtectStep) -> Result<File, Acl
         .write(true)
         .access_mode(FILE_GENERIC_WRITE | WRITE_DAC | READ_CONTROL)
         .create(true)
+        // Open a link itself rather than its target, so a symlink or
+        // junction swapped in after the check is caught on the handle.
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|e| failed(format!("open: {}", e)))?;
+    {
+        use std::os::windows::fs::MetadataExt;
+        let meta = file.metadata().map_err(|e| failed(format!("stat handle: {}", e)))?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(NotPrivate::ReparsePoint.into());
+        }
+    }
     protect(file.as_raw_handle() as HANDLE, &user)?;
     file.set_len(0).map_err(|e| failed(format!("truncate: {}", e)))?;
     Ok(file)
