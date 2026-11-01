@@ -61,7 +61,8 @@ use windows_sys::Win32::Security::{
     TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
+    CreateDirectoryW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
     READ_CONTROL, WRITE_DAC,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -83,6 +84,7 @@ pub(crate) enum NotPrivate {
     NullDacl,
     ForeignAccess,
     UnknownAllowEntry,
+    HardLinked,
 }
 
 impl std::fmt::Display for NotPrivate {
@@ -93,6 +95,7 @@ impl std::fmt::Display for NotPrivate {
             Self::NullDacl => "has no access list (everyone has access)",
             Self::ForeignAccess => "grants access to another account",
             Self::UnknownAllowEntry => "has an access entry this app does not check",
+            Self::HardLinked => "has more than one name (a hard link)",
         })
     }
 }
@@ -474,24 +477,39 @@ fn open_private_file_with(path: &Path, protect: ProtectStep) -> Result<File, Acl
     if let Entry::Present = entry_at(path)? {
         check_private_with(path, &user)?;
     }
+    let file = open_no_follow(path)?;
+    protect(file.as_raw_handle() as HANDLE, &user)?;
+    file.set_len(0).map_err(|e| failed(format!("truncate: {}", e)))?;
+    Ok(file)
+}
+
+/// Open (or create) `path` for writing without following a link, and
+/// refuse the handle if it is a reparse point or has more than one name.
+/// Nothing is truncated here.
+fn open_no_follow(path: &Path) -> Result<File, AclError> {
     let file = std::fs::OpenOptions::new()
         .write(true)
-        .access_mode(FILE_GENERIC_WRITE | WRITE_DAC | READ_CONTROL)
+        .access_mode(FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | WRITE_DAC | READ_CONTROL)
         .create(true)
         // Open a link itself rather than its target, so a symlink or
         // junction swapped in after the check is caught on the handle.
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|e| failed(format!("open: {}", e)))?;
-    {
-        use std::os::windows::fs::MetadataExt;
-        let meta = file.metadata().map_err(|e| failed(format!("stat handle: {}", e)))?;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(NotPrivate::ReparsePoint.into());
-        }
+    // SAFETY: BY_HANDLE_FILE_INFORMATION is plain data, valid when zeroed;
+    // the handle is open with FILE_READ_ATTRIBUTES.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
+        return Err(failed(format!("GetFileInformationByHandle error {}", last_error())));
     }
-    protect(file.as_raw_handle() as HANDLE, &user)?;
-    file.set_len(0).map_err(|e| failed(format!("truncate: {}", e)))?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(NotPrivate::ReparsePoint.into());
+    }
+    // A second name for the same file could sit in a folder that other
+    // accounts can list or that has other rules.
+    if info.nNumberOfLinks > 1 {
+        return Err(NotPrivate::HardLinked.into());
+    }
     Ok(file)
 }
 
@@ -771,6 +789,44 @@ mod tests {
         assert!(status.status.success(), "mklink /J failed");
         assert_eq!(check_private(&link), refused(NotPrivate::ReparsePoint));
         assert_eq!(ensure_private_dir(&link), refused(NotPrivate::ReparsePoint));
+    }
+
+    /// A junction at connection.enc itself, reaching the open step without
+    /// the path check that normally runs first (as if swapped in after
+    /// it): the open refuses it and nothing is written through the link.
+    /// Windows already fails the write open of a junction ("Access is
+    /// denied"); a file symlink would open and be refused by the handle
+    /// check, but creating one needs a privilege the tests don't have.
+    #[test]
+    fn junction_at_the_file_is_refused_on_the_handle() {
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        let link = base.path().join("connection.enc");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .expect("mklink");
+        assert!(status.status.success(), "mklink /J failed");
+        assert!(open_no_follow(&link).is_err(), "the open step must refuse a junction");
+        // Through the normal path, the path check names it.
+        assert_eq!(open_private_file(&link).err(), Some(AclError::NotPrivate(NotPrivate::ReparsePoint)));
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none(), "nothing written through the link");
+    }
+
+    /// A file with a second name (hard link) is refused and kept.
+    #[test]
+    fn hard_linked_file_is_refused_and_kept() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        ensure_private_dir(&dir).unwrap();
+        let path = dir.join("connection.enc");
+        std::fs::write(&path, b"the old pairing").unwrap();
+        std::fs::hard_link(&path, base.path().join("second-name")).unwrap();
+        assert_eq!(open_private_file(&path).err(), Some(AclError::NotPrivate(NotPrivate::HardLinked)));
+        assert_eq!(std::fs::read(&path).unwrap(), b"the old pairing");
     }
 
     /// A file where the folder should be is not taken for the folder.
