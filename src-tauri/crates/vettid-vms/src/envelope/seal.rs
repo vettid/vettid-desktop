@@ -17,7 +17,9 @@ pub fn seal_session(key: &[u8; KEY_SIZE], sender_kid: Kid, recipient_kid: Kid, p
     seal_session_with(key, sender_kid, recipient_kid, &fresh_nonce()?, padded)
 }
 
-fn seal_session_with(
+/// [`seal_session`] with the nonce given. The nonce must be fresh
+/// randomness: only the known-answer tests pass a fixed one.
+pub(crate) fn seal_session_with(
     key: &[u8; KEY_SIZE],
     sender_kid: Kid,
     recipient_kid: Kid,
@@ -65,7 +67,8 @@ impl Sealer {
         Ok(Self::from_parts(recipient, sender_kid, &enc, ctx))
     }
 
-    fn from_parts(recipient: &PublicKey, sender_kid: Kid, enc: &[u8], ctx: Sender) -> Self {
+    /// A sealer from an HPKE context set up for `recipient`.
+    pub(crate) fn from_parts(recipient: &PublicKey, sender_kid: Kid, enc: &[u8], ctx: Sender) -> Self {
         Sealer { header: header(Mode::Sealed, sender_kid, recipient.kid(), enc), ctx }
     }
 

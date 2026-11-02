@@ -20,6 +20,7 @@ pub use inner::{
 };
 pub use padding::{pad, pad_fixed, padded_len, unpad, unpad_fixed, valid_padded_len};
 pub use seal::{open_sealed, open_session, seal_sealed, seal_session, Sealer};
+pub(crate) use seal::seal_session_with;
 pub use ulid::{new_ulid, valid_ulid, ULID_LEN};
 
 use crate::suite::kid::Kid;
