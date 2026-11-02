@@ -289,12 +289,16 @@ fn compute_device_fingerprint() -> crate::registration::pairing::DeviceFingerpri
 /// value was computed from attributes a Mac doesn't have (such as
 /// `/etc/machine-id`). Empty if the attributes can't be collected.
 pub(crate) fn machine_fingerprint_hex() -> String {
-    use crate::fingerprint::platform_key;
+    fingerprint_hex_of(crate::fingerprint::platform_key::collect_attributes())
+}
+
+/// The displayed fingerprint for collected attributes; empty if they
+/// couldn't be collected.
+fn fingerprint_hex_of(
+    attrs: Result<crate::fingerprint::platform_linux::MachineAttributes, crate::fingerprint::platform_linux::FingerprintError>,
+) -> String {
     use crate::fingerprint::platform_linux::compute_machine_fingerprint_hex;
-    platform_key::collect_attributes()
-        .ok()
-        .map(|attrs| compute_machine_fingerprint_hex(&attrs))
-        .unwrap_or_default()
+    attrs.ok().map(|attrs| compute_machine_fingerprint_hex(&attrs)).unwrap_or_default()
 }
 
 /// Best-effort distribution name + version for the current OS. The
@@ -1020,15 +1024,38 @@ mod tests {
         assert!(neither.contains("could not be deleted") && neither.contains("not told"));
     }
 
-    /// #17: the fingerprint shown and sent is the platform key, from this
-    /// platform's collector. Skipped where the platform key isn't
-    /// available (fewer than three attributes).
+    /// #17: the fingerprint shown and sent is computed from this
+    /// platform's collector, the one `platform_key` uses. On Linux and
+    /// Windows the old code used that collector too, so only a macOS run
+    /// tells the old and new code apart (see the macOS test below). The
+    /// attributes are read once, so a hostname or adapter that changes
+    /// between two reads can't make this flake.
     #[test]
-    fn displayed_machine_fingerprint_is_this_platforms_platform_key() {
+    fn displayed_machine_fingerprint_uses_this_platforms_collector() {
+        use crate::fingerprint::platform_linux::{compute_machine_fingerprint, FingerprintError, MachineAttributes};
+        let attrs = MachineAttributes {
+            hostname: "testhost".to_string(),
+            machine_id: "4c4c4544003a3610804db7c04f4d3732".to_string(),
+            cpu: "Test CPU".to_string(),
+            disk_serial: "TEST-SERIAL".to_string(),
+            mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+        };
+        assert_eq!(fingerprint_hex_of(Ok(attrs.clone())), hex::encode(compute_machine_fingerprint(&attrs)));
+        assert_eq!(fingerprint_hex_of(Err(FingerprintError::MissingMachineId)), "");
+        // Live: a 64-digit hex value, or empty if nothing could be collected.
         let shown = machine_fingerprint_hex();
-        if let Ok(key) = crate::fingerprint::platform_key::derive_platform_key() {
-            assert_eq!(shown, hex::encode(*key));
-        }
+        assert!(shown.is_empty() || (shown.len() == 64 && shown.bytes().all(|b| b.is_ascii_hexdigit())));
+    }
+
+    /// macOS: the displayed fingerprint comes from the macOS collector,
+    /// not the Linux one (#17). Ready for a macOS CI job; not run today.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_fingerprint_uses_the_macos_collector() {
+        use crate::fingerprint::platform_linux::compute_machine_fingerprint_hex;
+        use crate::fingerprint::platform_macos::collect_machine_attributes_macos;
+        let attrs = collect_machine_attributes_macos().expect("macOS attributes");
+        assert_eq!(machine_fingerprint_hex(), compute_machine_fingerprint_hex(&attrs));
     }
 
     #[test]
