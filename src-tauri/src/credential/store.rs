@@ -196,16 +196,18 @@ pub enum CredentialError {
     /// [`UNREADABLE_NOTICE`].
     Unreadable,
     /// From [`load`] only: the file was sealed by an earlier build under the
-    /// public fingerprint, and has been deleted (or its deletion was
-    /// attempted). It carries the credentials it held, so the caller can
-    /// send `device.revoke` with them (#15): use
-    /// `registration::pairing::load_saved`, which does. Displays
-    /// [`UNREADABLE_NOTICE`].
-    OldBuildPairing(OldBuildCredentials),
-    /// An earlier build's pairing was deleted, and `revoke_sent` says
-    /// whether `device.revoke` was sent with it (#15). Displays
-    /// [`OLD_BUILD_REVOKED_NOTICE`] if it was, else [`UNREADABLE_NOTICE`].
-    OldBuildRemoved { revoke_sent: bool },
+    /// public fingerprint, and its deletion was attempted; `deleted` is
+    /// true only if the file system confirms it gone. It carries the
+    /// credentials it held, so the caller can send `device.revoke` with
+    /// them (#15): use `registration::pairing::load_saved`, which does.
+    /// Displays [`UNREADABLE_NOTICE`].
+    OldBuildPairing { creds: OldBuildCredentials, deleted: bool },
+    /// An earlier build's pairing was found (#15): `revoke_sent` says
+    /// whether `device.revoke` was sent with it, `deleted` whether it is
+    /// confirmed gone. Displays [`OLD_BUILD_REVOKED_NOTICE`] only if both
+    /// are true, else [`UNREADABLE_NOTICE`], which claims neither. A file
+    /// that is still there is found, and revoked, again at the next load.
+    OldBuildRemoved { revoke_sent: bool, deleted: bool },
     /// The keyring failed and the save may not fall back to the
     /// machine-bound key: on Windows, or because the store on disk is
     /// keyring-bound. Nothing was written. Displays
@@ -251,9 +253,11 @@ impl fmt::Display for CredentialError {
                 write!(f, "unsupported store version: {}", v)
             }
             CredentialError::Unreadable => f.write_str(UNREADABLE_NOTICE),
-            CredentialError::OldBuildPairing(_) => f.write_str(UNREADABLE_NOTICE),
-            CredentialError::OldBuildRemoved { revoke_sent: true } => f.write_str(OLD_BUILD_REVOKED_NOTICE),
-            CredentialError::OldBuildRemoved { revoke_sent: false } => f.write_str(UNREADABLE_NOTICE),
+            CredentialError::OldBuildPairing { .. } => f.write_str(UNREADABLE_NOTICE),
+            CredentialError::OldBuildRemoved { revoke_sent: true, deleted: true } => {
+                f.write_str(OLD_BUILD_REVOKED_NOTICE)
+            }
+            CredentialError::OldBuildRemoved { .. } => f.write_str(UNREADABLE_NOTICE),
             CredentialError::KeyringUnavailable => f.write_str(KEYRING_UNAVAILABLE_NOTICE),
             CredentialError::NoConfigDir => f.write_str(NO_CONFIG_DIR_NOTICE),
             CredentialError::NoMachineId => f.write_str(NO_MACHINE_ID_NOTICE),
@@ -270,8 +274,20 @@ impl std::error::Error for CredentialError {}
 /// The credentials of an earlier build's pairing, carried out of [`load`]
 /// so `device.revoke` can be sent with them (#15). Its `Debug` shows
 /// nothing of them, so an error logged with `{:?}` leaks no key. They are
-/// zeroized when dropped, as all `ConnectionCredentials` are.
-pub struct OldBuildCredentials(pub Box<ConnectionCredentials>);
+/// zeroized when dropped, as all `ConnectionCredentials` are. The field is
+/// private, so they can't be printed through it by mistake either.
+pub struct OldBuildCredentials(Box<ConnectionCredentials>);
+
+impl OldBuildCredentials {
+    pub(crate) fn new(creds: Box<ConnectionCredentials>) -> Self {
+        Self(creds)
+    }
+
+    /// The credentials, for the revoke.
+    pub(crate) fn into_inner(self) -> Box<ConnectionCredentials> {
+        self.0
+    }
+}
 
 impl fmt::Debug for OldBuildCredentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -699,8 +715,13 @@ fn load_with(
                 if let Err(de) = delete(config_dir) {
                     log::error!("credential store: could not delete the old file: {}", de);
                 }
-                // #15: its credentials go to the caller, for the revoke.
-                return Err(CredentialError::OldBuildPairing(OldBuildCredentials(Box::new(old))));
+                // #15: only what the file system confirms counts as deleted.
+                let deleted = matches!(pairing_present(config_dir), Ok(false));
+                // Its credentials go to the caller, for the revoke.
+                return Err(CredentialError::OldBuildPairing {
+                    creds: OldBuildCredentials::new(Box::new(old)),
+                    deleted,
+                });
             } else {
                 log::warn!(
                     "credential store: machine-bound file does not decrypt on this machine ({}); keeping it",
@@ -1507,11 +1528,13 @@ mod tests {
         assert!(!exists(dir.path()), "the unreadable file must be deleted");
         let debug = format!("{err:?}");
         match err {
-            CredentialError::OldBuildPairing(old) => {
+            CredentialError::OldBuildPairing { creds, deleted } => {
+                assert!(deleted);
+                let old = creds.into_inner();
                 let want = sample_creds();
-                assert_eq!(old.0.connection_id, want.connection_id);
-                assert_eq!(old.0.message_space_token, want.message_space_token);
-                assert_eq!(old.0.owner_guid, want.owner_guid);
+                assert_eq!(old.connection_id, want.connection_id);
+                assert_eq!(old.message_space_token, want.message_space_token);
+                assert_eq!(old.owner_guid, want.owner_guid);
                 assert!(!debug.contains(&want.connection_id), "{debug}");
                 assert!(!debug.contains(&want.message_space_token), "{debug}");
             }
@@ -1519,12 +1542,36 @@ mod tests {
         }
     }
 
-    /// #15: the notice after an earlier build's pairing was deleted says
-    /// the vault was asked only if the revoke was sent.
+    /// #15: an earlier build's file that can't be deleted (held open for
+    /// reading without delete sharing, as antivirus may) is reported as not
+    /// deleted, and is still there.
+    #[cfg(windows)]
     #[test]
-    fn old_build_notice_follows_the_revoke() {
-        assert_eq!(CredentialError::OldBuildRemoved { revoke_sent: true }.to_string(), OLD_BUILD_REVOKED_NOTICE);
-        assert_eq!(CredentialError::OldBuildRemoved { revoke_sent: false }.to_string(), UNREADABLE_NOTICE);
+    fn an_old_build_file_that_cant_be_deleted_says_so() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let old_build = FixedKeys { binding: BindingMode::MachineBound, master: FINGERPRINT, platform: FINGERPRINT };
+        save_with(&old_build, dir.path(), &sample_creds()).expect("save");
+        let held = fs::OpenOptions::new().read(true).share_mode(0x1).open(dir.path().join(CREDENTIAL_FILE)).unwrap(); // FILE_SHARE_READ only
+        let this_build = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: PLATFORM };
+        let err = load_with(&this_build, dir.path()).err().expect("must not load");
+        drop(held);
+        assert!(matches!(err, CredentialError::OldBuildPairing { deleted: false, .. }), "got {err:?}");
+        assert!(exists(dir.path()));
+    }
+
+    /// #15: the notice says the pairing was deleted and the vault asked
+    /// only if both happened; otherwise it claims neither.
+    #[test]
+    fn old_build_notice_follows_the_revoke_and_the_delete() {
+        for (revoke_sent, deleted, want) in [
+            (true, true, OLD_BUILD_REVOKED_NOTICE),
+            (true, false, UNREADABLE_NOTICE),
+            (false, true, UNREADABLE_NOTICE),
+            (false, false, UNREADABLE_NOTICE),
+        ] {
+            assert_eq!(CredentialError::OldBuildRemoved { revoke_sent, deleted }.to_string(), want);
+        }
     }
 
     /// The machine id changed (since #14 the only input): the machine-bound

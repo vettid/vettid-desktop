@@ -1026,8 +1026,19 @@ async fn end_session_on_disk(
         log::warn!("end_session: logged out meanwhile; not telling the vault");
         return None;
     }
+    // #15: if loading it found a pairing that can't be opened (an earlier
+    // build's, now deleted and revoked), the person is told that, not
+    // only that the session ended.
+    let mut pairing_notice = None;
     if let Err(e) = pairing::publish_end_session(&config_dir, "user_locked").await {
         log::warn!("device.end-session publish failed (continuing with local reset): {}", e);
+        if matches!(
+            e,
+            crate::registration::flow::RegistrationError::OldBuildRevoked
+                | crate::registration::flow::RegistrationError::PairingUnreadable
+        ) {
+            pairing_notice = Some(e.to_string());
+        }
     }
 
     // Persist the session-end to disk. The device stays PAIRED — the
@@ -1056,11 +1067,20 @@ async fn end_session_on_disk(
             "end_session: could not load creds to clear on-disk session fields: {}", e
         ),
     }
+    end_session_notice(pairing_notice, marker_removed, cleared_saved)
+}
+
+/// What End session tells the person: a notice about the pairing itself
+/// first (#15), else whether the end was recorded (#26).
+fn end_session_notice(pairing_notice: Option<String>, marker_removed: bool, cleared_saved: bool) -> Option<String> {
+    if pairing_notice.is_some() {
+        return pairing_notice;
+    }
     // The old session comes back at the next launch only if both failed.
     if marker_removed || cleared_saved {
         None
     } else {
-        Some(store::SESSION_END_NOT_RECORDED_NOTICE.to_string())
+        Some(crate::credential::store::SESSION_END_NOT_RECORDED_NOTICE.to_string())
     }
 }
 
@@ -1183,6 +1203,18 @@ mod tests {
         use crate::fingerprint::platform_macos::collect_machine_attributes_macos;
         let attrs = collect_machine_attributes_macos().expect("macOS attributes");
         assert_eq!(machine_fingerprint_hex(), compute_machine_fingerprint_hex(&attrs));
+    }
+
+    /// #15: End session passes on a notice about the pairing; otherwise it
+    /// speaks up only if the end couldn't be recorded at all.
+    #[test]
+    fn end_session_notice_prefers_the_pairing_notice() {
+        use crate::credential::store::{OLD_BUILD_REVOKED_NOTICE, SESSION_END_NOT_RECORDED_NOTICE};
+        let old = Some(OLD_BUILD_REVOKED_NOTICE.to_string());
+        assert_eq!(end_session_notice(old.clone(), true, true), old);
+        assert_eq!(end_session_notice(None, true, false), None);
+        assert_eq!(end_session_notice(None, false, true), None);
+        assert_eq!(end_session_notice(None, false, false), Some(SESSION_END_NOT_RECORDED_NOTICE.to_string()));
     }
 
     /// The store step of log-out, without deleting the real keyring key.

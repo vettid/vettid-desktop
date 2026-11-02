@@ -503,17 +503,45 @@ pub struct PairingOutcome {
 async fn load_stored_creds(
     config_dir: &PathBuf,
 ) -> Result<crate::credential::store::ConnectionCredentials, RegistrationError> {
-    use crate::credential::store::CredentialError;
+    creds_or_error(load_saved(config_dir).await)
+}
 
-    match load_saved(config_dir).await {
+/// [`load_stored_creds`]'s mapping: an earlier build's pairing is
+/// `OldBuildRevoked` only if it was revoked and deleted (#15); otherwise,
+/// like any pairing that can't be opened, `PairingUnreadable`.
+fn creds_or_error(
+    loaded: Result<
+        (crate::credential::store::ConnectionCredentials, crate::credential::keystore::BindingMode),
+        crate::credential::store::CredentialError,
+    >,
+) -> Result<crate::credential::store::ConnectionCredentials, RegistrationError> {
+    use crate::credential::store::CredentialError;
+    match loaded {
         Ok((creds, _)) => Ok(creds),
-        Err(CredentialError::OldBuildRemoved { revoke_sent: true }) => Err(RegistrationError::OldBuildRevoked),
-        Err(CredentialError::Unreadable | CredentialError::OldBuildRemoved { revoke_sent: false }) => {
+        Err(CredentialError::OldBuildRemoved { revoke_sent: true, deleted: true }) => {
+            Err(RegistrationError::OldBuildRevoked)
+        }
+        Err(CredentialError::Unreadable | CredentialError::OldBuildRemoved { .. }) => {
             Err(RegistrationError::PairingUnreadable)
         }
         Err(CredentialError::NoMachineId) => Err(RegistrationError::NoMachineId),
         Err(e) => Err(RegistrationError::Internal(format!("load creds: {}", e))),
     }
+}
+
+/// For logout (#15): whether loading the pairing already sent the revoke,
+/// with an earlier build's pairing. Then logout's own revoke has been sent,
+/// whether or not the file could be deleted (logout's wipe tries again).
+fn old_build_revoke_sent(
+    loaded: &Result<
+        (crate::credential::store::ConnectionCredentials, crate::credential::keystore::BindingMode),
+        crate::credential::store::CredentialError,
+    >,
+) -> bool {
+    matches!(
+        loaded,
+        Err(crate::credential::store::CredentialError::OldBuildRemoved { revoke_sent: true, .. })
+    )
 }
 
 /// Extend a session that has expired (or is about to). Reuses the stored NATS
@@ -615,10 +643,11 @@ pub async fn publish_end_session(
 /// If the saved pairing was made by an earlier build, loading it deletes it
 /// and sends the revoke with its credentials (#15), so that counts as sent.
 pub async fn publish_revoke(config_dir: &PathBuf) -> Result<(), RegistrationError> {
-    let creds = match load_stored_creds(config_dir).await {
-        Err(RegistrationError::OldBuildRevoked) => return Ok(()),
-        other => other?,
-    };
+    let loaded = load_saved(config_dir).await;
+    if old_build_revoke_sent(&loaded) {
+        return Ok(());
+    }
+    let creds = creds_or_error(loaded)?;
     send_device_frame(&creds, "revoke", "logout", DEVICE_FRAME_DEADLINE).await
 }
 
@@ -661,16 +690,16 @@ where
 {
     use crate::credential::store::CredentialError;
     match load(config_dir) {
-        Err(CredentialError::OldBuildPairing(old)) => {
-            // `old` zeroizes when the send is done with it.
-            let revoke_sent = match send_revoke(old.0).await {
+        Err(CredentialError::OldBuildPairing { creds, deleted }) => {
+            // The credentials zeroize when the send is done with them.
+            let revoke_sent = match send_revoke(creds.into_inner()).await {
                 Ok(()) => true,
                 Err(e) => {
                     log::warn!("device.revoke for an earlier build's pairing not sent: {}", e);
                     false
                 }
             };
-            Err(CredentialError::OldBuildRemoved { revoke_sent })
+            Err(CredentialError::OldBuildRemoved { revoke_sent, deleted })
         }
         other => other,
     }
@@ -787,11 +816,16 @@ mod device_frame_tests {
             session_expires_at: 0,
             session_duration_seconds: 0,
         };
-        for sent in [true, false] {
+        for (sent, gone) in [(true, true), (false, true), (true, false)] {
             let mut seen = None;
             let result = load_saved_with(
                 dir,
-                |_| Err(CredentialError::OldBuildPairing(OldBuildCredentials(Box::new(old())))),
+                |_| {
+                    Err(CredentialError::OldBuildPairing {
+                        creds: OldBuildCredentials::new(Box::new(old())),
+                        deleted: gone,
+                    })
+                },
                 |creds| {
                     seen = Some(creds.connection_id.clone());
                     async move {
@@ -805,7 +839,10 @@ mod device_frame_tests {
             )
             .await;
             assert_eq!(seen.as_deref(), Some("old-conn"));
-            assert!(matches!(result, Err(CredentialError::OldBuildRemoved { revoke_sent }) if revoke_sent == sent));
+            assert!(matches!(
+                result,
+                Err(CredentialError::OldBuildRemoved { revoke_sent, deleted }) if revoke_sent == sent && deleted == gone
+            ));
         }
 
         let mut called = false;
@@ -822,6 +859,24 @@ mod device_frame_tests {
         .await;
         assert!(ok.is_ok());
         assert!(!called, "no revoke for anything but an earlier build's pairing");
+    }
+
+    /// #15: what the commands and logout make of an earlier build's
+    /// pairing. "Revoked" (and its notice) only if it was revoked and
+    /// deleted; logout counts any sent revoke as its own.
+    #[test]
+    fn an_old_build_pairing_is_reported_as_it_went() {
+        use crate::credential::store::CredentialError;
+        let removed = |revoke_sent, deleted| Err(CredentialError::OldBuildRemoved { revoke_sent, deleted });
+        assert!(matches!(creds_or_error(removed(true, true)), Err(RegistrationError::OldBuildRevoked)));
+        for (sent, gone) in [(true, false), (false, true), (false, false)] {
+            assert!(matches!(creds_or_error(removed(sent, gone)), Err(RegistrationError::PairingUnreadable)));
+        }
+        assert!(matches!(creds_or_error(Err(CredentialError::Unreadable)), Err(RegistrationError::PairingUnreadable)));
+        assert!(old_build_revoke_sent(&removed(true, true)));
+        assert!(old_build_revoke_sent(&removed(true, false)));
+        assert!(!old_build_revoke_sent(&removed(false, true)));
+        assert!(!old_build_revoke_sent(&Err(CredentialError::Unreadable)));
     }
     use crate::credential::store::ConnectionCredentials;
 
