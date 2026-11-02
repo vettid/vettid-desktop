@@ -110,7 +110,8 @@ pub enum OperationError {
     /// approve in time (or denied without producing a response).
     ApprovalTimeout,
     /// The desktop stopped waiting: the person chose Stop waiting, or the
-    /// listener ended (lock, End session, log-out, a dropped connection).
+    /// listener ended on its own (a dropped connection); lock, End session
+    /// and log-out leave waiters to time out.
     /// The vault wasn't told, and can't be (#42), so the request may still
     /// be approved on the phone and carried out. Displays
     /// [`STOPPED_WAITING_NOTICE`]; never "cancelled".

@@ -92,6 +92,10 @@
   let pendingElapsed = $state(0);
   let pendingStartedAt = 0;
   let errorMessage = $state('');
+  // #42: set when the desktop stopped waiting for a send. The vault still
+  // has that request, so a second Confirm could send twice: Confirm stays
+  // off, and the warning stays, until Back or close.
+  let stoppedWaiting = $state(false);
   // Set on a successful broadcast — flips the sheet to the success view.
   let sentTxid = $state<string | null>(null);
 
@@ -255,7 +259,7 @@
   }
 
   async function confirmSend() {
-    if (sending || !selectedWallet) return;
+    if (sending || stoppedWaiting || !selectedWallet) return;
     sending = true;
     errorMessage = '';
     try {
@@ -282,7 +286,10 @@
           ? 'You denied the transaction on your phone.'
           : 'The transaction was not completed.');
       // #42: the vault still has the request, so the bitcoin can still go.
-      if (resp?.error_code === 'stopped_waiting') errorMessage = STOPPED_WAITING_SEND;
+      if (resp?.error_code === 'stopped_waiting') {
+        errorMessage = STOPPED_WAITING_SEND;
+        stoppedWaiting = true;
+      }
     } catch (e) {
       clearPending();
       const msg = String(e);
@@ -290,7 +297,10 @@
         errorMessage = 'Phone approval timed out. Try again when you have your phone handy.';
       // Thrown only on an IPC failure; phone-approval errors come back in
       // `resp.error` above.
-      else if (msg.includes('stopped waiting')) errorMessage = STOPPED_WAITING_SEND;
+      else if (msg.includes('stopped waiting')) {
+        errorMessage = STOPPED_WAITING_SEND;
+        stoppedWaiting = true;
+      }
       else if (msg.includes('did not acknowledge'))
         errorMessage = 'Vault is not responding — try again in a moment.';
       else errorMessage = msg;
@@ -494,8 +504,15 @@
       {/if}
     </div>
     <div class="modal-actions">
-      <button class="btn ghost" onclick={() => (stage = 'form')} disabled={sending}>Back</button>
-      <button class="btn primary" onclick={confirmSend} disabled={sending}>
+      <button
+        class="btn ghost"
+        onclick={() => {
+          stage = 'form';
+          stoppedWaiting = false;
+          errorMessage = '';
+        }}
+        disabled={sending}>Back</button>
+      <button class="btn primary" onclick={confirmSend} disabled={sending || stoppedWaiting}>
         {sending ? 'Sending…' : 'Confirm & Send'}
       </button>
     </div>
