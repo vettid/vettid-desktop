@@ -105,6 +105,19 @@ pub const SESSION_END_NOT_RECORDED_NOTICE: &str =
 pub const SESSION_NOT_RECORDED_NOTICE: &str =
     "This desktop is paired, but it couldn't record the new session on this computer. Choose Start New Session to try again. You don't need to pair again.";
 
+/// Windows: shown when the folder that holds the pairing folder
+/// (`%LOCALAPPDATA%`) lets another account remove, rename or replace what
+/// is in it, or is owned by another account or is a link (#21). Deleting
+/// the pairing folder wouldn't help, so this says who has to act.
+pub const PARENT_NOT_PRIVATE_NOTICE: &str =
+    "The folder this desktop keeps its pairing in is inside a folder (your local app data) that another account on this computer can change, so nothing was saved. Whoever manages this computer needs to fix that folder's permissions.";
+
+/// Windows: shown when `%LOCALAPPDATA%` itself is a symlink or junction
+/// (#21), e.g. moved to another drive with `mklink /J`. It could be
+/// pointed elsewhere after the check, so nothing is kept there.
+pub const PARENT_IS_LINK_NOTICE: &str =
+    "This desktop can't keep its pairing on this computer because your local app data folder is a link to another place, so nothing was saved.";
+
 /// Shown when the per-user folder for the pairing can't be found.
 pub const NO_CONFIG_DIR_NOTICE: &str =
     "This desktop can't find your user folder, so it can't keep a pairing on this computer. Nothing was saved.";
@@ -179,6 +192,13 @@ pub enum CredentialError {
     /// there is nowhere safe to keep a pairing. Displays
     /// [`NO_CONFIG_DIR_NOTICE`].
     NoConfigDir,
+    /// Windows: the folder that holds the pairing folder lets another
+    /// account change what is in it (#21). Nothing was changed. Displays
+    /// [`PARENT_NOT_PRIVATE_NOTICE`].
+    ParentNotPrivate,
+    /// Windows: `%LOCALAPPDATA%` is a symlink or junction (#21). Nothing
+    /// was changed. Displays [`PARENT_IS_LINK_NOTICE`].
+    ParentIsLink,
     /// This computer has no usable machine id, which the saved pairing is
     /// bound to (#14). Nothing was saved or opened. Displays
     /// [`NO_MACHINE_ID_NOTICE`].
@@ -208,6 +228,8 @@ impl fmt::Display for CredentialError {
             CredentialError::KeyringUnavailable => f.write_str(KEYRING_UNAVAILABLE_NOTICE),
             CredentialError::NoConfigDir => f.write_str(NO_CONFIG_DIR_NOTICE),
             CredentialError::NoMachineId => f.write_str(NO_MACHINE_ID_NOTICE),
+            CredentialError::ParentNotPrivate => f.write_str(PARENT_NOT_PRIVATE_NOTICE),
+            CredentialError::ParentIsLink => f.write_str(PARENT_IS_LINK_NOTICE),
             CredentialError::NotPrivate => f.write_str(NOT_PRIVATE_NOTICE),
         }
     }
@@ -442,9 +464,11 @@ fn unix_folder_check(config_dir: &Path) -> Result<(), FolderCheck> {
 /// private. Both leave it unchanged.
 #[cfg(windows)]
 fn acl_error(path: &Path, e: super::winacl::AclError) -> CredentialError {
-    use super::winacl::AclError;
+    use super::winacl::{AclError, NotPrivate};
     log::error!("Credential store: {} {}; refusing to use it", path.display(), e);
     match e {
+        AclError::NotPrivate(NotPrivate::ParentLink) => CredentialError::ParentIsLink,
+        AclError::NotPrivate(why) if why.is_about_the_parent() => CredentialError::ParentNotPrivate,
         AclError::NotPrivate(_) => CredentialError::NotPrivate,
         AclError::Failed(what) => CredentialError::IoError(format!("folder or file permissions: {}", what)),
     }
@@ -1470,6 +1494,54 @@ mod tests {
         fs::create_dir(&marker).unwrap();
         assert!(!session_is_recorded(&config_dir, "sess-1"), "a folder");
         assert_eq!(load_with(&keys, &config_dir).unwrap().0.session_expires_at, 0);
+    }
+
+    /// Windows (#21): a save under a parent another account controls is
+    /// refused with the parent notice, writes neither file, and leaves an
+    /// existing pairing and its marker as they were.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_save_under_an_unsafe_parent_changes_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("local");
+        let config_dir = parent.join("vettid-desktop");
+        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+        save_with(&keys, &config_dir, &creds_with_session("sess-1", 1_900_000_000)).unwrap();
+        let file = fs::read(config_dir.join(CREDENTIAL_FILE)).unwrap();
+        let marker = fs::read(config_dir.join(SESSION_LIVE_FILE)).unwrap();
+        super::super::winacl::test_let_everyone_delete_children(&parent);
+        let err = save_with(&keys, &config_dir, &creds_with_session("sess-2", 1_900_000_001)).err().expect("refused");
+        assert!(matches!(err, CredentialError::ParentNotPrivate), "got {err}");
+        assert_eq!(err.to_string(), PARENT_NOT_PRIVATE_NOTICE);
+        assert!(matches!(
+            save_with_mode(&keys, &config_dir, &creds_with_session("sess-1", 0), Mode::UpdateExisting),
+            Err(CredentialError::ParentNotPrivate)
+        ));
+        assert_eq!(fs::read(config_dir.join(CREDENTIAL_FILE)).unwrap(), file);
+        assert_eq!(fs::read(config_dir.join(SESSION_LIVE_FILE)).unwrap(), marker);
+    }
+
+    /// Windows (#21): a parent that is a junction gives the link notice,
+    /// not the "another account" one, and nothing is created through it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_linked_parent_gives_the_link_notice() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = base.path().join("local");
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .expect("mklink");
+        assert!(out.status.success(), "mklink /J failed");
+        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+        let err = save_with(&keys, &link.join("vettid-desktop"), &sample_creds()).err().expect("refused");
+        assert!(matches!(err, CredentialError::ParentIsLink), "got {err}");
+        assert_eq!(err.to_string(), PARENT_IS_LINK_NOTICE);
+        assert!(!real.join("vettid-desktop").exists());
     }
 
     /// Windows (#26): the case from the issue. The folder becomes shared,

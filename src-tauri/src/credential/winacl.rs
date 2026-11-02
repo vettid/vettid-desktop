@@ -34,8 +34,15 @@
 //! (a security call, creating the folder, a stat error) is
 //! [`AclError::Failed`]: still a refusal, with a different message.
 //!
-//! The parent of the folder (`%LOCALAPPDATA%` itself) is not checked. A
-//! folder swap through it is closed for the duration of a write: the
+//! The parent of the folder (`%LOCALAPPDATA%`) is checked too (#21): its
+//! owner must be trusted, and no other account may hold delete-child,
+//! delete, `WRITE_DAC` or `WRITE_OWNER` on it, since with any of those it
+//! could remove or rename the pairing folder and put its own in its place.
+//! The parent is held open (no delete sharing) and judged on that handle
+//! while the folder is created and during every write, and the folder must
+//! be directly inside it; a parent that is a link is refused. Folders
+//! further up are not judged, but the held parent can't be renamed while
+//! held. A folder swap is also closed for the duration of a write: the
 //! folder is held open with data access and no delete sharing, so it can't
 //! be renamed, nor can its parent (both tested); the new file is renamed
 //! relative to the held folder's handle, and its final path must be inside
@@ -61,7 +68,8 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     EqualSid, GetAce, GetLengthSid, GetTokenInformation, IsValidSid,
-    IsWellKnownSid, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE,
+    IsWellKnownSid, TokenUser, WinBuiltinAdministratorsSid, WinCreatorOwnerRightsSid, WinCreatorOwnerSid,
+    WinLocalSystemSid, ACCESS_ALLOWED_ACE,
     ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
     PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
@@ -98,6 +106,28 @@ pub(crate) enum NotPrivate {
     ForeignAccess,
     UnknownAllowEntry,
     HardLinked,
+    /// The pairing folder's parent is owned by another account (#21).
+    ParentForeignOwner,
+    /// Another account can delete or rename what is in the pairing
+    /// folder's parent, or change its permissions or owner (#21).
+    ParentForeignControl,
+    /// The pairing folder's parent is a symlink or junction, which could be
+    /// pointed elsewhere after the check (#21).
+    ParentLink,
+    /// The pairing folder's parent has an allow entry of a type this module
+    /// doesn't interpret, so it can't tell what it grants (#21).
+    ParentUnknownEntry,
+}
+
+impl NotPrivate {
+    /// Whether the refusal is about the pairing folder's parent rather
+    /// than the folder or file: it gets its own notice.
+    pub(crate) fn is_about_the_parent(&self) -> bool {
+        matches!(
+            self,
+            Self::ParentForeignOwner | Self::ParentForeignControl | Self::ParentLink | Self::ParentUnknownEntry
+        )
+    }
 }
 
 impl std::fmt::Display for NotPrivate {
@@ -109,6 +139,10 @@ impl std::fmt::Display for NotPrivate {
             Self::ForeignAccess => "grants access to another account",
             Self::UnknownAllowEntry => "has an access entry this app does not check",
             Self::HardLinked => "has more than one name (a hard link)",
+            Self::ParentForeignOwner => "is in a folder owned by another account",
+            Self::ParentForeignControl => "is in a folder where another account can delete, rename or replace it",
+            Self::ParentLink => "is in a folder that is a symlink or junction",
+            Self::ParentUnknownEntry => "is in a folder with an access entry this app does not check",
         })
     }
 }
@@ -329,6 +363,146 @@ unsafe fn judge(owner: PSID, dacl: *const ACL, user: &[u8]) -> Result<(), AclErr
     Ok(())
 }
 
+/// Rights on a folder that let an account remove, rename or replace an
+/// entry in it whatever the entry's own permissions say (delete-child), or
+/// give itself that right (change the permissions or the owner), or move
+/// the folder itself (delete). `GENERIC_ALL` covers all of them.
+const PARENT_CONTROL_RIGHTS: u32 = 0x0000_0040 // FILE_DELETE_CHILD
+    | 0x0001_0000 // DELETE
+    | 0x0004_0000 // WRITE_DAC
+    | 0x0008_0000 // WRITE_OWNER
+    | 0x1000_0000; // GENERIC_ALL
+
+/// INHERIT_ONLY_ACE: the entry applies only to what is created inside, not
+/// to the folder itself.
+const INHERIT_ONLY_ACE: u8 = 0x08;
+
+/// Judge the pairing folder's parent (#21). Its owner must be trusted (the
+/// user, SYSTEM or Administrators), and no other account may hold
+/// [`PARENT_CONTROL_RIGHTS`] on it. Other access (listing it, reading it,
+/// creating entries in it) is accepted: the pairing folder itself is
+/// checked and protected, and its protected DACL doesn't inherit from here.
+/// Inherit-only entries don't apply to the parent and are skipped; allow
+/// entries of a type this module doesn't interpret are refused.
+///
+/// SAFETY: as for [`judge`].
+unsafe fn judge_parent(owner: PSID, dacl: *const ACL, user: &[u8]) -> Result<(), AclError> {
+    if owner.is_null() || !is_trusted(owner, user) {
+        return Err(NotPrivate::ParentForeignOwner.into());
+    }
+    if dacl.is_null() {
+        return Err(NotPrivate::ParentForeignControl.into());
+    }
+    let count = (*dacl).AceCount as u32;
+    for index in 0..count {
+        let mut ace: *mut c_void = ptr::null_mut();
+        // `index` is below the ACL's entry count.
+        if GetAce(dacl, index, &mut ace) == 0 || ace.is_null() {
+            return Err(failed("GetAce failed"));
+        }
+        // Every ACE starts with a DWORD-aligned ACE_HEADER.
+        let header = *(ace as *const ACE_HEADER);
+        if header.AceFlags & INHERIT_ONLY_ACE != 0 {
+            continue;
+        }
+        match header.AceType {
+            ACCESS_ALLOWED_ACE_TYPE => {
+                let mask = (*(ace as *const ACCESS_ALLOWED_ACE)).Mask;
+                let sid = allowed_ace_sid(ace);
+                // OWNER RIGHTS applies to the owner, already checked as
+                // trusted; CREATOR OWNER grants nothing on the object it
+                // sits on (it is a template for what is created inside).
+                let inert = IsWellKnownSid(sid, WinCreatorOwnerRightsSid) != 0
+                    || IsWellKnownSid(sid, WinCreatorOwnerSid) != 0;
+                if mask & PARENT_CONTROL_RIGHTS != 0 && !inert && !is_trusted(sid, user) {
+                    return Err(NotPrivate::ParentForeignControl.into());
+                }
+            }
+            ACCESS_DENIED_ACE_TYPE
+            | ACCESS_DENIED_OBJECT_ACE_TYPE
+            | ACCESS_DENIED_CALLBACK_ACE_TYPE
+            | ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE
+            | SYSTEM_AUDIT_ACE_TYPE
+            | SYSTEM_ALARM_ACE_TYPE => {}
+            _ => return Err(NotPrivate::ParentUnknownEntry.into()),
+        }
+    }
+    Ok(())
+}
+
+/// The pairing folder's parent, held open while the folder is created or
+/// written (#21). Like [`HeldFolder`] it is opened without following a
+/// link, with data access and **without delete sharing**, so neither it
+/// nor (tested) its own parent can be renamed while held, and it is judged
+/// on this handle. The folder must then be directly inside its final path.
+struct HeldParent {
+    handle: HANDLE,
+    final_path: String,
+}
+
+impl Drop for HeldParent {
+    fn drop(&mut self) {
+        // SAFETY: `handle` was returned by CreateFileW and is closed once.
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
+fn hold_parent(parent: &Path, user: &[u8]) -> Result<HeldParent, AclError> {
+    let handle = open_folder_held(parent).map_err(|err| failed(format!("open parent folder: error {}", err)))?;
+    let mut held = HeldParent { handle, final_path: String::new() };
+    let info = handle_info(held.handle)?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(NotPrivate::ParentLink.into());
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(failed("parent is not a folder"));
+    }
+    check_parent_handle(held.handle, user)?;
+    held.final_path = final_path(held.handle)?;
+    Ok(held)
+}
+
+/// [`judge_parent`] on an open handle.
+fn check_parent_handle(handle: HANDLE, user: &[u8]) -> Result<(), AclError> {
+    let mut owner: PSID = ptr::null_mut();
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: as in check_handle_with.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(failed(format!("parent: GetSecurityInfo error {}", status)));
+    }
+    let _sd = LocalBox(sd);
+    // SAFETY: `owner` and `dacl` point into `sd`, alive until `_sd` drops.
+    unsafe { judge_parent(owner, dacl, user) }
+}
+
+/// Hold `dir`'s parent, judged (#21).
+fn hold_parent_of(dir: &Path, user: &[u8]) -> Result<HeldParent, AclError> {
+    let parent = dir.parent().ok_or_else(|| failed("the pairing folder has no parent"))?;
+    hold_parent(parent, user)
+}
+
+/// The held folder must be directly inside the held parent.
+fn require_inside(folder: &HeldFolder, parent: &HeldParent) -> Result<(), AclError> {
+    if is_directly_inside(&folder.final_path, &parent.final_path) {
+        Ok(())
+    } else {
+        Err(failed("the pairing folder is not in its checked parent"))
+    }
+}
+
 /// What is at a path, without following it.
 enum Entry {
     Absent,
@@ -418,12 +592,16 @@ pub(crate) fn check_private(path: &Path) -> Result<(), AclError> {
 
 /// Make sure `dir` exists and is private to the current user. Its parent
 /// folders are created as usual if missing. A new `dir` gets the user-only
-/// DACL; an existing one is only checked.
+/// DACL; an existing one is only checked. The parent is held and checked
+/// first (#21): if another account could delete, rename or replace entries
+/// in it, the pairing folder isn't created or used. (A missing parent is
+/// still created first, as before.)
 pub(crate) fn ensure_private_dir(dir: &Path) -> Result<(), AclError> {
+    let user = current_user_sid()?;
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent).map_err(|e| failed(format!("create parent: {}", e)))?;
     }
-    let user = current_user_sid()?;
+    let parent = hold_parent_of(dir, &user)?;
     let sd = Descriptor::from_sddl(&folder_sddl(&sid_string(&user)?))?;
     let attrs = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -439,11 +617,10 @@ pub(crate) fn ensure_private_dir(dir: &Path) -> Result<(), AclError> {
             return Err(failed(format!("CreateDirectoryW error {}", err)));
         }
     }
-    // Checked whether it was just made or already there.
-    check_private_with(dir, &user)?;
-    if !dir.is_dir() {
-        return Err(failed("not a folder"));
-    }
+    // Checked whether it was just made or already there, on a handle, and
+    // it must be the folder inside the parent that was checked.
+    let folder = hold_folder(dir, &user)?;
+    require_inside(&folder, &parent)?;
     Ok(())
 }
 
@@ -465,28 +642,47 @@ impl Drop for HeldFolder {
     }
 }
 
-fn hold_folder(dir: &Path, user: &[u8]) -> Result<HeldFolder, AclError> {
+/// Open a folder to hold it: no link followed, data access, and no
+/// FILE_SHARE_DELETE, so it can't be renamed while held. Another program
+/// (a backup or antivirus scanner) that has it open with delete access for
+/// a moment makes this fail with a sharing violation, so that is retried a
+/// few times (#37 review). Returns the Win32 error otherwise.
+fn open_folder_held(dir: &Path) -> Result<HANDLE, u32> {
+    const ERROR_SHARING_VIOLATION: u32 = 32;
+    const ATTEMPTS: u32 = 5;
     let dir_w = wide_path(dir);
-    // SAFETY: `dir_w` is NUL-terminated. FILE_FLAG_BACKUP_SEMANTICS is
-    // needed to open a directory; FILE_FLAG_OPEN_REPARSE_POINT opens a link
-    // itself. No FILE_SHARE_DELETE: the folder can't be renamed while held.
-    let handle = unsafe {
-        CreateFileW(
-            dir_w.as_ptr(),
-            // FILE_LIST_DIRECTORY is data access: share modes are only
-            // enforced against handles that have some, so it is what makes
-            // the missing FILE_SHARE_DELETE stop a rename.
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
-        return Err(failed(format!("open folder: error {}", last_error())));
+    for attempt in 1..=ATTEMPTS {
+        // SAFETY: `dir_w` is NUL-terminated. FILE_FLAG_BACKUP_SEMANTICS is
+        // needed to open a directory; FILE_FLAG_OPEN_REPARSE_POINT opens a
+        // link itself.
+        let handle = unsafe {
+            CreateFileW(
+                dir_w.as_ptr(),
+                // FILE_LIST_DIRECTORY is data access: share modes are only
+                // enforced against handles that have some, so it is what
+                // makes the missing FILE_SHARE_DELETE stop a rename.
+                FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE && !handle.is_null() {
+            return Ok(handle);
+        }
+        let err = last_error();
+        if err != ERROR_SHARING_VIOLATION || attempt == ATTEMPTS {
+            return Err(err);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt)));
     }
+    unreachable!("the loop returns")
+}
+
+fn hold_folder(dir: &Path, user: &[u8]) -> Result<HeldFolder, AclError> {
+    let handle = open_folder_held(dir).map_err(|err| failed(format!("open folder: error {}", err)))?;
     // Owns the handle from here on, so every early return closes it once.
     let mut held = HeldFolder { handle, final_path: String::new() };
     let info = handle_info(held.handle)?;
@@ -710,7 +906,11 @@ fn write_private_file_with(
     use std::os::windows::io::FromRawHandle;
 
     let user = current_user_sid()?;
+    // #21: the parent is held and judged for the whole write too, so it
+    // can't be swapped between ensure_private_dir and here.
+    let parent = hold_parent_of(dir, &user)?;
     let folder = hold_folder(dir, &user)?;
+    require_inside(&folder, &parent)?;
 
     let target = dir.join(name);
     if let Entry::Present = entry_at(&target)? {
@@ -797,6 +997,7 @@ fn write_private_file_with(
     let confirmed = confirm();
     drop(file);
     drop(folder);
+    drop(parent);
     if let Err(e) = confirmed {
         return Err(failed(format!(
             "the pairing was replaced, but the result could not be confirmed ({})",
@@ -889,6 +1090,14 @@ fn allowed_sids(path: &Path) -> Vec<String> {
 pub(crate) fn test_share_with_everyone(path: &Path) {
     let me = sid_string(&current_user_sid().unwrap()).unwrap();
     tests::set_dacl(path, &format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)(A;OICI;FR;;;WD)"));
+}
+
+/// For tests elsewhere in the crate: let Everyone delete what is in
+/// `path` (FILE_DELETE_CHILD), as on a parent another account controls.
+#[cfg(test)]
+pub(crate) fn test_let_everyone_delete_children(path: &Path) {
+    let me = sid_string(&current_user_sid().unwrap()).unwrap();
+    tests::set_dacl(path, &format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)(A;;0x40;;;WD)"));
 }
 
 /// For tests elsewhere in the crate: whether `path` is protected and
@@ -1110,6 +1319,162 @@ mod tests {
         assert!(!is_directly_inside(r"\\?\D:\x\f", r"\\?\C:\x"));
         assert!(!is_directly_inside(r"\\?\C:\x\", r"\\?\C:\x"));
         assert!(!is_directly_inside("f", r"\\?\C:\x"));
+    }
+
+    /// #21: a parent where another account can delete, rename or replace
+    /// entries (delete-child), delete the folder, or change its permissions
+    /// or owner is refused, and nothing is created in it.
+    #[test]
+    fn a_parent_another_account_controls_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("local");
+        std::fs::create_dir(&parent).unwrap();
+        let dir = parent.join("vettid-desktop");
+        let me = me();
+        for extra in [
+            "(A;;0x40;;;WD)",    // FILE_DELETE_CHILD for Everyone
+            "(A;;0x10000;;;WD)", // DELETE
+            "(A;;WD;;;AU)",      // WRITE_DAC for Authenticated Users
+            "(A;;WO;;;BU)",      // WRITE_OWNER for Users
+            "(A;;FA;;;WD)",      // full control
+            "(A;;GA;;;WD)",      // GENERIC_ALL
+        ] {
+            set_dacl(&parent, &format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY){extra}"));
+            assert_eq!(
+                ensure_private_dir(&dir),
+                refused(NotPrivate::ParentForeignControl),
+                "{extra}"
+            );
+            assert!(!dir.exists(), "{extra}: nothing created");
+        }
+    }
+
+    /// #21: other access to the parent is accepted: reading and listing,
+    /// creating entries, an inherit-only grant (it doesn't apply to the
+    /// parent), a deny entry, and Administrators. So is the default
+    /// %LOCALAPPDATA% shape (inherited user, SYSTEM, Administrators).
+    #[test]
+    fn a_parent_others_can_only_read_or_add_to_is_accepted() {
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("local");
+        std::fs::create_dir(&parent).unwrap();
+        let dir = parent.join("vettid-desktop");
+        let me = me();
+        for extra in [
+            "(A;OICI;FR;;;WD)",    // read for Everyone
+            "(A;;0x6;;;AU)",       // add file and add subfolder
+            "(A;OICIIO;FA;;;WD)",  // inherit-only
+            "(D;;0x40;;;WD)",      // a deny entry
+            "(A;OICI;FA;;;BA)",    // Administrators
+        ] {
+            set_dacl(&parent, &format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY){extra}"));
+            assert_eq!(ensure_private_dir(&dir), Ok(()), "{extra}");
+            assert!(test_is_user_only(&dir), "{extra}: the folder is still user-only");
+        }
+        // The real one on this machine.
+        let local = dirs::config_local_dir().expect("LOCALAPPDATA");
+        assert!(hold_parent(&local, &current_user_sid().unwrap()).is_ok());
+    }
+
+    /// Judge a parent described by SDDL directly, for shapes that can't
+    /// be set on a real folder without a privilege (another owner).
+    fn judge_parent_sddl(sddl: &str) -> Result<(), AclError> {
+        use windows_sys::Win32::Security::GetSecurityDescriptorOwner;
+        let sd = Descriptor::from_sddl(sddl).expect("sddl");
+        let mut owner: PSID = ptr::null_mut();
+        let mut defaulted = 0;
+        // SAFETY: `sd` is a valid descriptor; `owner` points into it.
+        assert_ne!(unsafe { GetSecurityDescriptorOwner(sd.ptr(), &mut owner, &mut defaulted) }, 0);
+        let dacl = sd.dacl().map(|d| d as *const ACL).unwrap_or(ptr::null());
+        // SAFETY: `owner` and `dacl` point into `sd`, alive for the call.
+        unsafe { judge_parent(owner, dacl, &current_user_sid().unwrap()) }
+    }
+
+    /// #21: the parent policy on shapes from the review.
+    #[test]
+    fn parent_policy_shapes() {
+        let me = me();
+        let ok = format!("O:{me}D:(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;{me})");
+        assert_eq!(judge_parent_sddl(&ok), Ok(()), "the default %LOCALAPPDATA% shape");
+        let cases = [
+            (format!("O:WDD:(A;;FA;;;{me})"), refused(NotPrivate::ParentForeignOwner), "another owner"),
+            (format!("O:{me}D:NO_ACCESS_CONTROL"), refused(NotPrivate::ParentForeignControl), "a NULL DACL"),
+            (format!("O:{me}D:(A;OICIID;0x1301bf;;;AU)"), refused(NotPrivate::ParentForeignControl), "inherited Modify (a second drive)"),
+            (format!("O:{me}D:(A;;GW;;;WD)"), Ok(()), "GENERIC_WRITE only"),
+            (format!("O:{me}D:(A;;FA;;;OW)"), Ok(()), "OWNER RIGHTS (the trusted owner)"),
+            (format!("O:{me}D:(A;;FA;;;CO)"), Ok(()), "CREATOR OWNER on the folder itself is inert"),
+            (format!("O:{me}D:(XA;;FA;;;WD;(WIN://SYSAPPID Contains \"x\"))"), refused(NotPrivate::ParentUnknownEntry), "a callback allow entry"),
+            (format!("O:{me}D:(XA;OICIIO;FA;;;WD;(WIN://SYSAPPID Contains \"x\"))"), Ok(()), "an inherit-only callback entry"),
+        ];
+        for (sddl, want, what) in cases {
+            if let Err(AclError::NotPrivate(why)) = &want {
+                // Every parent refusal gets the parent notice, not the
+                // folder's "delete that folder, then pair again".
+                assert!(why.is_about_the_parent(), "{what}: {why:?}");
+            }
+            assert_eq!(judge_parent_sddl(&sddl), want, "{what}: {sddl}");
+        }
+    }
+
+    /// A folder another program holds open with delete access only for a
+    /// moment is retried, not refused.
+    #[test]
+    fn a_folder_held_briefly_by_another_program_is_retried() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        ensure_private_dir(&dir).unwrap();
+        let busy = std::fs::OpenOptions::new()
+            .access_mode(DELETE | FILE_LIST_DIRECTORY)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | 0x4)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&dir)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            drop(busy);
+        });
+        write_private_file(&dir, "connection.enc", b"x").expect("retried until released");
+        release.join().unwrap();
+    }
+
+    /// #21: a parent that is a junction is refused, and so is a pairing
+    /// folder that isn't inside the held parent.
+    #[test]
+    fn a_parent_that_is_a_junction_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.path().join("local");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .expect("mklink");
+        assert!(status.status.success(), "mklink /J failed");
+        assert_eq!(ensure_private_dir(&link.join("vettid-desktop")), refused(NotPrivate::ParentLink));
+        assert!(!real.join("vettid-desktop").exists(), "nothing created through it");
+    }
+
+    /// #21: the write path holds and judges the parent too: once the parent
+    /// lets another account delete entries, a write is refused and the old
+    /// file is kept.
+    #[test]
+    fn a_write_under_a_parent_another_account_controls_is_refused_and_kept() {
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("local");
+        std::fs::create_dir(&parent).unwrap();
+        let dir = parent.join("vettid-desktop");
+        ensure_private_dir(&dir).unwrap();
+        write_private_file(&dir, "connection.enc", b"the old pairing").unwrap();
+        let me = me();
+        set_dacl(&parent, &format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)(A;;0x40;;;WD)"));
+        assert_eq!(
+            write_private_file(&dir, "connection.enc", b"new"),
+            refused(NotPrivate::ParentForeignControl)
+        );
+        assert_eq!(std::fs::read(dir.join("connection.enc")).unwrap(), b"the old pairing");
     }
 
     #[test]
