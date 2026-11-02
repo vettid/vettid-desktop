@@ -223,8 +223,13 @@ impl Claims {
 
 /// Sign `claims` as a deposit token (§5). Claims this crate would refuse
 /// to parse (a negative quota, an empty `jti`, a scope that doesn't fit
-/// `sub`, a year past 9999) aren't signed.
+/// `sub`, a year past 9999) aren't signed; nor are claims whose `iss`
+/// isn't the signing key's own mailbox (the relay would refuse them,
+/// §5.3 step 3), or whose `exp` isn't after `iat` in whole seconds.
 pub fn mint_token(key: &SigningKey, claims: &Claims) -> Result<Token, TokenError> {
+    if claims.iss != auth::mailbox_id(&key.verifying_key()) || claims.exp.timestamp() <= claims.iat.timestamp() {
+        return Err(TokenError::Invalid);
+    }
     let json = claims.to_json();
     parse_claims(json.as_bytes())?;
     Ok(sign_token(key, json.as_bytes()))
@@ -556,6 +561,10 @@ mod tests {
                 exp: chrono::NaiveDate::from_ymd_opt(10000, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc(),
                 ..vector_claims()
             },
+            // Another mailbox's iss: the recipient key signs only its own.
+            Claims { iss: auth::mailbox_id(&sender().verifying_key()), ..vector_claims() },
+            // exp not after iat once both are in whole seconds.
+            Claims { exp: t("2026-06-10T00:00:00Z") + chrono::Duration::milliseconds(500), ..vector_claims() },
         ];
         for c in bad {
             assert!(matches!(mint_token(&recipient(), &c), Err(TokenError::Invalid)), "{c:?}");

@@ -207,6 +207,11 @@ pub(crate) mod tests {
 
     /// §4.1: the empty body hashes as given, and headers carry millisecond
     /// timestamps, so two requests within a second sign differently.
+    ///
+    /// This is the only test that signs through `SignedHeaders::new`, and
+    /// so the only user of the process-wide `LAST_SIGNED_MS`; the stepping
+    /// rule itself is tested as `step` (`step_edges`). Keep it that way, or
+    /// a parallel test could land between `a` and `b`.
     #[test]
     fn headers_use_millisecond_timestamps() {
         assert_eq!(hex::encode(body_hash(b"")), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
