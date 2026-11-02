@@ -938,6 +938,20 @@ pub fn end_saved_session(config_dir: &Path) -> Result<(), CredentialError> {
 /// wiped the pairing since `since`, it fails with
 /// [`CredentialError::LoggedOutMeanwhile`] and removes nothing, since the
 /// marker there now may belong to a pairing made after that log-out.
+/// End a session the vault ended (#45): remove the live marker only if it
+/// still names `session_id`, under the writer lock, so a marker written
+/// since for another session (a Start New Session, a new pairing) is left
+/// alone. The pairing itself is never touched. `Ok(true)` if the marker
+/// was removed and is confirmed gone, `Ok(false)` if it named another
+/// session or none.
+pub fn end_saved_session_if(config_dir: &Path, session_id: &str) -> Result<bool, CredentialError> {
+    let guard = writer_lock();
+    if !session_marked_live(config_dir, session_id) {
+        return Ok(false);
+    }
+    end_saved_session_locked(config_dir, &guard).map(|()| true)
+}
+
 pub fn end_saved_session_since(config_dir: &Path, since: WipeEpoch) -> Result<(), CredentialError> {
     let guard = writer_lock();
     if wipe_epoch() != since {
@@ -1412,6 +1426,31 @@ pub(crate) mod tests {
     /// For tests elsewhere in the crate (#15): an earlier build's pairing
     /// (`sample_creds`, sealed under the public fingerprint) in `dir`.
     /// It names the legacy message server, as such pairings did.
+    /// For tests elsewhere in the crate (#45): a pairing in `dir` whose
+    /// session `session_id` is marked live.
+    pub(crate) fn save_pairing_with_live_session(dir: &Path, session_id: &str) {
+        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+        save_with(&keys, dir, &creds_with_session(session_id, 1_900_000_000)).expect("save");
+        assert!(session_is_recorded(dir, session_id));
+    }
+
+    /// #45: a vault-ended session's marker goes only if it still names
+    /// that session; the pairing stays either way.
+    #[test]
+    fn a_vault_ended_sessions_marker_goes_only_if_it_names_it() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        save_pairing_with_live_session(&config_dir, "s2");
+        assert_eq!(end_saved_session_if(&config_dir, "s1").unwrap(), false, "another session's marker");
+        assert!(session_is_recorded(&config_dir, "s2"));
+        assert_eq!(end_saved_session_if(&config_dir, "s2").unwrap(), true);
+        assert!(!session_is_recorded(&config_dir, "s2"));
+        assert!(exists(&config_dir), "the pairing stays");
+        assert_eq!(end_saved_session_if(&config_dir, "s2").unwrap(), false, "already gone");
+        let none = base.path().join("absent");
+        assert_eq!(end_saved_session_if(&none, "s2").unwrap(), false, "no folder");
+    }
+
     pub(crate) fn save_old_build_pairing(dir: &Path) {
         let old_build = FixedKeys { binding: BindingMode::MachineBound, master: FINGERPRINT, platform: FINGERPRINT };
         let mut creds = sample_creds();

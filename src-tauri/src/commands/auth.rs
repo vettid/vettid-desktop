@@ -1009,11 +1009,33 @@ pub(crate) async fn current_session_id(state: &AppState) -> Option<String> {
 /// `session_op`, so End session and Start New Session can't swap it in
 /// between. A message about another session (an old one, after Start New
 /// Session) says nothing about the current one and changes nothing (#43).
+///
+/// #45: the session's live marker on disk goes too, if it still names
+/// that session, so the next unlock or launch doesn't treat it as live.
 pub(crate) async fn end_session_from_vault_if_current(state: &AppState, revoked: bool, session_id: &str) {
+    let config_dir = crate::credential::store::default_config_dir().ok();
+    end_session_from_vault_if_current_in(state, revoked, session_id, config_dir.as_deref()).await;
+}
+
+/// [`end_session_from_vault_if_current`] with the pairing's folder passed
+/// in (tests use a temporary one; never this machine's real folder).
+async fn end_session_from_vault_if_current_in(
+    state: &AppState,
+    revoked: bool,
+    session_id: &str,
+    config_dir: Option<&std::path::Path>,
+) {
     let _session_op = state.session_op.lock().await;
     if current_session_id(state).await.as_deref() != Some(session_id) {
         log::info!("session_update for a session that isn't the current one; ignored");
         return;
+    }
+    // #45: disk first, as End session does (#26), and only that session's
+    // marker: a new session's or pairing's stays. Never the pairing.
+    if let Some(dir) = config_dir {
+        if let Err(e) = crate::credential::store::end_saved_session_if(dir, session_id) {
+            log::error!("vault ended the session, but its live marker couldn't be removed: {}", e);
+        }
     }
     end_session_from_vault(state, revoked).await;
 }
@@ -1422,13 +1444,52 @@ mod tests {
         };
         *state.credentials.write().await = Some(creds("new"));
         *state.connection_key.write().await = Some([7u8; 32]);
-        end_session_from_vault_if_current(&state, false, "old").await;
+        end_session_from_vault_if_current_in(&state, false, "old", None).await;
         assert_eq!(current_session_id(&state).await.as_deref(), Some("new"));
         assert!(state.connection_key.read().await.is_some());
 
-        end_session_from_vault_if_current(&state, true, "new").await;
+        end_session_from_vault_if_current_in(&state, true, "new", None).await;
         assert!(state.credentials.read().await.is_none());
         assert!(state.connection_key.read().await.is_none());
+    }
+
+    /// #45: a vault end for the current session removes its live marker
+    /// from disk, and leaves the pairing; one for another session leaves
+    /// the marker.
+    #[tokio::test]
+    async fn a_vault_end_removes_only_that_sessions_marker() {
+        use crate::credential::store;
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        store::tests::save_pairing_with_live_session(&config_dir, "s1");
+        let state = AppState::new();
+        *state.credentials.write().await = Some(test_creds("s1"));
+
+        end_session_from_vault_if_current_in(&state, false, "other", Some(&config_dir)).await;
+        assert!(store::session_is_recorded(&config_dir, "s1"), "another session's end leaves it");
+
+        end_session_from_vault_if_current_in(&state, false, "s1", Some(&config_dir)).await;
+        assert!(!store::session_is_recorded(&config_dir, "s1"), "the marker is gone");
+        assert!(store::exists(&config_dir), "the pairing stays");
+        assert!(state.credentials.read().await.is_none());
+    }
+
+    fn test_creds(session_id: &str) -> crate::credential::store::ConnectionCredentials {
+        crate::credential::store::ConnectionCredentials {
+            connection_id: "conn".into(),
+            connection_key: vec![7u8; 32],
+            key_id: "key".into(),
+            device_private_key: vec![1u8; 32],
+            device_public_key: vec![2u8; 32],
+            vault_public_key: vec![3u8; 32],
+            message_space_token: "token".into(),
+            message_space_url: "tls://example.invalid:443".into(),
+            owner_guid: "owner".into(),
+            owner_name: String::new(),
+            session_id: session_id.into(),
+            session_expires_at: 1_900_000_000,
+            session_duration_seconds: 3600,
+        }
     }
 
     /// #43, M2 race: the vault end waits for `session_op` (held here, as
@@ -1457,7 +1518,7 @@ mod tests {
         let session_op = state.session_op.lock().await;
         let end = {
             let state = state.clone();
-            tokio::spawn(async move { end_session_from_vault_if_current(&state, false, "old").await })
+            tokio::spawn(async move { end_session_from_vault_if_current_in(&state, false, "old", None).await })
         };
         tokio::task::yield_now().await;
         *state.credentials.write().await = Some(creds("new"));
