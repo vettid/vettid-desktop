@@ -988,7 +988,9 @@ fn overtaken_by_reset(state: &AppState, mark: ResetMark) -> bool {
 /// revoked), or its time ran out: the same reset as End session, so the
 /// key, the credentials, the listener and the connection go too, not only
 /// the session state. `revoked` keeps the session marked revoked rather
-/// than expired. Nothing on disk changes.
+/// than expired. Nothing on disk changes here; the vault-end path removes
+/// the session's live marker first (`end_session_from_vault_if_current`,
+/// #45).
 ///
 /// It stops the listener and waits for it to end, so the listener's own
 /// handler must not await this: spawn it ([`end_session_from_vault_later`]).
@@ -1033,6 +1035,8 @@ async fn end_session_from_vault_if_current_in(
     // #45: disk first, as End session does (#26), and only that session's
     // marker: a new session's or pairing's stays. Never the pairing.
     if let Some(dir) = config_dir {
+        // If the marker can't be removed, the session is still never live
+        // again in this run (the store records it as ended).
         if let Err(e) = crate::credential::store::end_saved_session_if(dir, session_id) {
             log::error!("vault ended the session, but its live marker couldn't be removed: {}", e);
         }
@@ -1461,17 +1465,32 @@ mod tests {
         use crate::credential::store;
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
-        store::tests::save_pairing_with_live_session(&config_dir, "s1");
+        store::tests::save_pairing_with_live_session(&config_dir, "vs-c");
         let state = AppState::new();
-        *state.credentials.write().await = Some(test_creds("s1"));
+        *state.credentials.write().await = Some(test_creds("vs-c"));
 
         end_session_from_vault_if_current_in(&state, false, "other", Some(&config_dir)).await;
-        assert!(store::session_is_recorded(&config_dir, "s1"), "another session's end leaves it");
+        assert!(store::session_is_recorded(&config_dir, "vs-c"), "another session's end leaves it");
 
-        end_session_from_vault_if_current_in(&state, false, "s1", Some(&config_dir)).await;
-        assert!(!store::session_is_recorded(&config_dir, "s1"), "the marker is gone");
+        end_session_from_vault_if_current_in(&state, false, "vs-c", Some(&config_dir)).await;
+        assert!(!store::session_is_recorded(&config_dir, "vs-c"), "the marker is gone");
         assert!(store::exists(&config_dir), "the pairing stays");
         assert!(state.credentials.read().await.is_none());
+    }
+
+    /// #45: memory holds s1 but the marker on disk names a newer session
+    /// (s2): the vault end for s1 clears memory and leaves s2's marker.
+    #[tokio::test]
+    async fn a_vault_end_leaves_a_newer_sessions_marker() {
+        use crate::credential::store;
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        store::tests::save_pairing_with_live_session(&config_dir, "s2-newer");
+        let state = AppState::new();
+        *state.credentials.write().await = Some(test_creds("s1-older"));
+        end_session_from_vault_if_current_in(&state, false, "s1-older", Some(&config_dir)).await;
+        assert!(state.credentials.read().await.is_none());
+        assert!(store::session_is_recorded(&config_dir, "s2-newer"));
     }
 
     fn test_creds(session_id: &str) -> crate::credential::store::ConnectionCredentials {

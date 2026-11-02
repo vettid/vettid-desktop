@@ -892,26 +892,57 @@ fn session_tag(session_id: &str) -> String {
 /// or restore it). A copy restored by an account that can write the
 /// folder can't be told apart without a key; the warning after unlock
 /// already covers that folder.
+///
+/// A session the vault ended in this run is never live again, even if its
+/// marker couldn't be removed (#45).
 fn session_marked_live(config_dir: &Path, session_id: &str) -> bool {
+    !session_id.is_empty()
+        && !ended_by_vault(session_id)
+        && read_marker(config_dir, session_id) == Marker::Names
+}
+
+/// What the live marker says about a session (#45).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Marker {
+    /// A private, readable marker naming the session.
+    Names,
+    /// A private, readable marker naming another session.
+    Other,
+    /// No marker.
+    Absent,
+    /// Something that can't be confirmed either way: a read error, a link
+    /// or a folder in its place, one too large, or (Windows) one another
+    /// account can open.
+    Unknown,
+}
+
+fn read_marker(config_dir: &Path, session_id: &str) -> Marker {
     use std::io::Read;
     const MAX_MARKER: u64 = 128;
-    if session_id.is_empty() {
-        return false;
-    }
     let path = config_dir.join(SESSION_LIVE_FILE);
     match fs::symlink_metadata(&path) {
         Ok(m) if m.file_type().is_file() && m.len() <= MAX_MARKER => {}
-        _ => return false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Marker::Absent,
+        _ => return Marker::Unknown,
     }
     #[cfg(windows)]
     if super::winacl::check_private(&path).is_err() {
-        return false;
+        return Marker::Unknown;
     }
     let mut tag = String::new();
     match fs::File::open(&path).and_then(|f| f.take(MAX_MARKER).read_to_string(&mut tag)) {
-        Ok(_) => tag.trim() == session_tag(session_id),
-        Err(_) => false,
+        Ok(_) if tag.trim() == session_tag(session_id) => Marker::Names,
+        Ok(_) => Marker::Other,
+        Err(_) => Marker::Unknown,
     }
+}
+
+/// Tags of the sessions the vault ended in this run (#45).
+static ENDED_BY_VAULT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn ended_by_vault(session_id: &str) -> bool {
+    let tag = session_tag(session_id);
+    ENDED_BY_VAULT.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|t| *t == tag)
 }
 
 /// Whether the saved session `session_id` is recorded as live (#26). A
@@ -934,24 +965,41 @@ pub fn end_saved_session(config_dir: &Path) -> Result<(), CredentialError> {
     end_saved_session_locked(config_dir, &writer_lock())
 }
 
+/// End a session the vault ended (#45). Under the writer lock:
+/// - the session is recorded as ended for the rest of this run, so it is
+///   never live again even if the marker can't be removed;
+/// - the live marker is removed if it names `session_id`, or if what is
+///   there can't be confirmed either way (removing it can only end a
+///   session, the safe direction; nothing of this process is writing a
+///   newer one meanwhile);
+/// - a readable marker naming another session (a Start New Session, a new
+///   pairing) is left alone.
+///
+/// The pairing itself is never touched. `Ok(true)` if a marker was removed
+/// and is confirmed gone, `Ok(false)` if there was none or it named another
+/// session.
+pub fn end_saved_session_if(config_dir: &Path, session_id: &str) -> Result<bool, CredentialError> {
+    let guard = writer_lock();
+    if session_id.is_empty() {
+        return Ok(false);
+    }
+    {
+        let mut ended = ENDED_BY_VAULT.lock().unwrap_or_else(|p| p.into_inner());
+        let tag = session_tag(session_id);
+        if !ended.contains(&tag) {
+            ended.push(tag);
+        }
+    }
+    match read_marker(config_dir, session_id) {
+        Marker::Absent | Marker::Other => Ok(false),
+        Marker::Names | Marker::Unknown => end_saved_session_locked(config_dir, &guard).map(|()| true),
+    }
+}
+
 /// Like [`end_saved_session`], for End session (#30): if a log-out has
 /// wiped the pairing since `since`, it fails with
 /// [`CredentialError::LoggedOutMeanwhile`] and removes nothing, since the
 /// marker there now may belong to a pairing made after that log-out.
-/// End a session the vault ended (#45): remove the live marker only if it
-/// still names `session_id`, under the writer lock, so a marker written
-/// since for another session (a Start New Session, a new pairing) is left
-/// alone. The pairing itself is never touched. `Ok(true)` if the marker
-/// was removed and is confirmed gone, `Ok(false)` if it named another
-/// session or none.
-pub fn end_saved_session_if(config_dir: &Path, session_id: &str) -> Result<bool, CredentialError> {
-    let guard = writer_lock();
-    if !session_marked_live(config_dir, session_id) {
-        return Ok(false);
-    }
-    end_saved_session_locked(config_dir, &guard).map(|()| true)
-}
-
 pub fn end_saved_session_since(config_dir: &Path, since: WipeEpoch) -> Result<(), CredentialError> {
     let guard = writer_lock();
     if wipe_epoch() != since {
@@ -1423,9 +1471,6 @@ fn encrypt_xchacha20(
 pub(crate) mod tests {
     use super::*;
 
-    /// For tests elsewhere in the crate (#15): an earlier build's pairing
-    /// (`sample_creds`, sealed under the public fingerprint) in `dir`.
-    /// It names the legacy message server, as such pairings did.
     /// For tests elsewhere in the crate (#45): a pairing in `dir` whose
     /// session `session_id` is marked live.
     pub(crate) fn save_pairing_with_live_session(dir: &Path, session_id: &str) {
@@ -1440,17 +1485,48 @@ pub(crate) mod tests {
     fn a_vault_ended_sessions_marker_goes_only_if_it_names_it() {
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
-        save_pairing_with_live_session(&config_dir, "s2");
-        assert_eq!(end_saved_session_if(&config_dir, "s1").unwrap(), false, "another session's marker");
-        assert!(session_is_recorded(&config_dir, "s2"));
-        assert_eq!(end_saved_session_if(&config_dir, "s2").unwrap(), true);
-        assert!(!session_is_recorded(&config_dir, "s2"));
+        save_pairing_with_live_session(&config_dir, "vs-b");
+        assert_eq!(end_saved_session_if(&config_dir, "vs-a").unwrap(), false, "another session's marker");
+        assert!(session_is_recorded(&config_dir, "vs-b"));
+        assert_eq!(end_saved_session_if(&config_dir, "vs-b").unwrap(), true);
+        assert!(!session_is_recorded(&config_dir, "vs-b"));
         assert!(exists(&config_dir), "the pairing stays");
-        assert_eq!(end_saved_session_if(&config_dir, "s2").unwrap(), false, "already gone");
+        assert_eq!(end_saved_session_if(&config_dir, "vs-b").unwrap(), false, "already gone");
         let none = base.path().join("absent");
-        assert_eq!(end_saved_session_if(&none, "s2").unwrap(), false, "no folder");
+        assert_eq!(end_saved_session_if(&none, "vs-b").unwrap(), false, "no folder");
     }
 
+    /// #45: a session the vault ended isn't live again in this run, even
+    /// if its marker couldn't be removed (here it is restored afterwards).
+    #[test]
+    fn a_vault_ended_session_stays_ended_if_its_marker_comes_back() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        save_pairing_with_live_session(&config_dir, "s-back");
+        let marker = fs::read(config_dir.join(SESSION_LIVE_FILE)).unwrap();
+        assert!(end_saved_session_if(&config_dir, "s-back").unwrap());
+        write_private(&config_dir, SESSION_LIVE_FILE, &marker).unwrap();
+        assert!(!session_is_recorded(&config_dir, "s-back"), "still ended");
+    }
+
+    /// #45, Windows: a marker another account can open can't be confirmed,
+    /// so a vault end removes it.
+    #[cfg(windows)]
+    #[test]
+    fn a_vault_end_removes_a_marker_it_cant_confirm() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        save_pairing_with_live_session(&config_dir, "s-shared");
+        super::super::winacl::test_let_everyone_read(&config_dir.join(SESSION_LIVE_FILE));
+        assert_eq!(read_marker(&config_dir, "s-shared"), Marker::Unknown);
+        assert!(end_saved_session_if(&config_dir, "s-shared").unwrap());
+        assert!(!config_dir.join(SESSION_LIVE_FILE).exists());
+        assert!(exists(&config_dir), "the pairing stays");
+    }
+
+    /// For tests elsewhere in the crate (#15): an earlier build's pairing
+    /// (`sample_creds`, sealed under the public fingerprint) in `dir`.
+    /// It names the legacy message server, as such pairings did.
     pub(crate) fn save_old_build_pairing(dir: &Path) {
         let old_build = FixedKeys { binding: BindingMode::MachineBound, master: FINGERPRINT, platform: FINGERPRINT };
         let mut creds = sample_creds();
