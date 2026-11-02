@@ -77,11 +77,15 @@ pub async fn register(
     use crate::credential::store;
     use crate::registration::pairing;
 
+    // #30: first, before anything that waits. A log-out from here on means
+    // this pairing is not saved.
+    let since = store::wipe_epoch();
     let config_dir = store::default_config_dir().map_err(|e| e.to_string())?;
     // Checked before pairing starts, so a folder another account can open,
     // or a computer without the machine id the pairing is bound to (#14),
     // is refused before the vault ever lists this desktop.
-    store::ensure_config_dir(&config_dir).map_err(|e| e.to_string())?;
+    // #30: under the store's lock, and not after a log-out since `since`.
+    store::ensure_config_dir_since(&config_dir, since).map_err(|e| e.to_string())?;
     store::check_machine_binding().map_err(|e| e.to_string())?;
 
     // Strip dashes/whitespace so users can paste either the grouped
@@ -138,6 +142,7 @@ pub async fn register(
         runtime,
         fingerprint,
         &config_dir,
+        since,
     )
     .await
     {
@@ -149,6 +154,20 @@ pub async fn register(
             let paired = matches!(e, crate::registration::flow::RegistrationError::SessionNotRecorded);
             if paired {
                 *state.is_registered.write().await = true;
+                // #30: as on success, set then check: a log-out since
+                // means nothing is paired.
+                if store::wipe_epoch() != since {
+                    clear_logged_out_memory(&state).await;
+                    return Ok(RegisterResponse {
+                        success: false,
+                        error: Some(store::LOGGED_OUT_MEANWHILE_NOTICE.to_string()),
+                        connection_id: None,
+                        session_id: None,
+                        expires_at: None,
+                        key_protection: None,
+                        paired_without_session: false,
+                    });
+                }
             }
             return Ok(RegisterResponse {
                 success: false,
@@ -201,6 +220,23 @@ pub async fn register(
 
         *state.credentials.write().await = Some(creds);
         *state.is_unlocked.write().await = true;
+    }
+
+    // #30: a log-out that ran after the save (its wipe removed it) cleared
+    // memory before or after the lines above. If it may have been before,
+    // what they set must go too: no connection, key or unlocked state is
+    // kept for a pairing the log-out reported removed.
+    if store::wipe_epoch() != since {
+        clear_logged_out_memory(&state).await;
+        return Ok(RegisterResponse {
+            success: false,
+            error: Some(store::LOGGED_OUT_MEANWHILE_NOTICE.to_string()),
+            connection_id: None,
+            session_id: None,
+            expires_at: None,
+            key_protection: None,
+            paired_without_session: false,
+        });
     }
 
     // Start the response listener now that AppState.nats is bound to
@@ -379,6 +415,9 @@ const UNLOCK_FAILED_NOTICE: &str = "This desktop couldn't open its saved pairing
 pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<UnlockResponse, String> {
     use crate::credential::store::{self, CredentialError};
 
+    // #30: first. A log-out from here on means nothing stays unlocked.
+    let since = store::wipe_epoch();
+
     let config_dir = match store::default_config_dir() {
         Ok(dir) => dir,
         Err(e) => {
@@ -459,6 +498,17 @@ pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<Unlock
     *state.credentials.write().await = Some(creds);
     *state.is_unlocked.write().await = true;
 
+    // #30: a log-out while this ran may have cleared memory before the
+    // lines above set it; then clear it again. Logout's own response tells
+    // the person what happened.
+    if store::wipe_epoch() != since {
+        clear_logged_out_memory(&state).await;
+        return Ok(UnlockResponse {
+            unlocked: false,
+            notice: None,
+        });
+    }
+
     // Spawn the background NATS listener so device_op_response
     // envelopes get decrypted + matched to pending request_ids.
     // Without this, every vault op hits the 30-second timeout —
@@ -519,10 +569,13 @@ pub async fn extend_session(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<RegisterResponse, String> {
-    // #33: never overlaps End session; see AppState::session_op.
-    let _session_op = state.session_op.lock().await;
     use crate::credential::store;
     use crate::registration::pairing;
+    // #30: first, before waiting for the lock. A log-out from here on
+    // means the new session is not saved.
+    let since = store::wipe_epoch();
+    // #33: never overlaps End session; see AppState::session_op.
+    let _session_op = state.session_op.lock().await;
 
     let config_dir = match store::default_config_dir() {
         Ok(dir) => dir,
@@ -569,6 +622,7 @@ pub async fn extend_session(
         runtime,
         fingerprint,
         &config_dir,
+        since,
     )
     .await
     {
@@ -602,9 +656,24 @@ pub async fn extend_session(
         Ok(loaded) => Some(loaded),
         Err(e) => {
             log::error!("extend_session: the new session was saved but couldn't be read back: {}", e);
+            // #30: a log-out since (its wipe may be why it can't be read):
+            // the pairing is gone, and so is anything in memory.
+            if store::wipe_epoch() != since {
+                clear_logged_out_memory(&state).await;
+                return Ok(RegisterResponse {
+                    success: false,
+                    error: Some(store::LOGGED_OUT_MEANWHILE_NOTICE.to_string()),
+                    connection_id: None,
+                    session_id: None,
+                    expires_at: None,
+                    key_protection: None,
+                    paired_without_session: false,
+                });
+            }
             // The disk must match what the person is told: the session
-            // isn't treated as live at the next launch either.
-            if let Err(e) = store::end_saved_session(&config_dir) {
+            // isn't treated as live at the next launch either. Not after a
+            // log-out, whose marker it would no longer be (#30).
+            if let Err(e) = store::end_saved_session_since(&config_dir, since) {
                 log::error!("extend_session: could not remove the live marker: {}", e);
             }
             {
@@ -671,6 +740,20 @@ pub async fn extend_session(
         *state.credentials.write().await = Some(creds);
     }
 
+    // #30: as in `register`.
+    if store::wipe_epoch() != since {
+        clear_logged_out_memory(&state).await;
+        return Ok(RegisterResponse {
+            success: false,
+            error: Some(store::LOGGED_OUT_MEANWHILE_NOTICE.to_string()),
+            connection_id: None,
+            session_id: None,
+            expires_at: None,
+            key_protection: None,
+            paired_without_session: false,
+        });
+    }
+
     // Restart the response listener for the rotated session keys.
     // Existing pending request channels are dropped by the previous
     // listener's exit path; new requests register against the fresh
@@ -719,23 +802,37 @@ fn logout_notice(revoke_sent: bool, local_wiped: bool) -> Option<&'static str> {
     }
 }
 
-/// Delete the desktop's config directory. Returns whether the saved
-/// pairing is gone afterwards: checked on disk, not assumed.
-fn wipe_local_pairing(config_dir: &std::path::Path) -> bool {
-    use crate::credential::store;
+/// Delete the desktop's config directory and the keyring key. Returns
+/// whether the saved pairing is gone afterwards: checked on disk, not
+/// assumed. With no usable folder only the key is deleted, and false is
+/// returned.
+fn wipe_local_pairing(config_dir: Option<&std::path::Path>) -> bool {
+    wipe_local_pairing_with(config_dir, crate::credential::store::wipe_for_logout)
+}
 
+/// [`wipe_local_pairing`] with the store step passed in, so tests can run
+/// it without deleting this machine's real keyring key.
+fn wipe_local_pairing_with(
+    config_dir: Option<&std::path::Path>,
+    wipe: impl FnOnce(Option<&std::path::Path>) -> Result<(), crate::credential::store::CredentialError>,
+) -> bool {
     // SECURITY: never remove a relative path, which would resolve against
     // whatever the current directory is. `default_config_dir` only returns
     // absolute paths; this guards the destructive step on its own.
-    if !config_dir.is_absolute() {
-        log::error!("Refusing to wipe a relative config path on logout");
-        return false;
-    }
+    let config_dir = config_dir.filter(|dir| {
+        let absolute = dir.is_absolute();
+        if !absolute {
+            log::error!("Refusing to wipe a relative config path on logout");
+        }
+        absolute
+    });
 
-    // Holds the store's write lock, so a save running at the same time
-    // can't put the pairing back after this reports it gone, and is Ok
-    // only when the file system confirms it is gone (#28).
-    match store::wipe(config_dir) {
+    // Holds the store's write lock across the wipe and the key deletion,
+    // so a save running at the same time can't put the pairing back after
+    // this reports it gone (#28), and a pairing or Start New Session that
+    // started before can't save afterwards (#30). Ok only when the file
+    // system confirms it is gone.
+    match wipe(config_dir) {
         Ok(()) => true,
         Err(e) => {
             log::error!("Failed to remove the saved pairing on logout: {}", e);
@@ -750,10 +847,8 @@ fn wipe_local_pairing(config_dir: &std::path::Path) -> bool {
 /// implies the vault was told when it wasn't.
 #[tauri::command]
 pub async fn logout(state: State<'_, AppState>) -> Result<LogoutResponse, String> {
-    use crate::credential::keystore;
     use crate::credential::store;
     use crate::registration::pairing;
-    use zeroize::Zeroize;
 
     // With no known folder there is nothing to revoke from or wipe, and
     // neither can be confirmed: both are reported as not done.
@@ -775,32 +870,18 @@ pub async fn logout(state: State<'_, AppState>) -> Result<LogoutResponse, String
         Err(_) => false,
     };
 
-    // Disconnect NATS
-    state.nats.lock().await.disconnect().await;
+    clear_logged_out_memory(&state).await;
 
-    // Zero key material in memory
-    {
-        let mut key_guard = state.connection_key.write().await;
-        if let Some(ref mut key) = *key_guard {
-            key.zeroize();
-        }
-        *key_guard = None;
-    }
-    *state.credentials.write().await = None;
-    *state.is_unlocked.write().await = false;
-    *state.is_registered.write().await = false;
-    state.session.write().await.revoke();
+    // Wipe the config directory entirely — nothing left on disk — and the
+    // master key from the keyring too. A future pairing on this machine
+    // will mint a fresh key — a leaked disk image from an earlier install
+    // can't be decrypted under the new key.
+    let local_wiped = wipe_local_pairing(config_dir.as_deref().ok());
 
-    // Wipe the config directory entirely — nothing left on disk.
-    let local_wiped = match &config_dir {
-        Ok(dir) => wipe_local_pairing(dir),
-        Err(_) => false,
-    };
-
-    // Wipe the master key from the keyring too. A future pairing on
-    // this machine will mint a fresh key — a leaked disk image from
-    // an earlier install can't be decrypted under the new key.
-    keystore::delete_keyring_key();
+    // #30: a pairing or Start New Session whose save ran just before the
+    // wipe may have set memory since the clear above. Clear it again; one
+    // that sets it after this sees the wipe and clears it itself.
+    clear_logged_out_memory(&state).await;
 
     Ok(LogoutResponse {
         revoke_sent,
@@ -826,6 +907,10 @@ pub async fn logout(state: State<'_, AppState>) -> Result<LogoutResponse, String
 pub async fn end_session(state: State<'_, AppState>) -> Result<EndSessionResponse, String> {
     use crate::credential::store;
 
+    // #30: first. If a log-out wipes the pairing from here on, the saved
+    // pairing isn't updated, even if a new one has been made since.
+    let since = store::wipe_epoch();
+
     // The in-memory session ends at once, so nothing reports it as live
     // while this waits for the lock or tells the vault.
     clear_in_memory_session(&state).await;
@@ -840,7 +925,7 @@ pub async fn end_session(state: State<'_, AppState>) -> Result<EndSessionRespons
 
     // With no known folder there is no stored pairing to end or update.
     let notice = match store::default_config_dir() {
-        Ok(config_dir) => end_session_on_disk(&config_dir).await,
+        Ok(config_dir) => end_session_on_disk(&config_dir, since).await,
         Err(e) => {
             log::warn!("end_session: {}; local reset only", e);
             None
@@ -848,6 +933,24 @@ pub async fn end_session(state: State<'_, AppState>) -> Result<EndSessionRespons
     };
 
     Ok(EndSessionResponse { notice })
+}
+
+/// Log-out's memory reset: NATS, the connection key (zeroized), the
+/// credentials, unlocked and registered, and the session (revoked).
+async fn clear_logged_out_memory(state: &State<'_, AppState>) {
+    use zeroize::Zeroize;
+    state.nats.lock().await.disconnect().await;
+    {
+        let mut key_guard = state.connection_key.write().await;
+        if let Some(ref mut key) = *key_guard {
+            key.zeroize();
+        }
+        *key_guard = None;
+    }
+    *state.credentials.write().await = None;
+    *state.is_unlocked.write().await = false;
+    *state.is_registered.write().await = false;
+    state.session.write().await.revoke();
 }
 
 /// Drop the in-memory session: NATS, the connection key (zeroized), the
@@ -878,7 +981,10 @@ pub struct EndSessionResponse {
 /// The stored-pairing half of [`end_session`]: record on disk that the
 /// session ended, tell the vault, then clear the session fields in the
 /// saved pairing. Returns a notice if ending it couldn't be recorded.
-async fn end_session_on_disk(config_dir: &std::path::Path) -> Option<String> {
+async fn end_session_on_disk(
+    config_dir: &std::path::Path,
+    since: crate::credential::store::WipeEpoch,
+) -> Option<String> {
     use crate::credential::store;
     use crate::registration::pairing;
 
@@ -887,8 +993,20 @@ async fn end_session_on_disk(config_dir: &std::path::Path) -> Option<String> {
     // #26: first, and needing no key: without the live marker the next
     // launch treats the session as ended, even if the save below is
     // refused (a folder that isn't private, an unreachable keyring).
-    let marker_removed = match store::end_saved_session(&config_dir) {
+    // #30: if a log-out has wiped the pairing since this started, the
+    // pairing that ended is gone, and what is there now (if anything) was
+    // made after it: leave it, and its session at the vault, alone.
+    let marker_removed = match store::end_saved_session_since(&config_dir, since) {
         Ok(()) => true,
+        Err(store::CredentialError::LoggedOutMeanwhile) => {
+            log::warn!("end_session: logged out meanwhile; nothing more to end");
+            // A pairing still there may be one the log-out failed to
+            // remove, with this session's marker: then the next launch
+            // could show it as open, so say so. It can't be told from a
+            // new pairing, so the notice errs that way.
+            return store::exists(&config_dir)
+                .then(|| store::SESSION_END_NOT_RECORDED_NOTICE.to_string());
+        }
         Err(e) => {
             log::error!("end_session: could not remove the live marker: {}", e);
             false
@@ -900,6 +1018,12 @@ async fn end_session_on_disk(config_dir: &std::path::Path) -> Option<String> {
     // before returning, within a deadline: on a clean return the
     // end-session frame was written to the connection. That is not a
     // confirmation from the vault. On error we still reset locally.
+    // #30: checked again: a log-out (and a new pairing) may have run
+    // since the marker was removed.
+    if store::wipe_epoch() != since {
+        log::warn!("end_session: logged out meanwhile; not telling the vault");
+        return None;
+    }
     if let Err(e) = pairing::publish_end_session(&config_dir, "user_locked").await {
         log::warn!("device.end-session publish failed (continuing with local reset): {}", e);
     }
@@ -917,8 +1041,9 @@ async fn end_session_on_disk(config_dir: &std::path::Path) -> Option<String> {
             creds.session_expires_at = 0;
             creds.session_duration_seconds = 0;
             // Update only: if a log-out wiped the pairing since it was
-            // loaded, nothing is written back (#28).
-            if let Err(e) = store::save_existing(&config_dir, &creds) {
+            // loaded, nothing is written back (#28), and not over a new
+            // pairing made after that log-out either (#30).
+            if let Err(e) = store::save_existing(&config_dir, &creds, since) {
                 log::error!("end_session: failed to persist cleared session state: {}", e);
             } else {
                 cleared_saved = true;
@@ -1058,13 +1183,50 @@ mod tests {
         assert_eq!(machine_fingerprint_hex(), compute_machine_fingerprint_hex(&attrs));
     }
 
+    /// The store step of log-out, without deleting the real keyring key.
+    fn wipe_only(dir: Option<&std::path::Path>) -> Result<(), crate::credential::store::CredentialError> {
+        match dir {
+            Some(dir) => crate::credential::store::wipe(dir),
+            None => Err(crate::credential::store::CredentialError::NoConfigDir),
+        }
+    }
+
+    fn wipe_keeping_the_key(dir: &std::path::Path) -> bool {
+        wipe_local_pairing_with(Some(dir), wipe_only)
+    }
+
+    /// With no folder, the store step still runs (it deletes the key), and
+    /// the pairing isn't reported removed.
+    #[test]
+    fn wipe_local_pairing_with_no_folder_still_runs_the_store_step() {
+        let mut ran = false;
+        assert!(!wipe_local_pairing_with(None, |dir| {
+            ran = true;
+            wipe_only(dir)
+        }));
+        assert!(ran);
+    }
+
+    /// A relative path is passed on as no folder: the key is still deleted
+    /// but nothing is removed.
+    #[test]
+    fn wipe_local_pairing_passes_a_relative_path_as_no_folder() {
+        let relative = std::path::Path::new("vettid-desktop-relative-wipe-test-does-not-exist");
+        let mut seen = Some(relative.to_path_buf());
+        assert!(!wipe_local_pairing_with(Some(relative), |dir| {
+            seen = dir.map(|d| d.to_path_buf());
+            wipe_only(dir)
+        }));
+        assert_eq!(seen, None);
+    }
+
     #[test]
     fn wipe_local_pairing_removes_the_directory() {
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("vettid-desktop");
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(config_dir.join("connection.enc"), b"{}").unwrap();
-        assert!(wipe_local_pairing(&config_dir));
+        assert!(wipe_keeping_the_key(&config_dir));
         assert!(!config_dir.exists());
     }
 
@@ -1074,13 +1236,13 @@ mod tests {
     #[test]
     fn wipe_local_pairing_refuses_a_relative_path() {
         let relative = std::path::Path::new("vettid-desktop-relative-wipe-test-does-not-exist");
-        assert!(!wipe_local_pairing(relative));
+        assert!(!wipe_keeping_the_key(relative));
     }
 
     #[test]
     fn wipe_local_pairing_with_nothing_there_is_wiped() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(wipe_local_pairing(&dir.path().join("absent")));
+        assert!(wipe_keeping_the_key(&dir.path().join("absent")));
     }
 
     /// A pairing that can't be deleted is reported, not assumed gone. On
@@ -1096,7 +1258,7 @@ mod tests {
         std::fs::write(config_dir.join("connection.enc"), b"{}").unwrap();
         std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
         let ignores_permissions = std::fs::write(config_dir.join("probe"), b"").is_ok();
-        let wiped = wipe_local_pairing(&config_dir);
+        let wiped = wipe_keeping_the_key(&config_dir);
         std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         if ignores_permissions {
             return;
@@ -1117,7 +1279,7 @@ mod tests {
         let path = config_dir.join("connection.enc");
         std::fs::write(&path, b"{}").unwrap();
         let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
-        let wiped = wipe_local_pairing(&config_dir);
+        let wiped = wipe_keeping_the_key(&config_dir);
         drop(held);
         assert!(!wiped, "a pairing still on disk must not be reported as wiped");
         assert!(path.exists());
