@@ -9,6 +9,10 @@ pub struct VaultOpResponse {
     pub success: bool,
     pub data: Option<serde_json::Value>,
     pub error: Option<String>,
+    /// A stable code for errors the frontend words for itself, so it
+    /// doesn't match on `error`'s text (#42). `"stopped_waiting"`: the
+    /// desktop stopped waiting, and the phone may still carry it out.
+    pub error_code: Option<&'static str>,
     pub pending_approval: bool,
 }
 
@@ -19,11 +23,13 @@ impl VaultOpResponse {
                 success: resp.success,
                 data: resp.data,
                 error: resp.error,
+                error_code: None,
                 pending_approval: resp.pending_phone_approval,
             },
             Err(e) => Self {
                 success: false,
                 data: None,
+                error_code: e.code(),
                 error: Some(e.to_string()),
                 pending_approval: false,
             },
@@ -244,11 +250,10 @@ pub async fn request_secrets_unlock(state: State<'_, AppState>) -> Result<VaultO
     Ok(VaultOpResponse::from_op(result))
 }
 
-/// Cancel a pending phone-approval operation by request_id. The
-/// awaiter wakes with a Cancelled error and the UI returns to the
-/// pre-request state. Vault-side orphan cleanup (dismissing the
-/// approval prompt on the phone) is a future enhancement; right
-/// now the orphan on the phone times out on its own.
+/// Stop waiting for a pending phone-approval operation by request_id. The
+/// awaiter wakes with a stopped-waiting error. The vault is not told,
+/// and the legacy vault can't cancel a pending request (#42): the prompt
+/// stays on the phone, and approving it there still carries it out.
 #[tauri::command]
 pub async fn cancel_pending_operation(state: State<'_, AppState>, request_id: String) -> Result<bool, String> {
     Ok(operations::cancel(&state, &request_id).await)
@@ -871,4 +876,21 @@ pub async fn presence_override_set(
         serde_json::json!({ "connection_id": connection_id, "override": r#override }),
     ).await;
     Ok(VaultOpResponse::from_op(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #42: a stopped wait reaches the frontend with its code and the
+    /// approved general text; other errors carry no code.
+    #[test]
+    fn a_stopped_wait_is_coded_for_the_frontend() {
+        let json = serde_json::to_value(VaultOpResponse::from_op(Err(operations::OperationError::StoppedWaiting))).unwrap();
+        assert_eq!(json["success"], false);
+        assert_eq!(json["error_code"], "stopped_waiting");
+        assert_eq!(json["error"], operations::STOPPED_WAITING_NOTICE);
+        let json = serde_json::to_value(VaultOpResponse::from_op(Err(operations::OperationError::ApprovalTimeout))).unwrap();
+        assert!(json["error_code"].is_null());
+    }
 }

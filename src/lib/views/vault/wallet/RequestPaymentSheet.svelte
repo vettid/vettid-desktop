@@ -244,7 +244,8 @@
             <span class="pending-title">Approve on your phone</span>
             <span class="pending-meta">Waiting for approval…</span>
           </div>
-          <button class="btn ghost small" onclick={cancelInFlight}>Cancel</button>
+          <!-- #42: only stops waiting; the vault isn't told. -->
+          <button class="btn ghost small" onclick={cancelInFlight}>Stop waiting</button>
         </div>
       {/if}
 

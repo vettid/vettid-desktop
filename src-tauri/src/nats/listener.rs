@@ -131,8 +131,9 @@ pub async fn spawn_listener(
 /// subscribe in between; a task waiting for that lock is aborted there.
 ///
 /// Pending response channels are left alone: their waiters time out as
-/// before. Dropping them would show "cancelled" for a request the phone
-/// may still approve (#42).
+/// before. (Before #42, dropping them showed "cancelled" for a request
+/// the phone could still approve; they would now say the desktop stopped
+/// waiting, so dropping them could be revisited.)
 pub async fn stop_listener(state: &AppState) {
     let handle = state.listener_handle.lock().await.take();
     if let Some(handle) = handle {

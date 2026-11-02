@@ -15,7 +15,11 @@
   // `pending_approval` ack, then the final result once the human taps
   // Approve. The pending state mirrors the SensitiveDataChip pattern —
   // we listen for `vault:operation-pending-approval` to capture the
-  // request_id so the user can Cancel a request in flight.
+  // request_id so the user can stop waiting for a request in flight.
+
+  // #42: owner-approved, 2026-11-02. The vault still has the request.
+  const STOPPED_WAITING_SEND =
+    "This desktop stopped waiting for this transaction. If your phone still shows it, approving it there will still send the bitcoin. Check your wallet's history before you send again.";
 
   interface WalletItem {
     wallet_id: string;
@@ -88,6 +92,10 @@
   let pendingElapsed = $state(0);
   let pendingStartedAt = 0;
   let errorMessage = $state('');
+  // #42: set when the desktop stopped waiting for a send. The vault still
+  // has that request, so a second Confirm could send twice: Confirm stays
+  // off, and the warning stays, until Back or close.
+  let stoppedWaiting = $state(false);
   // Set on a successful broadcast — flips the sheet to the success view.
   let sentTxid = $state<string | null>(null);
 
@@ -251,7 +259,7 @@
   }
 
   async function confirmSend() {
-    if (sending || !selectedWallet) return;
+    if (sending || stoppedWaiting || !selectedWallet) return;
     sending = true;
     errorMessage = '';
     try {
@@ -277,13 +285,22 @@
         (resp?.data?.status === 'denied'
           ? 'You denied the transaction on your phone.'
           : 'The transaction was not completed.');
+      // #42: the vault still has the request, so the bitcoin can still go.
+      if (resp?.error_code === 'stopped_waiting') {
+        errorMessage = STOPPED_WAITING_SEND;
+        stoppedWaiting = true;
+      }
     } catch (e) {
       clearPending();
       const msg = String(e);
       if (msg.includes('Phone approval timed out'))
         errorMessage = 'Phone approval timed out. Try again when you have your phone handy.';
-      else if (msg.toLowerCase().includes('cancelled'))
-        errorMessage = 'Transaction cancelled.';
+      // Thrown only on an IPC failure; phone-approval errors come back in
+      // `resp.error` above.
+      else if (msg.includes('stopped waiting')) {
+        errorMessage = STOPPED_WAITING_SEND;
+        stoppedWaiting = true;
+      }
       else if (msg.includes('did not acknowledge'))
         errorMessage = 'Vault is not responding — try again in a moment.';
       else errorMessage = msg;
@@ -298,8 +315,9 @@
     if (rid) {
       try { await invoke('cancel_pending_operation', { requestId: rid }); } catch (_) {}
     }
-    // The await in confirmSend() will wake with a Cancelled error and
-    // set errorMessage; nothing more to do here.
+    // The await in confirmSend() will wake with a stopped-waiting error
+    // and set errorMessage; nothing more to do here. The vault isn't told
+    // (#42), so this doesn't cancel the send.
   }
 
   function feeTierLabel(t: typeof feeTier): string {
@@ -476,7 +494,7 @@
             </span>
           </div>
           {#if pendingRequestId}
-            <button class="btn ghost small" onclick={cancelInFlight}>Cancel</button>
+            <button class="btn ghost small" onclick={cancelInFlight}>Stop waiting</button>
           {/if}
         </div>
       {/if}
@@ -486,8 +504,15 @@
       {/if}
     </div>
     <div class="modal-actions">
-      <button class="btn ghost" onclick={() => (stage = 'form')} disabled={sending}>Back</button>
-      <button class="btn primary" onclick={confirmSend} disabled={sending}>
+      <button
+        class="btn ghost"
+        onclick={() => {
+          stage = 'form';
+          stoppedWaiting = false;
+          errorMessage = '';
+        }}
+        disabled={sending}>Back</button>
+      <button class="btn primary" onclick={confirmSend} disabled={sending || stoppedWaiting}>
         {sending ? 'Sending…' : 'Confirm & Send'}
       </button>
     </div>
