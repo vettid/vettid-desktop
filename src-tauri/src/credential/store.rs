@@ -1406,8 +1406,24 @@ fn encrypt_xchacha20(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// For tests elsewhere in the crate (#15): an earlier build's pairing
+    /// (`sample_creds`, sealed under the public fingerprint) in `dir`.
+    /// It names the legacy message server, as such pairings did.
+    pub(crate) fn save_old_build_pairing(dir: &Path) {
+        let old_build = FixedKeys { binding: BindingMode::MachineBound, master: FINGERPRINT, platform: FINGERPRINT };
+        let mut creds = sample_creds();
+        creds.message_space_url = "tls://nats.vettid.dev:443".into();
+        save_with(&old_build, dir, &creds).expect("save");
+    }
+
+    /// For tests elsewhere in the crate (#15): `load` as this build, with
+    /// fixed keys.
+    pub(crate) fn load_as_this_build(dir: &Path) -> Result<(ConnectionCredentials, BindingMode), CredentialError> {
+        load_with(&FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: PLATFORM }, dir)
+    }
 
     #[test]
     fn xchacha20_roundtrip() {

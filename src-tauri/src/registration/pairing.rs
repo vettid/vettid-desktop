@@ -665,9 +665,31 @@ pub async fn load_saved(
     crate::credential::store::CredentialError,
 > {
     load_saved_with(config_dir, crate::credential::store::load, |creds| async move {
+        // Reason `old_build`, not `logout`: this revoke is for a pairing an
+        // earlier build left, whichever command found it.
         send_device_frame(&creds, "revoke", "old_build", DEVICE_FRAME_DEADLINE).await
     })
     .await
+}
+
+/// The only message server an earlier build's pairing ever named: the
+/// legacy vettid-dev bootstrap handed out `tls://nats.vettid.dev:443`
+/// (#15). VettID.org pairings don't use the old format.
+const LEGACY_MESSAGE_SERVER_HOST: &str = "nats.vettid.dev";
+
+/// Whether `url` is the legacy message server: exactly `tls://`, the host,
+/// and port 443 or 4222, nothing else (#15). Anyone who knows the public
+/// fingerprint can write an old-format file, so its revoke goes nowhere
+/// else: a planted file mustn't make the desktop connect to a server of
+/// its choosing.
+fn is_legacy_message_server(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("tls://") else {
+        return false;
+    };
+    let Some((host, port)) = rest.rsplit_once(':') else {
+        return false;
+    };
+    host == LEGACY_MESSAGE_SERVER_HOST && (port == "443" || port == "4222")
 }
 
 async fn load_saved_with<L, S, F>(
@@ -691,8 +713,14 @@ where
     use crate::credential::store::CredentialError;
     match load(config_dir) {
         Err(CredentialError::OldBuildPairing { creds, deleted }) => {
+            let creds = creds.into_inner();
+            if !is_legacy_message_server(&creds.message_space_url) {
+                // The credentials zeroize when dropped here.
+                log::warn!("an earlier build's pairing names a message server other than the legacy one; no revoke sent");
+                return Err(CredentialError::OldBuildRemoved { revoke_sent: false, deleted });
+            }
             // The credentials zeroize when the send is done with them.
-            let revoke_sent = match send_revoke(creds.into_inner()).await {
+            let revoke_sent = match send_revoke(creds).await {
                 Ok(()) => true,
                 Err(e) => {
                     log::warn!("device.revoke for an earlier build's pairing not sent: {}", e);
@@ -809,7 +837,7 @@ mod device_frame_tests {
             device_public_key: vec![2u8; 32],
             vault_public_key: vec![3u8; 32],
             message_space_token: "token".into(),
-            message_space_url: "nats://example.invalid:4222".into(),
+            message_space_url: "tls://nats.vettid.dev:443".into(),
             owner_guid: "owner".into(),
             owner_name: String::new(),
             session_id: String::new(),
@@ -859,6 +887,92 @@ mod device_frame_tests {
         .await;
         assert!(ok.is_ok());
         assert!(!called, "no revoke for anything but an earlier build's pairing");
+    }
+
+    /// #15: only the legacy message server, exactly, gets the revoke.
+    #[test]
+    fn only_the_legacy_message_server_is_accepted() {
+        for ok in ["tls://nats.vettid.dev:443", "tls://nats.vettid.dev:4222"] {
+            assert!(is_legacy_message_server(ok), "{ok}");
+        }
+        for bad in [
+            "nats.vettid.dev:443",
+            "nats://nats.vettid.dev:4222",
+            "tls://nats.vettid.dev",
+            "tls://nats.vettid.dev:8443",
+            "tls://nats.vettid.dev:443/x",
+            "tls://evil.example:443",
+            "tls://nats.vettid.dev.evil.example:443",
+            "tls://user@nats.vettid.dev:443",
+            "tls://NATS.vettid.dev:443",
+            "tls://relay.vettid.org:443",
+            "",
+        ] {
+            assert!(!is_legacy_message_server(bad), "{bad}");
+        }
+    }
+
+    /// #15: a planted old-format file naming another server gets no
+    /// revoke, and the plain notice.
+    #[tokio::test]
+    async fn an_old_build_pairing_naming_another_server_gets_no_revoke() {
+        use crate::credential::store::{ConnectionCredentials, CredentialError, OldBuildCredentials};
+        let planted = ConnectionCredentials {
+            connection_id: "planted".into(),
+            connection_key: vec![7u8; 32],
+            key_id: "key-1".into(),
+            device_private_key: vec![1u8; 32],
+            device_public_key: vec![2u8; 32],
+            vault_public_key: vec![3u8; 32],
+            message_space_token: "token".into(),
+            message_space_url: "tls://beacon.example:443".into(),
+            owner_guid: "owner".into(),
+            owner_name: String::new(),
+            session_id: String::new(),
+            session_expires_at: 0,
+            session_duration_seconds: 0,
+        };
+        let mut called = false;
+        let result = load_saved_with(
+            std::path::Path::new("unused"),
+            |_| {
+                Err(CredentialError::OldBuildPairing {
+                    creds: OldBuildCredentials::new(Box::new(planted)),
+                    deleted: true,
+                })
+            },
+            |_| {
+                called = true;
+                async { Ok(()) }
+            },
+        )
+        .await;
+        assert!(!called, "nothing sent");
+        let err = result.err().expect("not loaded");
+        assert!(matches!(err, CredentialError::OldBuildRemoved { revoke_sent: false, deleted: true }));
+        assert_eq!(err.to_string(), crate::credential::store::UNREADABLE_NOTICE);
+    }
+
+    /// #15, with the real store: an earlier build's file is deleted
+    /// before its revoke goes out, and the revoke carries its credentials.
+    #[tokio::test]
+    async fn an_old_build_file_is_gone_before_its_revoke_goes_out() {
+        use crate::credential::store;
+        let dir = tempfile::tempdir().unwrap();
+        store::tests::save_old_build_pairing(dir.path());
+        let path = dir.path().to_path_buf();
+        let mut sent_with = None;
+        let result = load_saved_with(dir.path(), store::tests::load_as_this_build, |creds| {
+            assert!(!store::exists(&path), "deleted before the revoke");
+            sent_with = Some(creds.connection_id.clone());
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(sent_with.as_deref(), Some("conn-1"));
+        assert!(matches!(
+            result,
+            Err(store::CredentialError::OldBuildRemoved { revoke_sent: true, deleted: true })
+        ));
     }
 
     /// #15: what the commands and logout make of an earlier build's
