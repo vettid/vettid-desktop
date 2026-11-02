@@ -3,6 +3,7 @@
 //! `error` (iff `status` is `error`), `exp` and `body`.
 
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
+use zeroize::Zeroizing;
 
 use super::{pad, unpad, EnvelopeError, Mode};
 use crate::strict_json::{self, Builder, Object, MAX_SAFE_INTEGER};
@@ -55,8 +56,9 @@ pub struct Inner {
     pub response: Option<Response>,
     /// Discard after this time if still unprocessed.
     pub exp: Option<DateTime<Utc>>,
-    /// The type-specific body: a JSON object, as text.
-    pub body: String,
+    /// The type-specific body: a JSON object, as text. Wiped when dropped
+    /// (it can carry secrets).
+    pub body: Zeroizing<String>,
 }
 
 impl std::fmt::Debug for Inner {
@@ -108,6 +110,11 @@ pub fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
     (format_ts(t) == s).then_some(t)
 }
 
+/// 0001-01-01T00:00:00.000Z, Go's zero time.
+fn zero_time() -> DateTime<Utc> {
+    NaiveDate::from_ymd_opt(1, 1, 1).expect("valid").and_hms_opt(0, 0, 0).expect("valid").and_utc()
+}
+
 /// Whether `s` is a registry name: dot-separated segments of
 /// `[a-z][a-z0-9-]*`, at most 64 bytes.
 pub fn valid_type(s: &str) -> bool {
@@ -133,6 +140,9 @@ impl Inner {
     fn validate(&self, mode: Mode) -> Result<(), EnvelopeError> {
         let bad = |c: bool| if c { Err(EnvelopeError::Inner) } else { Ok(()) };
         bad(!super::valid_ulid(&self.id) || !valid_type(&self.kind))?;
+        // The zero time (0001-01-01T00:00:00.000Z) is no sender's clock; the
+        // vault refuses it too.
+        bad(self.ts == zero_time())?;
         match mode {
             Mode::Session => bad(!self.seq.is_some_and(|s| (1..=MAX_SAFE_INTEGER).contains(&s)))?,
             Mode::Sealed => bad(self.seq.is_some())?,
@@ -213,7 +223,7 @@ impl Inner {
             _ => return Err(EnvelopeError::Inner),
         };
         o.object("body", 1).map_err(inner)?;
-        let body = o.get("body").expect("checked above").to_string();
+        let body = Zeroizing::new(o.get("body").expect("checked above").to_string());
         let parsed = Inner { id, kind, ts, seq, response, exp, body };
         parsed.validate(mode)?;
         Ok(parsed)
@@ -280,7 +290,7 @@ mod tests {
         i.seq = Some(7);
         i.exp = parse_ts("2026-10-01T12:05:00.000Z");
         i.response = Some(Response { re: RE.into(), status: Status::Error { code: "not_found".into(), message: Some("no \"x\"".into()) } });
-        i.body = r#" { "a" : [ 1 , 2 ] } "#.into();
+        i.body = Zeroizing::new(r#" { "a" : [ 1 , 2 ] } "#.into());
         let j = i.marshal(Mode::Session).unwrap();
         assert_eq!(
             j,
@@ -288,7 +298,7 @@ mod tests {
         );
         let back = Inner::parse(j.as_bytes(), Mode::Session).unwrap();
         assert_eq!(back.response, i.response);
-        assert_eq!(back.body, r#"{"a":[1,2]}"#);
+        assert_eq!(back.body.as_str(), r#"{"a":[1,2]}"#);
         let ok = r#"{"v":1,"id":"01JB2Z6V9K3M4N5P6Q7R8S9T0V","type":"x","ts":"2026-10-01T12:00:00.000Z","re":"01JB2Z6V9K3M4N5P6Q7R8S9T0W","status":"ok","body":{}}"#;
         assert_eq!(Inner::parse(ok.as_bytes(), Mode::Sealed).unwrap().response.unwrap().status, Status::Ok);
         // Unknown members are ignored.
@@ -366,6 +376,9 @@ mod tests {
         }
         let max = swap(r#","body""#, r#","seq":9007199254740991,"body""#);
         assert_eq!(Inner::parse(max.as_bytes(), Mode::Session).unwrap().seq, Some(9_007_199_254_740_991));
+        // The zero time is refused as ts, as the vault does.
+        let zero_ts = swap("2026-10-01T12:00:00.000Z", "0001-01-01T00:00:00.000Z");
+        assert_eq!(Inner::parse(zero_ts.as_bytes(), Mode::Sealed).unwrap_err(), EnvelopeError::Inner);
         // A zero exp is a time long past: expired, never "no expiry".
         let zero_exp = swap(r#","body""#, r#","exp":"0001-01-01T00:00:00.000Z","body""#);
         let z = Inner::parse(zero_exp.as_bytes(), Mode::Sealed).unwrap();
@@ -379,15 +392,15 @@ mod tests {
         i.seq = Some(1);
         assert_eq!(i.marshal(Mode::Sealed).unwrap_err(), EnvelopeError::Inner, "seq in sealed");
         i.seq = None;
-        i.body = r#"{"a":1,"a":2}"#.into();
+        i.body = Zeroizing::new(r#"{"a":1,"a":2}"#.into());
         assert_eq!(i.marshal(Mode::Sealed).unwrap_err(), EnvelopeError::Inner);
-        i.body = "[]".into();
+        i.body = Zeroizing::new("[]".into());
         assert_eq!(i.marshal(Mode::Sealed).unwrap_err(), EnvelopeError::Inner);
-        i.body = String::new();
+        i.body = Zeroizing::new(String::new());
         assert!(i.marshal(Mode::Sealed).unwrap().ends_with(r#""body":{}}"#));
         // Only an empty string means {}: Unicode or JSON whitespace isn't a body.
         for ws in [char::from_u32(0x3000).unwrap().to_string(), char::from_u32(0xa0).unwrap().to_string(), " ".to_string()] {
-            i.body = ws.clone();
+            i.body = Zeroizing::new(ws.clone());
             assert_eq!(i.marshal(Mode::Sealed).unwrap_err(), EnvelopeError::Inner, "{ws:?}");
         }
         let mut empty = ping();
@@ -430,7 +443,7 @@ mod tests {
     #[test]
     fn debug_leaves_out_the_body() {
         let mut i = ping();
-        i.body = r#"{"secret":"hunter2"}"#.into();
+        i.body = Zeroizing::new(r#"{"secret":"hunter2"}"#.into());
         assert!(!format!("{i:?}").contains("hunter2"));
     }
 }

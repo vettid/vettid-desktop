@@ -216,7 +216,10 @@ pub fn as_uint(raw: &str, min: u64, max: u64) -> Result<u64, JsonError> {
     Ok(v)
 }
 
-/// Read a raw value as an array's elements, as raw text.
+/// Read a raw value as an array's elements, as raw text. Its depth
+/// guarantee assumes `raw` comes from a text already checked by
+/// [`parse_object`] (an [`Object`] member or array element): it doesn't
+/// re-count the enclosing levels.
 pub fn as_array(raw: &str) -> Result<Vec<&str>, JsonError> {
     if !raw.starts_with('[') {
         return Err(JsonError::Type);
@@ -297,11 +300,17 @@ pub fn write_string(out: &mut String, s: &str) {
     out.push('"');
 }
 
-/// Writes a compact JSON object with members in call order.
-#[derive(Debug)]
+/// Writes a compact JSON object with members in call order. `Debug`
+/// prints nothing of what was written (it may be secret).
 pub struct Builder {
     out: String,
     first: bool,
+}
+
+impl std::fmt::Debug for Builder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Builder(..)")
+    }
 }
 
 impl Default for Builder {
@@ -749,6 +758,7 @@ mod tests {
         let o = parse_object(br#"{"secret":"hunter2"}"#).unwrap();
         assert!(!format!("{o:?}").contains("hunter2"));
         assert!(!err(r#"{"hunter2":1,"hunter2":2}"#).to_string().contains("hunter2"));
+        assert_eq!(format!("{:?}", Builder::new().string("k", "hunter2")), "Builder(..)");
     }
 
     /// Random mutations of valid texts never panic, and whatever is
