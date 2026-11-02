@@ -54,6 +54,13 @@ jobs:
           npm run build
       - name: cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      # The messaging crate's clippy.toml disallows the HPKE functions that
+      # take caller randomness outside its tests; -D warnings makes a use
+      # an error.
+      - name: clippy (vettid-vms)
+        run: |
+          rustup component add clippy
+          cargo clippy --manifest-path src-tauri/Cargo.toml -p vettid-vms --all-targets --locked -- -D warnings
 
   gitleaks:
     # Pinned binary over the FULL history (the gitleaks-action fails on a

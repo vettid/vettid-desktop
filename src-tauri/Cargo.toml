@@ -8,8 +8,8 @@ license = "AGPL-3.0-or-later"
 # The protocol crates (relay client, messaging) live in their own crates, so
 # they build and test without the Tauri app. `cargo test` here runs them too.
 [workspace]
-members = [".", "crates/vettid-relay"]
-default-members = [".", "crates/vettid-relay"]
+members = [".", "crates/vettid-relay", "crates/vettid-vms"]
+default-members = [".", "crates/vettid-relay", "crates/vettid-vms"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
