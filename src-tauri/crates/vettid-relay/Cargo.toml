@@ -1,0 +1,20 @@
+[package]
+name = "vettid-relay"
+version = "0.1.0"
+edition = "2021"
+description = "VettID relay client: request signing, mailbox ids and deposit tokens (RELAY-PROTOCOL)"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+ed25519-dalek = "2"
+# PASETO v4.public (MIT). Only v4: no v2, no PASERK, no serde/time.
+pasetors = { version = "0.8", default-features = false, features = ["v4"] }
+sha2 = "0.10"
+base64 = "0.22"
+data-encoding = "2"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+zeroize = "1"
