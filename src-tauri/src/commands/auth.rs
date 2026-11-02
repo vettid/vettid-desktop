@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::state::AppState;
 
@@ -417,6 +417,9 @@ pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<Unlock
 
     // #30: first. A log-out from here on means nothing stays unlocked.
     let since = store::wipe_epoch();
+    // #43: likewise a lock, End session, or a session the vault ended,
+    // including one already under way now.
+    let reset_mark_at_start = reset_mark(&state);
 
     let config_dir = match store::default_config_dir() {
         Ok(dir) => dir,
@@ -518,6 +521,23 @@ pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<Unlock
     // back to MessageSpace.{owner}.forOwner.device.{conn}, and
     // nobody's subscribed to it.
     crate::nats::listener::spawn_listener(app.clone(), connection_id).await;
+
+    // #43: a lock, End session or a session the vault ended that was under
+    // way when this started, or started since, may have cleared memory
+    // before the lines above set it. Then it stays locked, as that reset
+    // left it. Checked after the listener is started, so one started past
+    // the reset is stopped too. This lock may also clear an unlock or a
+    // pairing running alongside; that errs locked.
+    if overtaken_by_reset(&state, reset_mark_at_start) {
+        // Logged, so a reset that never finished (it would block every
+        // unlock until restart) can be told apart.
+        log::warn!("unlock: a lock, End session or vault end overlapped this unlock; staying locked");
+        lock_memory(&state).await;
+        return Ok(UnlockResponse {
+            unlocked: false,
+            notice: None,
+        });
+    }
 
     // Warn (never refuse) when another account can open the saved
     // pairing's folder or file (#24).
@@ -931,6 +951,82 @@ pub async fn end_session(state: State<'_, AppState>) -> Result<EndSessionRespons
     Ok(EndSessionResponse { notice })
 }
 
+/// #43: a memory reset is starting; see [`AppState::resets_started`].
+/// First, before anything is cleared.
+fn begin_reset(state: &AppState) {
+    state.resets_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// #43: a memory reset is done, after everything is cleared.
+fn finish_reset(state: &AppState) {
+    state.resets_finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Where the resets stood when an [`unlock`] started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResetMark {
+    started: u64,
+    under_way: bool,
+}
+
+/// Read `finished` first, then `started`: a reset that starts between the
+/// two reads counts as under way.
+fn reset_mark(state: &AppState) -> ResetMark {
+    use std::sync::atomic::Ordering::SeqCst;
+    let finished = state.resets_finished.load(SeqCst);
+    let started = state.resets_started.load(SeqCst);
+    ResetMark { started, under_way: started != finished }
+}
+
+/// Whether a reset was under way when `mark` was taken, or has started
+/// since: then what an unlock set may be what that reset meant to clear.
+fn overtaken_by_reset(state: &AppState, mark: ResetMark) -> bool {
+    mark.under_way || state.resets_started.load(std::sync::atomic::Ordering::SeqCst) != mark.started
+}
+
+/// #43: the vault ended this session (`session_update` expired or
+/// revoked), or its time ran out: the same reset as End session, so the
+/// key, the credentials, the listener and the connection go too, not only
+/// the session state. `revoked` keeps the session marked revoked rather
+/// than expired. Nothing on disk changes.
+///
+/// It stops the listener and waits for it to end, so the listener's own
+/// handler must not await this: spawn it ([`end_session_from_vault_later`]).
+pub(crate) async fn end_session_from_vault(state: &AppState, revoked: bool) {
+    clear_in_memory_session(state).await;
+    if revoked {
+        state.session.write().await.revoke();
+    }
+}
+
+/// The session the credentials in memory are for, if any.
+pub(crate) async fn current_session_id(state: &AppState) -> Option<String> {
+    state.credentials.read().await.as_ref().map(|c| c.session_id.clone()).filter(|id| !id.is_empty())
+}
+
+/// [`end_session_from_vault`] for a message that named `session_id`: only
+/// if that is still the session in memory, checked while holding
+/// `session_op`, so End session and Start New Session can't swap it in
+/// between. A message about another session (an old one, after Start New
+/// Session) says nothing about the current one and changes nothing (#43).
+pub(crate) async fn end_session_from_vault_if_current(state: &AppState, revoked: bool, session_id: &str) {
+    let _session_op = state.session_op.lock().await;
+    if current_session_id(state).await.as_deref() != Some(session_id) {
+        log::info!("session_update for a session that isn't the current one; ignored");
+        return;
+    }
+    end_session_from_vault(state, revoked).await;
+}
+
+/// [`end_session_from_vault_if_current`] on its own task, for callers that
+/// run inside the listener.
+pub(crate) fn end_session_from_vault_later(app: AppHandle, revoked: bool, session_id: String) {
+    tokio::spawn(async move {
+        let state = app.state::<AppState>();
+        end_session_from_vault_if_current(state.inner(), revoked, &session_id).await;
+    });
+}
+
 /// #40: stop the background listener, then disconnect, holding the NATS
 /// lock across both. A listener subscribes under that lock, so one spawned
 /// meanwhile either subscribed before (and is stopped here) or subscribes
@@ -945,6 +1041,7 @@ async fn stop_listener_and_disconnect(state: &AppState) {
 /// credentials, unlocked and registered, and the session (revoked).
 async fn clear_logged_out_memory(state: &AppState) {
     use zeroize::Zeroize;
+    begin_reset(state);
     stop_listener_and_disconnect(state).await;
     {
         let mut key_guard = state.connection_key.write().await;
@@ -957,12 +1054,14 @@ async fn clear_logged_out_memory(state: &AppState) {
     *state.is_unlocked.write().await = false;
     *state.is_registered.write().await = false;
     state.session.write().await.revoke();
+    finish_reset(state);
 }
 
 /// Drop the in-memory session: NATS, the connection key (zeroized), the
 /// credentials and the session state.
 async fn clear_in_memory_session(state: &AppState) {
     use zeroize::Zeroize;
+    begin_reset(state);
     stop_listener_and_disconnect(state).await;
     {
         let mut key_guard = state.connection_key.write().await;
@@ -974,6 +1073,7 @@ async fn clear_in_memory_session(state: &AppState) {
     *state.credentials.write().await = None;
     *state.is_unlocked.write().await = false;
     state.session.write().await.expire();
+    finish_reset(state);
 }
 
 /// What [`end_session`] tells the person. The session always ends in this
@@ -1105,6 +1205,11 @@ pub async fn lock(state: State<'_, AppState>) -> Result<bool, String> {
 /// [`lock`]'s work.
 async fn lock_memory(state: &AppState) {
     use zeroize::Zeroize;
+    begin_reset(state);
+
+    // #40: the listener, then NATS, under one lock; first, as in the other
+    // resets (#43), so nothing reconnects with what is cleared below.
+    stop_listener_and_disconnect(state).await;
 
     // SECURITY: Zeroize connection key before clearing
     {
@@ -1119,11 +1224,9 @@ async fn lock_memory(state: &AppState) {
     *state.credentials.write().await = None;
     *state.is_unlocked.write().await = false;
 
-    // #40: the listener, then NATS, under one lock.
-    stop_listener_and_disconnect(state).await;
-
     // Reset session
     state.session.write().await.expire();
+    finish_reset(state);
 }
 
 /// Get current authentication/registration status.
@@ -1259,6 +1362,169 @@ mod tests {
             assert!(dropped.load(Ordering::SeqCst), "{which}: the listener task ended");
             assert!(state.listener_handle.lock().await.is_none(), "{which}: the slot is empty");
         }
+    }
+
+    /// #43: every memory reset is counted as started and finished, so an
+    /// unlock that one overtook can tell.
+    #[tokio::test]
+    async fn every_reset_is_counted() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let state = AppState::new();
+        clear_logged_out_memory(&state).await;
+        clear_in_memory_session(&state).await;
+        lock_memory(&state).await;
+        end_session_from_vault(&state, false).await;
+        assert_eq!(state.resets_started.load(SeqCst), 4);
+        assert_eq!(state.resets_finished.load(SeqCst), 4);
+        assert!(state.credentials.read().await.is_none());
+    }
+
+    /// #43, M1: an unlock is overtaken by a reset that started after it
+    /// did, and by one already under way when it started, but not by one
+    /// that had finished before.
+    #[test]
+    fn an_unlock_sees_every_reset_it_overlapped() {
+        let state = AppState::new();
+        let quiet = reset_mark(&state);
+        assert!(!overtaken_by_reset(&state, quiet), "no reset");
+
+        begin_reset(&state);
+        assert!(overtaken_by_reset(&state, quiet), "a reset started since");
+        let during = reset_mark(&state);
+        assert!(overtaken_by_reset(&state, during), "a reset under way at the start");
+        finish_reset(&state);
+        assert!(overtaken_by_reset(&state, during), "still, once it finished");
+
+        let after = reset_mark(&state);
+        assert!(!overtaken_by_reset(&state, after), "one that finished before doesn't count");
+    }
+
+    /// #43, M2: a session_update about another session (the old one, after
+    /// Start New Session) leaves the current session alone; one about the
+    /// current session ends it.
+    #[tokio::test]
+    async fn a_vault_end_for_another_session_changes_nothing() {
+        let state = AppState::new();
+        let creds = |id: &str| crate::credential::store::ConnectionCredentials {
+            connection_id: "conn".into(),
+            connection_key: vec![7u8; 32],
+            key_id: "key".into(),
+            device_private_key: vec![1u8; 32],
+            device_public_key: vec![2u8; 32],
+            vault_public_key: vec![3u8; 32],
+            message_space_token: "token".into(),
+            message_space_url: "tls://example.invalid:443".into(),
+            owner_guid: "owner".into(),
+            owner_name: String::new(),
+            session_id: id.into(),
+            session_expires_at: 1_900_000_000,
+            session_duration_seconds: 3600,
+        };
+        *state.credentials.write().await = Some(creds("new"));
+        *state.connection_key.write().await = Some([7u8; 32]);
+        end_session_from_vault_if_current(&state, false, "old").await;
+        assert_eq!(current_session_id(&state).await.as_deref(), Some("new"));
+        assert!(state.connection_key.read().await.is_some());
+
+        end_session_from_vault_if_current(&state, true, "new").await;
+        assert!(state.credentials.read().await.is_none());
+        assert!(state.connection_key.read().await.is_none());
+    }
+
+    /// #43, M2 race: the vault end waits for `session_op` (held here, as
+    /// Start New Session does); meanwhile a new session is installed. When
+    /// the end gets the lock, its session is gone, and it changes nothing.
+    #[tokio::test]
+    async fn a_vault_end_overtaken_by_a_new_session_changes_nothing() {
+        use std::sync::Arc;
+        let state = Arc::new(AppState::new());
+        let creds = |id: &str| crate::credential::store::ConnectionCredentials {
+            connection_id: "conn".into(),
+            connection_key: vec![7u8; 32],
+            key_id: "key".into(),
+            device_private_key: vec![1u8; 32],
+            device_public_key: vec![2u8; 32],
+            vault_public_key: vec![3u8; 32],
+            message_space_token: "token".into(),
+            message_space_url: "tls://example.invalid:443".into(),
+            owner_guid: "owner".into(),
+            owner_name: String::new(),
+            session_id: id.into(),
+            session_expires_at: 1_900_000_000,
+            session_duration_seconds: 3600,
+        };
+        *state.credentials.write().await = Some(creds("old"));
+        let session_op = state.session_op.lock().await;
+        let end = {
+            let state = state.clone();
+            tokio::spawn(async move { end_session_from_vault_if_current(&state, false, "old").await })
+        };
+        tokio::task::yield_now().await;
+        *state.credentials.write().await = Some(creds("new"));
+        *state.connection_key.write().await = Some([7u8; 32]);
+        drop(session_op);
+        end.await.unwrap();
+        assert_eq!(current_session_id(&state).await.as_deref(), Some("new"));
+        assert!(state.connection_key.read().await.is_some(), "the new session is untouched");
+    }
+
+    /// #43: a session the vault ended takes the key, the credentials and
+    /// the listener with it; a revoked one stays marked revoked.
+    #[tokio::test]
+    async fn a_session_the_vault_ended_is_cleared_from_memory() {
+        use crate::session::manager::SessionState;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        struct Held(Arc<AtomicBool>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        for revoked in [false, true] {
+            let state = AppState::new();
+            *state.connection_key.write().await = Some([9u8; 32]);
+            *state.is_unlocked.write().await = true;
+            let dropped = Arc::new(AtomicBool::new(false));
+            let held = Held(dropped.clone());
+            *state.listener_handle.lock().await = Some(tokio::spawn(async move {
+                let _held = held;
+                std::future::pending::<()>().await;
+            }));
+            end_session_from_vault(&state, revoked).await;
+            assert!(state.connection_key.read().await.is_none());
+            assert!(!*state.is_unlocked.read().await);
+            assert!(dropped.load(Ordering::SeqCst), "the listener ended");
+            let want = if revoked { SessionState::Revoked } else { SessionState::Expired };
+            assert_eq!(state.session.read().await.state(), want);
+        }
+    }
+
+    /// #43: the listener's handler can't await the reset (it would wait
+    /// for itself). A reset spawned from inside the listener, as the
+    /// handler does, stops it without hanging.
+    #[tokio::test]
+    async fn a_reset_spawned_from_inside_the_listener_stops_it() {
+        use std::sync::Arc;
+        let state = Arc::new(AppState::new());
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let state2 = state.clone();
+        let slot = state.listener_handle.clone();
+        let mut guard = slot.lock().await;
+        *guard = Some(tokio::spawn(async move {
+            let state3 = state2.clone();
+            tokio::spawn(async move {
+                end_session_from_vault(&state3, true).await;
+                let _ = done_tx.send(());
+            });
+            std::future::pending::<()>().await;
+        }));
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
+            .await
+            .expect("the reset finished")
+            .unwrap();
+        assert!(state.listener_handle.lock().await.is_none());
     }
 
     /// #40: a listener spawned while a reset is under way (an unlock
