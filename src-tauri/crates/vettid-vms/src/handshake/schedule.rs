@@ -3,7 +3,7 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::{HandshakeError, EPOCH_ID_SIZE, SAS_NONCE_SIZE};
 use crate::suite::kid::Kid;
@@ -61,9 +61,12 @@ impl Schedule {
         let mut ikm = Zeroizing::new([0u8; 2 * KEY_SIZE]);
         ikm[..KEY_SIZE].copy_from_slice(ke);
         ikm[KEY_SIZE..].copy_from_slice(ks);
-        let (prk, hk) = Hkdf::<Sha256>::extract(Some(LABEL_SESSION.as_bytes()), &ikm[..]);
+        let (mut prk, hk) = Hkdf::<Sha256>::extract(Some(LABEL_SESSION.as_bytes()), &ikm[..]);
         let mut prk_bytes = Zeroizing::new([0u8; 32]);
         prk_bytes.copy_from_slice(&prk);
+        prk.as_mut_slice().zeroize();
+        // hkdf 0.12 doesn't wipe its HMAC state (`hk`) on drop; it lives
+        // only for this function (as in Go, whose HKDF keeps such copies).
         let kid = |label| Kid(*expand::<KID_SIZE>(&hk, label, &[&th]));
         Schedule {
             th1,

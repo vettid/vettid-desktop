@@ -31,8 +31,8 @@ pub struct Principal {
     pub relay: RelayAddr,
 }
 
-/// The `hs.init` body.
-#[derive(Debug, Clone)]
+/// The `hs.init` body. `Debug` leaves out the tokens and the profile.
+#[derive(Clone)]
 pub struct Init {
     pub purpose: Purpose,
     pub ctx: String,
@@ -48,8 +48,8 @@ pub struct Init {
     pub sas_commit: Option<[u8; SAS_NONCE_SIZE]>,
 }
 
-/// The `hs.resp` body.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The `hs.resp` body. `Debug` leaves out the tokens.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Resp {
     pub token: Option<String>,
     pub reconnect_token: Option<String>,
@@ -65,6 +65,28 @@ pub struct Fin {
     pub sig: [u8; 64],
     /// `n_I`, revealed here, exactly for purposes with a SAS.
     pub sas_nonce: Option<[u8; SAS_NONCE_SIZE]>,
+}
+
+impl std::fmt::Debug for Init {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Init")
+            .field("purpose", &self.purpose)
+            .field("ctx", &self.ctx)
+            .field("suites", &self.suites)
+            .field("token", &self.token.as_ref().map(|_| ".."))
+            .field("reconnect_token", &self.reconnect_token.as_ref().map(|_| ".."))
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Resp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Resp")
+            .field("suite", &self.suite)
+            .field("token", &self.token.as_ref().map(|_| ".."))
+            .field("reconnect_token", &self.reconnect_token.as_ref().map(|_| ".."))
+            .finish_non_exhaustive()
+    }
 }
 
 /// A relay base URL (§6.2): absolute, `https` (`http` only for a loopback
@@ -437,6 +459,19 @@ mod tests {
         assert_eq!(Fin::parse(&fb, Purpose::Desktop).unwrap(), f);
         assert_eq!(Fin::parse(&fb, Purpose::Rekey), Err(HandshakeError::Body));
         assert_eq!(f.marshal(Purpose::Rekey), Err(HandshakeError::Body));
+    }
+
+    /// Tokens are bearer secrets: `Debug` never prints them.
+    #[test]
+    fn debug_prints_no_token_material() {
+        let i = Init::parse(&init_body()).unwrap();
+        let s = format!("{i:?}");
+        assert!(s.contains("Connection") && !s.contains("VEVTVC") && !s.contains("v4.public"), "{s}");
+        let v = vectors::load("handshake");
+        let inner_text = v["hs_resp_inner"].as_str().unwrap();
+        let body = strict_json::parse_object(inner_text.as_bytes()).unwrap().get("body").unwrap().to_string();
+        let r = Resp::parse(&body, Purpose::Connection).unwrap();
+        assert_eq!(format!("{r:?}"), r#"Resp { suite: 2, token: Some(".."), reconnect_token: None, .. }"#);
     }
 
     #[test]

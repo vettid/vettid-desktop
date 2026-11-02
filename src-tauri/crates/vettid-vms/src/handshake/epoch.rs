@@ -239,7 +239,7 @@ mod tests {
         let mut own = ping("01JB2Z6V9K3M4N5P6Q7R8S9T0X");
         let mine = Envelope::parse(&i.seal(&mut own).unwrap()).unwrap();
         assert!(i.open(&mine).is_err());
-        assert!(!format!("{i:?}").contains("key"));
+        assert_eq!(format!("{i:?}"), "Epoch { role: Initiator, suite: 2, sent: 4, received: 1, .. }");
     }
 
     #[test]

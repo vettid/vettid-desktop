@@ -131,12 +131,24 @@ impl Initiator {
     /// Build and seal `hs.init`, with a fresh ephemeral KEM key (forward
     /// secrecy, §6.5) and, for a purpose with a SAS, the nonce `n_I` it
     /// commits to, chosen before `hs.init` is built (§6.2).
+    ///
+    /// Only `desktop` and `agent`: an `app` handshake needs a phone's
+    /// `device_attest` (§6.7, §11.7), and `connection` is between vaults.
+    /// (The known-answer test builds the vector's `connection` through
+    /// the same code.)
     pub fn new(cfg: InitiatorConfig) -> Result<Self, HandshakeError> {
+        if !matches!(cfg.purpose, Purpose::Desktop | Purpose::Agent) {
+            return Err(HandshakeError::Config);
+        }
         Self::build(cfg, &mut Os)
     }
 
     pub(super) fn build(mut cfg: InitiatorConfig, rng: &mut impl Randomness) -> Result<Self, HandshakeError> {
         if matches!(cfg.purpose, Purpose::Rekey | Purpose::Reconnect) {
+            return Err(HandshakeError::Config);
+        }
+        // An epoch without a bound would never be rekeyed (§6.5).
+        if cfg.policy.max_age <= chrono::TimeDelta::zero() && cfg.policy.max_messages == 0 {
             return Err(HandshakeError::Config);
         }
         if cfg.suites.is_empty() {
@@ -419,6 +431,10 @@ mod tests {
         let mut tampered = resp.clone();
         tampered[1500] ^= 1;
         assert_eq!(i.handle_resp_with(&tampered, &relay, now, &mut fixed).unwrap_err(), HandshakeError::Envelope(EnvelopeError::Decrypt));
+        // Another recipient kid: not for this eph, nothing tried.
+        let mut other = resp.clone();
+        other[12] ^= 1;
+        assert_eq!(i.handle_resp_with(&other, &relay, now, &mut fixed).unwrap_err(), HandshakeError::Envelope(EnvelopeError::Kid));
         let mut named = resp.clone();
         named[5] ^= 1;
         assert_eq!(i.handle_resp_with(&named, &relay, now, &mut fixed).unwrap_err(), HandshakeError::SenderKid);
@@ -435,6 +451,8 @@ mod tests {
             ("bad sig_R", "sig", HandshakeError::SigResp),
             ("wrong type", "type", HandshakeError::Type),
             ("suite 3", "suite", HandshakeError::Suite(crate::suite::SuiteError::UnsupportedSuite)),
+            ("stale ts", "ts", HandshakeError::Envelope(EnvelopeError::ClockPast)),
+            ("malformed body", "body", HandshakeError::Body),
         ] {
             let (cfg, mut fixed, relay, _) = setup();
             let now = cfg.now;
@@ -443,6 +461,8 @@ mod tests {
             match edit {
                 "sig" => inner["body"]["sig"] = serde_json::json!(base64::engine::general_purpose::STANDARD.encode([1u8; 64])),
                 "type" => inner["type"] = serde_json::json!("hs.fin"),
+                "ts" => inner["ts"] = serde_json::json!("2026-09-01T12:00:00.000Z"),
+                "body" => inner["body"] = serde_json::json!({}),
                 _ => inner["body"]["suite"] = serde_json::json!(3),
             }
             let parsed = Inner::parse(serde_json::to_string(&inner).unwrap().as_bytes(), Mode::Sealed).unwrap();
@@ -454,22 +474,91 @@ mod tests {
     }
 
     #[test]
-    fn rekeys_and_reconnects_are_not_built_here() {
+    fn only_desktop_and_agent_are_built() {
         for p in [Purpose::Rekey, Purpose::Reconnect] {
             let (mut cfg, mut fixed, _, _) = setup();
             cfg.purpose = p;
             assert_eq!(Initiator::build(cfg, &mut fixed).unwrap_err(), HandshakeError::Config);
         }
+        for p in [Purpose::App, Purpose::Connection, Purpose::Rekey] {
+            let (mut cfg, _, _, _) = setup();
+            cfg.purpose = p;
+            assert_eq!(Initiator::new(cfg).unwrap_err(), HandshakeError::Config, "{p:?}");
+        }
+        let (mut cfg, mut fixed, _, _) = setup();
+        cfg.policy = Policy { max_age: chrono::TimeDelta::zero(), max_messages: 0 };
+        assert_eq!(Initiator::build(cfg, &mut fixed).unwrap_err(), HandshakeError::Config, "an unbounded epoch");
+    }
+
+    /// Purpose desktop, end to end through the release path, against a
+    /// test responder built from §6.3 with the vault's keys: the initiator
+    /// completes, and both sides agree on the SAS, sig_I and the
+    /// commitment.
+    #[test]
+    fn desktop_round_trip() {
+        use crate::handshake::{check_sas_commit, sign_resp, verify_fin};
+        let (mut cfg, _, relay, _) = setup();
+        cfg.purpose = Purpose::Desktop;
+        cfg.ctx = "01JB2Z6V9K3M4N5P6Q7R8S9T0V".into();
+        cfg.profile = Some(r#"{"name":"Laptop"}"#.into());
+        cfg.id = None;
+        cfg.fin_id = None;
+        let now = cfg.now;
+        let initiator_ik = cfg.identity.verifying_key();
+        let mut i = Initiator::new(cfg).unwrap();
+
+        // The responder: the vault's KEM and identity keys.
+        let keys = vectors::load("keys");
+        let vault_kem = PrivateKey::from_seed(&vectors::seed(&keys["vault"]["kem_seed_hex"])).unwrap();
+        let vault_ik = identity_from_seed(&vectors::seed(&keys["vault"]["ik_seed_hex"]));
+        let env_init = i.envelope().to_vec();
+        let (padded, r_ctx) = open_sealed(&Envelope::parse(&env_init).unwrap(), &vault_kem).unwrap();
+        let mut ks = [0u8; 32];
+        r_ctx.export(LABEL_HS_KS.as_bytes(), &mut ks).unwrap();
+        let init_inner = Inner::decode(&padded, Mode::Sealed).unwrap();
+        let init = Init::parse(&init_inner.body).unwrap();
+        assert_eq!((init.purpose, init.profile.as_deref()), (Purpose::Desktop, Some(r#"{"name":"Laptop"}"#)));
+        let mut sealer = Sealer::new(&init.eph, ANONYMOUS).unwrap();
+        let mut ke = [0u8; 32];
+        sealer.export(LABEL_HS_KE.as_bytes(), &mut ke).unwrap();
+        let th_r = th(&env_init, sealer.header());
+        let sched = Schedule::derive(&ks, &ke, th1(&env_init), th_r);
+        let n_r = [5u8; 32];
+        let resp = Resp { token: Some("v4.public.resp".into()), reconnect_token: None, suite: 2, sas_nonce: Some(n_r), sig: sign_resp(&vault_ik, &th_r) };
+        let resp_inner = Inner {
+            id: new_ulid(now).unwrap(),
+            kind: TYPE_RESP.into(),
+            ts: now,
+            seq: None,
+            response: None,
+            exp: None,
+            body: Zeroizing::new(resp.marshal(Purpose::Desktop).unwrap()),
+        };
+        let env_resp = sealer.seal(&resp_inner.encode(Mode::Sealed).unwrap()).unwrap();
+
+        let out = i.handle_resp(&env_resp, &relay, now).unwrap();
+        // The responder checks hs.fin as section 6.3 says.
+        let fin_inner = Inner::decode(&crate::envelope::open_session(&Envelope::parse(&out.fin).unwrap(), &sched.k_i2r).unwrap(), Mode::Session).unwrap();
+        assert_eq!((fin_inner.kind.as_str(), fin_inner.seq), (TYPE_FIN, Some(1)));
+        let fin = Fin::parse(&fin_inner.body, Purpose::Desktop).unwrap();
+        verify_fin(&initiator_ik, &th_r, &fin.sig).unwrap();
+        let n_i = fin.sas_nonce.unwrap();
+        assert!(check_sas_commit(&init.sas_commit.unwrap(), &n_i));
+        assert_eq!(out.sas.unwrap(), sas(&sched, &n_i, &n_r).unwrap());
+        assert_eq!(out.epoch.id(), sched.epoch_id);
+        assert_eq!(out.resp.token.as_deref(), Some("v4.public.resp"));
     }
 
     #[test]
     fn release_initiators_use_fresh_randomness() {
-        let (cfg, _, _, _) = setup();
-        let (cfg2, _, _, _) = setup();
+        let (mut cfg, _, _, _) = setup();
+        let (mut cfg2, _, _, _) = setup();
+        cfg.purpose = Purpose::Desktop;
+        cfg2.purpose = Purpose::Desktop;
         let (a, b) = (Initiator::new(cfg).unwrap(), Initiator::new(cfg2).unwrap());
         assert_ne!(a.eph_kid(), b.eph_kid());
         assert_ne!(a.body().sas_commit, b.body().sas_commit);
         assert_ne!(a.envelope()[20..1140], b.envelope()[20..1140]);
-        assert!(!format!("{a:?}").contains("key"));
+        assert_eq!(format!("{a:?}"), "Initiator { purpose: Desktop, done: false, .. }");
     }
 }
