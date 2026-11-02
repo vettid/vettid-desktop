@@ -413,9 +413,7 @@ pub async fn complete_pairing(
     // save. If not, the next load treats it as ended, so don't report it
     // as started.
     if !store::session_is_recorded(config_dir, &activation_result.session_id) {
-        return Err(RegistrationError::Internal(
-            "the new session couldn't be recorded on this computer; start a new session".to_string(),
-        ));
+        return Err(RegistrationError::SessionNotRecorded);
     }
 
     Ok(PairingOutcome {

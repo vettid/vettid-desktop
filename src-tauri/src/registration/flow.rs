@@ -27,6 +27,9 @@ pub enum RegistrationError {
     /// This computer has no machine id to bind the pairing to (see
     /// `CredentialError::NoMachineId`). Displays the plain notice.
     NoMachineId,
+    /// The pairing is saved, but the new session couldn't be recorded on
+    /// this computer (#33). Displays the plain notice.
+    SessionNotRecorded,
 }
 
 impl fmt::Display for RegistrationError {
@@ -47,6 +50,9 @@ impl fmt::Display for RegistrationError {
             }
             Self::NotPrivate => f.write_str(crate::credential::store::NOT_PRIVATE_NOTICE),
             Self::NoMachineId => f.write_str(crate::credential::store::NO_MACHINE_ID_NOTICE),
+            Self::SessionNotRecorded => {
+                f.write_str(crate::credential::store::SESSION_NOT_RECORDED_NOTICE)
+            }
         }
     }
 }

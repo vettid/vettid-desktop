@@ -98,6 +98,13 @@ pub const NO_MACHINE_ID_NOTICE: &str =
 pub const SESSION_END_NOT_RECORDED_NOTICE: &str =
     "The session ended, but this desktop couldn't record that on this computer, so next time it may show the old session as still open. If it does, end the session again.";
 
+/// Shown when a pairing or Start New Session got a session from the vault
+/// but couldn't record it on this computer (#33, owner decision (a),
+/// 2026-11-01). The pairing itself is saved, so pairing again would only
+/// leave a stale device on the phone.
+pub const SESSION_NOT_RECORDED_NOTICE: &str =
+    "This desktop is paired, but it couldn't record the new session on this computer. Choose Start New Session to try again. You don't need to pair again.";
+
 /// Shown when the per-user folder for the pairing can't be found.
 pub const NO_CONFIG_DIR_NOTICE: &str =
     "This desktop can't find your user folder, so it can't keep a pairing on this computer. Nothing was saved.";
