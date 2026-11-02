@@ -1,0 +1,65 @@
+name: windows
+
+# Windows build and tests (#6, owner decision (a), 2026-11-01). Windows
+# minutes are billed at twice the Linux rate, so pull requests run this only
+# when they touch the Rust crate or this workflow; every push to main runs it.
+# The frontend's own job in ci.yml covers frontend-only changes.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "src-tauri/**"
+      - ".github/workflows/windows.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # The repository is checked out without line-ending conversion, as on
+      # the Windows test machine, so the tree matches Linux byte for byte.
+      - name: no line-ending conversion
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            src-tauri/target
+          key: windows-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: windows-cargo-
+      - name: npm ci
+        run: npm ci
+      - name: svelte-check
+        run: npm run check
+      # tauri::generate_context! embeds ../dist at compile time, so the
+      # frontend has to be built before the crate compiles.
+      - name: build frontend
+        run: npm run build
+      # The tests use the real Windows APIs on the runner: file DACLs and
+      # ownership, junctions and hard links, rename by handle, and the
+      # Credential Manager (written, read and deleted under a target name of
+      # each test's own). None is marked #[ignore]. A few fingerprint tests
+      # check nothing on a machine with fewer than three attributes; the
+      # Windows collector test is strict and fails then. Tests that would
+      # need a second Windows account don't exist yet.
+      - name: cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
