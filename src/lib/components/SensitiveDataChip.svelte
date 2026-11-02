@@ -10,13 +10,17 @@
   //
   //   Locked   → tap to request phone approval (default)
   //   Pending  → vault sent the approval request to the phone; chip
-  //              shows a spinner + elapsed time + Cancel
+  //              shows a spinner + elapsed time + Stop waiting
   //   Unlocked → grant active; shows mm:ss remaining + a Lock-now ✕
   //
   // Lock-now is client-only for now — clears the local mirror so the
   // UI re-hides Reveal buttons. The vault-side grant times out on its
   // own (SecretsUnlockedUntil). A future enclave change can add an
   // explicit `secret.lock-session` op for a hard server-side revoke.
+
+  // #42: owner-approved, 2026-11-02. The vault still has the request.
+  const STOPPED_WAITING_UNLOCK =
+    'This desktop stopped waiting for your approval. If you approve on your phone, your secrets will still unlock.';
 
   let pending = $state(false);
   let pendingRequestId = $state<string | null>(null);
@@ -136,16 +140,20 @@
         secretsUnlockStore.set({ unlockedUntil: until, pending: false, error: null });
         return;
       }
-      const errMsg = resp?.error || (resp?.data?.status === 'denied'
+      let errMsg = resp?.error || (resp?.data?.status === 'denied'
         ? 'You denied the approval on your phone.'
         : 'Approval did not complete.');
+      // #42: the vault still has the request; approving still unlocks.
+      if (resp?.error_code === 'stopped_waiting') errMsg = STOPPED_WAITING_UNLOCK;
       secretsUnlockStore.update((s) => ({ ...s, pending: false, error: errMsg }));
     } catch (e) {
       clearPendingState();
       const msg = String(e);
       let friendly = msg;
       if (msg.includes('Phone approval timed out')) friendly = 'Phone approval timed out. Try again when you have your phone handy.';
-      else if (msg.includes('cancelled')) friendly = 'Approval cancelled';
+      // Thrown only on an IPC failure; phone-approval errors come back in
+      // `resp.error` above.
+      else if (msg.includes('stopped waiting')) friendly = STOPPED_WAITING_UNLOCK;
       else if (msg.includes('did not acknowledge')) friendly = 'Vault is not responding — try again in a moment.';
       secretsUnlockStore.update((s) => ({ ...s, pending: false, error: friendly }));
     } finally {
@@ -158,7 +166,8 @@
     const rid = pendingRequestId;
     clearPendingState();
     try { await invoke('cancel_pending_operation', { requestId: rid }); } catch (_) {}
-    secretsUnlockStore.update((s) => ({ ...s, pending: false, error: 'Approval cancelled' }));
+    // #42: this only stops waiting; the vault isn't told.
+    secretsUnlockStore.update((s) => ({ ...s, pending: false, error: STOPPED_WAITING_UNLOCK }));
     pending = false;
   }
 
@@ -179,11 +188,11 @@
   <span class="sr-only" role="status" aria-live="polite">{a11yStatus}</span>
 
   {#if pending}
-    <button class="chip pending" onclick={cancelPending} title="Cancel approval request">
+    <button class="chip pending" onclick={cancelPending} title="Stop waiting for the phone">
       <span class="spinner-sm"></span>
       <span class="label">
         <span class="title">Waiting for phone…</span>
-        <span class="meta">{pendingElapsed}s · tap to cancel</span>
+        <span class="meta">{pendingElapsed}s · tap to stop waiting</span>
       </span>
     </button>
   {:else if unlocked}

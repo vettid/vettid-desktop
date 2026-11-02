@@ -140,5 +140,7 @@ export interface VaultOpResponse {
     success: boolean;
     data?: unknown;
     error?: string;
+    /** #42: "stopped_waiting" when the desktop stopped waiting; the phone may still carry it out. */
+    error_code?: 'stopped_waiting' | null;
     pending_approval: boolean;
 }

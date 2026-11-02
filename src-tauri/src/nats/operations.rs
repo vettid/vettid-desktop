@@ -109,9 +109,22 @@ pub enum OperationError {
     /// phone-approval window. Almost always means the human didn't
     /// approve in time (or denied without producing a response).
     ApprovalTimeout,
-    Cancelled,
+    /// The desktop stopped waiting: the person chose Stop waiting, or the
+    /// listener ended on its own (a dropped connection); lock, End session
+    /// and log-out leave waiters to time out.
+    /// The vault wasn't told, and can't be (#42), so the request may still
+    /// be approved on the phone and carried out. Displays
+    /// [`STOPPED_WAITING_NOTICE`]; never "cancelled".
+    StoppedWaiting,
     ResponseError(String),
 }
+
+/// Shown when the desktop stopped waiting for a request's answer (#42).
+/// The send sheet and the secrets chip show their own texts for it; they
+/// match on [`OperationError::code`] (`"stopped_waiting"`), and on this
+/// text's "stopped waiting" only for an error thrown over IPC.
+pub const STOPPED_WAITING_NOTICE: &str =
+    "This desktop stopped waiting for an answer. If your phone still shows the request, approving it there will still carry it out.";
 
 impl fmt::Display for OperationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -123,13 +136,23 @@ impl fmt::Display for OperationError {
             Self::PublishFailed(e) => write!(f, "Publish failed: {}", e),
             Self::AckTimeout => write!(f, "Vault did not acknowledge the request"),
             Self::ApprovalTimeout => write!(f, "Phone approval timed out"),
-            Self::Cancelled => write!(f, "Operation cancelled"),
+            Self::StoppedWaiting => f.write_str(STOPPED_WAITING_NOTICE),
             Self::ResponseError(e) => write!(f, "Response error: {}", e),
         }
     }
 }
 
 impl std::error::Error for OperationError {}
+
+impl OperationError {
+    /// A stable code for errors the frontend words for itself (#42).
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::StoppedWaiting => Some("stopped_waiting"),
+            _ => None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Execute a vault operation via NATS
@@ -230,59 +253,18 @@ pub async fn execute_operation(
 
     drop(nats_client);
 
-    // Helper: is this message a `pending_approval` ack (no payload,
-    // just "vault saw your request and is waiting on the human")?
-    fn is_pending_ack(v: &serde_json::Value) -> bool {
-        v.get("status")
-            .and_then(|s| s.as_str())
-            .map(|s| s == "pending_approval")
-            .unwrap_or(false)
-    }
-
-    // First read: short window. The vault should answer almost
-    // immediately — either the final response (no phone needed) or
-    // a pending_approval ack (phone-required).
-    let first = tokio::time::timeout(Duration::from_secs(ack_timeout_secs), rx.recv()).await;
-
-    let first_value = match first {
-        Err(_) => {
-            let pending = state.pending_responses.clone();
-            let rid = request_id.clone();
-            tokio::spawn(async move { pending.lock().await.remove(&rid); });
-            return Err(OperationError::AckTimeout);
-        }
-        Ok(None) => return Err(OperationError::Cancelled),
-        Ok(Some(v)) => v,
-    };
-
-    // If the first message is an ack, keep reading until we get a
-    // non-ack message — that's the real final response. Duplicate acks
-    // can arrive (e.g. listener fan-out, NATS replay, intermediate
-    // status updates) and must not poison the result, otherwise the
-    // caller sees `status: pending_approval` as if it were the final
-    // payload and reports "Approval did not complete" right after the
-    // human actually approved.
-    let final_value = if is_pending_ack(&first_value) {
-        loop {
-            match tokio::time::timeout(Duration::from_secs(final_timeout_secs), rx.recv()).await {
-                Err(_) => {
-                    let pending = state.pending_responses.clone();
-                    let rid = request_id.clone();
-                    tokio::spawn(async move { pending.lock().await.remove(&rid); });
-                    return Err(OperationError::ApprovalTimeout);
-                }
-                Ok(None) => return Err(OperationError::Cancelled),
-                Ok(Some(v)) => {
-                    if is_pending_ack(&v) {
-                        log::debug!("Ignoring duplicate pending_approval ack for {}", request_id);
-                        continue;
-                    }
-                    break v;
-                }
+    let final_value = match await_response(&mut rx, ack_timeout_secs, final_timeout_secs, &request_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            // Timed out: drop our pending entry. Stopped waiting: it's
+            // already gone (that's how we were told).
+            if matches!(e, OperationError::AckTimeout | OperationError::ApprovalTimeout) {
+                let pending = state.pending_responses.clone();
+                let rid = request_id.clone();
+                tokio::spawn(async move { pending.lock().await.remove(&rid); });
             }
+            return Err(e);
         }
-    } else {
-        first_value
     };
 
     // Parse as DeviceOpResponse
@@ -312,6 +294,55 @@ pub async fn execute_operation(
     Ok(response)
 }
 
+/// Whether a response is a `pending_approval` ack (no payload, just "the
+/// vault saw your request and is waiting on the human").
+fn is_pending_ack(v: &serde_json::Value) -> bool {
+    v.get("status")
+        .and_then(|s| s.as_str())
+        .map(|s| s == "pending_approval")
+        .unwrap_or(false)
+}
+
+/// Wait for a request's final response on `rx`.
+///
+/// First read: a short window. The vault should answer almost at once,
+/// with the final response (no phone needed) or a `pending_approval` ack
+/// (phone-required). After an ack, keep reading until a non-ack message:
+/// that's the real final response. Duplicate acks can arrive (listener
+/// fan-out, NATS replay, intermediate status updates) and must not poison
+/// the result, or the caller would see `pending_approval` as the final
+/// payload and report "Approval did not complete" right after the human
+/// approved.
+///
+/// A channel that closes means the desktop stopped waiting (#42):
+/// [`OperationError::StoppedWaiting`], never "cancelled", since the vault
+/// still has the request.
+async fn await_response(
+    rx: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+    ack_timeout_secs: u64,
+    final_timeout_secs: u64,
+    request_id: &str,
+) -> Result<serde_json::Value, OperationError> {
+    let first_value = match tokio::time::timeout(Duration::from_secs(ack_timeout_secs), rx.recv()).await {
+        Err(_) => return Err(OperationError::AckTimeout),
+        Ok(None) => return Err(OperationError::StoppedWaiting),
+        Ok(Some(v)) => v,
+    };
+    if !is_pending_ack(&first_value) {
+        return Ok(first_value);
+    }
+    loop {
+        match tokio::time::timeout(Duration::from_secs(final_timeout_secs), rx.recv()).await {
+            Err(_) => return Err(OperationError::ApprovalTimeout),
+            Ok(None) => return Err(OperationError::StoppedWaiting),
+            Ok(Some(v)) if is_pending_ack(&v) => {
+                log::debug!("Ignoring duplicate pending_approval ack for {}", request_id);
+            }
+            Ok(Some(v)) => return Ok(v),
+        }
+    }
+}
+
 /// Default for ops that don't require phone approval. Short ack and
 /// final windows — these ops answer immediately or not at all.
 pub async fn execute(
@@ -333,13 +364,77 @@ pub async fn execute_phone_required(
     execute_operation(state, operation, params, 5, 120).await
 }
 
-/// Cancel a pending operation locally. Removes the channel from
-/// `pending_responses` so the awaiter wakes with `Cancelled`. The
-/// vault is not notified — orphan approval requests on the phone
-/// will time out on their own. A future enhancement could publish
-/// a `device.cancel` op so the phone dismisses the prompt
-/// immediately.
+/// Stop waiting for a pending operation (the person's Stop waiting).
+/// Removes the channel from `pending_responses` so the awaiter wakes with
+/// [`OperationError::StoppedWaiting`]. The vault is not notified, and the
+/// legacy vault has no way to cancel a pending request (#42): the prompt
+/// stays on the phone, and approving it there still carries it out.
 pub async fn cancel(state: &AppState, request_id: &str) -> bool {
     let mut pending = state.pending_responses.lock().await;
     pending.remove(request_id).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// #42: a waiter whose channel closes, before or after the vault's
+    /// ack, stopped waiting: never "cancelled", and the text says the
+    /// phone may still carry it out.
+    #[tokio::test]
+    async fn a_dropped_request_says_the_desktop_stopped_waiting() {
+        // Before any answer.
+        let (tx, mut rx) = mpsc::unbounded_channel::<serde_json::Value>();
+        drop(tx);
+        let err = await_response(&mut rx, 5, 5, "r1").await.unwrap_err();
+        assert!(matches!(err, OperationError::StoppedWaiting));
+        // After the pending_approval ack, while the phone shows it.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(json!({"status": "pending_approval"})).unwrap();
+        drop(tx);
+        let err = await_response(&mut rx, 5, 5, "r2").await.unwrap_err();
+        assert!(matches!(err, OperationError::StoppedWaiting));
+        let text = err.to_string();
+        assert_eq!(text, STOPPED_WAITING_NOTICE);
+        assert!(!text.to_lowercase().contains("cancel"), "{text}");
+    }
+
+    /// The answer still comes through: directly, or after acks
+    /// (duplicates ignored).
+    #[tokio::test]
+    async fn the_final_response_comes_through_after_acks() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(json!({"status": "executed", "n": 1})).unwrap();
+        assert_eq!(await_response(&mut rx, 5, 5, "r3").await.unwrap()["n"], 1);
+        tx.send(json!({"status": "pending_approval"})).unwrap();
+        tx.send(json!({"status": "pending_approval"})).unwrap();
+        tx.send(json!({"status": "executed", "n": 2})).unwrap();
+        assert_eq!(await_response(&mut rx, 5, 5, "r4").await.unwrap()["n"], 2);
+    }
+
+    /// #42: the person's Stop waiting (`cancel`) wakes the waiter with
+    /// StoppedWaiting, coded for the frontend.
+    #[tokio::test]
+    async fn stop_waiting_wakes_the_waiter() {
+        let state = crate::state::AppState::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.pending_responses.lock().await.insert("r7".into(), tx);
+        assert!(cancel(&state, "r7").await);
+        let err = await_response(&mut rx, 5, 5, "r7").await.unwrap_err();
+        assert!(matches!(err, OperationError::StoppedWaiting));
+        assert_eq!(err.code(), Some("stopped_waiting"));
+        assert!(!cancel(&state, "r7").await, "already gone");
+    }
+
+    /// Timeouts are told apart from stopping: no answer at all, and an
+    /// ack with no final answer.
+    #[tokio::test]
+    async fn timeouts_are_not_stopped_waiting() {
+        let (_tx, mut rx) = mpsc::unbounded_channel::<serde_json::Value>();
+        assert!(matches!(await_response(&mut rx, 0, 0, "r5").await, Err(OperationError::AckTimeout)));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(json!({"status": "pending_approval"})).unwrap();
+        assert!(matches!(await_response(&mut rx, 1, 0, "r6").await, Err(OperationError::ApprovalTimeout)));
+    }
 }
