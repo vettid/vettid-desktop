@@ -46,14 +46,19 @@ const WAIT_MARGIN: Duration = Duration::from_secs(15);
 /// The timeout for a request that doesn't wait.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The most one call may take, all attempts and waits included, except a
+/// collect (its wait plus [`WAIT_MARGIN`]): VM §8.1's 30 s for an
+/// interactive request. A retry that wouldn't fit is not started.
+const CALL_DEADLINE: Duration = Duration::from_secs(30);
+
 /// The most bytes read from an error body, a claim, and any other small
 /// answer (register, deposit, ack).
 const MAX_ERROR_BODY: usize = 4096;
 const MAX_CLAIM_BODY: usize = 1 << 20;
 const MAX_SMALL_BODY: usize = 64 << 10;
 
-/// The default `max_payload_bytes` (§6.2), and the most this client will
-/// accept as a relay's advertised value when sizing a collect.
+/// The default `max_payload_bytes` (§6.2): the least a collect is sized
+/// for, whatever the relay advertised (a missing or zero limit included).
 pub const DEFAULT_MAX_PAYLOAD: usize = 262_144;
 const MAX_PAYLOAD_CEILING: usize = 8 << 20;
 
@@ -68,9 +73,11 @@ const MAX_COLLECT_BODY: usize = 64 << 20;
 /// ends the attempts and is returned to the caller.
 const MAX_RETRY_AFTER_SECS: u64 = 60;
 
-/// One collected message's largest size: base64 grows by 4/3.
+/// One collected message's largest size: base64 grows by 4/3. The
+/// payload limit counts as at least the default, so a relay that leaves it
+/// out, or lowers it after storing larger messages, can't wedge collect.
 fn per_message(payload: usize) -> usize {
-    payload.min(MAX_PAYLOAD_CEILING).div_ceil(3) * 4 + PER_MESSAGE_OVERHEAD
+    payload.clamp(DEFAULT_MAX_PAYLOAD, MAX_PAYLOAD_CEILING).div_ceil(3) * 4 + PER_MESSAGE_OVERHEAD
 }
 
 /// `max` (1..=100), lowered so `max` messages fit [`MAX_COLLECT_BODY`].
@@ -96,10 +103,20 @@ pub enum RelayError {
         retry_after: Option<u64>,
         quota: Option<String>,
     },
-    /// The request didn't complete (network, TLS, timeout).
+    /// The relay couldn't be reached (DNS, TCP or the TLS handshake):
+    /// nothing was sent.
+    Connect,
+    /// The request was sent, or may have been, but no answer came (the
+    /// connection broke, or a timeout).
     Transport,
-    /// A response that isn't what the protocol says.
+    /// A response that isn't what the protocol says. Never retried: a
+    /// success status counts as the answer, even if its body is broken.
     Malformed,
+    /// A success answer larger than this client reads. For a collect, the
+    /// relay's limits may have risen since [`RelayClient::register`]:
+    /// register again and set [`RelayClient::max_payload_bytes`], or
+    /// collect with `max = 1`.
+    TooLarge,
     /// A base URL or an id this client refuses to put in a request.
     Invalid,
 }
@@ -120,19 +137,32 @@ impl RelayError {
     pub fn retryable(&self) -> bool {
         match self {
             Self::Relay { status, code, .. } => (*status == 429 && code == "rate_limited") || *status >= 500,
-            Self::Transport => true,
-            Self::Malformed | Self::Invalid => false,
+            Self::Connect | Self::Transport => true,
+            Self::Malformed | Self::TooLarge | Self::Invalid => false,
         }
     }
 
     /// Whether this one attempt may have reached the relay and been stored
-    /// before it failed: a transport failure, a `5xx`, or an answer that
-    /// isn't the protocol's.
+    /// before it failed: a transport failure, a `5xx`, or a success answer
+    /// that isn't the protocol's. Not a connection that never opened.
     fn may_have_stored(&self) -> bool {
         match self {
             Self::Relay { status, .. } => *status >= 500,
-            Self::Transport | Self::Malformed => true,
-            Self::Invalid => false,
+            Self::Transport | Self::Malformed | Self::TooLarge => true,
+            Self::Connect | Self::Invalid => false,
+        }
+    }
+
+    /// Classify a `reqwest` failure: a request that couldn't be built is
+    /// ours (`Invalid`), a connection that never opened sent nothing
+    /// (`Connect`), anything else may have reached the relay.
+    fn from_reqwest(e: &reqwest::Error) -> Self {
+        if e.is_builder() {
+            Self::Invalid
+        } else if e.is_connect() {
+            Self::Connect
+        } else {
+            Self::Transport
         }
     }
 }
@@ -187,8 +217,10 @@ impl std::fmt::Display for RelayError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Relay { status, code, .. } => write!(f, "relay: {status} {code}"),
+            Self::Connect => f.write_str("relay: could not connect"),
             Self::Transport => f.write_str("relay: the request did not complete"),
             Self::Malformed => f.write_str("relay: malformed response"),
+            Self::TooLarge => f.write_str("relay: response too large"),
             Self::Invalid => f.write_str("relay: invalid request"),
         }
     }
@@ -220,8 +252,9 @@ fn parse_error(status: u16, body: &[u8]) -> RelayError {
 }
 
 /// The relay's advertised limits (§6.1). Members this client doesn't know
-/// are ignored.
+/// are ignored; a missing one is 0 (unknown).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(default)]
 pub struct Limits {
     pub max_payload_bytes: u64,
     pub message_ttl_seconds: u64,
@@ -299,6 +332,8 @@ struct Request<'a> {
     limit: usize,
     /// The success statuses this call accepts.
     expect: &'static [u16],
+    /// The most the whole call may take, retries included.
+    deadline: Duration,
 }
 
 /// A client for one relay key (the desktop's mailbox).
@@ -309,8 +344,8 @@ pub struct RelayClient {
     /// Attempts for retryable failures (at least 1).
     pub max_attempts: u32,
     /// The relay's `max_payload_bytes` (from [`Registration::limits`]),
-    /// which sizes the cap on a collect answer. Values above 8 MiB are
-    /// treated as 8 MiB.
+    /// which sizes the cap on a collect answer. Values below the default
+    /// (0 included) count as the default, values above 8 MiB as 8 MiB.
     pub max_payload_bytes: usize,
 }
 
@@ -358,6 +393,7 @@ impl RelayClient {
                 timeout: REQUEST_TIMEOUT,
                 limit: MAX_SMALL_BODY,
                 expect: &[200, 201],
+                deadline: CALL_DEADLINE,
             })
             .await?;
         let w: Wire = serde_json::from_slice(&bytes).map_err(|_| RelayError::Malformed)?;
@@ -392,6 +428,7 @@ impl RelayClient {
                 timeout: REQUEST_TIMEOUT,
                 limit: MAX_SMALL_BODY,
                 expect: &[201],
+                deadline: CALL_DEADLINE,
             })
             .await
             .map_err(|f| {
@@ -428,6 +465,7 @@ impl RelayClient {
                 timeout: Duration::from_secs(wait) + WAIT_MARGIN,
                 limit: collect_limit(max, self.max_payload_bytes),
                 expect: &[200],
+                deadline: Duration::from_secs(wait) + WAIT_MARGIN,
             })
             .await?;
         let w: Wire = serde_json::from_slice(&bytes).map_err(|_| RelayError::Malformed)?;
@@ -460,6 +498,7 @@ impl RelayClient {
             timeout: REQUEST_TIMEOUT,
             limit: MAX_SMALL_BODY,
             expect: &[204],
+            deadline: CALL_DEADLINE,
         })
         .await
         .map(|_| ())
@@ -474,20 +513,24 @@ impl RelayClient {
             return Err(RelayError::Invalid);
         }
         let url = format!("{}/v1/claim/{claim_id}", self.base_url);
-        let resp = self.http.get(url).timeout(REQUEST_TIMEOUT).send().await.map_err(|_| RelayError::Transport)?;
+        let resp = self.http.get(url).timeout(REQUEST_TIMEOUT).send().await.map_err(|e| RelayError::from_reqwest(&e))?;
         let (_, bytes) = read_response(resp, MAX_CLAIM_BODY, &[200]).await?;
         Ok(bytes)
     }
 
     /// Send `r`, retrying retryable failures (§7.2), each attempt signed
-    /// afresh. The failure records whether any attempt may have been
+    /// afresh, within `r.deadline`: each attempt's timeout is cut to the
+    /// time left, and a retry whose wait wouldn't leave any is not
+    /// started. The failure records whether any attempt may have been
     /// stored, not only the last.
     async fn send(&self, r: Request<'_>) -> Result<(u16, Vec<u8>), Failure> {
         let attempts = self.max_attempts.max(1);
+        let deadline = tokio::time::Instant::now() + r.deadline;
         let mut may_have_stored = false;
         let mut attempt = 0;
         loop {
-            let error = match self.once(&r).await {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let error = match self.once(&r, r.timeout.min(left)).await {
                 Ok(ok) => return Ok(ok),
                 Err(e) => e,
             };
@@ -498,6 +541,8 @@ impl RelayClient {
                 e if e.retryable() && attempt < attempts => Some(retry_delay(attempt, e)),
                 _ => None,
             };
+            // A retry must start with time to spare (1 s) before the deadline.
+            let wait = wait.filter(|d| tokio::time::Instant::now() + *d + Duration::from_secs(1) < deadline);
             match wait {
                 Some(d) => tokio::time::sleep(d).await,
                 None => return Err(Failure { error, may_have_stored }),
@@ -505,7 +550,7 @@ impl RelayClient {
         }
     }
 
-    async fn once(&self, r: &Request<'_>) -> Result<(u16, Vec<u8>), RelayError> {
+    async fn once(&self, r: &Request<'_>, timeout: Duration) -> Result<(u16, Vec<u8>), RelayError> {
         let mut url = format!("{}{}", self.base_url, r.path);
         if let Some(q) = &r.query {
             url.push('?');
@@ -513,17 +558,21 @@ impl RelayClient {
         }
         let body = r.body.clone().unwrap_or_default();
         let signed = SignedHeaders::new(&self.key, r.method.as_str(), &r.path, &body, chrono::Utc::now());
-        let mut req = self.http.request(r.method.clone(), url).timeout(r.timeout);
+        let mut req = self.http.request(r.method.clone(), url).timeout(timeout);
         for (name, value) in signed.pairs() {
             req = req.header(name, value);
         }
         if let Some(token) = r.token {
-            req = req.header(reqwest::header::AUTHORIZATION, format!("VettID-Deposit {}", token.as_str()));
+            // Sensitive: kept out of reqwest's and http's Debug output.
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("VettID-Deposit {}", token.as_str()))
+                .map_err(|_| RelayError::Invalid)?;
+            value.set_sensitive(true);
+            req = req.header(reqwest::header::AUTHORIZATION, value);
         }
         if r.body.is_some() {
             req = req.header(reqwest::header::CONTENT_TYPE, "application/json").body(body);
         }
-        let resp = req.send().await.map_err(|_| RelayError::Transport)?;
+        let resp = req.send().await.map_err(|e| RelayError::from_reqwest(&e))?;
         read_response(resp, r.limit, r.expect).await
     }
 }
@@ -544,9 +593,11 @@ async fn read_capped(resp: &mut reqwest::Response, limit: usize) -> Result<Optio
     Ok(Some(out))
 }
 
-/// Read a response: a success's body (an `expect`ed status, up to `limit`
-/// bytes, else `Malformed`), or the error body of §7.1 (up to 4 KiB; a
-/// longer, cut-off or unparsable one gives the code `http_<status>`).
+/// Read a response: a success's body (an `expect`ed status, else
+/// `Malformed`; up to `limit` bytes, else `TooLarge`; a body that breaks
+/// off is `Malformed`, not retried), or the error body of §7.1 (up to
+/// 4 KiB; a longer, cut-off or unparsable one gives the code
+/// `http_<status>`).
 async fn read_response(mut resp: reqwest::Response, limit: usize, expect: &[u16]) -> Result<(u16, Vec<u8>), RelayError> {
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -558,7 +609,9 @@ async fn read_response(mut resp: reqwest::Response, limit: usize, expect: &[u16]
     if !expect.contains(&status) {
         return Err(RelayError::Malformed);
     }
-    let bytes = read_capped(&mut resp, limit).await?.ok_or(RelayError::Malformed)?;
+    // The status is the relay's answer: a broken body after it is not a
+    // transport failure to retry (a deposit was stored).
+    let bytes = read_capped(&mut resp, limit).await.map_err(|_| RelayError::Malformed)?.ok_or(RelayError::TooLarge)?;
     Ok((status, bytes))
 }
 
@@ -929,7 +982,7 @@ mod tests {
     async fn oversized_answers_are_refused() {
         let big = "a".repeat(MAX_CLAIM_BODY + 1);
         let (base, _) = stub(vec![(200, big.as_str())]);
-        assert_eq!(client(&base).get_claim("gr2q7gf5lh6pzfdnurnkvputhp").await.unwrap_err(), RelayError::Malformed);
+        assert_eq!(client(&base).get_claim("gr2q7gf5lh6pzfdnurnkvputhp").await.unwrap_err(), RelayError::TooLarge);
 
         // The same with no Content-Length (chunked): the cap holds while
         // reading.
@@ -940,13 +993,11 @@ mod tests {
         }
         raw.push_str("0\r\n\r\n");
         let (base, _) = stub(vec![(0, raw.as_str())]);
-        assert_eq!(client(&base).get_claim("gr2q7gf5lh6pzfdnurnkvputhp").await.unwrap_err(), RelayError::Malformed);
+        assert_eq!(client(&base).get_claim("gr2q7gf5lh6pzfdnurnkvputhp").await.unwrap_err(), RelayError::TooLarge);
 
-        let body = format!(r#"{{"messages":[],"pad":"{}"}}"#, "x".repeat(collect_limit(1, 30)));
+        let body = format!(r#"{{"messages":[],"pad":"{}"}}"#, "x".repeat(collect_limit(1, 0)));
         let (base, _) = stub(vec![(200, body.as_str())]);
-        let mut c = client(&base);
-        c.max_payload_bytes = 30;
-        assert_eq!(c.collect(0, 1).await.unwrap_err(), RelayError::Malformed);
+        assert_eq!(client(&base).collect(0, 1).await.unwrap_err(), RelayError::TooLarge);
 
         let long_err = format!(r#"{{"code":"bad_request","message":"{}"}}"#, "m".repeat(MAX_ERROR_BODY));
         let (base, _) = stub(vec![(400, long_err.as_str())]);
@@ -967,6 +1018,67 @@ mod tests {
         }
         assert_eq!(collect_max(100, MAX_PAYLOAD_CEILING), 5);
         assert_eq!(collect_max(0, DEFAULT_MAX_PAYLOAD), 1);
+        // A missing (0) or small limit sizes for the default, so a normal
+        // message never wedges collect.
+        assert_eq!(collect_limit(1, 0), collect_limit(1, DEFAULT_MAX_PAYLOAD));
+        assert_eq!(collect_limit(1, 30), collect_limit(1, DEFAULT_MAX_PAYLOAD));
+    }
+
+    /// A registration whose limits leave members out (or leave limits out)
+    /// still parses; missing members are 0.
+    #[tokio::test]
+    async fn partial_limits_parse() {
+        let mailbox = auth::mailbox_id(&sender().verifying_key());
+        for limits in [r#","limits":{"max_payload_bytes":1000}"#, ""] {
+            let body = format!(r#"{{"mailbox_id":"{mailbox}"{limits}}}"#);
+            let (base, _) = stub(vec![(200, body.as_str())]);
+            let reg = client(&base).register().await.unwrap();
+            assert!(!reg.created);
+            assert_eq!(reg.limits.message_ttl_seconds, 0);
+        }
+    }
+
+    /// A connection that never opens sent nothing: retryable, not
+    /// possibly delivered. A request that can't be built is Invalid.
+    #[tokio::test]
+    async fn unreachable_and_unbuildable_requests_are_not_unconfirmed() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut c = client(&format!("http://127.0.0.1:{port}"));
+        c.max_attempts = 1;
+        let token = Token::from_received("v4.public.t".into());
+        let err = c.deposit("gr2q7gf5lh6pzfdnurnkvputhp", &token, b"x").await.unwrap_err();
+        assert_eq!(err.error, RelayError::Connect);
+        assert!(err.error.retryable() && !err.possibly_delivered);
+
+        let (base, seen) = stub(vec![(201, "{}")]);
+        let bad = Token::from_received("v4.public.a\nb".into());
+        let err = client(&base).deposit("gr2q7gf5lh6pzfdnurnkvputhp", &bad, b"x").await.unwrap_err();
+        assert_eq!(err, DepositError { error: RelayError::Invalid, possibly_delivered: false });
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// A 201 whose body breaks off is the relay's answer: not retried, and
+    /// the deposit is unconfirmed.
+    #[tokio::test]
+    async fn a_broken_success_body_is_not_retried() {
+        let raw = "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"msg";
+        let (base, seen) = stub(vec![(0, raw), (201, r#"{"msg_id":"01JXAMPE00000000000000000A"}"#)]);
+        let token = Token::from_received("v4.public.t".into());
+        let err = client(&base).deposit("gr2q7gf5lh6pzfdnurnkvputhp", &token, b"x").await.unwrap_err();
+        assert_eq!(err, DepositError { error: RelayError::Malformed, possibly_delivered: true });
+        assert_eq!(seen.lock().unwrap().len(), 1, "not retried");
+    }
+
+    /// A retry that wouldn't fit the call's 30 s isn't started.
+    #[tokio::test]
+    async fn retries_stay_within_the_deadline() {
+        let (base, seen) = stub(vec![(429, r#"{"code":"rate_limited","retry_after":45}"#), (204, "")]);
+        let c = client(&base);
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(5), c.ack(MSG_ID)).await.expect("no wait past the deadline").unwrap_err();
+        assert_eq!(err.code(), Some("rate_limited"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     /// More messages than asked for is Malformed.
