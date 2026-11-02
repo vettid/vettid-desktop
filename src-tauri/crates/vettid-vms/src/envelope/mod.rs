@@ -103,6 +103,8 @@ pub enum EnvelopeError {
     ClockPast,
     /// `exp` has passed.
     Expired,
+    /// An ephemeral message without `exp` (§5.3 requires it).
+    NoExpiry,
 }
 
 impl std::fmt::Display for EnvelopeError {
@@ -123,6 +125,7 @@ impl std::fmt::Display for EnvelopeError {
             Self::ClockFuture => f.write_str("envelope: timestamp too far in the future"),
             Self::ClockPast => f.write_str("envelope: timestamp too old"),
             Self::Expired => f.write_str("envelope: message expired"),
+            Self::NoExpiry => f.write_str("envelope: ephemeral message without exp"),
         }
     }
 }

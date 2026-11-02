@@ -224,6 +224,11 @@ mod tests {
         assert_eq!(open_session(&e, &[0; 32]).unwrap_err(), EnvelopeError::WrongMode);
         let s = Envelope::parse(&seal_session(&[1; 32], Kid([1; 8]), Kid([2; 8]), &padded).unwrap()).unwrap();
         assert_eq!(open_sealed(&s, &sk).unwrap_err(), EnvelopeError::WrongMode);
+        // A recipient kid that isn't the key's is refused before any
+        // decryption.
+        let mut wrong_kid = env.clone();
+        wrong_kid[12] ^= 1;
+        assert_eq!(open_sealed(&Envelope::parse(&wrong_kid).unwrap(), &sk).unwrap_err(), EnvelopeError::Kid);
         // A tampered header fails to open.
         let mut bad = env.clone();
         bad[5] ^= 1;

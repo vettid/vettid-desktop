@@ -152,7 +152,7 @@ impl Inner {
     /// session mode, and must be absent in sealed mode.
     pub fn marshal(&self, mode: Mode) -> Result<String, EnvelopeError> {
         self.validate(mode)?;
-        let body = if self.body.trim().is_empty() {
+        let body = if self.body.is_empty() {
             "{}".to_string()
         } else {
             strict_json::compact_object(&self.body, 2).map_err(|_| EnvelopeError::Inner)?
@@ -172,7 +172,8 @@ impl Inner {
                 Status::Ok => b = b.string("status", "ok"),
                 Status::Error { code, message } => {
                     let mut e = Builder::new().string("code", code);
-                    if let Some(m) = message {
+                    // An empty message is left out, as the vault writes it.
+                    if let Some(m) = message.as_deref().filter(|m| !m.is_empty()) {
                         e = e.string("message", m);
                     }
                     b = b.string("status", "error").raw("error", &e.finish());
@@ -219,9 +220,13 @@ impl Inner {
     }
 
     /// The freshness rules (§8.4, §5.3): `ts` at most 5 minutes in the
-    /// future; for durable types at most 16 days in the past; and `exp`
-    /// not passed.
+    /// future; for durable types at most 16 days in the past; for
+    /// ephemeral types `exp` present (§5.3 requires it, and it is their
+    /// only staleness bound, §8.5); and `exp` not passed.
     pub fn check_time(&self, now: DateTime<Utc>, durable: bool) -> Result<(), EnvelopeError> {
+        if !durable && self.exp.is_none() {
+            return Err(EnvelopeError::NoExpiry);
+        }
         if self.ts - now > MAX_CLOCK_SKEW_FUTURE {
             return Err(EnvelopeError::ClockFuture);
         }
@@ -336,6 +341,13 @@ mod tests {
             ("high at the end", swap(r#""body":{}"#, r#""body":{"a":"x\ud800"}"#)),
             ("lone low", swap(r#""body":{}"#, r#""body":{"a":"\udc00"}"#)),
             ("low after a pair", swap(r#""body":{}"#, r#""body":{"a":"\ud83d\ude00\udc00"}"#)),
+            ("re not a ulid", swap(r#","body""#, r#","re":"x","status":"ok","body""#)),
+            ("bad exp", swap(r#","body""#, r#","exp":"2026-10-01T12:00:00Z","body""#)),
+            ("error null", swap(r#","body""#, &format!(r#","re":"{RE}","status":"error","error":null,"body""#))),
+            ("error string", swap(r#","body""#, &format!(r#","re":"{RE}","status":"error","error":"x","body""#))),
+            ("message not a string", swap(r#","body""#, &format!(r#","re":"{RE}","status":"error","error":{{"code":"x","message":1}},"body""#))),
+            ("message too long", swap(r#","body""#, &format!(r#","re":"{RE}","status":"error","error":{{"code":"x","message":"{}"}},"body""#, "m".repeat(1025)))),
+            ("empty status", swap(r#","body""#, &format!(r#","re":"{RE}","status":"","body""#))),
             ("too deep", swap(r#""body":{}"#, &format!(r#""body":{}{}"#, "{\"a\":".repeat(31) + "{", "}".repeat(32)))),
         ];
         for (why, text) in cases {
@@ -348,8 +360,16 @@ mod tests {
         assert!(Inner::parse(deep.as_bytes(), Mode::Sealed).is_ok());
         // Session mode needs seq ≥ 1.
         assert_eq!(Inner::parse(SPEC_INNER.as_bytes(), Mode::Session).unwrap_err(), EnvelopeError::Inner);
-        let zero = swap(r#","body""#, r#","seq":0,"body""#);
-        assert_eq!(Inner::parse(zero.as_bytes(), Mode::Session).unwrap_err(), EnvelopeError::Inner);
+        for seq in ["0", "9007199254740992", r#""1""#, "1.0", "-1"] {
+            let t = swap(r#","body""#, &format!(r#","seq":{seq},"body""#));
+            assert_eq!(Inner::parse(t.as_bytes(), Mode::Session).unwrap_err(), EnvelopeError::Inner, "seq {seq}");
+        }
+        let max = swap(r#","body""#, r#","seq":9007199254740991,"body""#);
+        assert_eq!(Inner::parse(max.as_bytes(), Mode::Session).unwrap().seq, Some(9_007_199_254_740_991));
+        // A zero exp is a time long past: expired, never "no expiry".
+        let zero_exp = swap(r#","body""#, r#","exp":"0001-01-01T00:00:00.000Z","body""#);
+        let z = Inner::parse(zero_exp.as_bytes(), Mode::Sealed).unwrap();
+        assert_eq!(z.check_time(z.ts, true), Err(EnvelopeError::Expired));
     }
 
     #[test]
@@ -365,6 +385,14 @@ mod tests {
         assert_eq!(i.marshal(Mode::Sealed).unwrap_err(), EnvelopeError::Inner);
         i.body = String::new();
         assert!(i.marshal(Mode::Sealed).unwrap().ends_with(r#""body":{}}"#));
+        // Only an empty string means {}: Unicode or JSON whitespace isn't a body.
+        for ws in [char::from_u32(0x3000).unwrap().to_string(), char::from_u32(0xa0).unwrap().to_string(), " ".to_string()] {
+            i.body = ws.clone();
+            assert_eq!(i.marshal(Mode::Sealed).unwrap_err(), EnvelopeError::Inner, "{ws:?}");
+        }
+        let mut empty = ping();
+        empty.response = Some(Response { re: RE.into(), status: Status::Error { code: "x".into(), message: Some(String::new()) } });
+        assert!(empty.marshal(Mode::Sealed).unwrap().contains(r#""error":{"code":"x"}"#), "an empty message is left out");
         i.kind = "Bad".into();
         assert_eq!(i.marshal(Mode::Sealed).unwrap_err(), EnvelopeError::Inner);
         let mut r = ping();
@@ -391,6 +419,8 @@ mod tests {
         assert_eq!(i.check_time(now - TimeDelta::minutes(5) - TimeDelta::milliseconds(1), true), Err(EnvelopeError::ClockFuture));
         assert_eq!(i.check_time(now + TimeDelta::days(16), true), Ok(()));
         assert_eq!(i.check_time(now + TimeDelta::days(16) + TimeDelta::milliseconds(1), true), Err(EnvelopeError::ClockPast));
+        assert_eq!(i.check_time(now, false), Err(EnvelopeError::NoExpiry), "ephemeral types need exp");
+        i.exp = Some(now + TimeDelta::days(18));
         assert_eq!(i.check_time(now + TimeDelta::days(17), false), Ok(()), "ephemeral types have no age limit");
         i.exp = Some(now + TimeDelta::seconds(10));
         assert_eq!(i.check_time(now + TimeDelta::seconds(10), false), Ok(()));

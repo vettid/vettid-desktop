@@ -613,6 +613,9 @@ mod tests {
         assert_eq!(o.get("c"), Some(r#"[true,false,null,-1.5e+3,{}]"#));
         // Noncharacters are accepted (I-JSON's rule on them isn't adopted).
         assert!(parse_object(br#"{"a":"\ufdd0\uffff\ud83f\udffe"}"#).is_ok());
+        // Raw (unescaped) U+2028 and noncharacters are accepted too.
+        let raw: String = [0x2028u32, 0xfdd0, 0xffff].iter().map(|c| char::from_u32(*c).unwrap()).collect();
+        assert!(parse_object(format!(r#"{{"a":"{raw}"}}"#).as_bytes()).is_ok());
         // Duplicate-looking names that differ in case are distinct.
         assert!(parse_object(br#"{"a":1,"A":2}"#).is_ok());
     }
@@ -634,6 +637,7 @@ mod tests {
             ("high at the end", r#"{"a":"x\ud800"}"#, JsonError::Surrogate),
             ("high then char", r#"{"a":"\ud800x"}"#, JsonError::Surrogate),
             ("lone low", r#"{"a":"\udc00"}"#, JsonError::Surrogate),
+            ("high then high", r#"{"a":"\ud800\ud800"}"#, JsonError::Surrogate),
             ("low after a pair", r#"{"a":"\ud83d\ude00\ude00"}"#, JsonError::Surrogate),
             ("surrogate in a name", r#"{"\ud800":1}"#, JsonError::Surrogate),
             ("surrogate deep", r#"{"a":[[{"b":"\udfff"}]]}"#, JsonError::Surrogate),
