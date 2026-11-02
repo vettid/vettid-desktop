@@ -441,22 +441,7 @@ impl Drop for HeldParent {
 }
 
 fn hold_parent(parent: &Path, user: &[u8]) -> Result<HeldParent, AclError> {
-    let parent_w = wide_path(parent);
-    // SAFETY: as in hold_folder.
-    let handle = unsafe {
-        CreateFileW(
-            parent_w.as_ptr(),
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
-        return Err(failed(format!("open parent folder: error {}", last_error())));
-    }
+    let handle = open_folder_held(parent).map_err(|err| failed(format!("open parent folder: error {}", err)))?;
     let mut held = HeldParent { handle, final_path: String::new() };
     let info = handle_info(held.handle)?;
     if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -650,28 +635,47 @@ impl Drop for HeldFolder {
     }
 }
 
-fn hold_folder(dir: &Path, user: &[u8]) -> Result<HeldFolder, AclError> {
+/// Open a folder to hold it: no link followed, data access, and no
+/// FILE_SHARE_DELETE, so it can't be renamed while held. Another program
+/// (a backup or antivirus scanner) that has it open with delete access for
+/// a moment makes this fail with a sharing violation, so that is retried a
+/// few times (#37 review). Returns the Win32 error otherwise.
+fn open_folder_held(dir: &Path) -> Result<HANDLE, u32> {
+    const ERROR_SHARING_VIOLATION: u32 = 32;
+    const ATTEMPTS: u32 = 5;
     let dir_w = wide_path(dir);
-    // SAFETY: `dir_w` is NUL-terminated. FILE_FLAG_BACKUP_SEMANTICS is
-    // needed to open a directory; FILE_FLAG_OPEN_REPARSE_POINT opens a link
-    // itself. No FILE_SHARE_DELETE: the folder can't be renamed while held.
-    let handle = unsafe {
-        CreateFileW(
-            dir_w.as_ptr(),
-            // FILE_LIST_DIRECTORY is data access: share modes are only
-            // enforced against handles that have some, so it is what makes
-            // the missing FILE_SHARE_DELETE stop a rename.
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
-        return Err(failed(format!("open folder: error {}", last_error())));
+    for attempt in 1..=ATTEMPTS {
+        // SAFETY: `dir_w` is NUL-terminated. FILE_FLAG_BACKUP_SEMANTICS is
+        // needed to open a directory; FILE_FLAG_OPEN_REPARSE_POINT opens a
+        // link itself.
+        let handle = unsafe {
+            CreateFileW(
+                dir_w.as_ptr(),
+                // FILE_LIST_DIRECTORY is data access: share modes are only
+                // enforced against handles that have some, so it is what
+                // makes the missing FILE_SHARE_DELETE stop a rename.
+                FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE && !handle.is_null() {
+            return Ok(handle);
+        }
+        let err = last_error();
+        if err != ERROR_SHARING_VIOLATION || attempt == ATTEMPTS {
+            return Err(err);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt)));
     }
+    unreachable!("the loop returns")
+}
+
+fn hold_folder(dir: &Path, user: &[u8]) -> Result<HeldFolder, AclError> {
+    let handle = open_folder_held(dir).map_err(|err| failed(format!("open folder: error {}", err)))?;
     // Owns the handle from here on, so every early return closes it once.
     let mut held = HeldFolder { handle, final_path: String::new() };
     let info = handle_info(held.handle)?;
@@ -1398,6 +1402,28 @@ mod tests {
         for (sddl, want, what) in cases {
             assert_eq!(judge_parent_sddl(&sddl), want, "{what}: {sddl}");
         }
+    }
+
+    /// A folder another program holds open with delete access only for a
+    /// moment is retried, not refused.
+    #[test]
+    fn a_folder_held_briefly_by_another_program_is_retried() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        ensure_private_dir(&dir).unwrap();
+        let busy = std::fs::OpenOptions::new()
+            .access_mode(DELETE | FILE_LIST_DIRECTORY)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | 0x4)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&dir)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            drop(busy);
+        });
+        write_private_file(&dir, "connection.enc", b"x").expect("retried until released");
+        release.join().unwrap();
     }
 
     /// #21: a parent that is a junction is refused, and so is a pairing

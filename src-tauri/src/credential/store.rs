@@ -112,6 +112,12 @@ pub const SESSION_NOT_RECORDED_NOTICE: &str =
 pub const PARENT_NOT_PRIVATE_NOTICE: &str =
     "The folder this desktop keeps its pairing in is inside a folder (your local app data) that another account on this computer can change, so nothing was saved. Whoever manages this computer needs to fix that folder's permissions.";
 
+/// Windows: shown when `%LOCALAPPDATA%` itself is a symlink or junction
+/// (#21), e.g. moved to another drive with `mklink /J`. It could be
+/// pointed elsewhere after the check, so nothing is kept there.
+pub const PARENT_IS_LINK_NOTICE: &str =
+    "This desktop can't keep its pairing on this computer because your local app data folder is a link to another place, so nothing was saved.";
+
 /// Shown when the per-user folder for the pairing can't be found.
 pub const NO_CONFIG_DIR_NOTICE: &str =
     "This desktop can't find your user folder, so it can't keep a pairing on this computer. Nothing was saved.";
@@ -190,6 +196,9 @@ pub enum CredentialError {
     /// account change what is in it (#21). Nothing was changed. Displays
     /// [`PARENT_NOT_PRIVATE_NOTICE`].
     ParentNotPrivate,
+    /// Windows: `%LOCALAPPDATA%` is a symlink or junction (#21). Nothing
+    /// was changed. Displays [`PARENT_IS_LINK_NOTICE`].
+    ParentIsLink,
     /// This computer has no usable machine id, which the saved pairing is
     /// bound to (#14). Nothing was saved or opened. Displays
     /// [`NO_MACHINE_ID_NOTICE`].
@@ -220,6 +229,7 @@ impl fmt::Display for CredentialError {
             CredentialError::NoConfigDir => f.write_str(NO_CONFIG_DIR_NOTICE),
             CredentialError::NoMachineId => f.write_str(NO_MACHINE_ID_NOTICE),
             CredentialError::ParentNotPrivate => f.write_str(PARENT_NOT_PRIVATE_NOTICE),
+            CredentialError::ParentIsLink => f.write_str(PARENT_IS_LINK_NOTICE),
             CredentialError::NotPrivate => f.write_str(NOT_PRIVATE_NOTICE),
         }
     }
@@ -454,9 +464,10 @@ fn unix_folder_check(config_dir: &Path) -> Result<(), FolderCheck> {
 /// private. Both leave it unchanged.
 #[cfg(windows)]
 fn acl_error(path: &Path, e: super::winacl::AclError) -> CredentialError {
-    use super::winacl::AclError;
+    use super::winacl::{AclError, NotPrivate};
     log::error!("Credential store: {} {}; refusing to use it", path.display(), e);
     match e {
+        AclError::NotPrivate(NotPrivate::ParentLink) => CredentialError::ParentIsLink,
         AclError::NotPrivate(why) if why.is_about_the_parent() => CredentialError::ParentNotPrivate,
         AclError::NotPrivate(_) => CredentialError::NotPrivate,
         AclError::Failed(what) => CredentialError::IoError(format!("folder or file permissions: {}", what)),

@@ -28,6 +28,9 @@ pub enum RegistrationError {
     /// change what is in it (see `CredentialError::ParentNotPrivate`).
     /// Displays the plain notice.
     ParentNotPrivate,
+    /// `%LOCALAPPDATA%` is a link (see `CredentialError::ParentIsLink`).
+    /// Displays the plain notice.
+    ParentIsLink,
     /// This computer has no machine id to bind the pairing to (see
     /// `CredentialError::NoMachineId`). Displays the plain notice.
     NoMachineId,
@@ -54,6 +57,7 @@ impl fmt::Display for RegistrationError {
             }
             Self::NotPrivate => f.write_str(crate::credential::store::NOT_PRIVATE_NOTICE),
             Self::ParentNotPrivate => f.write_str(crate::credential::store::PARENT_NOT_PRIVATE_NOTICE),
+            Self::ParentIsLink => f.write_str(crate::credential::store::PARENT_IS_LINK_NOTICE),
             Self::NoMachineId => f.write_str(crate::credential::store::NO_MACHINE_ID_NOTICE),
             Self::SessionNotRecorded => {
                 f.write_str(crate::credential::store::SESSION_NOT_RECORDED_NOTICE)
