@@ -11,6 +11,7 @@ those files are authoritative: this crate must reproduce them byte for byte.
 | `hpke.json` | `df79ca9fbc4b5cb8f3d08c17285c819e71b5fc07` (2026-10-02) | `08fa20d793577a27196f37e9fe5f5222bbcd90e5adabc015679be3d98b47b226` |
 | `envelope_session.json` | `df79ca9fbc4b5cb8f3d08c17285c819e71b5fc07` (2026-10-02) | `8cbf6324c294e6c99011bd3bd5f875fcd329cbe7be1e354b7be06f3c03044827` |
 | `handshake.json` | `19c03153e2ecda009f449cb26d13929f34085783` (2026-10-04) | `9b69503b507fd117ab3d6a66368cb60bb24e09286867921a6f473fb476fb0577` |
+| `invite.json` | `df79ca9fbc4b5cb8f3d08c17285c819e71b5fc07` (2026-10-02) | `6d7be9ba65f8426070ee54f0ea6ed84fed1e49c54eb31e09a1e177d3d5286d2f` |
 | `envelope_sealed.json` | `df79ca9fbc4b5cb8f3d08c17285c819e71b5fc07` (2026-10-02) | `3ab4f20eebb3ec621e97d3b03705c8b3851312e99e227d423e8f0e6066887360` |
 
 Copied on 2026-11-02 with `git show origin/main:testdata/vectors/<file>`
