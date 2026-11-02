@@ -9,6 +9,8 @@ those files are authoritative: this crate must reproduce them byte for byte.
 |---|---|---|
 | `keys.json` | `7eb063767ad7dfd5dc4128ba1e90b3a71fc514b6` (2026-10-07) | `568c65595189051a6297653511acb27c88fed17257b985af070342d5bfc1660e` |
 | `hpke.json` | `df79ca9fbc4b5cb8f3d08c17285c819e71b5fc07` (2026-10-02) | `08fa20d793577a27196f37e9fe5f5222bbcd90e5adabc015679be3d98b47b226` |
+| `envelope_session.json` | `df79ca9fbc4b5cb8f3d08c17285c819e71b5fc07` (2026-10-02) | `8cbf6324c294e6c99011bd3bd5f875fcd329cbe7be1e354b7be06f3c03044827` |
+| `envelope_sealed.json` | `df79ca9fbc4b5cb8f3d08c17285c819e71b5fc07` (2026-10-02) | `3ab4f20eebb3ec621e97d3b03705c8b3851312e99e227d423e8f0e6066887360` |
 
 Copied on 2026-11-02 with `git show origin/main:testdata/vectors/<file>`
 (not from a working tree, whose line endings may differ). To update: copy
