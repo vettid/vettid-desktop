@@ -1048,6 +1048,12 @@ async fn end_session_on_disk(
     // from the on-disk session_expires_at, so leaving it set meant a
     // relaunch reloaded a dead session: the desktop routed straight to
     // the vault and every op hung because the vault no longer had it.
+    // #15: not if loading it above found a pairing that can't be opened:
+    // there is nothing to clear, and an earlier build's file that couldn't
+    // be deleted would only be revoked again.
+    if pairing_notice.is_some() {
+        return end_session_notice(pairing_notice, marker_removed, cleared_saved);
+    }
     match pairing::load_saved(&config_dir).await {
         Ok((mut creds, _)) => {
             creds.session_id.clear();
