@@ -1521,6 +1521,29 @@ mod tests {
         assert_eq!(fs::read(config_dir.join(SESSION_LIVE_FILE)).unwrap(), marker);
     }
 
+    /// Windows (#21): a parent that is a junction gives the link notice,
+    /// not the "another account" one, and nothing is created through it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_a_linked_parent_gives_the_link_notice() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = base.path().join("local");
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .expect("mklink");
+        assert!(out.status.success(), "mklink /J failed");
+        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+        let err = save_with(&keys, &link.join("vettid-desktop"), &sample_creds()).err().expect("refused");
+        assert!(matches!(err, CredentialError::ParentIsLink), "got {err}");
+        assert_eq!(err.to_string(), PARENT_IS_LINK_NOTICE);
+        assert!(!real.join("vettid-desktop").exists());
+    }
+
     /// Windows (#26): the case from the issue. The folder becomes shared,
     /// so the save that clears the session is refused, but ending the
     /// session still removes the marker, and the session isn't reloaded
