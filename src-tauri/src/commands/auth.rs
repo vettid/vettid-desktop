@@ -529,6 +529,9 @@ pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<Unlock
     // the reset is stopped too. This lock may also clear an unlock or a
     // pairing running alongside; that errs locked.
     if overtaken_by_reset(&state, reset_mark_at_start) {
+        // Logged, so a reset that never finished (it would block every
+        // unlock until restart) can be told apart.
+        log::warn!("unlock: a lock, End session or vault end overlapped this unlock; staying locked");
         lock_memory(&state).await;
         return Ok(UnlockResponse {
             unlocked: false,
@@ -1426,6 +1429,43 @@ mod tests {
         end_session_from_vault_if_current(&state, true, "new").await;
         assert!(state.credentials.read().await.is_none());
         assert!(state.connection_key.read().await.is_none());
+    }
+
+    /// #43, M2 race: the vault end waits for `session_op` (held here, as
+    /// Start New Session does); meanwhile a new session is installed. When
+    /// the end gets the lock, its session is gone, and it changes nothing.
+    #[tokio::test]
+    async fn a_vault_end_overtaken_by_a_new_session_changes_nothing() {
+        use std::sync::Arc;
+        let state = Arc::new(AppState::new());
+        let creds = |id: &str| crate::credential::store::ConnectionCredentials {
+            connection_id: "conn".into(),
+            connection_key: vec![7u8; 32],
+            key_id: "key".into(),
+            device_private_key: vec![1u8; 32],
+            device_public_key: vec![2u8; 32],
+            vault_public_key: vec![3u8; 32],
+            message_space_token: "token".into(),
+            message_space_url: "tls://example.invalid:443".into(),
+            owner_guid: "owner".into(),
+            owner_name: String::new(),
+            session_id: id.into(),
+            session_expires_at: 1_900_000_000,
+            session_duration_seconds: 3600,
+        };
+        *state.credentials.write().await = Some(creds("old"));
+        let session_op = state.session_op.lock().await;
+        let end = {
+            let state = state.clone();
+            tokio::spawn(async move { end_session_from_vault_if_current(&state, false, "old").await })
+        };
+        tokio::task::yield_now().await;
+        *state.credentials.write().await = Some(creds("new"));
+        *state.connection_key.write().await = Some([7u8; 32]);
+        drop(session_op);
+        end.await.unwrap();
+        assert_eq!(current_session_id(&state).await.as_deref(), Some("new"));
+        assert!(state.connection_key.read().await.is_some(), "the new session is untouched");
     }
 
     /// #43: a session the vault ended takes the key, the credentials and
