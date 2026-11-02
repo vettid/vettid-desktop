@@ -27,10 +27,13 @@ zeroize = { version = "1", features = ["derive"] }
 # Canonical standard base64 (strict JSON members) and the inner timestamps.
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+# The handshake key schedule (HKDF-SHA256), relay URL checks, and mailbox
+# ids (the relay crate of this workspace).
+hkdf = "0.12"
+url = "2"
+vettid-relay = { path = "../vettid-relay" }
 
 [dev-dependencies]
 hex = "0.4"
-hkdf = "0.12"
 rand_core = "0.10"
 serde_json = "1"
-vettid-relay = { path = "../vettid-relay" }
