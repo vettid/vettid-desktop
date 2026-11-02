@@ -413,12 +413,7 @@ pub async fn complete_pairing(
 
     session_key.zeroize();
 
-    // #26: the session is live only if its marker was written with the
-    // save. If not, the next load treats it as ended, so don't report it
-    // as started.
-    if !store::session_is_recorded(config_dir, &activation_result.session_id) {
-        return Err(RegistrationError::SessionNotRecorded);
-    }
+    session_recorded(config_dir, &activation_result.session_id, since)?;
 
     Ok(PairingOutcome {
         connection_id: session.connection_id,
@@ -431,6 +426,25 @@ pub async fn complete_pairing(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// After a save: was the new session recorded? #26: it is live only if its
+/// marker was written with the save; if not, the next load treats it as
+/// ended, so it isn't reported as started. #30: a log-out that wiped the
+/// pairing since `since` is reported first, since the save is gone too.
+fn session_recorded(
+    config_dir: &std::path::Path,
+    session_id: &str,
+    since: crate::credential::store::WipeEpoch,
+) -> Result<(), RegistrationError> {
+    use crate::credential::store;
+    if store::wipe_epoch() != since {
+        return Err(RegistrationError::LoggedOutMeanwhile);
+    }
+    if !store::session_is_recorded(config_dir, session_id) {
+        return Err(RegistrationError::SessionNotRecorded);
+    }
+    Ok(())
+}
 
 fn derive_session_key(
     shared_secret: &[u8; 32],
@@ -655,6 +669,35 @@ async fn send_device_frame(
 #[cfg(test)]
 mod device_frame_tests {
     use super::*;
+
+    /// #30: a save a log-out then wiped is reported as logged out, not as
+    /// a session that couldn't be recorded.
+    #[test]
+    fn a_session_wiped_by_a_logout_is_reported_as_logged_out() {
+        use crate::credential::store;
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let since = store::wipe_epoch();
+        store::wipe(&config_dir).expect("log-out");
+        assert!(matches!(
+            session_recorded(&config_dir, "sess-1", since),
+            Err(RegistrationError::LoggedOutMeanwhile)
+        ));
+        // With no log-out since, a missing marker is "not recorded". Other
+        // tests wipe at the same time, so an attempt one overtook is retried.
+        let mut saw_not_recorded = false;
+        for _ in 0..100 {
+            match session_recorded(&config_dir, "sess-1", store::wipe_epoch()) {
+                Err(RegistrationError::SessionNotRecorded) => {
+                    saw_not_recorded = true;
+                    break;
+                }
+                Err(RegistrationError::LoggedOutMeanwhile) => continue,
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(saw_not_recorded);
+    }
     use crate::credential::store::ConnectionCredentials;
 
     /// A listener that accepts connections and never answers: the TLS

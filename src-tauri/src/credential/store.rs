@@ -524,6 +524,18 @@ pub fn save_existing(
     save_since(&SystemKeys, config_dir, creds, Mode::UpdateExisting, Some(since))
 }
 
+/// [`ensure_config_dir`] for the start of a pairing (#30): under the writer
+/// lock, and refused with [`CredentialError::LoggedOutMeanwhile`] if a
+/// log-out has wiped the pairing since `since`, so it can't recreate the
+/// folder after a log-out's wipe.
+pub fn ensure_config_dir_since(config_dir: &Path, since: WipeEpoch) -> Result<(), CredentialError> {
+    let _one_at_a_time = writer_lock();
+    if wipe_epoch() != since {
+        return Err(CredentialError::LoggedOutMeanwhile);
+    }
+    ensure_config_dir(config_dir)
+}
+
 /// How many wipes this process has run (#30). Bumped by every wipe while
 /// it holds the writer lock, before it removes anything; compared by a
 /// save while it holds the lock, before it writes anything. So a save
@@ -968,8 +980,10 @@ fn pairing_present(config_dir: &Path) -> std::io::Result<bool> {
     }
 }
 
-/// Delete the credential file from `config_dir`.
-pub fn delete(config_dir: &Path) -> Result<(), CredentialError> {
+/// Delete the credential file from `config_dir`. Used only by [`load`] for
+/// an earlier build's file; it isn't a log-out, so it doesn't move the
+/// wipe count (#30). The app logs out through [`wipe_for_logout`].
+fn delete(config_dir: &Path) -> Result<(), CredentialError> {
     let _one_at_a_time = writer_lock();
     delete_locked(config_dir)
 }
@@ -2241,6 +2255,21 @@ mod tests {
             Err(CredentialError::LoggedOutMeanwhile)
         ));
         assert!(session_is_recorded(&config_dir, "new"));
+    }
+
+    /// #30: the folder check at the start of a pairing doesn't recreate the
+    /// folder after a log-out it didn't start before.
+    #[test]
+    fn the_pairing_folder_isnt_made_after_a_logout() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let since = wipe_epoch();
+        wipe(&config_dir).expect("log-out");
+        assert!(matches!(
+            ensure_config_dir_since(&config_dir, since),
+            Err(CredentialError::LoggedOutMeanwhile)
+        ));
+        assert!(!config_dir.exists());
     }
 
     /// #30: with no folder, log-out still deletes the key, and doesn't

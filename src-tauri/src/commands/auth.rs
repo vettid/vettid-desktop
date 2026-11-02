@@ -84,7 +84,8 @@ pub async fn register(
     // Checked before pairing starts, so a folder another account can open,
     // or a computer without the machine id the pairing is bound to (#14),
     // is refused before the vault ever lists this desktop.
-    store::ensure_config_dir(&config_dir).map_err(|e| e.to_string())?;
+    // #30: under the store's lock, and not after a log-out since `since`.
+    store::ensure_config_dir_since(&config_dir, since).map_err(|e| e.to_string())?;
     store::check_machine_binding().map_err(|e| e.to_string())?;
 
     // Strip dashes/whitespace so users can paste either the grouped
@@ -153,6 +154,20 @@ pub async fn register(
             let paired = matches!(e, crate::registration::flow::RegistrationError::SessionNotRecorded);
             if paired {
                 *state.is_registered.write().await = true;
+                // #30: as on success, set then check: a log-out since
+                // means nothing is paired.
+                if store::wipe_epoch() != since {
+                    clear_logged_out_memory(&state).await;
+                    return Ok(RegisterResponse {
+                        success: false,
+                        error: Some(store::LOGGED_OUT_MEANWHILE_NOTICE.to_string()),
+                        connection_id: None,
+                        session_id: None,
+                        expires_at: None,
+                        key_protection: None,
+                        paired_without_session: false,
+                    });
+                }
             }
             return Ok(RegisterResponse {
                 success: false,
@@ -400,6 +415,9 @@ const UNLOCK_FAILED_NOTICE: &str = "This desktop couldn't open its saved pairing
 pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<UnlockResponse, String> {
     use crate::credential::store::{self, CredentialError};
 
+    // #30: first. A log-out from here on means nothing stays unlocked.
+    let since = store::wipe_epoch();
+
     let config_dir = match store::default_config_dir() {
         Ok(dir) => dir,
         Err(e) => {
@@ -479,6 +497,17 @@ pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<Unlock
     let connection_id = creds.connection_id.clone();
     *state.credentials.write().await = Some(creds);
     *state.is_unlocked.write().await = true;
+
+    // #30: a log-out while this ran may have cleared memory before the
+    // lines above set it; then clear it again. Logout's own response tells
+    // the person what happened.
+    if store::wipe_epoch() != since {
+        clear_logged_out_memory(&state).await;
+        return Ok(UnlockResponse {
+            unlocked: false,
+            notice: None,
+        });
+    }
 
     // Spawn the background NATS listener so device_op_response
     // envelopes get decrypted + matched to pending request_ids.
@@ -627,9 +656,24 @@ pub async fn extend_session(
         Ok(loaded) => Some(loaded),
         Err(e) => {
             log::error!("extend_session: the new session was saved but couldn't be read back: {}", e);
+            // #30: a log-out since (its wipe may be why it can't be read):
+            // the pairing is gone, and so is anything in memory.
+            if store::wipe_epoch() != since {
+                clear_logged_out_memory(&state).await;
+                return Ok(RegisterResponse {
+                    success: false,
+                    error: Some(store::LOGGED_OUT_MEANWHILE_NOTICE.to_string()),
+                    connection_id: None,
+                    session_id: None,
+                    expires_at: None,
+                    key_protection: None,
+                    paired_without_session: false,
+                });
+            }
             // The disk must match what the person is told: the session
-            // isn't treated as live at the next launch either.
-            if let Err(e) = store::end_saved_session(&config_dir) {
+            // isn't treated as live at the next launch either. Not after a
+            // log-out, whose marker it would no longer be (#30).
+            if let Err(e) = store::end_saved_session_since(&config_dir, since) {
                 log::error!("extend_session: could not remove the live marker: {}", e);
             }
             {
