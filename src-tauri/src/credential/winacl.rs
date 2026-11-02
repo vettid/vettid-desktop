@@ -34,8 +34,12 @@
 //! (a security call, creating the folder, a stat error) is
 //! [`AclError::Failed`]: still a refusal, with a different message.
 //!
-//! The parent of the folder (`%LOCALAPPDATA%` itself) is not checked. A
-//! folder swap through it is closed for the duration of a write: the
+//! The parent of the folder (`%LOCALAPPDATA%`) is checked too (#21): its
+//! owner must be trusted, and no other account may hold delete-child,
+//! delete, `WRITE_DAC` or `WRITE_OWNER` on it, since with any of those it
+//! could remove or rename the pairing folder and put its own in its place.
+//! Folders further up are not checked. A folder swap is also closed for
+//! the duration of a write: the
 //! folder is held open with data access and no delete sharing, so it can't
 //! be renamed, nor can its parent (both tested); the new file is renamed
 //! relative to the held folder's handle, and its final path must be inside
@@ -98,6 +102,11 @@ pub(crate) enum NotPrivate {
     ForeignAccess,
     UnknownAllowEntry,
     HardLinked,
+    /// The pairing folder's parent is owned by another account (#21).
+    ParentForeignOwner,
+    /// Another account can delete or rename what is in the pairing
+    /// folder's parent, or change its permissions or owner (#21).
+    ParentForeignControl,
 }
 
 impl std::fmt::Display for NotPrivate {
@@ -109,6 +118,8 @@ impl std::fmt::Display for NotPrivate {
             Self::ForeignAccess => "grants access to another account",
             Self::UnknownAllowEntry => "has an access entry this app does not check",
             Self::HardLinked => "has more than one name (a hard link)",
+            Self::ParentForeignOwner => "is in a folder owned by another account",
+            Self::ParentForeignControl => "is in a folder where another account can delete, rename or replace it",
         })
     }
 }
@@ -329,6 +340,96 @@ unsafe fn judge(owner: PSID, dacl: *const ACL, user: &[u8]) -> Result<(), AclErr
     Ok(())
 }
 
+/// Rights on a folder that let an account remove, rename or replace an
+/// entry in it whatever the entry's own permissions say (delete-child), or
+/// give itself that right (change the permissions or the owner), or move
+/// the folder itself (delete). `GENERIC_ALL` covers all of them.
+const PARENT_CONTROL_RIGHTS: u32 = 0x0000_0040 // FILE_DELETE_CHILD
+    | 0x0001_0000 // DELETE
+    | 0x0004_0000 // WRITE_DAC
+    | 0x0008_0000 // WRITE_OWNER
+    | 0x1000_0000; // GENERIC_ALL
+
+/// INHERIT_ONLY_ACE: the entry applies only to what is created inside, not
+/// to the folder itself.
+const INHERIT_ONLY_ACE: u8 = 0x08;
+
+/// Judge the pairing folder's parent (#21). Its owner must be trusted (the
+/// user, SYSTEM or Administrators), and no other account may hold
+/// [`PARENT_CONTROL_RIGHTS`] on it. Other access (listing it, reading it,
+/// creating entries in it) is accepted: the pairing folder itself is
+/// checked and protected, and its protected DACL doesn't inherit from here.
+/// Inherit-only entries don't apply to the parent and are skipped; allow
+/// entries of a type this module doesn't interpret are refused.
+///
+/// SAFETY: as for [`judge`].
+unsafe fn judge_parent(owner: PSID, dacl: *const ACL, user: &[u8]) -> Result<(), AclError> {
+    if owner.is_null() || !is_trusted(owner, user) {
+        return Err(NotPrivate::ParentForeignOwner.into());
+    }
+    if dacl.is_null() {
+        return Err(NotPrivate::ParentForeignControl.into());
+    }
+    let count = (*dacl).AceCount as u32;
+    for index in 0..count {
+        let mut ace: *mut c_void = ptr::null_mut();
+        // `index` is below the ACL's entry count.
+        if GetAce(dacl, index, &mut ace) == 0 || ace.is_null() {
+            return Err(failed("GetAce failed"));
+        }
+        // Every ACE starts with a DWORD-aligned ACE_HEADER.
+        let header = *(ace as *const ACE_HEADER);
+        if header.AceFlags & INHERIT_ONLY_ACE != 0 {
+            continue;
+        }
+        match header.AceType {
+            ACCESS_ALLOWED_ACE_TYPE => {
+                let mask = (*(ace as *const ACCESS_ALLOWED_ACE)).Mask;
+                if mask & PARENT_CONTROL_RIGHTS != 0 && !is_trusted(allowed_ace_sid(ace), user) {
+                    return Err(NotPrivate::ParentForeignControl.into());
+                }
+            }
+            ACCESS_DENIED_ACE_TYPE
+            | ACCESS_DENIED_OBJECT_ACE_TYPE
+            | ACCESS_DENIED_CALLBACK_ACE_TYPE
+            | ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE
+            | SYSTEM_AUDIT_ACE_TYPE
+            | SYSTEM_ALARM_ACE_TYPE => {}
+            _ => return Err(NotPrivate::UnknownAllowEntry.into()),
+        }
+    }
+    Ok(())
+}
+
+/// The pairing folder's parent, judged by [`judge_parent`]. Read by path:
+/// a parent that is itself a link is judged where it leads, which is where
+/// the pairing goes.
+fn check_parent_with(parent: &Path, user: &[u8]) -> Result<(), AclError> {
+    let path_w = wide_path(parent);
+    let mut owner: PSID = ptr::null_mut();
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: as in check_private_with.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path_w.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(failed(format!("parent: GetNamedSecurityInfoW error {}", status)));
+    }
+    let _sd = LocalBox(sd);
+    // SAFETY: `owner` and `dacl` point into `sd`, alive until `_sd` drops.
+    unsafe { judge_parent(owner, dacl, user) }
+}
+
 /// What is at a path, without following it.
 enum Entry {
     Absent,
@@ -418,12 +519,15 @@ pub(crate) fn check_private(path: &Path) -> Result<(), AclError> {
 
 /// Make sure `dir` exists and is private to the current user. Its parent
 /// folders are created as usual if missing. A new `dir` gets the user-only
-/// DACL; an existing one is only checked.
+/// DACL; an existing one is only checked. The parent is checked first
+/// (#21): if another account could delete, rename or replace entries in
+/// it, nothing is created or written.
 pub(crate) fn ensure_private_dir(dir: &Path) -> Result<(), AclError> {
+    let user = current_user_sid()?;
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent).map_err(|e| failed(format!("create parent: {}", e)))?;
+        check_parent_with(parent, &user)?;
     }
-    let user = current_user_sid()?;
     let sd = Descriptor::from_sddl(&folder_sddl(&sid_string(&user)?))?;
     let attrs = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -1110,6 +1214,61 @@ mod tests {
         assert!(!is_directly_inside(r"\\?\D:\x\f", r"\\?\C:\x"));
         assert!(!is_directly_inside(r"\\?\C:\x\", r"\\?\C:\x"));
         assert!(!is_directly_inside("f", r"\\?\C:\x"));
+    }
+
+    /// #21: a parent where another account can delete, rename or replace
+    /// entries (delete-child), delete the folder, or change its permissions
+    /// or owner is refused, and nothing is created in it.
+    #[test]
+    fn a_parent_another_account_controls_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("local");
+        std::fs::create_dir(&parent).unwrap();
+        let dir = parent.join("vettid-desktop");
+        let me = me();
+        for extra in [
+            "(A;;0x40;;;WD)",    // FILE_DELETE_CHILD for Everyone
+            "(A;;0x10000;;;WD)", // DELETE
+            "(A;;WD;;;AU)",      // WRITE_DAC for Authenticated Users
+            "(A;;WO;;;BU)",      // WRITE_OWNER for Users
+            "(A;;FA;;;WD)",      // full control
+            "(A;;GA;;;WD)",      // GENERIC_ALL
+        ] {
+            set_dacl(&parent, &format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY){extra}"));
+            assert_eq!(
+                ensure_private_dir(&dir),
+                refused(NotPrivate::ParentForeignControl),
+                "{extra}"
+            );
+            assert!(!dir.exists(), "{extra}: nothing created");
+        }
+    }
+
+    /// #21: other access to the parent is accepted: reading and listing,
+    /// creating entries, an inherit-only grant (it doesn't apply to the
+    /// parent), a deny entry, and Administrators. So is the default
+    /// %LOCALAPPDATA% shape (inherited user, SYSTEM, Administrators).
+    #[test]
+    fn a_parent_others_can_only_read_or_add_to_is_accepted() {
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("local");
+        std::fs::create_dir(&parent).unwrap();
+        let dir = parent.join("vettid-desktop");
+        let me = me();
+        for extra in [
+            "(A;OICI;FR;;;WD)",    // read for Everyone
+            "(A;;0x6;;;AU)",       // add file and add subfolder
+            "(A;OICIIO;FA;;;WD)",  // inherit-only
+            "(D;;0x40;;;WD)",      // a deny entry
+            "(A;OICI;FA;;;BA)",    // Administrators
+        ] {
+            set_dacl(&parent, &format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY){extra}"));
+            assert_eq!(ensure_private_dir(&dir), Ok(()), "{extra}");
+            assert!(test_is_user_only(&dir), "{extra}: the folder is still user-only");
+        }
+        // The real one on this machine.
+        let local = dirs::config_local_dir().expect("LOCALAPPDATA");
+        assert_eq!(check_parent_with(&local, &current_user_sid().unwrap()), Ok(()));
     }
 
     #[test]
