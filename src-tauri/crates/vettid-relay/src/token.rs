@@ -112,6 +112,13 @@ pub fn verify_token(token: &str, issuer: &VerifyingKey) -> Result<Vec<u8>, Token
     // Footer `None`: pasetors then accepts any footer, and `Some(b"")`
     // refuses footer-less tokens too, so the "no footer" rule is the
     // alphabet check above (a footer needs a second '.'), tested below.
+    //
+    // pasetors verifies with ed25519-compact: non-canonical S, non-canonical
+    // points and small-order keys and R are refused (as strict as Go's
+    // `ed25519.Verify`, stricter on small order), but its final equation is
+    // cofactored where Go's is not. Only the issuer's own key could make a
+    // token that passes here and fails at the relay; that is no forgery, and
+    // the deposit would fail as `token_invalid`.
     let trusted = PublicToken::verify(&issuer, &untrusted, None, None).map_err(|_| TokenError::Invalid)?;
     Ok(trusted.payload().as_bytes().to_vec())
 }
