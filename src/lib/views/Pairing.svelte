@@ -62,6 +62,8 @@
         // Start New Session, don't offer to pair again.
         step = 'paired-no-session';
         errorMessage = result.error || '';
+        // Shown on Start New Session too, if routing gets there first.
+        sessionNotice.set(result.error || null);
       } else {
         step = 'error';
         errorMessage = result.error || 'Pairing failed';

@@ -756,23 +756,6 @@ fn session_marked_live(config_dir: &Path, session_id: &str) -> bool {
     }
 }
 
-/// Whether the live marker is a readable tag that isn't `session_id`'s:
-/// a session other than the one being ended is marked live.
-fn marker_names_another_session(config_dir: &Path, session_id: &str) -> bool {
-    use std::io::Read;
-    let path = config_dir.join(SESSION_LIVE_FILE);
-    match fs::symlink_metadata(&path) {
-        Ok(m) if m.file_type().is_file() && m.len() <= 128 => {}
-        _ => return false,
-    }
-    let mut tag = String::new();
-    if fs::File::open(&path).and_then(|f| f.take(128).read_to_string(&mut tag)).is_err() {
-        return false;
-    }
-    let tag = tag.trim();
-    tag.len() == 64 && tag.bytes().all(|b| b.is_ascii_hexdigit()) && tag != session_tag(session_id)
-}
-
 /// Whether the saved session `session_id` is recorded as live (#26). A
 /// pairing or extension checks this after its save, so it never reports
 /// a session as started that the next load would treat as ended.
@@ -789,20 +772,8 @@ fn remove_session_marker(config_dir: &Path) {
 /// next launch treats the session as ended even if the cleared session
 /// can't be saved. Ok only if the marker is confirmed gone; the caller
 /// tells the person otherwise ([`SESSION_END_NOT_RECORDED_NOTICE`]).
-///
-/// `ending`, when known, is the session being ended (#33): a marker that
-/// names a different session belongs to one started since (Start New
-/// Session finishing while this ran) and is left alone. A marker that
-/// names no session (unreadable, a link, garbage) isn't live anyway and
-/// is removed.
-pub fn end_saved_session(config_dir: &Path, ending: Option<&str>) -> Result<(), CredentialError> {
+pub fn end_saved_session(config_dir: &Path) -> Result<(), CredentialError> {
     let _one_at_a_time = writer_lock();
-    if let Some(id) = ending {
-        if !id.is_empty() && marker_names_another_session(config_dir, id) {
-            log::info!("credential store: a newer session is marked live; leaving it");
-            return Ok(());
-        }
-    }
     let path = config_dir.join(SESSION_LIVE_FILE);
     match fs::remove_file(&path) {
         Ok(()) => {}
@@ -1416,13 +1387,13 @@ mod tests {
         let (live, _) = load_with(&keys, &config_dir).unwrap();
         assert_eq!(live.session_expires_at, 1_900_000_000, "marked live");
 
-        end_saved_session(&config_dir, None).expect("ended");
+        end_saved_session(&config_dir).expect("ended");
         assert!(!config_dir.join(SESSION_LIVE_FILE).exists());
         let (ended, _) = load_with(&keys, &config_dir).unwrap();
         assert_eq!(ended.session_expires_at, 0, "not live without the marker");
         assert_eq!(ended.session_duration_seconds, 0);
         assert_eq!(ended.session_id, "sess-1", "kept for the vault");
-        assert!(end_saved_session(&config_dir, None).is_ok(), "ending twice is fine");
+        assert!(end_saved_session(&config_dir).is_ok(), "ending twice is fine");
     }
 
     /// #26: the marker names one session. A marker for another session,
@@ -1448,25 +1419,6 @@ mod tests {
         save_with(&keys, &config_dir, &creds_with_session("sess-2", 0)).unwrap();
         assert!(!config_dir.join(SESSION_LIVE_FILE).exists(), "cleared session removes it");
         delete(&config_dir).unwrap();
-        assert!(!config_dir.join(SESSION_LIVE_FILE).exists());
-    }
-
-    /// #33: ending a session leaves a newer session's marker alone, and
-    /// removes its own.
-    #[test]
-    fn ending_a_session_leaves_a_newer_one_live() {
-        let base = tempfile::tempdir().unwrap();
-        let config_dir = base.path().join("vettid-desktop");
-        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
-        // sess-1 was live when End session started; sess-2 started since.
-        save_with(&keys, &config_dir, &creds_with_session("sess-2", 1_900_000_000)).unwrap();
-        end_saved_session(&config_dir, Some("sess-1")).unwrap();
-        assert!(session_is_recorded(&config_dir, "sess-2"), "the newer session stays live");
-        end_saved_session(&config_dir, Some("sess-2")).unwrap();
-        assert!(!config_dir.join(SESSION_LIVE_FILE).exists(), "its own marker is removed");
-        // A marker that names nothing is removed whatever is being ended.
-        fs::write(config_dir.join(SESSION_LIVE_FILE), b"garbage").unwrap();
-        end_saved_session(&config_dir, Some("sess-1")).unwrap();
         assert!(!config_dir.join(SESSION_LIVE_FILE).exists());
     }
 
@@ -1537,7 +1489,7 @@ mod tests {
             Err(CredentialError::NotPrivate)
         ));
         assert!(session_is_recorded(&config_dir, "sess-1"), "the refused save left it");
-        end_saved_session(&config_dir, None).expect("the marker can still be removed");
+        end_saved_session(&config_dir).expect("the marker can still be removed");
         assert_eq!(load_with(&keys, &config_dir).unwrap().0.session_expires_at, 0);
         assert_eq!(not_private_extension_notice(&config_dir), NOT_PRIVATE_KEYRING_NOTICE);
     }

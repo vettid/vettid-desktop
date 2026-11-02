@@ -511,6 +511,8 @@ pub async fn extend_session(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<RegisterResponse, String> {
+    // #33: never overlaps End session; see AppState::session_op.
+    let _session_op = state.session_op.lock().await;
     use crate::credential::store;
     use crate::registration::pairing;
 
@@ -584,9 +586,35 @@ pub async fn extend_session(
         }
     };
 
-    // Refresh AppState with the rotated session
+    // Refresh AppState with the rotated session. If the saved pairing
+    // can't be read back, memory must not keep the old session as if it
+    // were current (#33): clear it and report a failure.
     let mut listener_conn_id: Option<String> = None;
-    if let Ok((creds, _)) = store::load(&config_dir) {
+    let reloaded = match store::load(&config_dir) {
+        Ok(loaded) => Some(loaded),
+        Err(e) => {
+            log::error!("extend_session: the new session was saved but couldn't be read back: {}", e);
+            {
+                let mut key_guard = state.connection_key.write().await;
+                if let Some(ref mut key) = *key_guard {
+                    zeroize::Zeroize::zeroize(key);
+                }
+                *key_guard = None;
+            }
+            *state.credentials.write().await = None;
+            *state.is_unlocked.write().await = false;
+            return Ok(RegisterResponse {
+                success: false,
+                error: Some(store::SESSION_NOT_RECORDED_NOTICE.to_string()),
+                connection_id: None,
+                session_id: None,
+                expires_at: None,
+                key_protection: None,
+                paired_without_session: false,
+            });
+        }
+    };
+    if let Some((creds, _)) = reloaded {
         if creds.connection_key.len() == 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&creds.connection_key);
@@ -786,9 +814,9 @@ pub async fn end_session(state: State<'_, AppState>) -> Result<EndSessionRespons
     use crate::credential::store;
     use zeroize::Zeroize;
 
-    // The session being ended, so the disk steps below leave alone one
-    // started since (#33).
-    let ending = state.credentials.read().await.as_ref().map(|c| c.session_id.clone());
+    // #33: no Start New Session runs while this does, and one started
+    // meanwhile waits until the end is done on disk and at the vault.
+    let _session_op = state.session_op.lock().await;
 
     // The in-memory session ends first, so nothing reports it as live
     // while the vault is being told (up to the frame deadline).
@@ -807,7 +835,7 @@ pub async fn end_session(state: State<'_, AppState>) -> Result<EndSessionRespons
 
     // With no known folder there is no stored pairing to end or update.
     let notice = match store::default_config_dir() {
-        Ok(config_dir) => end_session_on_disk(&config_dir, ending.as_deref()).await,
+        Ok(config_dir) => end_session_on_disk(&config_dir).await,
         Err(e) => {
             log::warn!("end_session: {}; local reset only", e);
             None
@@ -828,7 +856,7 @@ pub struct EndSessionResponse {
 /// The stored-pairing half of [`end_session`]: record on disk that the
 /// session ended, tell the vault, then clear the session fields in the
 /// saved pairing. Returns a notice if ending it couldn't be recorded.
-async fn end_session_on_disk(config_dir: &std::path::Path, ending: Option<&str>) -> Option<String> {
+async fn end_session_on_disk(config_dir: &std::path::Path) -> Option<String> {
     use crate::credential::store;
     use crate::registration::pairing;
 
@@ -837,7 +865,7 @@ async fn end_session_on_disk(config_dir: &std::path::Path, ending: Option<&str>)
     // #26: first, and needing no key: without the live marker the next
     // launch treats the session as ended, even if the save below is
     // refused (a folder that isn't private, an unreachable keyring).
-    let marker_removed = match store::end_saved_session(&config_dir, ending) {
+    let marker_removed = match store::end_saved_session(&config_dir) {
         Ok(()) => true,
         Err(e) => {
             log::error!("end_session: could not remove the live marker: {}", e);
@@ -862,12 +890,6 @@ async fn end_session_on_disk(config_dir: &std::path::Path, ending: Option<&str>)
     // relaunch reloaded a dead session: the desktop routed straight to
     // the vault and every op hung because the vault no longer had it.
     match store::load(&config_dir) {
-        Ok((creds, _)) if ending.is_some_and(|id| !id.is_empty() && creds.session_id != id) => {
-            // #33: Start New Session finished while this ran; its session
-            // is the saved one now and stays.
-            log::info!("end_session: a newer session is saved; leaving it");
-            cleared_saved = true;
-        }
         Ok((mut creds, _)) => {
             creds.session_id.clear();
             creds.session_expires_at = 0;

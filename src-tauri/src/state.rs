@@ -57,6 +57,12 @@ pub struct AppState {
     /// got mistaken for the final response).
     pub listener_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 
+    /// Held for the whole of End session and of Start New Session, so the
+    /// two never overlap (#33). The vault's end-session frame names the
+    /// connection, not a session: an end that overlapped a new session
+    /// could end the new one at the vault while the desktop kept it live.
+    pub session_op: Arc<Mutex<()>>,
+
     /// Currently active WebRTC call session, if any. Only one call at a time
     /// — multi-call (call-waiting) would warrant a HashMap keyed by call_id,
     /// but the Android app is single-call and we follow that model.
@@ -76,6 +82,7 @@ impl AppState {
             is_unlocked: Arc::new(RwLock::new(false)),
             pending_responses: Arc::new(Mutex::new(HashMap::new())),
             listener_handle: Arc::new(Mutex::new(None)),
+            session_op: Arc::new(Mutex::new(())),
             #[cfg(feature = "webrtc")]
             active_call: Arc::new(Mutex::new(None)),
         }
