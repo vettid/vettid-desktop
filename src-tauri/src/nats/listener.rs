@@ -126,9 +126,13 @@ pub async fn spawn_listener(
 /// Stop the background listener, for log-out, End session and lock (#40).
 /// The task is aborted and awaited, so its subscription to the device
 /// channel is dropped before the caller disconnects: a live subscriber
-/// would keep the connection open after `disconnect`. Pending response
-/// channels are dropped too, as when the listener ends by itself, so
-/// waiting operations fail at once instead of timing out.
+/// would keep the connection open after `disconnect`. The caller holds
+/// `state.nats` across this and the disconnect, so no listener can
+/// subscribe in between; a task waiting for that lock is aborted there.
+///
+/// Pending response channels are left alone: their waiters time out as
+/// before. Dropping them would show "cancelled" for a request the phone
+/// may still approve (#42).
 pub async fn stop_listener(state: &AppState) {
     let handle = state.listener_handle.lock().await.take();
     if let Some(handle) = handle {
@@ -136,12 +140,6 @@ pub async fn stop_listener(state: &AppState) {
         // Cancelled (or already finished): either way the task is gone.
         let _ = handle.await;
         log::info!("Background listener stopped");
-    }
-    let mut pending = state.pending_responses.lock().await;
-    let count = pending.len();
-    pending.clear();
-    if count > 0 {
-        log::warn!("Listener stopped: dropped {} pending response channels", count);
     }
 }
 
@@ -478,10 +476,10 @@ fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     /// #40: stopping the listener ends its task (dropping what it holds,
-    /// such as its subscription), empties the slot, and drops pending
-    /// response channels, so their waiters see the channel close.
+    /// such as its subscription) and empties the slot. Pending response
+    /// channels are left to time out (#42).
     #[tokio::test]
-    async fn stop_listener_ends_the_task_and_drops_pending_responses() {
+    async fn stop_listener_ends_the_task() {
         use crate::state::AppState;
         let state = AppState::new();
         struct Held(std::sync::Arc<std::sync::atomic::AtomicBool>);
@@ -504,8 +502,8 @@ mod tests {
 
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst), "the task's state is dropped");
         assert!(state.listener_handle.lock().await.is_none());
-        assert!(state.pending_responses.lock().await.is_empty());
-        assert!(rx.recv().await.is_none(), "a waiter sees the channel close");
+        assert_eq!(state.pending_responses.lock().await.len(), 1, "pending requests are left");
+        assert!(rx.try_recv().is_err(), "and still waiting");
 
         // With no listener it's a no-op.
         super::stop_listener(&state).await;
