@@ -678,15 +678,9 @@ pub async fn extend_session(
             if let Err(e) = store::end_saved_session_since(&config_dir, since) {
                 log::error!("extend_session: could not remove the live marker: {}", e);
             }
-            {
-                let mut key_guard = state.connection_key.write().await;
-                if let Some(ref mut key) = *key_guard {
-                    zeroize::Zeroize::zeroize(key);
-                }
-                *key_guard = None;
-            }
-            *state.credentials.write().await = None;
-            *state.is_unlocked.write().await = false;
+            // As End session: the listener stopped, NATS disconnected, the
+            // key zeroized, the credentials cleared (#40).
+            clear_in_memory_session(&state).await;
             return Ok(RegisterResponse {
                 success: false,
                 error: Some(store::SESSION_NOT_RECORDED_NOTICE.to_string()),
