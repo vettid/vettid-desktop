@@ -877,3 +877,20 @@ pub async fn presence_override_set(
     ).await;
     Ok(VaultOpResponse::from_op(result))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #42: a stopped wait reaches the frontend with its code and the
+    /// approved general text; other errors carry no code.
+    #[test]
+    fn a_stopped_wait_is_coded_for_the_frontend() {
+        let json = serde_json::to_value(VaultOpResponse::from_op(Err(operations::OperationError::StoppedWaiting))).unwrap();
+        assert_eq!(json["success"], false);
+        assert_eq!(json["error_code"], "stopped_waiting");
+        assert_eq!(json["error"], operations::STOPPED_WAITING_NOTICE);
+        let json = serde_json::to_value(VaultOpResponse::from_op(Err(operations::OperationError::ApprovalTimeout))).unwrap();
+        assert!(json["error_code"].is_null());
+    }
+}
