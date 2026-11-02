@@ -47,7 +47,9 @@ pub fn spawn_heartbeat(
             }
 
             if remaining <= 0 {
-                state.session.write().await.expire();
+                // #43: the whole End session reset, not only the state.
+                // This task isn't the listener, so it can await it.
+                crate::commands::auth::end_session_from_vault(&state, false).await;
                 let _ = app_handle.emit("vault:session-update", &serde_json::json!({
                     "status": "expired",
                     "reason": "session TTL elapsed",

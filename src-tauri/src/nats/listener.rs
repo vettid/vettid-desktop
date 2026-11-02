@@ -236,17 +236,30 @@ async fn handle_response_message(
             }
         }
         "session_update" => {
+            let mut ended = None;
             if let Some(status) = payload_data.get("status").and_then(|v| v.as_str()) {
                 let mut session = state.session.write().await;
                 match status {
                     "suspended" => session.suspend(),
-                    "expired" => session.expire(),
-                    "revoked" => session.revoke(),
+                    "expired" => {
+                        session.expire();
+                        ended = Some(false);
+                    }
+                    "revoked" => {
+                        session.revoke();
+                        ended = Some(true);
+                    }
                     "active" => session.resume(),
                     _ => {}
                 }
             }
             let _ = app_handle.emit("vault:session-update", &payload_data);
+            // #43: an ended session takes the key, the credentials, this
+            // listener and the connection with it. Spawned: the reset stops
+            // this task and waits for it, so it can't run here.
+            if let Some(revoked) = ended {
+                crate::commands::auth::end_session_from_vault_later(app_handle.clone(), revoked);
+            }
         }
         "phone_approval_result" => {
             if let Some(request_id) = payload_data.get("request_id").and_then(|v| v.as_str()) {
