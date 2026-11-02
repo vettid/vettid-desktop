@@ -2,7 +2,7 @@
 name = "vettid-vms"
 version = "0.1.0"
 edition = "2021"
-description = "VettID messaging (VAULT-MESSAGING suite 2): KEM, HPKE, session AEAD, kids and signatures"
+description = "VettID messaging (VAULT-MESSAGING suite 2): KEM, HPKE, session AEAD, kids, signatures, the v2 envelope and strict JSON"
 license = "AGPL-3.0-or-later"
 publish = false
 
@@ -24,9 +24,11 @@ ed25519-dalek = "2"
 rand = "0.8"
 subtle = "2"
 zeroize = { version = "1", features = ["derive"] }
+# Canonical standard base64 (strict JSON members) and the inner timestamps.
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 [dev-dependencies]
-base64 = "0.22"
 hex = "0.4"
 hkdf = "0.12"
 rand_core = "0.10"
