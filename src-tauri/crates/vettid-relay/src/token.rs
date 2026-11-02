@@ -59,8 +59,9 @@ fn pae(pieces: &[&[u8]]) -> Vec<u8> {
 
 /// A deposit token as sent (`v4.public.…`). An open token is a bearer
 /// capability (§5.6), so its `Debug` prints nothing and it has no
-/// `Display`: use [`Token::as_str`] where it's sent.
-#[derive(Clone, PartialEq, Eq)]
+/// `Display`: use [`Token::as_str`] where it's sent. It has no `PartialEq`
+/// either, so it isn't compared in variable time by accident.
+#[derive(Clone)]
 pub struct Token(String);
 
 impl Token {
@@ -557,7 +558,7 @@ mod tests {
             },
         ];
         for c in bad {
-            assert_eq!(mint_token(&recipient(), &c), Err(TokenError::Invalid), "{c:?}");
+            assert!(matches!(mint_token(&recipient(), &c), Err(TokenError::Invalid)), "{c:?}");
         }
     }
 

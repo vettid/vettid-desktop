@@ -92,15 +92,26 @@ pub fn timestamp(now: chrono::DateTime<chrono::Utc>) -> String {
 /// The last millisecond a request was signed at, in this process.
 static LAST_SIGNED_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
 
+/// How far ahead of the clock the last signed timestamp may be and still be
+/// stepped past: twice the relay's 90 s freshness window. Beyond that the
+/// clock was moved back (or a caller passed a future time), and the clock
+/// is followed again: an older timestamp can't collide with one still in
+/// the relay's replay cache, and staying ahead would make every request
+/// `timestamp_stale`.
+const STEP_WINDOW_MS: i64 = 2 * 90_000;
+
 /// `now`, or a millisecond after the last request signed in this process
-/// if that is later: request timestamps never repeat, so even a request
-/// re-signed within the same millisecond (a fast retry) isn't a replay.
+/// if that is at or just ahead of `now`: request timestamps don't repeat,
+/// so even a request re-signed within the same millisecond (a fast retry)
+/// isn't a replay. A clock moved back by more than [`STEP_WINDOW_MS`] is
+/// followed at once.
 fn strictly_after_last(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
     use std::sync::atomic::Ordering::SeqCst;
     let now_ms = now.timestamp_millis();
     let mut last = LAST_SIGNED_MS.load(SeqCst);
     loop {
-        let next = now_ms.max(last.saturating_add(1));
+        let ahead = last.saturating_sub(now_ms);
+        let next = if (0..STEP_WINDOW_MS).contains(&ahead) { last.saturating_add(1) } else { now_ms };
         match LAST_SIGNED_MS.compare_exchange(last, next, SeqCst, SeqCst) {
             Ok(_) => return chrono::DateTime::from_timestamp_millis(next).unwrap_or(now),
             Err(seen) => last = seen,
@@ -201,6 +212,13 @@ pub(crate) mod tests {
         assert!(a.timestamp.ends_with('Z') && a.timestamp.len() == "2026-06-10T12:00:00.000Z".len());
         assert_ne!(a.sig, b.sig);
         assert_eq!(a.key, encode_key(&sender().verifying_key()));
+
+        // A clock corrected backwards is followed, not out-run: signed at
+        // +10 min, then at the real time, the second is the real time.
+        let later = t0 + chrono::Duration::minutes(10);
+        let _ = SignedHeaders::new(&sender(), "GET", "/v1/mailbox", b"", later);
+        let c = SignedHeaders::new(&sender(), "GET", "/v1/mailbox", b"", t1 + chrono::Duration::seconds(1));
+        assert_eq!(c.timestamp, timestamp(t1 + chrono::Duration::seconds(1)), "follows the corrected clock");
         assert_eq!(format!("{a:?}"), "SignedHeaders(..)", "nothing secret or signed is printed");
     }
 
