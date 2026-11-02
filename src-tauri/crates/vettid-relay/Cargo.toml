@@ -18,3 +18,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 zeroize = "1"
+# The transport. reqwest as the app uses it (rustls, no native TLS).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["time"] }
+rand = "0.8"
+
+[features]
+# The local dev stack's relay is plain HTTP on 127.0.0.1. Off by default:
+# no release build may talk to a relay without TLS.
+devstack = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
