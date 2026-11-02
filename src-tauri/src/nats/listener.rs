@@ -236,29 +236,30 @@ async fn handle_response_message(
             }
         }
         "session_update" => {
-            let mut ended = None;
+            // #43: this message isn't encrypted or signed, so it is acted on
+            // only if it names the session in memory. One about another
+            // session (an old one, after Start New Session) or about none
+            // says nothing about the current session.
+            let current = crate::commands::auth::current_session_id(state).await;
+            let ended = session_update_ends(&payload_data, current.as_deref());
             if let Some(status) = payload_data.get("status").and_then(|v| v.as_str()) {
-                let mut session = state.session.write().await;
-                match status {
-                    "suspended" => session.suspend(),
-                    "expired" => {
-                        session.expire();
-                        ended = Some(false);
+                if ended.is_some() || matches!(status, "suspended" | "active") {
+                    let mut session = state.session.write().await;
+                    match status {
+                        "suspended" => session.suspend(),
+                        "expired" => session.expire(),
+                        "revoked" => session.revoke(),
+                        "active" => session.resume(),
+                        _ => {}
                     }
-                    "revoked" => {
-                        session.revoke();
-                        ended = Some(true);
-                    }
-                    "active" => session.resume(),
-                    _ => {}
                 }
             }
             let _ = app_handle.emit("vault:session-update", &payload_data);
-            // #43: an ended session takes the key, the credentials, this
+            // An ended session takes the key, the credentials, this
             // listener and the connection with it. Spawned: the reset stops
             // this task and waits for it, so it can't run here.
-            if let Some(revoked) = ended {
-                crate::commands::auth::end_session_from_vault_later(app_handle.clone(), revoked);
+            if let (Some(revoked), Some(session_id)) = (ended, current) {
+                crate::commands::auth::end_session_from_vault_later(app_handle.clone(), revoked, session_id);
             }
         }
         "phone_approval_result" => {
@@ -278,6 +279,19 @@ async fn handle_response_message(
     }
 
     Ok(())
+}
+
+/// #43: whether a `session_update` ends the session in memory: `Some(true)`
+/// for revoked, `Some(false)` for expired, and only if its `session_id` is
+/// the current one. `None` for anything else.
+fn session_update_ends(payload: &serde_json::Value, current_session_id: Option<&str>) -> Option<bool> {
+    let revoked = match payload.get("status").and_then(|v| v.as_str()) {
+        Some("expired") => false,
+        Some("revoked") => true,
+        _ => return None,
+    };
+    let named = payload.get("session_id").and_then(|v| v.as_str())?;
+    (Some(named) == current_session_id).then_some(revoked)
 }
 
 // ---------------------------------------------------------------------------
@@ -488,6 +502,20 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// #43: only an expired or revoked update naming the current session
+    /// ends it.
+    #[test]
+    fn only_an_update_for_the_current_session_ends_it() {
+        use serde_json::json;
+        let ends = super::session_update_ends;
+        assert_eq!(ends(&json!({"status": "expired", "session_id": "s1"}), Some("s1")), Some(false));
+        assert_eq!(ends(&json!({"status": "revoked", "session_id": "s1"}), Some("s1")), Some(true));
+        assert_eq!(ends(&json!({"status": "expired", "session_id": "old"}), Some("s1")), None);
+        assert_eq!(ends(&json!({"status": "expired"}), Some("s1")), None, "no session named");
+        assert_eq!(ends(&json!({"status": "revoked", "session_id": "s1"}), None), None, "no session in memory");
+        assert_eq!(ends(&json!({"status": "suspended", "session_id": "s1"}), Some("s1")), None);
+    }
+
     /// #40: stopping the listener ends its task (dropping what it holds,
     /// such as its subscription) and empties the slot. Pending response
     /// channels are left to time out (#42).

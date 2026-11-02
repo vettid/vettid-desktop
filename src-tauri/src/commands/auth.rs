@@ -417,8 +417,9 @@ pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<Unlock
 
     // #30: first. A log-out from here on means nothing stays unlocked.
     let since = store::wipe_epoch();
-    // #43: likewise a lock, End session, or a session the vault ended.
-    let resets_at_start = resets_now(&state);
+    // #43: likewise a lock, End session, or a session the vault ended,
+    // including one already under way now.
+    let reset_mark_at_start = reset_mark(&state);
 
     let config_dir = match store::default_config_dir() {
         Ok(dir) => dir,
@@ -512,15 +513,6 @@ pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<Unlock
             notice: None,
         });
     }
-    // #43: the same for a lock, End session, or a session the vault
-    // ended while this ran: it stays locked, as that reset left it.
-    if resets_now(&state) != resets_at_start {
-        lock_memory(&state).await;
-        return Ok(UnlockResponse {
-            unlocked: false,
-            notice: None,
-        });
-    }
 
     // Spawn the background NATS listener so device_op_response
     // envelopes get decrypted + matched to pending request_ids.
@@ -529,6 +521,20 @@ pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<Unlock
     // back to MessageSpace.{owner}.forOwner.device.{conn}, and
     // nobody's subscribed to it.
     crate::nats::listener::spawn_listener(app.clone(), connection_id).await;
+
+    // #43: a lock, End session or a session the vault ended that was under
+    // way when this started, or started since, may have cleared memory
+    // before the lines above set it. Then it stays locked, as that reset
+    // left it. Checked after the listener is started, so one started past
+    // the reset is stopped too. This lock may also clear an unlock or a
+    // pairing running alongside; that errs locked.
+    if overtaken_by_reset(&state, reset_mark_at_start) {
+        lock_memory(&state).await;
+        return Ok(UnlockResponse {
+            unlocked: false,
+            notice: None,
+        });
+    }
 
     // Warn (never refuse) when another account can open the saved
     // pairing's folder or file (#24).
@@ -942,15 +948,37 @@ pub async fn end_session(state: State<'_, AppState>) -> Result<EndSessionRespons
     Ok(EndSessionResponse { notice })
 }
 
-/// #43: a memory reset is starting; see [`AppState::resets`]. First, before
-/// anything is cleared.
-fn count_reset(state: &AppState) {
-    state.resets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+/// #43: a memory reset is starting; see [`AppState::resets_started`].
+/// First, before anything is cleared.
+fn begin_reset(state: &AppState) {
+    state.resets_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// The current reset count, for [`unlock`] to re-check.
-fn resets_now(state: &AppState) -> u64 {
-    state.resets.load(std::sync::atomic::Ordering::SeqCst)
+/// #43: a memory reset is done, after everything is cleared.
+fn finish_reset(state: &AppState) {
+    state.resets_finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Where the resets stood when an [`unlock`] started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResetMark {
+    started: u64,
+    under_way: bool,
+}
+
+/// Read `finished` first, then `started`: a reset that starts between the
+/// two reads counts as under way.
+fn reset_mark(state: &AppState) -> ResetMark {
+    use std::sync::atomic::Ordering::SeqCst;
+    let finished = state.resets_finished.load(SeqCst);
+    let started = state.resets_started.load(SeqCst);
+    ResetMark { started, under_way: started != finished }
+}
+
+/// Whether a reset was under way when `mark` was taken, or has started
+/// since: then what an unlock set may be what that reset meant to clear.
+fn overtaken_by_reset(state: &AppState, mark: ResetMark) -> bool {
+    mark.under_way || state.resets_started.load(std::sync::atomic::Ordering::SeqCst) != mark.started
 }
 
 /// #43: the vault ended this session (`session_update` expired or
@@ -968,12 +996,31 @@ pub(crate) async fn end_session_from_vault(state: &AppState, revoked: bool) {
     }
 }
 
-/// [`end_session_from_vault`] on its own task, for callers that run inside
-/// the listener.
-pub(crate) fn end_session_from_vault_later(app: AppHandle, revoked: bool) {
+/// The session the credentials in memory are for, if any.
+pub(crate) async fn current_session_id(state: &AppState) -> Option<String> {
+    state.credentials.read().await.as_ref().map(|c| c.session_id.clone()).filter(|id| !id.is_empty())
+}
+
+/// [`end_session_from_vault`] for a message that named `session_id`: only
+/// if that is still the session in memory, checked while holding
+/// `session_op`, so End session and Start New Session can't swap it in
+/// between. A message about another session (an old one, after Start New
+/// Session) says nothing about the current one and changes nothing (#43).
+pub(crate) async fn end_session_from_vault_if_current(state: &AppState, revoked: bool, session_id: &str) {
+    let _session_op = state.session_op.lock().await;
+    if current_session_id(state).await.as_deref() != Some(session_id) {
+        log::info!("session_update for a session that isn't the current one; ignored");
+        return;
+    }
+    end_session_from_vault(state, revoked).await;
+}
+
+/// [`end_session_from_vault_if_current`] on its own task, for callers that
+/// run inside the listener.
+pub(crate) fn end_session_from_vault_later(app: AppHandle, revoked: bool, session_id: String) {
     tokio::spawn(async move {
         let state = app.state::<AppState>();
-        end_session_from_vault(state.inner(), revoked).await;
+        end_session_from_vault_if_current(state.inner(), revoked, &session_id).await;
     });
 }
 
@@ -991,7 +1038,7 @@ async fn stop_listener_and_disconnect(state: &AppState) {
 /// credentials, unlocked and registered, and the session (revoked).
 async fn clear_logged_out_memory(state: &AppState) {
     use zeroize::Zeroize;
-    count_reset(state);
+    begin_reset(state);
     stop_listener_and_disconnect(state).await;
     {
         let mut key_guard = state.connection_key.write().await;
@@ -1004,13 +1051,14 @@ async fn clear_logged_out_memory(state: &AppState) {
     *state.is_unlocked.write().await = false;
     *state.is_registered.write().await = false;
     state.session.write().await.revoke();
+    finish_reset(state);
 }
 
 /// Drop the in-memory session: NATS, the connection key (zeroized), the
 /// credentials and the session state.
 async fn clear_in_memory_session(state: &AppState) {
     use zeroize::Zeroize;
-    count_reset(state);
+    begin_reset(state);
     stop_listener_and_disconnect(state).await;
     {
         let mut key_guard = state.connection_key.write().await;
@@ -1022,6 +1070,7 @@ async fn clear_in_memory_session(state: &AppState) {
     *state.credentials.write().await = None;
     *state.is_unlocked.write().await = false;
     state.session.write().await.expire();
+    finish_reset(state);
 }
 
 /// What [`end_session`] tells the person. The session always ends in this
@@ -1153,7 +1202,11 @@ pub async fn lock(state: State<'_, AppState>) -> Result<bool, String> {
 /// [`lock`]'s work.
 async fn lock_memory(state: &AppState) {
     use zeroize::Zeroize;
-    count_reset(state);
+    begin_reset(state);
+
+    // #40: the listener, then NATS, under one lock; first, as in the other
+    // resets (#43), so nothing reconnects with what is cleared below.
+    stop_listener_and_disconnect(state).await;
 
     // SECURITY: Zeroize connection key before clearing
     {
@@ -1168,11 +1221,9 @@ async fn lock_memory(state: &AppState) {
     *state.credentials.write().await = None;
     *state.is_unlocked.write().await = false;
 
-    // #40: the listener, then NATS, under one lock.
-    stop_listener_and_disconnect(state).await;
-
     // Reset session
     state.session.write().await.expire();
+    finish_reset(state);
 }
 
 /// Get current authentication/registration status.
@@ -1310,17 +1361,71 @@ mod tests {
         }
     }
 
-    /// #43: every memory reset is counted, so an unlock that one overtook
-    /// can tell.
+    /// #43: every memory reset is counted as started and finished, so an
+    /// unlock that one overtook can tell.
     #[tokio::test]
     async fn every_reset_is_counted() {
+        use std::sync::atomic::Ordering::SeqCst;
         let state = AppState::new();
-        let before = resets_now(&state);
         clear_logged_out_memory(&state).await;
         clear_in_memory_session(&state).await;
         lock_memory(&state).await;
         end_session_from_vault(&state, false).await;
-        assert_eq!(resets_now(&state), before + 4);
+        assert_eq!(state.resets_started.load(SeqCst), 4);
+        assert_eq!(state.resets_finished.load(SeqCst), 4);
+        assert!(state.credentials.read().await.is_none());
+    }
+
+    /// #43, M1: an unlock is overtaken by a reset that started after it
+    /// did, and by one already under way when it started, but not by one
+    /// that had finished before.
+    #[test]
+    fn an_unlock_sees_every_reset_it_overlapped() {
+        let state = AppState::new();
+        let quiet = reset_mark(&state);
+        assert!(!overtaken_by_reset(&state, quiet), "no reset");
+
+        begin_reset(&state);
+        assert!(overtaken_by_reset(&state, quiet), "a reset started since");
+        let during = reset_mark(&state);
+        assert!(overtaken_by_reset(&state, during), "a reset under way at the start");
+        finish_reset(&state);
+        assert!(overtaken_by_reset(&state, during), "still, once it finished");
+
+        let after = reset_mark(&state);
+        assert!(!overtaken_by_reset(&state, after), "one that finished before doesn't count");
+    }
+
+    /// #43, M2: a session_update about another session (the old one, after
+    /// Start New Session) leaves the current session alone; one about the
+    /// current session ends it.
+    #[tokio::test]
+    async fn a_vault_end_for_another_session_changes_nothing() {
+        let state = AppState::new();
+        let creds = |id: &str| crate::credential::store::ConnectionCredentials {
+            connection_id: "conn".into(),
+            connection_key: vec![7u8; 32],
+            key_id: "key".into(),
+            device_private_key: vec![1u8; 32],
+            device_public_key: vec![2u8; 32],
+            vault_public_key: vec![3u8; 32],
+            message_space_token: "token".into(),
+            message_space_url: "tls://example.invalid:443".into(),
+            owner_guid: "owner".into(),
+            owner_name: String::new(),
+            session_id: id.into(),
+            session_expires_at: 1_900_000_000,
+            session_duration_seconds: 3600,
+        };
+        *state.credentials.write().await = Some(creds("new"));
+        *state.connection_key.write().await = Some([7u8; 32]);
+        end_session_from_vault_if_current(&state, false, "old").await;
+        assert_eq!(current_session_id(&state).await.as_deref(), Some("new"));
+        assert!(state.connection_key.read().await.is_some());
+
+        end_session_from_vault_if_current(&state, true, "new").await;
+        assert!(state.credentials.read().await.is_none());
+        assert!(state.connection_key.read().await.is_none());
     }
 
     /// #43: a session the vault ended takes the key, the credentials and

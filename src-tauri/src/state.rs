@@ -63,11 +63,13 @@ pub struct AppState {
     /// could end the new one at the vault while the desktop kept it live.
     pub session_op: Arc<Mutex<()>>,
 
-    /// How many memory resets (lock, End session, log-out, a session the
-    /// vault ended) this process has run (#43). Each bumps it before it
-    /// clears anything; `unlock` re-checks it after setting memory, so an
-    /// unlock that a reset overtook doesn't put back what it cleared.
-    pub resets: Arc<std::sync::atomic::AtomicU64>,
+    /// Memory resets (lock, End session, log-out, a session the vault
+    /// ended) this process has started and finished (#43). A reset bumps
+    /// `resets_started` before it clears anything and `resets_finished`
+    /// when it's done. `unlock` goes ahead only if none was under way when
+    /// it started and none started since.
+    pub resets_started: Arc<std::sync::atomic::AtomicU64>,
+    pub resets_finished: Arc<std::sync::atomic::AtomicU64>,
 
     /// Currently active WebRTC call session, if any. Only one call at a time
     /// — multi-call (call-waiting) would warrant a HashMap keyed by call_id,
@@ -89,7 +91,8 @@ impl AppState {
             pending_responses: Arc::new(Mutex::new(HashMap::new())),
             listener_handle: Arc::new(Mutex::new(None)),
             session_op: Arc::new(Mutex::new(())),
-            resets: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            resets_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            resets_finished: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "webrtc")]
             active_call: Arc::new(Mutex::new(None)),
         }
