@@ -941,6 +941,9 @@ pub async fn end_session(state: State<'_, AppState>) -> Result<EndSessionRespons
 /// credentials, unlocked and registered, and the session (revoked).
 async fn clear_logged_out_memory(state: &State<'_, AppState>) {
     use zeroize::Zeroize;
+    // #40: the listener first, so its subscription doesn't keep the
+    // connection open after the disconnect.
+    crate::nats::listener::stop_listener(state.inner()).await;
     state.nats.lock().await.disconnect().await;
     {
         let mut key_guard = state.connection_key.write().await;
@@ -959,6 +962,9 @@ async fn clear_logged_out_memory(state: &State<'_, AppState>) {
 /// credentials and the session state.
 async fn clear_in_memory_session(state: &State<'_, AppState>) {
     use zeroize::Zeroize;
+    // #40: the listener first, so its subscription doesn't keep the
+    // connection open after the disconnect.
+    crate::nats::listener::stop_listener(state.inner()).await;
     state.nats.lock().await.disconnect().await;
     {
         let mut key_guard = state.connection_key.write().await;
@@ -1108,6 +1114,10 @@ pub async fn lock(state: State<'_, AppState>) -> Result<bool, String> {
     // Clear credentials (ConnectionCredentials implements Zeroize on drop)
     *state.credentials.write().await = None;
     *state.is_unlocked.write().await = false;
+
+    // #40: the listener first, so its subscription doesn't keep the
+    // connection open after the disconnect.
+    crate::nats::listener::stop_listener(state.inner()).await;
 
     // Disconnect NATS
     state.nats.lock().await.disconnect().await;
