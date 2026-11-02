@@ -244,11 +244,10 @@ pub async fn request_secrets_unlock(state: State<'_, AppState>) -> Result<VaultO
     Ok(VaultOpResponse::from_op(result))
 }
 
-/// Cancel a pending phone-approval operation by request_id. The
-/// awaiter wakes with a Cancelled error and the UI returns to the
-/// pre-request state. Vault-side orphan cleanup (dismissing the
-/// approval prompt on the phone) is a future enhancement; right
-/// now the orphan on the phone times out on its own.
+/// Stop waiting for a pending phone-approval operation by request_id. The
+/// awaiter wakes with a stopped-waiting error. The vault is not told,
+/// and the legacy vault can't cancel a pending request (#42): the prompt
+/// stays on the phone, and approving it there still carries it out.
 #[tauri::command]
 pub async fn cancel_pending_operation(state: State<'_, AppState>, request_id: String) -> Result<bool, String> {
     Ok(operations::cancel(&state, &request_id).await)

@@ -15,7 +15,7 @@
   // `pending_approval` ack, then the final result once the human taps
   // Approve. The pending state mirrors the SensitiveDataChip pattern —
   // we listen for `vault:operation-pending-approval` to capture the
-  // request_id so the user can Cancel a request in flight.
+  // request_id so the user can stop waiting for a request in flight.
 
   interface WalletItem {
     wallet_id: string;
@@ -277,13 +277,19 @@
         (resp?.data?.status === 'denied'
           ? 'You denied the transaction on your phone.'
           : 'The transaction was not completed.');
+      // #42: the vault still has the request, so the bitcoin can still go.
+      if (errorMessage.includes('stopped waiting'))
+        errorMessage =
+          "This desktop stopped waiting for this transaction. If your phone still shows it, approving it there will still send the bitcoin. Check your wallet's history before you send again.";
     } catch (e) {
       clearPending();
       const msg = String(e);
       if (msg.includes('Phone approval timed out'))
         errorMessage = 'Phone approval timed out. Try again when you have your phone handy.';
-      else if (msg.toLowerCase().includes('cancelled'))
-        errorMessage = 'Transaction cancelled.';
+      // #42: the vault still has the request, so the bitcoin can still go.
+      else if (msg.includes('stopped waiting'))
+        errorMessage =
+          "This desktop stopped waiting for this transaction. If your phone still shows it, approving it there will still send the bitcoin. Check your wallet's history before you send again.";
       else if (msg.includes('did not acknowledge'))
         errorMessage = 'Vault is not responding — try again in a moment.';
       else errorMessage = msg;
@@ -298,8 +304,9 @@
     if (rid) {
       try { await invoke('cancel_pending_operation', { requestId: rid }); } catch (_) {}
     }
-    // The await in confirmSend() will wake with a Cancelled error and
-    // set errorMessage; nothing more to do here.
+    // The await in confirmSend() will wake with a stopped-waiting error
+    // and set errorMessage; nothing more to do here. The vault isn't told
+    // (#42), so this doesn't cancel the send.
   }
 
   function feeTierLabel(t: typeof feeTier): string {
@@ -476,7 +483,7 @@
             </span>
           </div>
           {#if pendingRequestId}
-            <button class="btn ghost small" onclick={cancelInFlight}>Cancel</button>
+            <button class="btn ghost small" onclick={cancelInFlight}>Stop waiting</button>
           {/if}
         </div>
       {/if}
