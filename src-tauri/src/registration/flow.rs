@@ -37,6 +37,10 @@ pub enum RegistrationError {
     /// The pairing is saved, but the new session couldn't be recorded on
     /// this computer (#33). Displays the plain notice.
     SessionNotRecorded,
+    /// The desktop was logged out while this was under way, so nothing was
+    /// saved (#30; see `CredentialError::LoggedOutMeanwhile`). Displays the
+    /// plain notice.
+    LoggedOutMeanwhile,
 }
 
 impl fmt::Display for RegistrationError {
@@ -61,6 +65,9 @@ impl fmt::Display for RegistrationError {
             Self::NoMachineId => f.write_str(crate::credential::store::NO_MACHINE_ID_NOTICE),
             Self::SessionNotRecorded => {
                 f.write_str(crate::credential::store::SESSION_NOT_RECORDED_NOTICE)
+            }
+            Self::LoggedOutMeanwhile => {
+                f.write_str(crate::credential::store::LOGGED_OUT_MEANWHILE_NOTICE)
             }
         }
     }

@@ -118,6 +118,12 @@ pub const PARENT_NOT_PRIVATE_NOTICE: &str =
 pub const PARENT_IS_LINK_NOTICE: &str =
     "This desktop can't keep its pairing on this computer because your local app data folder is a link to another place, so nothing was saved.";
 
+/// Shown when this desktop was logged out while a pairing or a Start New
+/// Session was under way, so what it got from the vault wasn't saved (#30).
+/// The vault may still list the desktop.
+pub const LOGGED_OUT_MEANWHILE_NOTICE: &str =
+    "This desktop was logged out while it was connecting to your vault, so nothing was saved. If your phone still lists this desktop, remove it there.";
+
 /// Shown when the per-user folder for the pairing can't be found.
 pub const NO_CONFIG_DIR_NOTICE: &str =
     "This desktop can't find your user folder, so it can't keep a pairing on this computer. Nothing was saved.";
@@ -208,6 +214,9 @@ pub enum CredentialError {
     /// symlink or junction. Unix: another account owns the folder or can
     /// write to it. Nothing was changed. Displays [`NOT_PRIVATE_NOTICE`].
     NotPrivate,
+    /// A log-out wiped the pairing after the save's command started (#30).
+    /// Nothing was written. Displays [`LOGGED_OUT_MEANWHILE_NOTICE`].
+    LoggedOutMeanwhile,
 }
 
 impl fmt::Display for CredentialError {
@@ -231,6 +240,7 @@ impl fmt::Display for CredentialError {
             CredentialError::ParentNotPrivate => f.write_str(PARENT_NOT_PRIVATE_NOTICE),
             CredentialError::ParentIsLink => f.write_str(PARENT_IS_LINK_NOTICE),
             CredentialError::NotPrivate => f.write_str(NOT_PRIVATE_NOTICE),
+            CredentialError::LoggedOutMeanwhile => f.write_str(LOGGED_OUT_MEANWHILE_NOTICE),
         }
     }
 }
@@ -483,17 +493,53 @@ fn acl_error(path: &Path, e: super::winacl::AclError) -> CredentialError {
 ///
 /// SECURITY: Intermediate key material is zeroized after use; the
 /// `MasterKey` returned by the keystore zeroizes on drop.
-pub fn save(config_dir: &Path, creds: &ConnectionCredentials) -> Result<BindingMode, CredentialError> {
-    save_with(&SystemKeys, config_dir, creds)
+///
+/// `since` is [`wipe_epoch`] as recorded when the command that saves
+/// started (a pairing, a Start New Session). If a log-out has wiped the
+/// pairing since, the save fails with [`CredentialError::LoggedOutMeanwhile`]
+/// and writes nothing: it must not recreate a pairing the log-out reported
+/// removed (#30).
+pub fn save(
+    config_dir: &Path,
+    creds: &ConnectionCredentials,
+    since: WipeEpoch,
+) -> Result<BindingMode, CredentialError> {
+    save_since(&SystemKeys, config_dir, creds, Mode::CreateOrReplace, Some(since))
 }
 
 /// Like [`save`], for updating a pairing that is already saved (clearing
 /// the session at end_session). Fails with [`CredentialError::NotFound`],
 /// writing nothing and creating no folder, if `connection.enc` isn't there
 /// when the write lock is taken: a log-out that wiped the pairing must not
-/// be undone by an update that loaded it just before (#28).
-pub fn save_existing(config_dir: &Path, creds: &ConnectionCredentials) -> Result<BindingMode, CredentialError> {
-    save_with_mode(&SystemKeys, config_dir, creds, Mode::UpdateExisting)
+/// be undone by an update that loaded it just before (#28). It fails with
+/// [`CredentialError::LoggedOutMeanwhile`] if a log-out wiped the pairing
+/// after `since`, even if a new pairing has been saved since: the update
+/// carries the old pairing's credentials and must not overwrite the new one
+/// (#30).
+pub fn save_existing(
+    config_dir: &Path,
+    creds: &ConnectionCredentials,
+    since: WipeEpoch,
+) -> Result<BindingMode, CredentialError> {
+    save_since(&SystemKeys, config_dir, creds, Mode::UpdateExisting, Some(since))
+}
+
+/// How many wipes this process has run (#30). Bumped by every wipe while
+/// it holds the writer lock, before it removes anything; compared by a
+/// save while it holds the lock, before it writes anything. So a save
+/// whose command started before a wipe began can't write after it.
+static WIPES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A point in this process's wipes, from [`wipe_epoch`]. A command that
+/// saves records it when it starts and hands it to [`save`] or
+/// [`save_existing`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WipeEpoch(u64);
+
+/// The current [`WipeEpoch`]. Record it at the start of the command that
+/// will save, before anything that could wait.
+pub fn wipe_epoch() -> WipeEpoch {
+    WipeEpoch(WIPES.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 /// Whether a save may create the pairing or only update it.
@@ -635,6 +681,8 @@ fn writer_lock() -> std::sync::MutexGuard<'static, ()> {
     WRITER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// A save with no log-out check, for tests that don't concern log-out.
+#[cfg(test)]
 fn save_with(
     keys: &dyn KeySource,
     config_dir: &Path,
@@ -643,13 +691,32 @@ fn save_with(
     save_with_mode(keys, config_dir, creds, Mode::CreateOrReplace)
 }
 
+#[cfg(test)]
 fn save_with_mode(
     keys: &dyn KeySource,
     config_dir: &Path,
     creds: &ConnectionCredentials,
     mode: Mode,
 ) -> Result<BindingMode, CredentialError> {
+    save_since(keys, config_dir, creds, mode, None)
+}
+
+/// A save, refused if a wipe has run since `since` (#30). `None` only in
+/// tests that don't concern log-out.
+fn save_since(
+    keys: &dyn KeySource,
+    config_dir: &Path,
+    creds: &ConnectionCredentials,
+    mode: Mode,
+    since: Option<WipeEpoch>,
+) -> Result<BindingMode, CredentialError> {
     let _one_at_a_time = writer_lock();
+    if let Some(since) = since {
+        if wipe_epoch() != since {
+            log::warn!("Credential store: a log-out wiped the pairing after this save's command started; nothing written");
+            return Err(CredentialError::LoggedOutMeanwhile);
+        }
+    }
     if mode == Mode::UpdateExisting {
         match pairing_present(config_dir) {
             Ok(true) => {}
@@ -899,8 +966,37 @@ pub fn delete(config_dir: &Path) -> Result<(), CredentialError> {
 /// pairing is removed from the folder it points to, that is confirmed,
 /// and then the link itself is removed. `remove_dir_all` would remove only
 /// the link and leave the pairing behind.
+///
+/// Every save whose command started before this is refused afterwards,
+/// even if this fails (#30).
 pub fn wipe(config_dir: &Path) -> Result<(), CredentialError> {
     let _one_at_a_time = writer_lock();
+    WIPES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    wipe_locked(config_dir)
+}
+
+/// Log-out's local half (#30): as [`wipe`] when the folder is known, then,
+/// still holding the writer lock, delete the keyring key. A save can't run
+/// between the two, so none is sealed under a key that is then deleted.
+/// The key is deleted even if the wipe fails or there is no folder. Ok
+/// only if the pairing is confirmed gone; with no folder, `NoConfigDir`.
+pub fn wipe_for_logout(config_dir: Option<&Path>) -> Result<(), CredentialError> {
+    wipe_then(config_dir, super::keystore::delete_keyring_key)
+}
+
+fn wipe_then(config_dir: Option<&Path>, delete_key: impl FnOnce()) -> Result<(), CredentialError> {
+    let _one_at_a_time = writer_lock();
+    WIPES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let wiped = match config_dir {
+        Some(dir) => wipe_locked(dir),
+        None => Err(CredentialError::NoConfigDir),
+    };
+    delete_key();
+    wiped
+}
+
+/// [`wipe`]'s work; the caller holds the writer lock.
+fn wipe_locked(config_dir: &Path) -> Result<(), CredentialError> {
     let is_link = fs::symlink_metadata(config_dir).map(|m| m.file_type().is_symlink()).unwrap_or(false);
     if is_link {
         delete_locked(config_dir)?;
@@ -2007,6 +2103,119 @@ mod tests {
         ));
         assert!(!config_dir.exists(), "not recreated");
         assert!(wipe(&config_dir).is_ok(), "nothing there is wiped");
+    }
+
+    /// #30: a pairing or Start New Session whose command started before a
+    /// log-out's wipe saves nothing afterwards, and creates no folder.
+    #[test]
+    fn a_save_that_started_before_a_wipe_writes_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+        let since = wipe_epoch();
+        wipe(&config_dir).expect("wipe");
+        let err = save_since(&keys, &config_dir, &creds_with_session("sess-1", 1_900_000_000), Mode::CreateOrReplace, Some(since))
+            .err()
+            .expect("refused");
+        assert!(matches!(err, CredentialError::LoggedOutMeanwhile), "got {err}");
+        assert_eq!(err.to_string(), LOGGED_OUT_MEANWHILE_NOTICE);
+        assert!(!config_dir.exists(), "nothing recreated");
+    }
+
+    /// #30, from #29's review: end_session loaded the old pairing, then a
+    /// log-out and a new pairing both completed. Its update is refused and
+    /// the new pairing and its marker are left as they were.
+    #[test]
+    fn an_end_session_update_is_not_written_over_a_pairing_made_after_a_logout() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+        save_with(&keys, &config_dir, &creds_with_session("old", 1_900_000_000)).unwrap();
+        let since = wipe_epoch();
+        let (mut old, _) = load_with(&keys, &config_dir).unwrap();
+        wipe(&config_dir).expect("log-out");
+        save_with(&keys, &config_dir, &creds_with_session("new", 1_900_000_001)).unwrap();
+        let file = fs::read(config_dir.join(CREDENTIAL_FILE)).unwrap();
+        let marker = fs::read(config_dir.join(SESSION_LIVE_FILE)).unwrap();
+        old.session_id.clear();
+        old.session_expires_at = 0;
+        assert!(matches!(
+            save_since(&keys, &config_dir, &old, Mode::UpdateExisting, Some(since)),
+            Err(CredentialError::LoggedOutMeanwhile)
+        ));
+        assert_eq!(fs::read(config_dir.join(CREDENTIAL_FILE)).unwrap(), file);
+        assert_eq!(fs::read(config_dir.join(SESSION_LIVE_FILE)).unwrap(), marker);
+        assert!(session_is_recorded(&config_dir, "new"));
+    }
+
+    /// #30: with no wipe since its command started, a save goes ahead as
+    /// before, both a create and an update. Other tests wipe at the same
+    /// time (the count is per process), so an attempt one of them overtook
+    /// is tried again.
+    #[test]
+    fn with_no_wipe_since_it_started_a_save_goes_ahead() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+        for mode in [Mode::CreateOrReplace, Mode::UpdateExisting] {
+            let mut saved = false;
+            for _ in 0..100 {
+                let since = wipe_epoch();
+                match save_since(&keys, &config_dir, &creds_with_session("sess-1", 1_900_000_000), mode, Some(since)) {
+                    Ok(_) => {
+                        saved = true;
+                        break;
+                    }
+                    Err(CredentialError::LoggedOutMeanwhile) => assert_ne!(wipe_epoch(), since, "refused with no wipe"),
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            assert!(saved);
+        }
+        assert!(session_is_recorded(&config_dir, "sess-1"));
+    }
+
+    /// #30: log-out deletes the keyring key while it still holds the writer
+    /// lock, so a save that starts meanwhile runs only after the key is
+    /// gone (it then mints a new one) and is never sealed under the deleted
+    /// key.
+    #[test]
+    fn logout_deletes_the_key_before_any_waiting_save_runs() {
+        use std::sync::{Arc, Mutex};
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let other = base.path().join("other");
+        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+        save_with(&keys, &config_dir, &sample_creds()).unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut saver = None;
+        wipe_then(Some(&config_dir), || {
+            let (order2, other2) = (order.clone(), other.clone());
+            let handle = std::thread::spawn(move || {
+                let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+                save_with(&keys, &other2, &sample_creds()).unwrap();
+                order2.lock().unwrap().push("saved");
+            });
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            assert!(!handle.is_finished(), "a save ran while log-out held the lock");
+            order.lock().unwrap().push("key deleted");
+            saver = Some(handle);
+        })
+        .expect("wiped");
+        saver.unwrap().join().unwrap();
+        assert_eq!(*order.lock().unwrap(), ["key deleted", "saved"]);
+        assert!(!config_dir.exists());
+    }
+
+    /// #30: with no folder, log-out still deletes the key, and doesn't
+    /// report the pairing removed.
+    #[test]
+    fn logout_with_no_folder_still_deletes_the_key() {
+        let mut deleted = false;
+        let since = wipe_epoch();
+        assert!(matches!(wipe_then(None, || deleted = true), Err(CredentialError::NoConfigDir)));
+        assert!(deleted);
+        assert_ne!(wipe_epoch(), since, "a save that started before is still refused");
     }
 
     /// The key protection shown in Settings follows the file's header.

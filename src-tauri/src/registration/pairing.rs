@@ -267,11 +267,14 @@ pub async fn resolve_invite(
 /// Stage 2: connect with the scoped creds and publish device.request-session,
 /// then wait for device.session.activated and derive the session key.
 /// On success, writes the encrypted credentials to disk and returns.
+/// `since` is the store's wipe epoch from when the command started: if
+/// the desktop was logged out since, nothing is saved (#30).
 pub async fn complete_pairing(
     session: InviteSession,
     runtime: PairingRuntime,
     fingerprint: DeviceFingerprint,
     config_dir: &PathBuf,
+    since: crate::credential::store::WipeEpoch,
 ) -> Result<PairingOutcome, RegistrationError> {
     let mut client = NatsClient::new();
     client
@@ -402,7 +405,8 @@ pub async fn complete_pairing(
         session_duration_seconds: activation_result.duration_s,
     };
 
-    let binding = store::save(config_dir, &creds).map_err(|e| match e {
+    let binding = store::save(config_dir, &creds, since).map_err(|e| match e {
+        store::CredentialError::LoggedOutMeanwhile => RegistrationError::LoggedOutMeanwhile,
         store::CredentialError::KeyringUnavailable => RegistrationError::KeyringUnavailable,
         store::CredentialError::NotPrivate => RegistrationError::NotPrivate,
         store::CredentialError::ParentNotPrivate => RegistrationError::ParentNotPrivate,
