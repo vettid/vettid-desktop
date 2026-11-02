@@ -956,7 +956,12 @@ async fn end_session_on_disk(
         Ok(()) => true,
         Err(store::CredentialError::LoggedOutMeanwhile) => {
             log::warn!("end_session: logged out meanwhile; nothing more to end");
-            return None;
+            // A pairing still there may be one the log-out failed to
+            // remove, with this session's marker: then the next launch
+            // could show it as open, so say so. It can't be told from a
+            // new pairing, so the notice errs that way.
+            return store::exists(&config_dir)
+                .then(|| store::SESSION_END_NOT_RECORDED_NOTICE.to_string());
         }
         Err(e) => {
             log::error!("end_session: could not remove the live marker: {}", e);
