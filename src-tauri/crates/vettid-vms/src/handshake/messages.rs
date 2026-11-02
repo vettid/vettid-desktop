@@ -93,7 +93,9 @@ impl std::fmt::Debug for Resp {
 /// host, in development), no user info, query or fragment, at most 256
 /// bytes, no whitespace.
 pub fn valid_relay_url(s: &str) -> bool {
-    if s.is_empty() || s.len() > MAX_URL_LEN || s.contains([' ', '\t', '\r', '\n']) {
+    // ASCII only (no homoglyph host) and no backslash, which a URL parser
+    // turns into a slash (Go refuses `https://relay.example\@evil.com`).
+    if s.is_empty() || s.len() > MAX_URL_LEN || !s.is_ascii() || s.bytes().any(|c| c.is_ascii_whitespace() || c.is_ascii_control() || c == b'\\') {
         return false;
     }
     let lower = s.to_ascii_lowercase();
@@ -483,6 +485,11 @@ mod tests {
             assert!(!valid_relay_url(bad), "{bad}");
         }
         assert!(!valid_relay_url(&format!("https://{}.example", "a".repeat(250))));
+        assert!(!valid_relay_url("https://relay.vettid.org\\@evil.com"));
+        assert!(!valid_relay_url("https://relay.vettid.org\\x"));
+        let homoglyph = format!("https://relay.v{}ttid.org", char::from_u32(0x435).unwrap());
+        assert!(!valid_relay_url(&homoglyph), "a Cyrillic e");
+        assert!(!valid_relay_url("https://relay.vettid.org/x\ty"));
         assert!(valid_token("v4.public.abc-_.DEF"));
         for bad in ["v4.public.", "v4.local.abc", "v4.public.a+b", "v4.public.a=b"] {
             assert!(!valid_token(bad), "{bad}");

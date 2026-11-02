@@ -31,6 +31,8 @@ pub const MAX_HINT_NAME: usize = 128;
 /// The longest link payload decoded, and its base64url length.
 pub const MAX_LINK_PAYLOAD: usize = 1024;
 const MAX_LINK_LEN: usize = 1366;
+/// Room for a URL form's `<relay>/connect#` before the link.
+const MAX_URL_PREFIX: usize = 300;
 
 const EXP_FORMAT: &str = "%Y-%m-%dT%H:%M:%SZ";
 
@@ -107,8 +109,9 @@ impl Kind {
     }
 }
 
-/// The QR / link payload. `Debug` leaves out `k`.
-#[derive(Clone, PartialEq, Eq)]
+/// The QR / link payload. `Debug` leaves out `k`; equality compares it
+/// in constant time.
+#[derive(Clone)]
 pub struct Qr {
     pub kind: Kind,
     /// The relay base URL (`r`): it decides the relay, whatever host a
@@ -123,6 +126,16 @@ pub struct Qr {
     pub exp: u64,
 }
 
+impl PartialEq for Qr {
+    fn eq(&self, o: &Self) -> bool {
+        // The key in constant time, and always compared.
+        let key = ct_eq(&self.key[..], &o.key[..]);
+        key && self.kind == o.kind && self.relay == o.relay && self.claim_id == o.claim_id && self.hash == o.hash && self.exp == o.exp
+    }
+}
+
+impl Eq for Qr {}
+
 impl std::fmt::Debug for Qr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Qr").field("kind", &self.kind).field("relay", &self.relay).field("exp", &self.exp).finish_non_exhaustive()
@@ -135,9 +148,10 @@ fn valid_claim_id(s: &str) -> bool {
 
 /// Decode canonical unpadded base64url of exactly `n` bytes (`None`: any
 /// length): no padding, CR or LF, and no other spelling of the same bytes.
-fn decode_raw_url(s: &str, n: Option<usize>) -> Option<Vec<u8>> {
-    let b = URL_SAFE_NO_PAD.decode(s).ok()?;
-    if n.is_some_and(|n| b.len() != n) || URL_SAFE_NO_PAD.encode(&b) != s {
+/// The result is wiped when dropped: it may be `k_b`.
+fn decode_raw_url(s: &str, n: Option<usize>) -> Option<Zeroizing<Vec<u8>>> {
+    let b = Zeroizing::new(URL_SAFE_NO_PAD.decode(s).ok()?);
+    if n.is_some_and(|n| b.len() != n) || *Zeroizing::new(URL_SAFE_NO_PAD.encode(&b[..])) != s {
         return None;
     }
     Some(b)
@@ -166,25 +180,35 @@ impl Qr {
             .finish())
     }
 
+    /// Whether the invitation has expired at `now` (`e` ≤ now): don't
+    /// fetch a dead claim.
+    pub fn expired(&self, now: DateTime<Utc>) -> bool {
+        now.timestamp() >= 0 && now.timestamp() as u64 >= self.exp
+    }
+
     /// The link: the unpadded base64url of [`Qr::marshal`].
     pub fn link(&self) -> Result<String, InviteError> {
         Ok(URL_SAFE_NO_PAD.encode(self.marshal()?))
     }
 
-    /// Parse the compact JSON strictly.
+    /// Parse the compact JSON strictly (at most 1,024 bytes).
     pub fn parse(b: &[u8]) -> Result<Self, InviteError> {
         let qr = |_| InviteError::Qr;
+        if b.len() > MAX_LINK_PAYLOAD {
+            return Err(InviteError::Qr);
+        }
         let o = strict_json::parse_object(b).map_err(qr)?;
         o.uint("v", QR_VERSION, QR_VERSION).map_err(qr)?;
         let kind = Kind::from_letter(&o.string("t").map_err(qr)?).ok_or(InviteError::Qr)?;
         let hash = decode_raw_url(&o.string("h").map_err(qr)?, Some(32)).ok_or(InviteError::Qr)?;
-        let key = decode_raw_url(&o.string("k").map_err(qr)?, Some(KEY_SIZE)).ok_or(InviteError::Qr)?;
+        let k = Zeroizing::new(o.string("k").map_err(qr)?);
+        let key = decode_raw_url(&k, Some(KEY_SIZE)).ok_or(InviteError::Qr)?;
         let q = Qr {
             kind,
             relay: o.string("r").map_err(qr)?,
             claim_id: o.string("c").map_err(qr)?,
-            hash: hash.try_into().expect("checked length"),
-            key: Zeroizing::new(key.try_into().expect("checked length")),
+            hash: hash[..].try_into().expect("checked length"),
+            key: Zeroizing::new(key[..].try_into().expect("checked length")),
             exp: o.uint("e", 1, strict_json::MAX_SAFE_INTEGER).map_err(qr)?,
         };
         q.validate()?;
@@ -213,11 +237,27 @@ impl Qr {
         if t.starts_with('{') {
             return Self::parse(t.as_bytes());
         }
-        match t.split_once('#') {
-            Some((url, frag)) if url.ends_with("/connect") => Self::parse_link(frag),
-            Some(_) => Err(InviteError::Qr),
-            None => Self::parse_link(t),
+        // No whitespace or control characters inside (a URL parser would
+        // quietly drop some of them), and ASCII only.
+        if !t.is_ascii() || t.bytes().any(|c| c.is_ascii_whitespace() || c.is_ascii_control()) {
+            return Err(InviteError::Qr);
         }
+        if !t.contains('#') {
+            return Self::parse_link(t);
+        }
+        if t.len() > MAX_LINK_LEN + MAX_URL_PREFIX {
+            return Err(InviteError::Qr);
+        }
+        let u = url::Url::parse(t).map_err(|_| InviteError::Qr)?;
+        let form_ok = match u.scheme() {
+            "https" | "http" => u.host_str().is_some() && u.path() == "/connect",
+            "vettid" => u.host_str() == Some("connect") && u.path().is_empty(),
+            _ => false,
+        };
+        if !form_ok || !u.username().is_empty() || u.password().is_some() || u.query().is_some() {
+            return Err(InviteError::Qr);
+        }
+        Self::parse_link(u.fragment().ok_or(InviteError::Qr)?)
     }
 }
 
@@ -326,8 +366,14 @@ impl Bundle {
 /// Open a claim's `blob` with the QR that points to it, as a scanner
 /// MUST: `SHA-256(blob)` = `h` in constant time before decrypting, then
 /// decrypt under `k`, then refuse a bundle whose `kind` isn't `t`, whose
-/// `exp` isn't `e`, or that has expired at `now`.
-pub fn open_bundle(blob: &[u8], qr: &Qr, now: DateTime<Utc>) -> Result<Bundle, InviteError> {
+/// `exp` isn't `e`, or that has expired at `now`. `want` is the kind this
+/// caller handles (a desktop pairs: `Desktop`); any other QR is refused
+/// before anything is read (a connection code goes to the vault in
+/// `connection.invite.accept`, not opened here).
+pub fn open_bundle(blob: &[u8], qr: &Qr, want: Kind, now: DateTime<Utc>) -> Result<Bundle, InviteError> {
+    if qr.kind != want {
+        return Err(InviteError::Kind);
+    }
     let got: [u8; 32] = Sha256::digest(blob).into();
     if !ct_eq(&got, &qr.hash) {
         return Err(InviteError::Hash);
@@ -390,7 +436,7 @@ mod tests {
         assert_eq!(qr.marshal().unwrap(), s(&v["qr_json"]));
         assert_eq!(qr.link().unwrap(), s(&v["link"]));
         assert_eq!(Qr::parse_link(s(&v["link"])).unwrap(), qr);
-        let b = open_bundle(&blob, &qr, now).unwrap();
+        let b = open_bundle(&blob, &qr, Kind::Connection, now).unwrap();
         assert_eq!(b.marshal().unwrap(), s(&v["bundle_json"]));
         assert_eq!((b.kind, b.hint_name.as_deref(), b.remote, b.service), (Purpose::Connection, Some("Test Vault"), false, false));
         let keys = vectors::load("keys");
@@ -404,21 +450,25 @@ mod tests {
         let (_, qr, blob, now) = vector();
         let mut tampered = blob.clone();
         tampered[30] ^= 1;
-        assert_eq!(open_bundle(&tampered, &qr, now).unwrap_err(), InviteError::Hash, "the hash before decrypting");
+        let c = Kind::Connection;
+        assert_eq!(open_bundle(&tampered, &qr, c, now).unwrap_err(), InviteError::Hash, "the hash before decrypting");
         let mut wrong_key = qr.clone();
         wrong_key.key = Zeroizing::new([1; 32]);
-        assert_eq!(open_bundle(&blob, &wrong_key, now).unwrap_err(), InviteError::Decrypt);
+        assert_ne!(wrong_key, qr, "the key takes part in equality");
+        assert_eq!(open_bundle(&blob, &wrong_key, c, now).unwrap_err(), InviteError::Decrypt);
         let mut desktop = qr.clone();
         desktop.kind = Kind::Desktop;
-        assert_eq!(open_bundle(&blob, &desktop, now).unwrap_err(), InviteError::Kind);
+        assert_eq!(open_bundle(&blob, &desktop, Kind::Desktop, now).unwrap_err(), InviteError::Kind, "t isn't the bundle's kind");
+        assert_eq!(open_bundle(&blob, &qr, Kind::Desktop, now).unwrap_err(), InviteError::Kind, "not the kind this caller handles");
         let mut other_exp = qr.clone();
         other_exp.exp += 1;
-        assert_eq!(open_bundle(&blob, &other_exp, now).unwrap_err(), InviteError::Bundle);
+        assert_eq!(open_bundle(&blob, &other_exp, c, now).unwrap_err(), InviteError::Bundle);
         let at_exp = DateTime::from_timestamp(qr.exp as i64, 0).unwrap();
-        assert_eq!(open_bundle(&blob, &qr, at_exp).unwrap_err(), InviteError::Expired);
-        assert!(open_bundle(&blob, &qr, at_exp - chrono::TimeDelta::seconds(1)).is_ok());
+        assert_eq!(open_bundle(&blob, &qr, c, at_exp).unwrap_err(), InviteError::Expired);
+        assert!(open_bundle(&blob, &qr, c, at_exp - chrono::TimeDelta::seconds(1)).is_ok());
+        assert!(qr.expired(at_exp) && !qr.expired(at_exp - chrono::TimeDelta::seconds(1)));
         let short_hash = Qr { hash: Sha256::digest(&blob[..10]).into(), ..qr.clone() };
-        assert_eq!(open_bundle(&blob[..10], &short_hash, now).unwrap_err(), InviteError::Decrypt);
+        assert_eq!(open_bundle(&blob[..10], &short_hash, c, now).unwrap_err(), InviteError::Decrypt);
     }
 
     #[test]
@@ -441,6 +491,15 @@ mod tests {
             format!("{link}!"),
             String::new(),
             format!("vettid://connect/#{link}"),
+            format!("javascript:alert(1)/connect#{link}"),
+            format!("https://relay.vettid.org/x/connect#{link}"),
+            format!("/connect#{link}"),
+            format!("x/connect#{link}"),
+            format!("https://relay.vettid.org/connect?q#{link}"),
+            format!("https://u@relay.vettid.org/connect#{link}"),
+            format!("https://relay.vettid.org/connect#{}", &link[..10]) + "\n" + &link[10..],
+            "https://relay.vettid.org/connect#".to_string(),
+            format!("{} {}", &link[..10], &link[10..]),
         ] {
             assert_eq!(Qr::parse_any(&bad).unwrap_err(), InviteError::Qr, "{bad}");
         }
@@ -451,6 +510,10 @@ mod tests {
         assert_eq!(Qr::parse_link(&padded(MAX_LINK_PAYLOAD)).unwrap(), qr);
         assert_eq!(padded(MAX_LINK_PAYLOAD).len(), MAX_LINK_LEN);
         assert_eq!(Qr::parse_link(&padded(MAX_LINK_PAYLOAD + 1)).unwrap_err(), InviteError::Qr);
+        // The pasted JSON form has the same cap.
+        let raw_json = |n: usize| format!("{json}{}", " ".repeat(n - json.len()));
+        assert_eq!(Qr::parse_any(&format!("{} x", raw_json(MAX_LINK_PAYLOAD - 2)).replace(" x", "  ")).unwrap(), qr);
+        assert_eq!(Qr::parse(raw_json(MAX_LINK_PAYLOAD + 1).as_bytes()).unwrap_err(), InviteError::Qr);
     }
 
     #[test]
