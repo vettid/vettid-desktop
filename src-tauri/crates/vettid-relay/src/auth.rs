@@ -100,6 +100,17 @@ static LAST_SIGNED_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI
 /// `timestamp_stale`.
 const STEP_WINDOW_MS: i64 = 2 * 90_000;
 
+/// The next signing millisecond after `last`, at clock `now_ms`: one past
+/// `last` if it is at or less than [`STEP_WINDOW_MS`] ahead, else the clock.
+fn step(last: i64, now_ms: i64) -> i64 {
+    let ahead = last.saturating_sub(now_ms);
+    if (0..STEP_WINDOW_MS).contains(&ahead) {
+        last.saturating_add(1)
+    } else {
+        now_ms
+    }
+}
+
 /// `now`, or a millisecond after the last request signed in this process
 /// if that is at or just ahead of `now`: request timestamps don't repeat,
 /// so even a request re-signed within the same millisecond (a fast retry)
@@ -110,8 +121,7 @@ fn strictly_after_last(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<c
     let now_ms = now.timestamp_millis();
     let mut last = LAST_SIGNED_MS.load(SeqCst);
     loop {
-        let ahead = last.saturating_sub(now_ms);
-        let next = if (0..STEP_WINDOW_MS).contains(&ahead) { last.saturating_add(1) } else { now_ms };
+        let next = step(last, now_ms);
         match LAST_SIGNED_MS.compare_exchange(last, next, SeqCst, SeqCst) {
             Ok(_) => return chrono::DateTime::from_timestamp_millis(next).unwrap_or(now),
             Err(seen) => last = seen,
@@ -220,6 +230,19 @@ pub(crate) mod tests {
         let c = SignedHeaders::new(&sender(), "GET", "/v1/mailbox", b"", t1 + chrono::Duration::seconds(1));
         assert_eq!(c.timestamp, timestamp(t1 + chrono::Duration::seconds(1)), "follows the corrected clock");
         assert_eq!(format!("{a:?}"), "SignedHeaders(..)", "nothing secret or signed is printed");
+    }
+
+    /// The stepping rule at its edges.
+    #[test]
+    fn step_edges() {
+        let now = 1_000_000_000;
+        assert_eq!(step(i64::MIN, now), now, "first request follows the clock");
+        assert_eq!(step(now - 5, now), now, "the clock moved on");
+        assert_eq!(step(now, now), now + 1, "same millisecond");
+        assert_eq!(step(now + STEP_WINDOW_MS - 1, now), now + STEP_WINDOW_MS, "just inside the window");
+        assert_eq!(step(now + STEP_WINDOW_MS, now), now, "clock moved back: follow it");
+        assert_eq!(step(i64::MAX, now), now);
+        assert_eq!(step(i64::MAX, i64::MAX), i64::MAX, "no overflow");
     }
 
     /// Keys decode in exactly one spelling.
