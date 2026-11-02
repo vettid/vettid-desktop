@@ -17,6 +17,10 @@ pub enum RegistrationError {
     /// The saved pairing can't be opened on this machine (see
     /// `CredentialError::Unreadable`). Displays the plain notice.
     PairingUnreadable,
+    /// A pairing saved by an earlier build was deleted, and the revoke was
+    /// sent with it (#15; see `CredentialError::OldBuildRemoved`). Displays
+    /// the plain notice.
+    OldBuildRevoked,
     /// The pairing can't be saved: the system keyring can't be reached
     /// and a weaker key is not allowed (see
     /// `CredentialError::KeyringUnavailable`). Displays the plain notice.
@@ -53,6 +57,9 @@ impl fmt::Display for RegistrationError {
             Self::Denied(reason) => write!(f, "connection denied: {}", reason),
             Self::Timeout => write!(f, "timed out waiting for approval"),
             Self::Internal(msg) => write!(f, "internal error: {}", msg),
+            Self::OldBuildRevoked => {
+                f.write_str(crate::credential::store::OLD_BUILD_REVOKED_NOTICE)
+            }
             Self::PairingUnreadable => {
                 f.write_str(crate::credential::store::UNREADABLE_NOTICE)
             }

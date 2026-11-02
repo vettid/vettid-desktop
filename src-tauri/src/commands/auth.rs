@@ -183,7 +183,7 @@ pub async fn register(
 
     *state.is_registered.write().await = true;
     let mut listener_conn_id: Option<String> = None;
-    if let Ok((creds, _)) = store::load(&config_dir) {
+    if let Ok((creds, _)) = pairing::load_saved(&config_dir).await {
         if creds.connection_key.len() == 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&creds.connection_key);
@@ -428,9 +428,11 @@ pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<Unlock
         }
     };
 
-    let (creds, binding) = match store::load(&config_dir) {
+    // #15: an earlier build's pairing is deleted and revoked here; the
+    // notice says whether the revoke was sent.
+    let (creds, binding) = match crate::registration::pairing::load_saved(&config_dir).await {
         Ok(loaded) => loaded,
-        Err(e @ (CredentialError::Unreadable | CredentialError::NoMachineId)) => {
+        Err(e @ (CredentialError::Unreadable | CredentialError::OldBuildRemoved { .. } | CredentialError::NoMachineId)) => {
             return Ok(UnlockResponse {
                 unlocked: false,
                 notice: Some(e.to_string()),
@@ -652,7 +654,7 @@ pub async fn extend_session(
     // can't be read back, memory must not keep the old session as if it
     // were current (#33): clear it and report a failure.
     let mut listener_conn_id: Option<String> = None;
-    let reloaded = match store::load(&config_dir) {
+    let reloaded = match pairing::load_saved(&config_dir).await {
         Ok(loaded) => Some(loaded),
         Err(e) => {
             log::error!("extend_session: the new session was saved but couldn't be read back: {}", e);
@@ -1024,8 +1026,19 @@ async fn end_session_on_disk(
         log::warn!("end_session: logged out meanwhile; not telling the vault");
         return None;
     }
+    // #15: if loading it found a pairing that can't be opened (an earlier
+    // build's, now deleted and revoked), the person is told that, not
+    // only that the session ended.
+    let mut pairing_notice = None;
     if let Err(e) = pairing::publish_end_session(&config_dir, "user_locked").await {
         log::warn!("device.end-session publish failed (continuing with local reset): {}", e);
+        if matches!(
+            e,
+            crate::registration::flow::RegistrationError::OldBuildRevoked
+                | crate::registration::flow::RegistrationError::PairingUnreadable
+        ) {
+            pairing_notice = Some(e.to_string());
+        }
     }
 
     // Persist the session-end to disk. The device stays PAIRED — the
@@ -1035,7 +1048,13 @@ async fn end_session_on_disk(
     // from the on-disk session_expires_at, so leaving it set meant a
     // relaunch reloaded a dead session: the desktop routed straight to
     // the vault and every op hung because the vault no longer had it.
-    match store::load(&config_dir) {
+    // #15: not if loading it above found a pairing that can't be opened:
+    // there is nothing to clear, and an earlier build's file that couldn't
+    // be deleted would only be revoked again.
+    if pairing_notice.is_some() {
+        return end_session_notice(pairing_notice, marker_removed, cleared_saved);
+    }
+    match pairing::load_saved(&config_dir).await {
         Ok((mut creds, _)) => {
             creds.session_id.clear();
             creds.session_expires_at = 0;
@@ -1054,11 +1073,20 @@ async fn end_session_on_disk(
             "end_session: could not load creds to clear on-disk session fields: {}", e
         ),
     }
+    end_session_notice(pairing_notice, marker_removed, cleared_saved)
+}
+
+/// What End session tells the person: a notice about the pairing itself
+/// first (#15), else whether the end was recorded (#26).
+fn end_session_notice(pairing_notice: Option<String>, marker_removed: bool, cleared_saved: bool) -> Option<String> {
+    if pairing_notice.is_some() {
+        return pairing_notice;
+    }
     // The old session comes back at the next launch only if both failed.
     if marker_removed || cleared_saved {
         None
     } else {
-        Some(store::SESSION_END_NOT_RECORDED_NOTICE.to_string())
+        Some(crate::credential::store::SESSION_END_NOT_RECORDED_NOTICE.to_string())
     }
 }
 
@@ -1181,6 +1209,18 @@ mod tests {
         use crate::fingerprint::platform_macos::collect_machine_attributes_macos;
         let attrs = collect_machine_attributes_macos().expect("macOS attributes");
         assert_eq!(machine_fingerprint_hex(), compute_machine_fingerprint_hex(&attrs));
+    }
+
+    /// #15: End session passes on a notice about the pairing; otherwise it
+    /// speaks up only if the end couldn't be recorded at all.
+    #[test]
+    fn end_session_notice_prefers_the_pairing_notice() {
+        use crate::credential::store::{OLD_BUILD_REVOKED_NOTICE, SESSION_END_NOT_RECORDED_NOTICE};
+        let old = Some(OLD_BUILD_REVOKED_NOTICE.to_string());
+        assert_eq!(end_session_notice(old.clone(), true, true), old);
+        assert_eq!(end_session_notice(None, true, false), None);
+        assert_eq!(end_session_notice(None, false, true), None);
+        assert_eq!(end_session_notice(None, false, false), Some(SESSION_END_NOT_RECORDED_NOTICE.to_string()));
     }
 
     /// The store step of log-out, without deleting the real keyring key.
