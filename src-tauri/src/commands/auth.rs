@@ -1267,27 +1267,36 @@ mod tests {
         }
     }
 
-    /// #40: a listener waiting for the NATS lock (as one being spawned
-    /// does, to subscribe) when the stop takes it is stopped, not left to
-    /// subscribe after the disconnect.
+    /// #40: a listener spawned while a reset is under way (an unlock
+    /// racing lock) never subscribes on the live client. The reset holds
+    /// the NATS lock from before its stop until after its disconnect, so a
+    /// listener tracked meanwhile is stopped while it waits for that lock.
+    /// With the stop outside the lock, the stop would find no listener and
+    /// this one would subscribe before the disconnect.
     #[tokio::test]
-    async fn a_listener_waiting_to_subscribe_is_stopped() {
+    async fn a_listener_spawned_during_a_reset_never_subscribes() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         let state = Arc::new(AppState::new());
         let subscribed = Arc::new(AtomicBool::new(false));
-        let nats = state.nats.lock().await;
+        // Something else holds the NATS lock, so the reset queues for it.
+        let busy = state.nats.lock().await;
+        let reset = {
+            let state = state.clone();
+            tokio::spawn(async move { stop_listener_and_disconnect(&state).await })
+        };
+        tokio::task::yield_now().await;
+        // A listener is spawned and tracked, and queues to subscribe.
         let (state2, subscribed2) = (state.clone(), subscribed.clone());
         *state.listener_handle.lock().await = Some(tokio::spawn(async move {
             let _nats = state2.nats.lock().await;
             subscribed2.store(true, Ordering::SeqCst);
         }));
         tokio::task::yield_now().await;
-        // As stop_listener_and_disconnect does, with the lock already held.
-        crate::nats::listener::stop_listener(&state).await;
-        drop(nats);
+        drop(busy);
+        reset.await.unwrap();
         tokio::task::yield_now().await;
-        assert!(!subscribed.load(Ordering::SeqCst), "it never got the lock");
+        assert!(!subscribed.load(Ordering::SeqCst), "it never subscribed");
         assert!(state.listener_handle.lock().await.is_none());
     }
 
