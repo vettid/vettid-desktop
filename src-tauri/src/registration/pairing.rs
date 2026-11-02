@@ -500,14 +500,17 @@ pub struct PairingOutcome {
 /// Load the stored pairing for a request to the vault. A pairing that
 /// can't be opened on this machine becomes the plain notice, not a raw
 /// crypto error.
-fn load_stored_creds(
+async fn load_stored_creds(
     config_dir: &PathBuf,
 ) -> Result<crate::credential::store::ConnectionCredentials, RegistrationError> {
-    use crate::credential::store::{self, CredentialError};
+    use crate::credential::store::CredentialError;
 
-    match store::load(config_dir) {
+    match load_saved(config_dir).await {
         Ok((creds, _)) => Ok(creds),
-        Err(CredentialError::Unreadable) => Err(RegistrationError::PairingUnreadable),
+        Err(CredentialError::OldBuildRemoved { revoke_sent: true }) => Err(RegistrationError::OldBuildRevoked),
+        Err(CredentialError::Unreadable | CredentialError::OldBuildRemoved { revoke_sent: false }) => {
+            Err(RegistrationError::PairingUnreadable)
+        }
         Err(CredentialError::NoMachineId) => Err(RegistrationError::NoMachineId),
         Err(e) => Err(RegistrationError::Internal(format!("load creds: {}", e))),
     }
@@ -525,7 +528,7 @@ fn load_stored_creds(
 pub async fn start_extension(
     config_dir: &PathBuf,
 ) -> Result<(InviteSession, PairingRuntime), RegistrationError> {
-    let creds = load_stored_creds(config_dir)?;
+    let creds = load_stored_creds(config_dir).await?;
 
     // Parse JWT+seed out of the stored creds block so we can reuse them for
     // NATS auth. Format matches what complete_pairing wrote.
@@ -597,7 +600,7 @@ pub async fn publish_end_session(
     config_dir: &PathBuf,
     reason: &str,
 ) -> Result<(), RegistrationError> {
-    let creds = load_stored_creds(config_dir)?;
+    let creds = load_stored_creds(config_dir).await?;
     send_device_frame(&creds, "end-session", reason, DEVICE_FRAME_DEADLINE).await
 }
 
@@ -608,9 +611,69 @@ pub async fn publish_end_session(
 /// Returns within [`DEVICE_FRAME_DEADLINE`]. `Ok` means the frame was
 /// written to the connection. The vault does not acknowledge a revoke, so
 /// `Ok` does not mean the vault has removed this device.
+///
+/// If the saved pairing was made by an earlier build, loading it deletes it
+/// and sends the revoke with its credentials (#15), so that counts as sent.
 pub async fn publish_revoke(config_dir: &PathBuf) -> Result<(), RegistrationError> {
-    let creds = load_stored_creds(config_dir)?;
+    let creds = match load_stored_creds(config_dir).await {
+        Err(RegistrationError::OldBuildRevoked) => return Ok(()),
+        other => other?,
+    };
     send_device_frame(&creds, "revoke", "logout", DEVICE_FRAME_DEADLINE).await
+}
+
+/// [`store::load`](crate::credential::store::load) for the app: if the saved
+/// pairing was made by an earlier build (and has just been deleted), send
+/// `device.revoke` with its credentials, within [`DEVICE_FRAME_DEADLINE`],
+/// and report [`CredentialError::OldBuildRemoved`] with whether it was sent
+/// (#15). Every other result is passed through.
+///
+/// [`CredentialError::OldBuildRemoved`]: crate::credential::store::CredentialError::OldBuildRemoved
+pub async fn load_saved(
+    config_dir: &std::path::Path,
+) -> Result<
+    (crate::credential::store::ConnectionCredentials, crate::credential::keystore::BindingMode),
+    crate::credential::store::CredentialError,
+> {
+    load_saved_with(config_dir, crate::credential::store::load, |creds| async move {
+        send_device_frame(&creds, "revoke", "old_build", DEVICE_FRAME_DEADLINE).await
+    })
+    .await
+}
+
+async fn load_saved_with<L, S, F>(
+    config_dir: &std::path::Path,
+    load: L,
+    send_revoke: S,
+) -> Result<
+    (crate::credential::store::ConnectionCredentials, crate::credential::keystore::BindingMode),
+    crate::credential::store::CredentialError,
+>
+where
+    L: FnOnce(
+        &std::path::Path,
+    ) -> Result<
+        (crate::credential::store::ConnectionCredentials, crate::credential::keystore::BindingMode),
+        crate::credential::store::CredentialError,
+    >,
+    S: FnOnce(Box<crate::credential::store::ConnectionCredentials>) -> F,
+    F: std::future::Future<Output = Result<(), RegistrationError>>,
+{
+    use crate::credential::store::CredentialError;
+    match load(config_dir) {
+        Err(CredentialError::OldBuildPairing(old)) => {
+            // `old` zeroizes when the send is done with it.
+            let revoke_sent = match send_revoke(old.0).await {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!("device.revoke for an earlier build's pairing not sent: {}", e);
+                    false
+                }
+            };
+            Err(CredentialError::OldBuildRemoved { revoke_sent })
+        }
+        other => other,
+    }
 }
 
 /// Connect once, publish `device.{kind}` and flush, all within `deadline`.
@@ -699,6 +762,66 @@ mod device_frame_tests {
             }
         }
         assert!(saw_not_recorded);
+    }
+
+    /// #15: an earlier build's pairing gets the revoke with its own
+    /// credentials, and the result says whether it was sent. Anything else
+    /// is passed through with no revoke.
+    #[tokio::test]
+    async fn an_old_build_pairing_is_revoked_with_its_credentials() {
+        use crate::credential::keystore::BindingMode;
+        use crate::credential::store::{ConnectionCredentials, CredentialError, OldBuildCredentials};
+        let dir = std::path::Path::new("unused");
+        let old = || ConnectionCredentials {
+            connection_id: "old-conn".into(),
+            connection_key: vec![7u8; 32],
+            key_id: "key-1".into(),
+            device_private_key: vec![1u8; 32],
+            device_public_key: vec![2u8; 32],
+            vault_public_key: vec![3u8; 32],
+            message_space_token: "token".into(),
+            message_space_url: "nats://example.invalid:4222".into(),
+            owner_guid: "owner".into(),
+            owner_name: String::new(),
+            session_id: String::new(),
+            session_expires_at: 0,
+            session_duration_seconds: 0,
+        };
+        for sent in [true, false] {
+            let mut seen = None;
+            let result = load_saved_with(
+                dir,
+                |_| Err(CredentialError::OldBuildPairing(OldBuildCredentials(Box::new(old())))),
+                |creds| {
+                    seen = Some(creds.connection_id.clone());
+                    async move {
+                        if sent {
+                            Ok(())
+                        } else {
+                            Err(RegistrationError::Timeout)
+                        }
+                    }
+                },
+            )
+            .await;
+            assert_eq!(seen.as_deref(), Some("old-conn"));
+            assert!(matches!(result, Err(CredentialError::OldBuildRemoved { revoke_sent }) if revoke_sent == sent));
+        }
+
+        let mut called = false;
+        let result = load_saved_with(dir, |_| Err(CredentialError::Unreadable), |_| {
+            called = true;
+            async { Ok(()) }
+        })
+        .await;
+        assert!(matches!(result, Err(CredentialError::Unreadable)));
+        let ok = load_saved_with(dir, |_| Ok((old(), BindingMode::Keyring)), |_| {
+            called = true;
+            async { Ok(()) }
+        })
+        .await;
+        assert!(ok.is_ok());
+        assert!(!called, "no revoke for anything but an earlier build's pairing");
     }
     use crate::credential::store::ConnectionCredentials;
 

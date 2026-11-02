@@ -183,7 +183,7 @@ pub async fn register(
 
     *state.is_registered.write().await = true;
     let mut listener_conn_id: Option<String> = None;
-    if let Ok((creds, _)) = store::load(&config_dir) {
+    if let Ok((creds, _)) = pairing::load_saved(&config_dir).await {
         if creds.connection_key.len() == 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&creds.connection_key);
@@ -428,9 +428,11 @@ pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<Unlock
         }
     };
 
-    let (creds, binding) = match store::load(&config_dir) {
+    // #15: an earlier build's pairing is deleted and revoked here; the
+    // notice says whether the revoke was sent.
+    let (creds, binding) = match crate::registration::pairing::load_saved(&config_dir).await {
         Ok(loaded) => loaded,
-        Err(e @ (CredentialError::Unreadable | CredentialError::NoMachineId)) => {
+        Err(e @ (CredentialError::Unreadable | CredentialError::OldBuildRemoved { .. } | CredentialError::NoMachineId)) => {
             return Ok(UnlockResponse {
                 unlocked: false,
                 notice: Some(e.to_string()),
@@ -652,7 +654,7 @@ pub async fn extend_session(
     // can't be read back, memory must not keep the old session as if it
     // were current (#33): clear it and report a failure.
     let mut listener_conn_id: Option<String> = None;
-    let reloaded = match store::load(&config_dir) {
+    let reloaded = match pairing::load_saved(&config_dir).await {
         Ok(loaded) => Some(loaded),
         Err(e) => {
             log::error!("extend_session: the new session was saved but couldn't be read back: {}", e);
@@ -1035,7 +1037,7 @@ async fn end_session_on_disk(
     // from the on-disk session_expires_at, so leaving it set meant a
     // relaunch reloaded a dead session: the desktop routed straight to
     // the vault and every op hung because the vault no longer had it.
-    match store::load(&config_dir) {
+    match pairing::load_saved(&config_dir).await {
         Ok((mut creds, _)) => {
             creds.session_id.clear();
             creds.session_expires_at = 0;
