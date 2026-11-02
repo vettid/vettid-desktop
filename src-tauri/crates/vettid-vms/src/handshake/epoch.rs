@@ -1,7 +1,13 @@
 //! An epoch (§6.3, §6.5): a send and a receive direction, each with its
 //! key and kids, the per-direction `seq`, and the rekey secret `rk`.
 //! Rekey, retention of previous epochs and persistence come with the
-//! device engine.
+//! device engine, and so do the receive-side rules this type doesn't
+//! apply: `seq` as an ordering hint and gap detector (§5.3), and the
+//! dedupe of relay `msg_id`s and inner `id`s that catches replays (§8.2).
+//!
+//! An epoch starts **inactive** unless its handshake activates it at
+//! once: a pairing's or connection's epoch activates only at approval
+//! (§6.3, §6.7), and until then it refuses to seal.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use zeroize::Zeroizing;
@@ -46,6 +52,7 @@ pub struct Epoch {
     suite: u8,
     policy: Policy,
     created: DateTime<Utc>,
+    active: bool,
     send: Option<Direction>,
     recv: Direction,
     // Read by rekeys, which come with the device engine.
@@ -61,6 +68,7 @@ impl std::fmt::Debug for Epoch {
         f.debug_struct("Epoch")
             .field("role", &self.role)
             .field("suite", &self.suite)
+            .field("active", &self.active)
             .field("sent", &self.sent)
             .field("received", &self.received)
             .finish_non_exhaustive()
@@ -68,8 +76,9 @@ impl std::fmt::Debug for Epoch {
 }
 
 impl Epoch {
-    /// From a schedule: direction i2r uses `k_i2r` with `recipient_kid =
-    /// kid_i2r` and `sender_kid = kid_r2i`; r2i mirrors it (§6.3).
+    /// From a schedule, inactive: direction i2r uses `k_i2r` with
+    /// `recipient_kid = kid_i2r` and `sender_kid = kid_r2i`; r2i mirrors it
+    /// (§6.3).
     pub(crate) fn new(s: &Schedule, role: Role, suite: u8, policy: Policy, now: DateTime<Utc>) -> Self {
         let i2r = || Direction { key: s.k_i2r.clone(), recipient_kid: s.kid_i2r, sender_kid: s.kid_r2i };
         let r2i = || Direction { key: s.k_r2i.clone(), recipient_kid: s.kid_r2i, sender_kid: s.kid_i2r };
@@ -83,6 +92,7 @@ impl Epoch {
             suite,
             policy,
             created: now,
+            active: false,
             send: Some(send),
             recv,
             rk: Some(s.rk.clone()),
@@ -122,10 +132,16 @@ impl Epoch {
         (self.sent, self.received)
     }
 
-    /// Restart the epoch's age and counts at activation: a new device's
-    /// first epoch counts from the owner's approval, not from `hs.fin`
-    /// (§6.5).
-    pub fn mark_activated(&mut self, now: DateTime<Utc>) {
+    /// Whether the epoch is active (may seal).
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Activate the epoch, at the owner's approval for a pairing (§6.7),
+    /// restarting its age and counts: a new device's first epoch counts
+    /// from activation, not from `hs.fin` (§6.5).
+    pub fn activate(&mut self, now: DateTime<Utc>) {
+        self.active = true;
         self.created = now;
         self.sent = 0;
         self.received = 0;
@@ -152,13 +168,18 @@ impl Epoch {
     /// Seal an inner plaintext in session mode with a fresh nonce,
     /// assigning its `seq`: per epoch and direction, from 1 (§5.3). The
     /// same `id` may be sealed again for a retransmission; each call is a
-    /// new envelope.
+    /// new envelope. Refused (`Inactive`) until the epoch is activated.
     pub fn seal(&mut self, inner: &mut Inner) -> Result<Vec<u8>, HandshakeError> {
+        if !self.active {
+            return Err(HandshakeError::Inactive);
+        }
         self.seal_with(inner, &fresh_nonce()?)
     }
 
-    /// [`Epoch::seal`] with the nonce given: the nonce must be fresh
-    /// randomness (only the known-answer tests pass a fixed one).
+    /// [`Epoch::seal`] with the nonce given and no activation check: for
+    /// the handshake's own `hs.fin`, the first message of the new epoch,
+    /// which goes out before approval. The nonce must be fresh randomness
+    /// (only the known-answer tests pass a fixed one).
     pub(super) fn seal_with(&mut self, inner: &mut Inner, nonce: &[u8; XNONCE_SIZE]) -> Result<Vec<u8>, HandshakeError> {
         let send = self.send.as_ref().ok_or(HandshakeError::EpochRetired)?;
         inner.seq = Some(self.last_seq + 1);
@@ -206,7 +227,27 @@ mod tests {
     fn pair() -> (Epoch, Epoch) {
         let s = Schedule::derive(&[1; 32], &[2; 32], [3; 32], [4; 32]);
         let now = DateTime::from_timestamp(1_790_000_000, 0).unwrap();
-        (Epoch::new(&s, Role::Initiator, 2, POLICY_VAULT_TO_DEVICE, now), Epoch::new(&s, Role::Responder, 2, POLICY_VAULT_TO_DEVICE, now))
+        let (mut i, mut r) = (Epoch::new(&s, Role::Initiator, 2, POLICY_VAULT_TO_DEVICE, now), Epoch::new(&s, Role::Responder, 2, POLICY_VAULT_TO_DEVICE, now));
+        i.activate(now);
+        r.activate(now);
+        (i, r)
+    }
+
+    /// An epoch refuses to seal until activated; hs.fin's own path doesn't
+    /// need it.
+    #[test]
+    fn inactive_epochs_do_not_seal() {
+        let s = Schedule::derive(&[1; 32], &[2; 32], [3; 32], [4; 32]);
+        let now = DateTime::from_timestamp(1_790_000_000, 0).unwrap();
+        let mut e = Epoch::new(&s, Role::Initiator, 2, POLICY_VAULT_TO_DEVICE, now);
+        assert!(!e.is_active());
+        let mut m = ping("01JB2Z6V9K3M4N5P6Q7R8S9T0V");
+        assert_eq!(e.seal(&mut m).unwrap_err(), HandshakeError::Inactive);
+        assert_eq!(m.seq, None, "nothing assigned");
+        assert!(e.seal_with(&mut m, &[0; 24]).is_ok(), "hs.fin's path");
+        e.activate(now);
+        assert!(e.is_active());
+        assert!(e.seal(&mut ping("01JB2Z6V9K3M4N5P6Q7R8S9T0W")).is_ok());
     }
 
     fn ping(id: &str) -> Inner {
@@ -239,7 +280,7 @@ mod tests {
         let mut own = ping("01JB2Z6V9K3M4N5P6Q7R8S9T0X");
         let mine = Envelope::parse(&i.seal(&mut own).unwrap()).unwrap();
         assert!(i.open(&mine).is_err());
-        assert_eq!(format!("{i:?}"), "Epoch { role: Initiator, suite: 2, sent: 4, received: 1, .. }");
+        assert_eq!(format!("{i:?}"), "Epoch { role: Initiator, suite: 2, active: true, sent: 4, received: 1, .. }");
     }
 
     #[test]
@@ -248,7 +289,7 @@ mod tests {
         let t = i.created();
         assert!(!i.needs_rekey(t + TimeDelta::days(7) - TimeDelta::seconds(1)));
         assert!(i.needs_rekey(t + TimeDelta::days(7)));
-        i.mark_activated(t + TimeDelta::days(1));
+        i.activate(t + TimeDelta::days(1));
         assert!(!i.needs_rekey(t + TimeDelta::days(7)));
         assert!(i.rk().is_ok() && i.can_send());
     }

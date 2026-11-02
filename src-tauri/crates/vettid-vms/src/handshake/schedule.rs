@@ -121,7 +121,7 @@ pub fn verify_resp(ik: &VerifyingKey, th: &[u8; 32], sig: &[u8]) -> Result<(), H
 
 /// Check `sig_I`.
 pub fn verify_fin(ik: &VerifyingKey, th: &[u8; 32], sig: &[u8]) -> Result<(), HandshakeError> {
-    sign::verify(ik, LABEL_SIG_FIN, th, sig).map_err(|_| HandshakeError::Body)
+    sign::verify(ik, LABEL_SIG_FIN, th, sig).map_err(|_| HandshakeError::SigFin)
 }
 
 #[cfg(test)]

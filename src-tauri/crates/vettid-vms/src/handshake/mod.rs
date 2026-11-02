@@ -111,6 +111,12 @@ pub enum HandshakeError {
     Sender,
     /// `sig_R` didn't verify: the handshake is aborted.
     SigResp,
+    /// `sig_I` didn't verify. A responder drops the `hs.fin` and keeps the
+    /// handshake pending (§6.3), unlike a commitment mismatch.
+    SigFin,
+    /// The epoch isn't active yet: a pairing's epoch activates at the
+    /// owner's approval (§6.7).
+    Inactive,
     /// The handshake was aborted, or finished.
     Done,
     /// The configuration is incomplete or not supported here.
@@ -129,6 +135,8 @@ impl std::fmt::Display for HandshakeError {
             Self::SenderKid => f.write_str("handshake: sender kid does not match"),
             Self::Sender => f.write_str("handshake: relay sender does not match"),
             Self::SigResp => f.write_str("handshake: sig_R verification failed"),
+            Self::SigFin => f.write_str("handshake: sig_I verification failed"),
+            Self::Inactive => f.write_str("handshake: epoch not active yet"),
             Self::Done => f.write_str("handshake: handshake aborted or completed"),
             Self::Config => f.write_str("handshake: invalid configuration"),
             Self::EpochRetired => f.write_str("handshake: epoch key retired"),

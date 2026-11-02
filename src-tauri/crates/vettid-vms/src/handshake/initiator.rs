@@ -61,8 +61,9 @@ impl std::fmt::Debug for InitiatorConfig {
 
 /// A completed handshake, on the initiator side.
 pub struct Outcome {
-    /// The new epoch. For a pairing it becomes active at the owner's
-    /// approval (§6.7): until then its messages are left unacked.
+    /// The new epoch, **inactive**: for a pairing it activates at the
+    /// owner's approval (§6.7, `device.paired`), and refuses to seal until
+    /// [`Epoch::activate`]. Until then its messages are left unacked.
     pub epoch: Epoch,
     /// `hs.fin`, sealed in the new epoch, to deposit.
     pub fin: Vec<u8>,
@@ -110,6 +111,12 @@ impl Randomness for Os {
 }
 
 /// The initiator of one handshake. `Debug` prints nothing secret.
+///
+/// It doesn't expire by itself: the engine that holds a pending initiator
+/// must [`abort`](Initiator::abort) it once its invitation or pairing
+/// window has passed (the bundle's `exp`), so a late `hs.resp` isn't
+/// accepted forever. ([`Inner::check_time`] bounds only how old the
+/// `hs.resp` itself may be.)
 pub struct Initiator {
     cfg: InitiatorConfig,
     body: Init,
