@@ -977,7 +977,12 @@ pub fn end_saved_session(config_dir: &Path) -> Result<(), CredentialError> {
 ///
 /// The pairing itself is never touched. `Ok(true)` if a marker was removed
 /// and is confirmed gone, `Ok(false)` if there was none or it named another
-/// session.
+/// session, `Err` if one named this session or couldn't be confirmed but
+/// wasn't removed (a folder in its place, say).
+///
+/// This relies on the vault giving each session a new id, as the legacy
+/// vault does (a new UUID per pairing and per rotation): a reused id would
+/// stay ended for the rest of the run.
 pub fn end_saved_session_if(config_dir: &Path, session_id: &str) -> Result<bool, CredentialError> {
     let guard = writer_lock();
     if session_id.is_empty() {
