@@ -594,6 +594,11 @@ pub async fn extend_session(
         Ok(loaded) => Some(loaded),
         Err(e) => {
             log::error!("extend_session: the new session was saved but couldn't be read back: {}", e);
+            // The disk must match what the person is told: the session
+            // isn't treated as live at the next launch either.
+            if let Err(e) = store::end_saved_session(&config_dir) {
+                log::error!("extend_session: could not remove the live marker: {}", e);
+            }
             {
                 let mut key_guard = state.connection_key.write().await;
                 if let Some(ref mut key) = *key_guard {
@@ -812,26 +817,18 @@ pub async fn logout(state: State<'_, AppState>) -> Result<LogoutResponse, String
 #[tauri::command]
 pub async fn end_session(state: State<'_, AppState>) -> Result<EndSessionResponse, String> {
     use crate::credential::store;
-    use zeroize::Zeroize;
+
+    // The in-memory session ends at once, so nothing reports it as live
+    // while this waits for the lock or tells the vault.
+    clear_in_memory_session(&state).await;
 
     // #33: no Start New Session runs while this does, and one started
-    // meanwhile waits until the end is done on disk and at the vault.
+    // meanwhile waits until the end is done on disk and at the vault. A
+    // Start New Session that was running holds the lock until it
+    // finishes (up to its activation timeout), so memory is cleared again
+    // once the lock is ours: anything it put back is ended too.
     let _session_op = state.session_op.lock().await;
-
-    // The in-memory session ends first, so nothing reports it as live
-    // while the vault is being told (up to the frame deadline).
-    state.nats.lock().await.disconnect().await;
-
-    {
-        let mut key_guard = state.connection_key.write().await;
-        if let Some(ref mut key) = *key_guard {
-            key.zeroize();
-        }
-        *key_guard = None;
-    }
-    *state.credentials.write().await = None;
-    *state.is_unlocked.write().await = false;
-    state.session.write().await.expire();
+    clear_in_memory_session(&state).await;
 
     // With no known folder there is no stored pairing to end or update.
     let notice = match store::default_config_dir() {
@@ -843,6 +840,23 @@ pub async fn end_session(state: State<'_, AppState>) -> Result<EndSessionRespons
     };
 
     Ok(EndSessionResponse { notice })
+}
+
+/// Drop the in-memory session: NATS, the connection key (zeroized), the
+/// credentials and the session state.
+async fn clear_in_memory_session(state: &State<'_, AppState>) {
+    use zeroize::Zeroize;
+    state.nats.lock().await.disconnect().await;
+    {
+        let mut key_guard = state.connection_key.write().await;
+        if let Some(ref mut key) = *key_guard {
+            key.zeroize();
+        }
+        *key_guard = None;
+    }
+    *state.credentials.write().await = None;
+    *state.is_unlocked.write().await = false;
+    state.session.write().await.expire();
 }
 
 /// What [`end_session`] tells the person. The session always ends in this
