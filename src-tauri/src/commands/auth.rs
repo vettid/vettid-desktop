@@ -247,13 +247,6 @@ pub(crate) fn warm_device_fingerprint() {
 
 fn compute_device_fingerprint() -> crate::registration::pairing::DeviceFingerprint {
     use crate::fingerprint::binary::binary_fingerprint;
-    #[cfg(not(windows))]
-    use crate::fingerprint::platform_linux::{collect_machine_attributes, compute_machine_fingerprint_hex};
-    #[cfg(windows)]
-    use crate::fingerprint::platform_windows::{
-        collect_machine_attributes_windows as collect_machine_attributes,
-        compute_machine_fingerprint_hex,
-    };
     use crate::registration::pairing::DeviceFingerprint;
 
     let hostname = hostname::get()
@@ -268,10 +261,7 @@ fn compute_device_fingerprint() -> crate::registration::pairing::DeviceFingerpri
     // can compare against Settings → Device on the desktop. This value
     // is public; the credential store's machine-bound fallback key is
     // derived separately and is never this value.
-    let machine_fp = collect_machine_attributes()
-        .ok()
-        .map(|attrs| compute_machine_fingerprint_hex(&attrs))
-        .unwrap_or_default();
+    let machine_fp = machine_fingerprint_hex();
 
     // os_name + os_version are surfaced verbatim in the phone-side
     // detail screen so the user can verify which physical machine is
@@ -291,6 +281,20 @@ fn compute_device_fingerprint() -> crate::registration::pairing::DeviceFingerpri
         binary_fingerprint: binary_fp,
         machine_fingerprint: machine_fp,
     }
+}
+
+/// The machine fingerprint shown in Settings and sent at pairing, from
+/// this platform's collector: the one `platform_key` uses (#17). Before,
+/// every platform but Windows used the Linux collector, so on macOS the
+/// value was computed from attributes a Mac doesn't have (such as
+/// `/etc/machine-id`). Empty if the attributes can't be collected.
+pub(crate) fn machine_fingerprint_hex() -> String {
+    use crate::fingerprint::platform_key;
+    use crate::fingerprint::platform_linux::compute_machine_fingerprint_hex;
+    platform_key::collect_attributes()
+        .ok()
+        .map(|attrs| compute_machine_fingerprint_hex(&attrs))
+        .unwrap_or_default()
 }
 
 /// Best-effort distribution name + version for the current OS. The
@@ -1014,6 +1018,17 @@ mod tests {
         assert!(not_wiped.contains("could not be deleted"));
         let neither = logout_notice(false, false).unwrap();
         assert!(neither.contains("could not be deleted") && neither.contains("not told"));
+    }
+
+    /// #17: the fingerprint shown and sent is the platform key, from this
+    /// platform's collector. Skipped where the platform key isn't
+    /// available (fewer than three attributes).
+    #[test]
+    fn displayed_machine_fingerprint_is_this_platforms_platform_key() {
+        let shown = machine_fingerprint_hex();
+        if let Ok(key) = crate::fingerprint::platform_key::derive_platform_key() {
+            assert_eq!(shown, hex::encode(*key));
+        }
     }
 
     #[test]
