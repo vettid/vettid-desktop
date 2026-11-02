@@ -57,15 +57,43 @@ fn pae(pieces: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// A deposit token as sent (`v4.public.…`). An open token is a bearer
+/// capability (§5.6), so its `Debug` prints nothing and it has no
+/// `Display`: use [`Token::as_str`] where it's sent.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Token(String);
+
+impl Token {
+    /// A token received from a peer, kept as is. It isn't checked here:
+    /// only the mailbox owner (the relay) can verify it.
+    pub fn from_received(token: String) -> Self {
+        Self(token)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Token(..)")
+    }
+}
+
 /// A v4.public token over the exact message bytes `m` (empty footer and
 /// implicit assertion). Ed25519 is deterministic: the same key and bytes
 /// always give the same token.
-pub fn sign_token(key: &SigningKey, m: &[u8]) -> String {
+pub fn sign_token(key: &SigningKey, m: &[u8]) -> Token {
     let sig = key.sign(&pae(&[HEADER.as_bytes(), m, b"", b""]));
     let mut body = Vec::with_capacity(m.len() + 64);
     body.extend_from_slice(m);
     body.extend_from_slice(&sig.to_bytes());
-    format!("{HEADER}{}", URL_SAFE_NO_PAD.encode(body))
+    Token(format!("{HEADER}{}", URL_SAFE_NO_PAD.encode(body)))
 }
 
 /// Check a token's form and signature against `issuer`, and return the
@@ -86,6 +114,9 @@ pub fn verify_token(token: &str, issuer: &VerifyingKey) -> Result<Vec<u8>, Token
     }
     let (m, sig) = raw.split_at(raw.len() - 64);
     let sig = Signature::from_slice(sig).map_err(|_| TokenError::Invalid)?;
+    // `verify_strict`: as Go's `ed25519.Verify` (S < L, R compared as
+    // encoded), and also refusing small-order keys and R, which an honest
+    // key never produces.
     issuer
         .verify_strict(&pae(&[HEADER.as_bytes(), m, b"", b""]), &sig)
         .map_err(|_| TokenError::Invalid)?;
@@ -99,8 +130,9 @@ pub struct Quota {
     pub bytes: Option<i64>,
 }
 
-/// Deposit-token claims (§5.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Deposit-token claims (§5.2). `Debug` leaves out `sub` (a relay key)
+/// and `jti` (the revocation handle).
+#[derive(Clone, PartialEq, Eq)]
 pub struct Claims {
     /// The issuing (recipient) mailbox id.
     pub iss: String,
@@ -115,6 +147,22 @@ pub struct Claims {
     pub quota: Option<Quota>,
     /// (0.9.2) Minted by the mailbox owner for one of its own devices.
     pub owner_device: bool,
+}
+
+impl std::fmt::Debug for Claims {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Claims")
+            .field("iss", &self.iss)
+            .field("sub", &"..")
+            .field("aud", &self.aud)
+            .field("iat", &self.iat)
+            .field("exp", &self.exp)
+            .field("jti", &"..")
+            .field("scope", &self.scope)
+            .field("quota", &self.quota)
+            .field("owner_device", &self.owner_device)
+            .finish()
+    }
 }
 
 impl Claims {
@@ -133,9 +181,16 @@ impl Claims {
     }
 
     /// The compact JSON claims in spec key order (iss, sub, aud, iat, exp,
-    /// jti, scope[, quota][, owner_device]), timestamps in whole seconds.
+    /// jti, scope[, quota][, owner_device]), timestamps in whole seconds,
+    /// escaped as Go's encoder does (U+2028 and U+2029 too), so the bytes
+    /// match the relay's own `MintToken`.
     pub fn to_json(&self) -> String {
-        let s = |v: &str| serde_json::to_string(v).expect("a string always serializes");
+        let s = |v: &str| {
+            serde_json::to_string(v)
+                .expect("a string always serializes")
+                .replace('\u{2028}', "\\u2028")
+                .replace('\u{2029}', "\\u2029")
+        };
         let t = |v: &DateTime<Utc>| s(&v.to_rfc3339_opts(SecondsFormat::Secs, true));
         let mut out = format!(
             "{{\"iss\":{},\"sub\":{},\"aud\":{},\"iat\":{},\"exp\":{},\"jti\":{},\"scope\":{}",
@@ -165,13 +220,17 @@ impl Claims {
     }
 }
 
-/// Sign `claims` as a deposit token (§5).
-pub fn mint_token(key: &SigningKey, claims: &Claims) -> String {
-    sign_token(key, claims.to_json().as_bytes())
+/// Sign `claims` as a deposit token (§5). Claims this crate would refuse
+/// to parse (a negative quota, an empty `jti`, a scope that doesn't fit
+/// `sub`, a year past 9999) aren't signed.
+pub fn mint_token(key: &SigningKey, claims: &Claims) -> Result<Token, TokenError> {
+    let json = claims.to_json();
+    parse_claims(json.as_bytes())?;
+    Ok(sign_token(key, json.as_bytes()))
 }
 
+// Unknown quota members are ignored, as unknown claims are.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WireQuota {
     msgs: Option<i64>,
     bytes: Option<i64>,
@@ -195,7 +254,9 @@ struct WireClaims {
 
 /// Decode and structurally check claim JSON. Every required claim must be
 /// present with the right type; unknown claims are ignored; a duplicated
-/// claim is refused.
+/// claim is refused. Timestamps must be RFC 3339 as Go's `time.RFC3339`
+/// parses them. It has no length cap of its own: tokens reach it through
+/// [`verify_token`] (at most [`MAX_TOKEN_LEN`]).
 pub fn parse_claims(m: &[u8]) -> Result<Claims, TokenError> {
     let text = std::str::from_utf8(m).map_err(|_| TokenError::Invalid)?;
     // The typed parse refuses a duplicated claim; the map tells a present
@@ -213,7 +274,7 @@ pub fn parse_claims(m: &[u8]) -> Result<Claims, TokenError> {
         Some(serde_json::Value::Bool(true)) => true,
         Some(_) => return Err(TokenError::Invalid),
     };
-    let time = |v: &str| DateTime::parse_from_rfc3339(v).map(|t| t.with_timezone(&Utc)).map_err(|_| TokenError::Invalid);
+    let time = |v: &str| strict_time(v).ok_or(TokenError::Invalid);
     let claims = Claims {
         iat: time(&iat)?,
         exp: time(&exp)?,
@@ -239,6 +300,49 @@ pub fn parse_claims(m: &[u8]) -> Result<Claims, TokenError> {
         }
     }
     Ok(claims)
+}
+
+/// An RFC 3339 timestamp in the shape Go's `time.RFC3339` accepts:
+/// `YYYY-MM-DDTHH:MM:SS[.frac](Z|±hh:mm)`, uppercase `T` and `Z`, seconds
+/// at most 59. chrono alone also takes a lowercase `t` or `z`, a space for
+/// `T`, and a leap second, which the relay refuses.
+fn strict_time(v: &str) -> Option<DateTime<Utc>> {
+    let b = v.as_bytes();
+    let digits = |r: std::ops::Range<usize>| b.get(r).is_some_and(|d| d.iter().all(u8::is_ascii_digit));
+    let shape = b.len() >= 20
+        && digits(0..4)
+        && b[4] == b'-'
+        && digits(5..7)
+        && b[7] == b'-'
+        && digits(8..10)
+        && b[10] == b'T'
+        && digits(11..13)
+        && b[13] == b':'
+        && digits(14..16)
+        && b[16] == b':'
+        && digits(17..19)
+        && &v[17..19] <= "59";
+    if !shape {
+        return None;
+    }
+    let mut rest = &v[19..];
+    if let Some(frac) = rest.strip_prefix('.') {
+        let n = frac.bytes().take_while(u8::is_ascii_digit).count();
+        if n == 0 {
+            return None;
+        }
+        rest = &frac[n..];
+    }
+    let zone = rest == "Z"
+        || (rest.len() == 6
+            && matches!(rest.as_bytes()[0], b'+' | b'-')
+            && rest.as_bytes()[1..3].iter().all(u8::is_ascii_digit)
+            && rest.as_bytes()[3] == b':'
+            && rest.as_bytes()[4..6].iter().all(u8::is_ascii_digit));
+    if !zone {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(v).ok().map(|t| t.with_timezone(&Utc))
 }
 
 /// Verify a token against the issuer's key and parse its claims.
@@ -286,9 +390,9 @@ mod tests {
     /// parses back.
     #[test]
     fn vector_9_2_deposit_token() {
-        assert_eq!(sign_token(&recipient(), VECTOR_CLAIMS.as_bytes()), VECTOR_TOKEN);
+        assert_eq!(sign_token(&recipient(), VECTOR_CLAIMS.as_bytes()).as_str(), VECTOR_TOKEN);
         assert_eq!(vector_claims().to_json(), VECTOR_CLAIMS);
-        assert_eq!(mint_token(&recipient(), &vector_claims()), VECTOR_TOKEN);
+        assert_eq!(mint_token(&recipient(), &vector_claims()).unwrap().as_str(), VECTOR_TOKEN);
         let claims = parse_token(VECTOR_TOKEN, &recipient().verifying_key()).unwrap();
         assert_eq!(claims, vector_claims());
         assert_eq!(claims.sub_key(), Some(sender().verifying_key()));
@@ -302,12 +406,12 @@ mod tests {
         c.quota = Some(Quota { msgs: Some(5), bytes: None });
         c.owner_device = true;
         assert!(c.to_json().ends_with(r#""scope":"deposit","quota":{"msgs":5},"owner_device":true}"#));
-        assert_eq!(parse_token(&mint_token(&recipient(), &c), &recipient().verifying_key()).unwrap(), c);
+        assert_eq!(parse_token(mint_token(&recipient(), &c).unwrap().as_str(), &recipient().verifying_key()).unwrap(), c);
 
         let mut open = vector_claims();
         open.scope = SCOPE_DEPOSIT_OPEN.into();
         open.sub = OPEN_SUB.into();
-        let parsed = parse_token(&mint_token(&recipient(), &open), &recipient().verifying_key()).unwrap();
+        let parsed = parse_token(mint_token(&recipient(), &open).unwrap().as_str(), &recipient().verifying_key()).unwrap();
         assert!(parsed.is_open());
         assert_eq!(parsed.sub_key(), None);
     }
@@ -326,6 +430,7 @@ mod tests {
             &format!("{VECTOR_TOKEN}="),        // padding
             &VECTOR_TOKEN.replacen('_', "/", 1), // standard alphabet
             &format!("{}\n{}", &VECTOR_TOKEN[..20], &VECTOR_TOKEN[20..]),
+            &format!("{}\r{}", &VECTOR_TOKEN[..20], &VECTOR_TOKEN[20..]),
             "v4.public.",
             "v4.public.AAAA",
             &format!("v4.public.{}", "A".repeat(MAX_TOKEN_LEN)),
@@ -355,12 +460,139 @@ mod tests {
             ("negative quota", base.replacen('}', r#","quota":{"msgs":-1}}"#, 1)),
             ("duplicate claim", base.replacen('}', r#","jti":"other"}"#, 1)),
             ("trailing data", format!("{base}{{}}")),
+            ("trailing brace", format!("{base}}}")),
+            ("duplicate owner_device", base.replacen('}', r#","owner_device":false,"owner_device":true}"#, 1)),
+            ("lowercase t", edit("2026-06-10T00:00:00Z", "2026-06-10t00:00:00Z")),
+            ("lowercase z", edit("2026-06-10T00:00:00Z", "2026-06-10T00:00:00z")),
+            ("space for T", edit("2026-06-10T00:00:00Z", "2026-06-10 00:00:00Z")),
+            ("leap second", edit("2026-06-10T00:00:00Z", "2026-06-10T23:59:60Z")),
+            ("comma fraction", edit("2026-06-10T00:00:00Z", "2026-06-10T00:00:00,5Z")),
         ] {
             assert_eq!(parse_claims(bad.as_bytes()), Err(TokenError::Invalid), "{what}");
         }
         assert_eq!(parse_claims(&[0xff, 0xfe]), Err(TokenError::Invalid), "not UTF-8");
         let unknown = base.replacen('}', r#","extra":1}"#, 1);
         assert!(parse_claims(unknown.as_bytes()).is_ok(), "unknown claims are ignored");
+        let unknown_quota = base.replacen('}', r#","quota":{"msgs":1,"x":2}}"#, 1);
+        assert!(parse_claims(unknown_quota.as_bytes()).is_ok(), "unknown quota members are ignored");
+        for ok in ["2026-06-10T00:00:00.5Z", "2026-06-10T02:00:00+02:00", "2026-06-10T00:00:00.000Z"] {
+            assert!(parse_claims(edit("2026-06-10T00:00:00Z", ok).as_bytes()).is_ok(), "{ok}");
+        }
+    }
+
+    /// A byte changed inside the signed message, re-encoded, fails the
+    /// signature check itself.
+    #[test]
+    fn a_changed_message_byte_fails_the_signature() {
+        let rest = VECTOR_TOKEN.strip_prefix("v4.public.").unwrap();
+        let mut raw = URL_SAFE_NO_PAD.decode(rest).unwrap();
+        raw[3] ^= 0x01;
+        let tampered = format!("v4.public.{}", URL_SAFE_NO_PAD.encode(raw));
+        assert_eq!(verify_token(&tampered, &recipient().verifying_key()), Err(TokenError::Invalid));
+    }
+
+    /// Tokens of the shapes the vault issues, minted by the relay's own Go
+    /// `relayauth.MintToken` (vettid-relay 3d7ce03): a standing token with
+    /// a full quota and owner_device, and an open token with a message
+    /// quota. Rust mints the same bytes and parses them back.
+    #[test]
+    fn go_minted_tokens_match() {
+        const GO_STANDING: &str = "v4.public.eyJpc3MiOiJncjJxN2dmNWxoNnB6ZmRudXJua3ZwdXRocCIsInN1YiI6ImdUbDNEcWg5RjE5V28xUm13MHgrek11TmlwRzA3amVpWGZZUFc0L0pzNVE9IiwiYXVkIjoiaHR0cHM6Ly9yZWxheS52ZXR0aWQudGVzdCIsImlhdCI6IjIwMjYtMDYtMTBUMDA6MDA6MDBaIiwiZXhwIjoiMjAyNi0wNy0xMFQwMDowMDowMFoiLCJqdGkiOiIwMUpTVEFORElORzAwMDAwMDAwMDAwMDAwIiwic2NvcGUiOiJkZXBvc2l0IiwicXVvdGEiOnsibXNncyI6MTAwLCJieXRlcyI6MTA0ODU3Nn0sIm93bmVyX2RldmljZSI6dHJ1ZX1g9SgDbxAzDWYLXeFQNsOb-tX2vZfe_m2DlQihHs8v5P8wyFIuL0zUnvNqtme1pEXq7EaO75K3uFkht0GTnXUJ";
+        const GO_OPEN: &str = "v4.public.eyJpc3MiOiJncjJxN2dmNWxoNnB6ZmRudXJua3ZwdXRocCIsInN1YiI6IioiLCJhdWQiOiJodHRwczovL3JlbGF5LnZldHRpZC50ZXN0IiwiaWF0IjoiMjAyNi0wNi0xMFQwMDowMDowMFoiLCJleHAiOiIyMDI2LTA2LTEwVDAwOjEwOjAwWiIsImp0aSI6IjAxSk9QRU4wMDAwMDAwMDAwMDAwMDAwMDAiLCJzY29wZSI6ImRlcG9zaXRfb3BlbiIsInF1b3RhIjp7Im1zZ3MiOjF9fQV8XGpR1h4ru-LVKX3RI5h3ldnQ6eqSBTzvqN8YgtkajA6fQXSH_xYVvk59dyzTIZlNiVQmrzPljEPe8Ab8uAo";
+        let standing = Claims {
+            iss: "gr2q7gf5lh6pzfdnurnkvputhp".into(),
+            sub: auth::encode_key(&sender().verifying_key()),
+            aud: "https://relay.vettid.test".into(),
+            iat: t("2026-06-10T00:00:00Z"),
+            exp: t("2026-07-10T00:00:00Z"),
+            jti: "01JSTANDING00000000000000".into(),
+            scope: SCOPE_DEPOSIT.into(),
+            quota: Some(Quota { msgs: Some(100), bytes: Some(1_048_576) }),
+            owner_device: true,
+        };
+        let open = Claims {
+            sub: OPEN_SUB.into(),
+            exp: t("2026-06-10T00:10:00Z"),
+            jti: "01JOPEN000000000000000000".into(),
+            scope: SCOPE_DEPOSIT_OPEN.into(),
+            quota: Some(Quota { msgs: Some(1), bytes: None }),
+            owner_device: false,
+            ..standing.clone()
+        };
+        for (claims, go) in [(&standing, GO_STANDING), (&open, GO_OPEN)] {
+            assert_eq!(mint_token(&recipient(), claims).unwrap().as_str(), go);
+            assert_eq!(&parse_token(go, &recipient().verifying_key()).unwrap(), claims);
+        }
+    }
+
+    /// Optional quota shapes round trip: bytes only, and empty.
+    #[test]
+    fn quota_shapes_round_trip() {
+        for quota in [Quota { msgs: None, bytes: Some(9) }, Quota::default()] {
+            let c = Claims { quota: Some(quota), ..vector_claims() };
+            let token = mint_token(&recipient(), &c).unwrap();
+            assert_eq!(parse_token(token.as_str(), &recipient().verifying_key()).unwrap(), c);
+        }
+        let empty = Claims { quota: Some(Quota::default()), ..vector_claims() };
+        assert!(empty.to_json().contains(r#","quota":{}"#));
+    }
+
+    /// U+2028 and U+2029 are escaped as Go's encoder does.
+    #[test]
+    fn line_separators_are_escaped_as_go_does() {
+        let c = Claims { aud: "https://r\u{2028}\u{2029}".into(), ..vector_claims() };
+        assert!(c.to_json().contains(r#""aud":"https://r\u2028\u2029""#), "{}", c.to_json());
+    }
+
+    /// Claims the parser would refuse are not minted.
+    #[test]
+    fn invalid_claims_are_not_minted() {
+        let bad = [
+            Claims { quota: Some(Quota { msgs: Some(-1), bytes: None }), ..vector_claims() },
+            Claims { jti: String::new(), ..vector_claims() },
+            Claims { scope: SCOPE_DEPOSIT_OPEN.into(), ..vector_claims() },
+            Claims {
+                exp: chrono::NaiveDate::from_ymd_opt(10000, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc(),
+                ..vector_claims()
+            },
+        ];
+        for c in bad {
+            assert_eq!(mint_token(&recipient(), &c), Err(TokenError::Invalid), "{c:?}");
+        }
+    }
+
+    /// Neither a token nor the sender key or jti in claims is printed.
+    #[test]
+    fn debug_prints_no_token_material() {
+        let token = mint_token(&recipient(), &vector_claims()).unwrap();
+        assert_eq!(format!("{token:?}"), "Token(..)");
+        let claims = format!("{:?}", vector_claims());
+        assert!(!claims.contains("gTl3Dqh9"), "{claims}");
+        assert!(!claims.contains("01JXAMPLE"), "{claims}");
+    }
+
+    /// Hostile input never panics the parsers (a stable stand-in until
+    /// the fuzz target lands).
+    #[test]
+    fn hostile_input_never_panics() {
+        let key = recipient().verifying_key();
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.=\r\n{}\":,[]";
+        for _ in 0..2000 {
+            let len = (next() % 600) as usize;
+            let s: String = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize] as char).collect();
+            let _ = verify_token(&format!("v4.public.{s}"), &key);
+            let _ = parse_claims(s.as_bytes());
+            let bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            let _ = parse_claims(&bytes);
+            let _ = strict_time(&s);
+        }
     }
 
     /// `iat <= now < exp`.

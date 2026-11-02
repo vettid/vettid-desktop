@@ -89,6 +89,25 @@ pub fn timestamp(now: chrono::DateTime<chrono::Utc>) -> String {
     now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// The last millisecond a request was signed at, in this process.
+static LAST_SIGNED_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// `now`, or a millisecond after the last request signed in this process
+/// if that is later: request timestamps never repeat, so even a request
+/// re-signed within the same millisecond (a fast retry) isn't a replay.
+fn strictly_after_last(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let now_ms = now.timestamp_millis();
+    let mut last = LAST_SIGNED_MS.load(SeqCst);
+    loop {
+        let next = now_ms.max(last.saturating_add(1));
+        match LAST_SIGNED_MS.compare_exchange(last, next, SeqCst, SeqCst) {
+            Ok(_) => return chrono::DateTime::from_timestamp_millis(next).unwrap_or(now),
+            Err(seen) => last = seen,
+        }
+    }
+}
+
 /// The three signed-request headers for one request (§4.1). Sign again for
 /// every attempt: the relay keeps a replay cache.
 #[derive(Clone, PartialEq, Eq)]
@@ -106,9 +125,12 @@ impl std::fmt::Debug for SignedHeaders {
 }
 
 impl SignedHeaders {
-    /// Headers for `method path` with `body`, signed at `now`.
+    /// Headers for `method path` with `body`, signed at `now` (or just
+    /// after the last request signed in this process). `path` is the
+    /// escaped path the relay sees, with `/v1` and without the query.
     pub fn new(key: &SigningKey, method: &str, path: &str, body: &[u8], now: chrono::DateTime<chrono::Utc>) -> Self {
-        let ts = timestamp(now);
+        debug_assert!(path.starts_with("/v1/") && !path.contains('?'), "sign the path only");
+        let ts = timestamp(strictly_after_last(now));
         let sig = sign_request(key, method, path, &ts, &body_hash(body));
         Self { key: encode_key(&key.verifying_key()), timestamp: ts, sig: STANDARD.encode(sig) }
     }
@@ -169,10 +191,14 @@ pub(crate) mod tests {
         assert_eq!(hex::encode(body_hash(b"")), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
         let t0 = chrono::DateTime::parse_from_rfc3339("2026-06-10T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
         let t1 = t0 + chrono::Duration::milliseconds(1);
+        assert_eq!(timestamp(t0), "2026-06-10T12:00:00.000Z");
+        assert_eq!(timestamp(t1), "2026-06-10T12:00:00.001Z");
         let a = SignedHeaders::new(&sender(), "GET", "/v1/mailbox", b"", t0);
-        let b = SignedHeaders::new(&sender(), "GET", "/v1/mailbox", b"", t1);
-        assert_eq!(a.timestamp, "2026-06-10T12:00:00.000Z");
-        assert_eq!(b.timestamp, "2026-06-10T12:00:00.001Z");
+        let b = SignedHeaders::new(&sender(), "GET", "/v1/mailbox", b"", t0);
+        // Both signed "at" the same millisecond: the second moves on, so
+        // the relay's replay cache doesn't refuse it.
+        assert!(b.timestamp > a.timestamp, "{} then {}", a.timestamp, b.timestamp);
+        assert!(a.timestamp.ends_with('Z') && a.timestamp.len() == "2026-06-10T12:00:00.000Z".len());
         assert_ne!(a.sig, b.sig);
         assert_eq!(a.key, encode_key(&sender().verifying_key()));
         assert_eq!(format!("{a:?}"), "SignedHeaders(..)", "nothing secret or signed is printed");
