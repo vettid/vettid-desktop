@@ -1,0 +1,28 @@
+[package]
+name = "vettid-vms"
+version = "0.1.0"
+edition = "2021"
+description = "VettID messaging (VAULT-MESSAGING suite 2): KEM, HPKE, session AEAD, kids and signatures"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+# HPKE (RFC 9180) with X-Wing, KEM MLKEM768X25519 (0x647a), by the owner's
+# decision: a maintained crate, no hand-written HPKE. hpke 0.15.1 (rozbb,
+# MIT/Apache-2.0) on RustCrypto's x-wing 0.1.1 and ml-kem (MIT/Apache-2.0).
+# "getrandom" gives hpke::setup_sender its own OS randomness.
+hpke = { version = "0.15", default-features = false, features = ["alloc", "getrandom", "mlkem", "x25519", "chacha", "hkdfsha2"] }
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+ed25519-dalek = "2"
+rand = "0.8"
+subtle = "2"
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+base64 = "0.22"
+hex = "0.4"
+hkdf = "0.12"
+rand_core = "0.10"
+serde_json = "1"
+vettid-relay = { path = "../vettid-relay" }
