@@ -1,0 +1,30 @@
+[package]
+name = "vettid-device"
+version = "0.1.0"
+edition = "2021"
+description = "VettID device engine: pairing a desktop with its vault (VAULT-MESSAGING §6.7) over the relay"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+vettid-relay = { path = "../vettid-relay" }
+vettid-vms = { path = "../vettid-vms" }
+ed25519-dalek = "2"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+zeroize = "1"
+rand = "0.8"
+base64 = "0.22"
+hex = "0.4"
+
+[features]
+# A plain-file key store for development only. It must never be in a
+# release build: lib.rs refuses to compile it without debug_assertions,
+# and CI checks both that and that the app doesn't enable it.
+dev-file-store = []
+# The local dev stack's plain-HTTP relay (passed through to vettid-relay).
+devstack = ["vettid-relay/devstack"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+serde_json = "1"
+sha2 = "0.10"

@@ -61,6 +61,20 @@ jobs:
         run: |
           rustup component add clippy
           cargo clippy --manifest-path src-tauri/Cargo.toml -p vettid-vms --all-targets --locked -- -D warnings
+      - name: clippy (vettid-device)
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml -p vettid-device --all-targets --locked -- -D warnings
+      # The dev-only plain-file key store: tested in debug builds, refused by
+      # the compiler in release builds, and never enabled by the app.
+      - name: dev key store gate (vettid-device)
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml -p vettid-device --features dev-file-store --locked
+          if cargo check --manifest-path src-tauri/Cargo.toml -p vettid-device --features dev-file-store --release --locked 2> release.log; then
+            echo "a release build accepted the dev-file-store feature"; exit 1
+          fi
+          grep -q "for development builds only" release.log
+          if cargo tree --manifest-path src-tauri/Cargo.toml -p vettid-desktop -e features --locked | grep -q "dev-file-store"; then
+            echo "the app enables the dev-file-store feature"; exit 1
+          fi
 
   gitleaks:
     # Pinned binary over the FULL history (the gitleaks-action fails on a

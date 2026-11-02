@@ -75,11 +75,76 @@ impl std::fmt::Debug for Epoch {
     }
 }
 
+/// Everything an epoch holds, for storing it and restoring it later (the
+/// device engine's persistence). It is secret: its keys wipe themselves,
+/// and `Debug` prints nothing.
+pub struct EpochState {
+    pub id: [u8; EPOCH_ID_SIZE],
+    pub role: Role,
+    pub suite: u8,
+    pub policy: Policy,
+    pub created: DateTime<Utc>,
+    pub active: bool,
+    /// The send key and its kids (`recipient_kid`, `sender_kid`), unless
+    /// retired.
+    pub send: Option<(Zeroizing<[u8; KEY_SIZE]>, Kid, Kid)>,
+    /// The receive key and its kids (`recipient_kid`, `sender_kid`).
+    pub recv: (Zeroizing<[u8; KEY_SIZE]>, Kid, Kid),
+    pub rk: Option<Zeroizing<[u8; KEY_SIZE]>>,
+    pub last_seq: u64,
+    pub sent: u64,
+    pub received: u64,
+}
+
+impl std::fmt::Debug for EpochState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EpochState(..)")
+    }
+}
+
 impl Epoch {
+    /// Everything the epoch holds, to store (secret).
+    pub fn snapshot(&self) -> EpochState {
+        let dir = |d: &Direction| (d.key.clone(), d.recipient_kid, d.sender_kid);
+        EpochState {
+            id: self.id,
+            role: self.role,
+            suite: self.suite,
+            policy: self.policy,
+            created: self.created,
+            active: self.active,
+            send: self.send.as_ref().map(dir),
+            recv: dir(&self.recv),
+            rk: self.rk.clone(),
+            last_seq: self.last_seq,
+            sent: self.sent,
+            received: self.received,
+        }
+    }
+
+    /// An epoch from a stored [`EpochState`].
+    pub fn restore(s: EpochState) -> Self {
+        let dir = |(key, recipient_kid, sender_kid): (Zeroizing<[u8; KEY_SIZE]>, Kid, Kid)| Direction { key, recipient_kid, sender_kid };
+        Epoch {
+            id: s.id,
+            role: s.role,
+            suite: s.suite,
+            policy: s.policy,
+            created: s.created,
+            active: s.active,
+            send: s.send.map(dir),
+            recv: dir(s.recv),
+            rk: s.rk,
+            last_seq: s.last_seq,
+            sent: s.sent,
+            received: s.received,
+        }
+    }
+
     /// From a schedule, inactive: direction i2r uses `k_i2r` with
     /// `recipient_kid = kid_i2r` and `sender_kid = kid_r2i`; r2i mirrors it
     /// (§6.3).
-    pub(crate) fn new(s: &Schedule, role: Role, suite: u8, policy: Policy, now: DateTime<Utc>) -> Self {
+    pub fn new(s: &Schedule, role: Role, suite: u8, policy: Policy, now: DateTime<Utc>) -> Self {
         let i2r = || Direction { key: s.k_i2r.clone(), recipient_kid: s.kid_i2r, sender_kid: s.kid_r2i };
         let r2i = || Direction { key: s.k_r2i.clone(), recipient_kid: s.kid_r2i, sender_kid: s.kid_i2r };
         let (send, recv) = match role {
@@ -281,6 +346,21 @@ mod tests {
         let mine = Envelope::parse(&i.seal(&mut own).unwrap()).unwrap();
         assert!(i.open(&mine).is_err());
         assert_eq!(format!("{i:?}"), "Epoch { role: Initiator, suite: 2, active: true, sent: 4, received: 1, .. }");
+    }
+
+    /// A snapshot restores to an epoch that carries on where it was.
+    #[test]
+    fn snapshot_and_restore() {
+        let (mut i, mut r) = pair();
+        let mut m = ping("01JB2Z6V9K3M4N5P6Q7R8S9T0V");
+        r.open(&Envelope::parse(&i.seal(&mut m).unwrap()).unwrap()).unwrap();
+        let mut i2 = Epoch::restore(i.snapshot());
+        assert_eq!((i2.id(), i2.counts(), i2.is_active()), (i.id(), i.counts(), true));
+        let mut next = ping("01JB2Z6V9K3M4N5P6Q7R8S9T0W");
+        let env = Envelope::parse(&i2.seal(&mut next).unwrap()).unwrap();
+        assert_eq!(next.seq, Some(2), "seq carries on");
+        assert!(r.open(&env).is_ok());
+        assert_eq!(format!("{:?}", i2.snapshot()), "EpochState(..)");
     }
 
     #[test]
