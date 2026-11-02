@@ -369,6 +369,7 @@ pub async fn complete_pairing(
 
     store::ensure_config_dir(config_dir).map_err(|e| match e {
         store::CredentialError::NotPrivate => RegistrationError::NotPrivate,
+        store::CredentialError::ParentNotPrivate => RegistrationError::ParentNotPrivate,
         e => RegistrationError::Internal(e.to_string()),
     })?;
 
@@ -403,6 +404,7 @@ pub async fn complete_pairing(
     let binding = store::save(config_dir, &creds).map_err(|e| match e {
         store::CredentialError::KeyringUnavailable => RegistrationError::KeyringUnavailable,
         store::CredentialError::NotPrivate => RegistrationError::NotPrivate,
+        store::CredentialError::ParentNotPrivate => RegistrationError::ParentNotPrivate,
         store::CredentialError::NoMachineId => RegistrationError::NoMachineId,
         e => RegistrationError::Internal(format!("save credentials: {}", e)),
     })?;
