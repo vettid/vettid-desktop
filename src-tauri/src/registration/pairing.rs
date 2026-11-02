@@ -429,21 +429,23 @@ pub async fn complete_pairing(
 
 /// After a save: was the new session recorded? #26: it is live only if its
 /// marker was written with the save; if not, the next load treats it as
-/// ended, so it isn't reported as started. #30: a log-out that wiped the
-/// pairing since `since` is reported first, since the save is gone too.
+/// ended, so it isn't reported as started. #30: when the marker is missing,
+/// a log-out that wiped the pairing since `since` is the reason given,
+/// since the save is gone too. The count is read after the marker, so a
+/// wipe that removed it is always seen.
 fn session_recorded(
     config_dir: &std::path::Path,
     session_id: &str,
     since: crate::credential::store::WipeEpoch,
 ) -> Result<(), RegistrationError> {
     use crate::credential::store;
+    if store::session_is_recorded(config_dir, session_id) {
+        return Ok(());
+    }
     if store::wipe_epoch() != since {
         return Err(RegistrationError::LoggedOutMeanwhile);
     }
-    if !store::session_is_recorded(config_dir, session_id) {
-        return Err(RegistrationError::SessionNotRecorded);
-    }
-    Ok(())
+    Err(RegistrationError::SessionNotRecorded)
 }
 
 fn derive_session_key(
