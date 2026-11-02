@@ -1,13 +1,20 @@
 //! Deposit tokens: PASETO v4.public (RELAY-PROTOCOL §5).
 //!
-//! Implemented directly on Ed25519, as the relay's Go `relayauth` does.
-//! Footer and implicit assertion are empty in protocol v1 (§5.1); a token
-//! carrying a footer is refused.
+//! Signing and verification are the `pasetors` crate's (v4.public); this
+//! module adds the protocol's rules on top: the form checks, the claim
+//! JSON in spec order, and the claim rules. Footer and implicit assertion
+//! are empty in protocol v1 (§5.1); a token carrying a footer is refused.
 
+#[cfg(test)]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+#[cfg(test)]
 use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use pasetors::keys::{AsymmetricPublicKey, AsymmetricSecretKey};
+use pasetors::token::UntrustedToken;
+use pasetors::version4::{PublicToken, V4};
+use pasetors::Public;
 use serde::Deserialize;
 
 use crate::auth;
@@ -46,17 +53,6 @@ impl std::fmt::Display for TokenError {
 
 impl std::error::Error for TokenError {}
 
-/// PASETO Pre-Authentication Encoding.
-fn pae(pieces: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + pieces.iter().map(|p| 8 + p.len()).sum::<usize>());
-    out.extend_from_slice(&((pieces.len() as u64) & !(1 << 63)).to_le_bytes());
-    for p in pieces {
-        out.extend_from_slice(&((p.len() as u64) & !(1 << 63)).to_le_bytes());
-        out.extend_from_slice(p);
-    }
-    out
-}
-
 /// A deposit token as sent (`v4.public.…`). An open token is a bearer
 /// capability (§5.6), so its `Debug` prints nothing and it has no
 /// `Display`: use [`Token::as_str`] where it's sent. It has no `PartialEq`
@@ -89,12 +85,14 @@ impl std::fmt::Debug for Token {
 /// A v4.public token over the exact message bytes `m` (empty footer and
 /// implicit assertion). Ed25519 is deterministic: the same key and bytes
 /// always give the same token.
-pub fn sign_token(key: &SigningKey, m: &[u8]) -> Token {
-    let sig = key.sign(&pae(&[HEADER.as_bytes(), m, b"", b""]));
-    let mut body = Vec::with_capacity(m.len() + 64);
-    body.extend_from_slice(m);
-    body.extend_from_slice(&sig.to_bytes());
-    Token(format!("{HEADER}{}", URL_SAFE_NO_PAD.encode(body)))
+///
+/// Refuses an empty message (`pasetors` does).
+pub fn sign_token(key: &SigningKey, m: &[u8]) -> Result<Token, TokenError> {
+    // The 64-byte keypair copy is wiped when dropped; pasetors' key type
+    // wipes its own.
+    let keypair = zeroize::Zeroizing::new(key.to_keypair_bytes());
+    let secret = AsymmetricSecretKey::<V4>::from(&keypair[..]).map_err(|_| TokenError::Invalid)?;
+    PublicToken::sign(&secret, m, None, None).map(Token).map_err(|_| TokenError::Invalid)
 }
 
 /// Check a token's form and signature against `issuer`, and return the
@@ -109,19 +107,13 @@ pub fn verify_token(token: &str, issuer: &VerifyingKey) -> Result<Vec<u8>, Token
     if !rest.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
         return Err(TokenError::Invalid);
     }
-    let raw = URL_SAFE_NO_PAD.decode(rest).map_err(|_| TokenError::Invalid)?;
-    if raw.len() < 64 {
-        return Err(TokenError::Invalid);
-    }
-    let (m, sig) = raw.split_at(raw.len() - 64);
-    let sig = Signature::from_slice(sig).map_err(|_| TokenError::Invalid)?;
-    // `verify_strict`: as Go's `ed25519.Verify` (S < L, R compared as
-    // encoded), and also refusing small-order keys and R, which an honest
-    // key never produces.
-    issuer
-        .verify_strict(&pae(&[HEADER.as_bytes(), m, b"", b""]), &sig)
-        .map_err(|_| TokenError::Invalid)?;
-    Ok(m.to_vec())
+    let untrusted = UntrustedToken::<Public, V4>::try_from(token).map_err(|_| TokenError::Invalid)?;
+    let issuer = AsymmetricPublicKey::<V4>::from(issuer.as_bytes()).map_err(|_| TokenError::Invalid)?;
+    // Footer `None`: pasetors then accepts any footer, and `Some(b"")`
+    // refuses footer-less tokens too, so the "no footer" rule is the
+    // alphabet check above (a footer needs a second '.'), tested below.
+    let trusted = PublicToken::verify(&issuer, &untrusted, None, None).map_err(|_| TokenError::Invalid)?;
+    Ok(trusted.payload().as_bytes().to_vec())
 }
 
 /// The optional per-token deposit cap (§5.2).
@@ -232,7 +224,7 @@ pub fn mint_token(key: &SigningKey, claims: &Claims) -> Result<Token, TokenError
     }
     let json = claims.to_json();
     parse_claims(json.as_bytes())?;
-    Ok(sign_token(key, json.as_bytes()))
+    sign_token(key, json.as_bytes())
 }
 
 // Unknown quota members are ignored, as unknown claims are.
@@ -396,7 +388,7 @@ mod tests {
     /// parses back.
     #[test]
     fn vector_9_2_deposit_token() {
-        assert_eq!(sign_token(&recipient(), VECTOR_CLAIMS.as_bytes()).as_str(), VECTOR_TOKEN);
+        assert_eq!(sign_token(&recipient(), VECTOR_CLAIMS.as_bytes()).unwrap().as_str(), VECTOR_TOKEN);
         assert_eq!(vector_claims().to_json(), VECTOR_CLAIMS);
         assert_eq!(mint_token(&recipient(), &vector_claims()).unwrap().as_str(), VECTOR_TOKEN);
         let claims = parse_token(VECTOR_TOKEN, &recipient().verifying_key()).unwrap();
@@ -433,6 +425,7 @@ mod tests {
             tampered.as_str(),
             &VECTOR_TOKEN.replacen("v4.public.", "v4.local.", 1),
             &format!("{VECTOR_TOKEN}.e30"),     // a footer
+            &PublicTokenWithFooter::make(),     // a validly signed token with a footer
             &format!("{VECTOR_TOKEN}="),        // padding
             &VECTOR_TOKEN.replacen('_', "/", 1), // standard alphabet
             &format!("{}\n{}", &VECTOR_TOKEN[..20], &VECTOR_TOKEN[20..]),
@@ -484,6 +477,21 @@ mod tests {
         for ok in ["2026-06-10T00:00:00.5Z", "2026-06-10T02:00:00+02:00", "2026-06-10T00:00:00.000Z"] {
             assert!(parse_claims(edit("2026-06-10T00:00:00Z", ok).as_bytes()).is_ok(), "{ok}");
         }
+    }
+
+    struct PublicTokenWithFooter;
+    impl PublicTokenWithFooter {
+        /// A token signed by the recipient with a non-empty footer.
+        fn make() -> String {
+            let secret = AsymmetricSecretKey::<V4>::from(&recipient().to_keypair_bytes()).unwrap();
+            PublicToken::sign(&secret, VECTOR_CLAIMS.as_bytes(), Some(b"footer"), None).unwrap()
+        }
+    }
+
+    /// An empty message isn't signed.
+    #[test]
+    fn an_empty_message_is_not_signed() {
+        assert!(matches!(sign_token(&recipient(), b""), Err(TokenError::Invalid)));
     }
 
     /// A byte changed inside the signed message, re-encoded, fails the
