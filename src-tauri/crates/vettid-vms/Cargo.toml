@@ -12,7 +12,13 @@ publish = false
 # MIT/Apache-2.0) on RustCrypto's x-wing 0.1.1 and ml-kem (MIT/Apache-2.0).
 # "getrandom" gives hpke::setup_sender its own OS randomness.
 hpke = { version = "0.15", default-features = false, features = ["alloc", "getrandom", "mlkem", "x25519", "chacha", "hkdfsha2"] }
+# Pinned exactly: pre-1.0 and tracking an IETF draft. Re-run the vectors
+# (cargo test -p vettid-vms) on any bump.
+x-wing = "=0.1.1"
 chacha20poly1305 = "0.10"
+# Only its x25519 function, for the low-order check (as Go's ecdh refuses
+# an all-zero shared secret). The app already uses x25519-dalek 2.
+x25519-dalek = "2"
 sha2 = "0.10"
 ed25519-dalek = "2"
 rand = "0.8"

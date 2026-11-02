@@ -7,7 +7,9 @@
 //! Release code encapsulates with the crate's own OS randomness
 //! ([`hpke::setup_sender`]); only the known-answer tests pass fixed
 //! randomness (`hpke::setup_sender_with_rng`, called in `#[cfg(test)]`
-//! code only).
+//! code only). The crate's `clippy.toml` disallows the `_with_rng`
+//! functions, and CI runs clippy with `-D warnings`, so any other call is
+//! an error.
 
 use hpke::aead::{AeadCtxR, AeadCtxS};
 use hpke::kem::XWing;
@@ -27,13 +29,19 @@ pub struct Sender {
     used: bool,
 }
 
-/// A receiving context, for exactly one message. Prints nothing.
+/// A receiving context, for exactly one message. Prints nothing. It
+/// exports only after its message opened (anyone can encapsulate to a
+/// public key, so nothing derived is trusted before that).
 pub struct Recipient {
     ctx: AeadCtxR<Aead, Kdf, XWing>,
     used: bool,
+    opened: bool,
 }
 
 /// `SetupBaseS(pk, info)` with fresh OS randomness: `(enc, ctx)`.
+///
+/// If the operating system's random source fails, the crate panics rather
+/// than encapsulate with weak randomness; nothing has been sealed then.
 pub fn setup_sender(pk: &PublicKey, info: &[u8]) -> Result<([u8; ENC_SIZE], Sender), SuiteError> {
     let (enc, ctx) = hpke::setup_sender::<Aead, Kdf, XWing>(&OpModeS::Base, pk.inner(), info).map_err(|_| SuiteError::BadKey)?;
     Ok((enc_bytes(&enc)?, Sender { ctx, used: false }))
@@ -44,9 +52,13 @@ pub fn setup_recipient(enc: &[u8], sk: &PrivateKey, info: &[u8]) -> Result<Recip
     if enc.len() != ENC_SIZE {
         return Err(SuiteError::KeySize);
     }
+    // A low-order ct_X is refused, as Go and Kotlin do (see kem).
+    if super::kem::x25519_low_order(enc[super::kem::CT_M_SIZE..].try_into().expect("size")) {
+        return Err(SuiteError::Decrypt);
+    }
     let enc = EncappedKey::from_bytes(enc).map_err(|_| SuiteError::BadKey)?;
     let ctx = hpke::setup_receiver::<Aead, Kdf, XWing>(&OpModeR::Base, sk.inner(), &enc, info).map_err(|_| SuiteError::Decrypt)?;
-    Ok(Recipient { ctx, used: false })
+    Ok(Recipient { ctx, used: false, opened: false })
 }
 
 fn enc_bytes(enc: &EncappedKey) -> Result<[u8; ENC_SIZE], SuiteError> {
@@ -54,15 +66,16 @@ fn enc_bytes(enc: &EncappedKey) -> Result<[u8; ENC_SIZE], SuiteError> {
 }
 
 impl Sender {
-    /// Seal the context's one message.
+    /// Seal the context's one message. The plaintext is the caller's to
+    /// wipe.
     pub fn seal(&mut self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, SuiteError> {
         take(&mut self.used)?;
-        self.ctx.seal(plaintext, aad).map_err(|_| SuiteError::Decrypt)
+        self.ctx.seal(plaintext, aad).map_err(|_| SuiteError::Encrypt)
     }
 
     /// `Export(exporter_context, L)`.
     pub fn export(&self, exporter_context: &[u8], out: &mut [u8]) -> Result<(), SuiteError> {
-        self.ctx.export(exporter_context, out).map_err(|_| SuiteError::KeySize)
+        self.ctx.export(exporter_context, out).map_err(|_| SuiteError::ExportLength)
     }
 }
 
@@ -70,12 +83,17 @@ impl Recipient {
     /// Open the context's one message.
     pub fn open(&mut self, aad: &[u8], ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, SuiteError> {
         take(&mut self.used)?;
-        self.ctx.open(ciphertext, aad).map(Zeroizing::new).map_err(|_| SuiteError::Decrypt)
+        let plaintext = self.ctx.open(ciphertext, aad).map(Zeroizing::new).map_err(|_| SuiteError::Decrypt)?;
+        self.opened = true;
+        Ok(plaintext)
     }
 
-    /// `Export(exporter_context, L)`.
+    /// `Export(exporter_context, L)`, only after the message opened.
     pub fn export(&self, exporter_context: &[u8], out: &mut [u8]) -> Result<(), SuiteError> {
-        self.ctx.export(exporter_context, out).map_err(|_| SuiteError::KeySize)
+        if !self.opened {
+            return Err(SuiteError::NotOpened);
+        }
+        self.ctx.export(exporter_context, out).map_err(|_| SuiteError::ExportLength)
     }
 }
 
@@ -133,7 +151,9 @@ pub(crate) mod tests {
     }
     impl rand_core::TryCryptoRng for FixedRng {}
 
-    /// `SetupBaseS` with fixed randomness (tests only).
+    /// `SetupBaseS` with fixed randomness (tests only; the crate's
+    /// clippy.toml disallows it everywhere else).
+    #[allow(clippy::disallowed_methods)]
     pub(crate) fn setup_sender_with(pk: &PublicKey, info: &[u8], rng: &mut FixedRng) -> ([u8; ENC_SIZE], Sender) {
         let (enc, ctx) = hpke::setup_sender_with_rng::<Aead, Kdf, XWing>(&OpModeS::Base, pk.inner(), info, rng).unwrap();
         (enc_bytes(&enc).unwrap(), Sender { ctx, used: false })
@@ -185,9 +205,10 @@ pub(crate) mod tests {
         let sk = PrivateKey::from_seed(&vectors::seed(&keys["vault"]["kem_seed_hex"])).unwrap();
         let mut recipient = setup_recipient(&enc, &sk, INFO_SEALED.as_bytes()).unwrap();
         let mut theirs = [0u8; 32];
+        assert!(matches!(recipient.export(b"ctx", &mut theirs), Err(SuiteError::NotOpened)), "not before it opens");
+        assert_eq!(&recipient.open(b"aad", &ct).unwrap()[..], b"hello vault");
         recipient.export(b"ctx", &mut theirs).unwrap();
         assert_eq!(theirs, want);
-        assert_eq!(&recipient.open(b"aad", &ct).unwrap()[..], b"hello vault");
     }
 
     /// One message per context; a wrong AAD, info, key or ciphertext fails.
@@ -215,6 +236,39 @@ pub(crate) mod tests {
         assert!(matches!(ok.open(b"aad", &tampered), Err(SuiteError::Decrypt)));
         assert!(matches!(setup_recipient(&enc[..ENC_SIZE - 1], &sk, b"info"), Err(SuiteError::KeySize)));
         assert_eq!(format!("{ok:?}"), "hpke::Recipient(..)");
+    }
+
+    /// A changed `enc` decapsulates to another secret (ML-KEM's implicit
+    /// rejection), so the message doesn't open; an over-long export is
+    /// refused.
+    #[test]
+    fn a_tampered_enc_fails_to_open() {
+        let sk = PrivateKey::generate().unwrap();
+        let (mut enc, mut sender) = setup_sender(sk.public(), b"info").unwrap();
+        let ct = sender.seal(b"aad", b"m").unwrap();
+        enc[17] ^= 0x01;
+        let mut r = setup_recipient(&enc, &sk, b"info").unwrap();
+        assert!(matches!(r.open(b"aad", &ct), Err(SuiteError::Decrypt)));
+        let mut out = [0u8; 32];
+        assert!(matches!(r.export(b"ctx", &mut out), Err(SuiteError::NotOpened)), "nor after a failed open");
+    }
+
+    /// An `enc` whose X25519 part has low order is refused (Go and Kotlin
+    /// refuse it too); an over-long export after a good open is refused.
+    #[test]
+    fn low_order_enc_and_long_exports_are_refused() {
+        let sk = PrivateKey::generate().unwrap();
+        let (enc, mut sender) = setup_sender(sk.public(), b"info").unwrap();
+        let ct = sender.seal(b"aad", b"m").unwrap();
+        for u in [[0u8; 32], { let mut one = [0u8; 32]; one[0] = 1; one }] {
+            let mut bad = enc;
+            bad[crate::suite::kem::CT_M_SIZE..].copy_from_slice(&u);
+            assert!(matches!(setup_recipient(&bad, &sk, b"info"), Err(SuiteError::Decrypt)));
+        }
+        let mut r = setup_recipient(&enc, &sk, b"info").unwrap();
+        r.open(b"aad", &ct).unwrap();
+        let mut too_long = vec![0u8; 255 * 32 + 1];
+        assert!(matches!(r.export(b"ctx", &mut too_long), Err(SuiteError::ExportLength)));
     }
 
     /// Two senders to the same key never share an `enc`: release code

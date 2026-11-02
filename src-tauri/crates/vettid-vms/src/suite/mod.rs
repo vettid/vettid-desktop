@@ -75,6 +75,14 @@ pub enum SuiteError {
     ContextUsed,
     /// A signature that doesn't verify.
     Signature,
+    /// Sealing failed (the AEAD refused, e.g. a message past its limit).
+    Encrypt,
+    /// An HPKE export of a length the KDF can't produce.
+    ExportLength,
+    /// A receiving context exported before its message opened: anyone can
+    /// encapsulate to a public key, so nothing derived is trusted until the
+    /// message authenticates.
+    NotOpened,
     /// The system's random source failed.
     Random,
 }
@@ -89,6 +97,9 @@ impl std::fmt::Display for SuiteError {
             Self::Decrypt => "decryption failed",
             Self::ContextUsed => "HPKE context already used for a message",
             Self::Signature => "signature verification failed",
+            Self::Encrypt => "encryption failed",
+            Self::ExportLength => "export length not supported",
+            Self::NotOpened => "export before the message opened",
             Self::Random => "randomness unavailable",
         })
     }
@@ -187,6 +198,7 @@ mod vendored {
             ("keys.json", include_bytes!("../../tests/vectors/keys.json").as_slice()),
             ("hpke.json", include_bytes!("../../tests/vectors/hpke.json").as_slice()),
         ] {
+            assert!(!text.contains(&b'\r'), "{name}: LF line endings, as in the vault");
             let hash = hex::encode(Sha256::digest(text));
             let row = source.lines().find(|l| l.contains(&format!("`{name}`"))).expect("a row in SOURCE.md");
             assert!(row.contains(&hash), "{name}: {hash} not in SOURCE.md");

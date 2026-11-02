@@ -1,0 +1,7 @@
+# The HPKE functions that take caller-supplied randomness are for the
+# known-answer tests only (#[allow]ed there). Anywhere else they would let a
+# caller fix the encapsulation randomness. CI runs clippy with -D warnings.
+disallowed-methods = [
+    { path = "hpke::setup_sender_with_rng", reason = "tests only: release code uses hpke::setup_sender (OS randomness)" },
+    { path = "hpke::single_shot_seal_with_rng", reason = "tests only: release code uses OS randomness" },
+]

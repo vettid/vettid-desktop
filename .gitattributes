@@ -1,0 +1,2 @@
+# Vendored test vectors are byte-for-byte copies of the vault's (LF); never convert them.
+src-tauri/crates/vettid-vms/tests/vectors/*.json -text
