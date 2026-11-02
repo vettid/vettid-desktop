@@ -114,13 +114,19 @@ pub(crate) enum NotPrivate {
     /// The pairing folder's parent is a symlink or junction, which could be
     /// pointed elsewhere after the check (#21).
     ParentLink,
+    /// The pairing folder's parent has an allow entry of a type this module
+    /// doesn't interpret, so it can't tell what it grants (#21).
+    ParentUnknownEntry,
 }
 
 impl NotPrivate {
     /// Whether the refusal is about the pairing folder's parent rather
     /// than the folder or file: it gets its own notice.
     pub(crate) fn is_about_the_parent(&self) -> bool {
-        matches!(self, Self::ParentForeignOwner | Self::ParentForeignControl | Self::ParentLink)
+        matches!(
+            self,
+            Self::ParentForeignOwner | Self::ParentForeignControl | Self::ParentLink | Self::ParentUnknownEntry
+        )
     }
 }
 
@@ -136,6 +142,7 @@ impl std::fmt::Display for NotPrivate {
             Self::ParentForeignOwner => "is in a folder owned by another account",
             Self::ParentForeignControl => "is in a folder where another account can delete, rename or replace it",
             Self::ParentLink => "is in a folder that is a symlink or junction",
+            Self::ParentUnknownEntry => "is in a folder with an access entry this app does not check",
         })
     }
 }
@@ -417,7 +424,7 @@ unsafe fn judge_parent(owner: PSID, dacl: *const ACL, user: &[u8]) -> Result<(),
             | ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE
             | SYSTEM_AUDIT_ACE_TYPE
             | SYSTEM_ALARM_ACE_TYPE => {}
-            _ => return Err(NotPrivate::UnknownAllowEntry.into()),
+            _ => return Err(NotPrivate::ParentUnknownEntry.into()),
         }
     }
     Ok(())
@@ -1396,10 +1403,15 @@ mod tests {
             (format!("O:{me}D:(A;;GW;;;WD)"), Ok(()), "GENERIC_WRITE only"),
             (format!("O:{me}D:(A;;FA;;;OW)"), Ok(()), "OWNER RIGHTS (the trusted owner)"),
             (format!("O:{me}D:(A;;FA;;;CO)"), Ok(()), "CREATOR OWNER on the folder itself is inert"),
-            (format!("O:{me}D:(XA;;FA;;;WD;(WIN://SYSAPPID Contains \"x\"))"), refused(NotPrivate::UnknownAllowEntry), "a callback allow entry"),
+            (format!("O:{me}D:(XA;;FA;;;WD;(WIN://SYSAPPID Contains \"x\"))"), refused(NotPrivate::ParentUnknownEntry), "a callback allow entry"),
             (format!("O:{me}D:(XA;OICIIO;FA;;;WD;(WIN://SYSAPPID Contains \"x\"))"), Ok(()), "an inherit-only callback entry"),
         ];
         for (sddl, want, what) in cases {
+            if let Err(AclError::NotPrivate(why)) = &want {
+                // Every parent refusal gets the parent notice, not the
+                // folder's "delete that folder, then pair again".
+                assert!(why.is_about_the_parent(), "{what}: {why:?}");
+            }
             assert_eq!(judge_parent_sddl(&sddl), want, "{what}: {sddl}");
         }
     }
