@@ -367,15 +367,11 @@ pub async fn complete_pairing(
     )?;
     shared_secret.zeroize();
 
-    // Save encrypted credentials
+    // Save encrypted credentials. The folder is made (or checked) by the
+    // save itself, under the store's writer lock and after its log-out
+    // check, so a pairing that a log-out overtook doesn't recreate an
+    // empty folder after the wipe (#30).
     use crate::credential::store::{self, ConnectionCredentials};
-
-    store::ensure_config_dir(config_dir).map_err(|e| match e {
-        store::CredentialError::NotPrivate => RegistrationError::NotPrivate,
-        store::CredentialError::ParentNotPrivate => RegistrationError::ParentNotPrivate,
-        store::CredentialError::ParentIsLink => RegistrationError::ParentIsLink,
-        e => RegistrationError::Internal(e.to_string()),
-    })?;
 
     let nats_creds = format!(
         "-----BEGIN NATS USER JWT-----\n{}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\n{}\n------END USER NKEY SEED------",

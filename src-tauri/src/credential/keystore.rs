@@ -283,6 +283,11 @@ fn machine_bound(src: &dyn Sources) -> Result<MasterKey, FingerprintError> {
 /// `connection.enc` slipped past the local wipe.
 #[cfg(not(windows))]
 pub fn delete_keyring_key() {
+    // Tests must never delete this machine's real keyring or Credential
+    // Manager entry; one that reaches this is a test bug.
+    if cfg!(test) {
+        panic!("a test reached delete_keyring_key");
+    }
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT) {
         let _ = entry.delete_credential();
     }
@@ -293,6 +298,11 @@ pub fn delete_keyring_key() {
 /// crate, whose entries roam.
 #[cfg(windows)]
 pub fn delete_keyring_key() {
+    // Tests must never delete this machine's real keyring or Credential
+    // Manager entry; one that reaches this is a test bug.
+    if cfg!(test) {
+        panic!("a test reached delete_keyring_key");
+    }
     if let Err(e) = super::wincred::delete() {
         log::warn!("Keystore: could not delete the Credential Manager entry: {}", e);
     }

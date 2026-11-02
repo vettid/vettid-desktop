@@ -119,8 +119,8 @@ pub const PARENT_IS_LINK_NOTICE: &str =
     "This desktop can't keep its pairing on this computer because your local app data folder is a link to another place, so nothing was saved.";
 
 /// Shown when this desktop was logged out while a pairing or a Start New
-/// Session was under way, so what it got from the vault wasn't saved (#30).
-/// The vault may still list the desktop.
+/// Session was under way, so what it got from the vault wasn't saved (#30,
+/// owner decision (a), 2026-11-02). The vault may still list the desktop.
 pub const LOGGED_OUT_MEANWHILE_NOTICE: &str =
     "This desktop was logged out while it was connecting to your vault, so nothing was saved. If your phone still lists this desktop, remove it there.";
 
@@ -864,7 +864,25 @@ fn remove_session_marker(config_dir: &Path) {
 /// can't be saved. Ok only if the marker is confirmed gone; the caller
 /// tells the person otherwise ([`SESSION_END_NOT_RECORDED_NOTICE`]).
 pub fn end_saved_session(config_dir: &Path) -> Result<(), CredentialError> {
-    let _one_at_a_time = writer_lock();
+    end_saved_session_locked(config_dir, &writer_lock())
+}
+
+/// Like [`end_saved_session`], for End session (#30): if a log-out has
+/// wiped the pairing since `since`, it fails with
+/// [`CredentialError::LoggedOutMeanwhile`] and removes nothing, since the
+/// marker there now may belong to a pairing made after that log-out.
+pub fn end_saved_session_since(config_dir: &Path, since: WipeEpoch) -> Result<(), CredentialError> {
+    let guard = writer_lock();
+    if wipe_epoch() != since {
+        return Err(CredentialError::LoggedOutMeanwhile);
+    }
+    end_saved_session_locked(config_dir, &guard)
+}
+
+fn end_saved_session_locked(
+    config_dir: &Path,
+    _one_at_a_time: &std::sync::MutexGuard<'static, ()>,
+) -> Result<(), CredentialError> {
     let path = config_dir.join(SESSION_LIVE_FILE);
     match fs::remove_file(&path) {
         Ok(()) => {}
@@ -968,8 +986,9 @@ pub fn delete(config_dir: &Path) -> Result<(), CredentialError> {
 /// the link and leave the pairing behind.
 ///
 /// Every save whose command started before this is refused afterwards,
-/// even if this fails (#30).
-pub fn wipe(config_dir: &Path) -> Result<(), CredentialError> {
+/// even if this fails (#30). The app wipes through [`wipe_for_logout`].
+#[cfg(test)]
+pub(crate) fn wipe(config_dir: &Path) -> Result<(), CredentialError> {
     let _one_at_a_time = writer_lock();
     WIPES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     wipe_locked(config_dir)
@@ -2205,6 +2224,23 @@ mod tests {
         saver.unwrap().join().unwrap();
         assert_eq!(*order.lock().unwrap(), ["key deleted", "saved"]);
         assert!(!config_dir.exists());
+    }
+
+    /// #30: End session's marker removal after a log-out leaves the marker
+    /// of a pairing made since alone.
+    #[test]
+    fn end_session_after_a_logout_leaves_a_new_pairings_marker() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
+        let since = wipe_epoch();
+        wipe(&config_dir).expect("log-out");
+        save_with(&keys, &config_dir, &creds_with_session("new", 1_900_000_000)).unwrap();
+        assert!(matches!(
+            end_saved_session_since(&config_dir, since),
+            Err(CredentialError::LoggedOutMeanwhile)
+        ));
+        assert!(session_is_recorded(&config_dir, "new"));
     }
 
     /// #30: with no folder, log-out still deletes the key, and doesn't
