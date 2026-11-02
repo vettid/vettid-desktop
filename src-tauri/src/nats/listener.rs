@@ -35,16 +35,18 @@ pub async fn spawn_listener(
     // duplicate ack from listener #2 poisoned the multi-shot
     // phone-approval reader ("Approval did not complete" after the
     // human approved).
+    //
+    // The slot stays locked from the abort until the new handle is stored
+    // (#40), so a `stop_listener` running at the same time either stops
+    // the new listener or runs after it is tracked, never in between.
     let listener_slot = {
         let state = app_handle.state::<AppState>();
         state.listener_handle.clone()
     };
-    {
-        let mut slot = listener_slot.lock().await;
-        if let Some(prev) = slot.take() {
-            prev.abort();
-            log::debug!("Aborted previous background listener before respawn");
-        }
+    let mut slot = listener_slot.lock().await;
+    if let Some(prev) = slot.take() {
+        prev.abort();
+        log::debug!("Aborted previous background listener before respawn");
     }
 
     let app_handle_for_task = app_handle.clone();
@@ -118,8 +120,27 @@ pub async fn spawn_listener(
     });
 
     // Track the new task so the next respawn can abort it.
-    let mut slot = listener_slot.lock().await;
     *slot = Some(handle);
+}
+
+/// Stop the background listener, for log-out, End session and lock (#40).
+/// The task is aborted and awaited, so its subscription to the device
+/// channel is dropped before the caller disconnects: a live subscriber
+/// would keep the connection open after `disconnect`. The caller holds
+/// `state.nats` across this and the disconnect, so no listener can
+/// subscribe in between; a task waiting for that lock is aborted there.
+///
+/// Pending response channels are left alone: their waiters time out as
+/// before. Dropping them would show "cancelled" for a request the phone
+/// may still approve (#42).
+pub async fn stop_listener(state: &AppState) {
+    let handle = state.listener_handle.lock().await.take();
+    if let Some(handle) = handle {
+        handle.abort();
+        // Cancelled (or already finished): either way the task is gone.
+        let _ = handle.await;
+        log::info!("Background listener stopped");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +475,40 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// #40: stopping the listener ends its task (dropping what it holds,
+    /// such as its subscription) and empties the slot. Pending response
+    /// channels are left to time out (#42).
+    #[tokio::test]
+    async fn stop_listener_ends_the_task() {
+        use crate::state::AppState;
+        let state = AppState::new();
+        struct Held(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = Held(dropped.clone());
+        let task = tokio::spawn(async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        *state.listener_handle.lock().await = Some(task);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state.pending_responses.lock().await.insert("req-1".into(), tx);
+
+        super::stop_listener(&state).await;
+
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst), "the task's state is dropped");
+        assert!(state.listener_handle.lock().await.is_none());
+        assert_eq!(state.pending_responses.lock().await.len(), 1, "pending requests are left");
+        assert!(rx.try_recv().is_err(), "and still waiting");
+
+        // With no listener it's a no-op.
+        super::stop_listener(&state).await;
+    }
+
     use super::event_suffix;
 
     // The desktop subscribes to the per-device fan-out shape, so the

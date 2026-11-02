@@ -678,15 +678,9 @@ pub async fn extend_session(
             if let Err(e) = store::end_saved_session_since(&config_dir, since) {
                 log::error!("extend_session: could not remove the live marker: {}", e);
             }
-            {
-                let mut key_guard = state.connection_key.write().await;
-                if let Some(ref mut key) = *key_guard {
-                    zeroize::Zeroize::zeroize(key);
-                }
-                *key_guard = None;
-            }
-            *state.credentials.write().await = None;
-            *state.is_unlocked.write().await = false;
+            // As End session: the listener stopped, NATS disconnected, the
+            // key zeroized, the credentials cleared (#40).
+            clear_in_memory_session(&state).await;
             return Ok(RegisterResponse {
                 success: false,
                 error: Some(store::SESSION_NOT_RECORDED_NOTICE.to_string()),
@@ -937,11 +931,21 @@ pub async fn end_session(state: State<'_, AppState>) -> Result<EndSessionRespons
     Ok(EndSessionResponse { notice })
 }
 
+/// #40: stop the background listener, then disconnect, holding the NATS
+/// lock across both. A listener subscribes under that lock, so one spawned
+/// meanwhile either subscribed before (and is stopped here) or subscribes
+/// after, on a client that is no longer connected, and ends.
+async fn stop_listener_and_disconnect(state: &AppState) {
+    let mut nats = state.nats.lock().await;
+    crate::nats::listener::stop_listener(state).await;
+    nats.disconnect().await;
+}
+
 /// Log-out's memory reset: NATS, the connection key (zeroized), the
 /// credentials, unlocked and registered, and the session (revoked).
-async fn clear_logged_out_memory(state: &State<'_, AppState>) {
+async fn clear_logged_out_memory(state: &AppState) {
     use zeroize::Zeroize;
-    state.nats.lock().await.disconnect().await;
+    stop_listener_and_disconnect(state).await;
     {
         let mut key_guard = state.connection_key.write().await;
         if let Some(ref mut key) = *key_guard {
@@ -957,9 +961,9 @@ async fn clear_logged_out_memory(state: &State<'_, AppState>) {
 
 /// Drop the in-memory session: NATS, the connection key (zeroized), the
 /// credentials and the session state.
-async fn clear_in_memory_session(state: &State<'_, AppState>) {
+async fn clear_in_memory_session(state: &AppState) {
     use zeroize::Zeroize;
-    state.nats.lock().await.disconnect().await;
+    stop_listener_and_disconnect(state).await;
     {
         let mut key_guard = state.connection_key.write().await;
         if let Some(ref mut key) = *key_guard {
@@ -1094,6 +1098,12 @@ fn end_session_notice(pairing_notice: Option<String>, marker_removed: bool, clea
 /// SECURITY: Zeroizes key material before dropping.
 #[tauri::command]
 pub async fn lock(state: State<'_, AppState>) -> Result<bool, String> {
+    lock_memory(&state).await;
+    Ok(true)
+}
+
+/// [`lock`]'s work.
+async fn lock_memory(state: &AppState) {
     use zeroize::Zeroize;
 
     // SECURITY: Zeroize connection key before clearing
@@ -1109,13 +1119,11 @@ pub async fn lock(state: State<'_, AppState>) -> Result<bool, String> {
     *state.credentials.write().await = None;
     *state.is_unlocked.write().await = false;
 
-    // Disconnect NATS
-    state.nats.lock().await.disconnect().await;
+    // #40: the listener, then NATS, under one lock.
+    stop_listener_and_disconnect(state).await;
 
     // Reset session
     state.session.write().await.expire();
-
-    Ok(true)
 }
 
 /// Get current authentication/registration status.
@@ -1221,6 +1229,69 @@ mod tests {
         assert_eq!(end_session_notice(None, true, false), None);
         assert_eq!(end_session_notice(None, false, true), None);
         assert_eq!(end_session_notice(None, false, false), Some(SESSION_END_NOT_RECORDED_NOTICE.to_string()));
+    }
+
+    /// #40: logout's and End session's memory resets and lock each stop the
+    /// background listener: its task ends and the slot is empty.
+    #[tokio::test]
+    async fn logout_end_session_and_lock_stop_the_listener() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        struct Held(Arc<AtomicBool>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        for which in ["logout", "end session", "lock"] {
+            let state = AppState::new();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let held = Held(dropped.clone());
+            *state.listener_handle.lock().await = Some(tokio::spawn(async move {
+                let _held = held;
+                std::future::pending::<()>().await;
+            }));
+            match which {
+                "logout" => clear_logged_out_memory(&state).await,
+                "end session" => clear_in_memory_session(&state).await,
+                _ => lock_memory(&state).await,
+            }
+            assert!(dropped.load(Ordering::SeqCst), "{which}: the listener task ended");
+            assert!(state.listener_handle.lock().await.is_none(), "{which}: the slot is empty");
+        }
+    }
+
+    /// #40: a listener spawned while a reset is under way (an unlock
+    /// racing lock) never subscribes on the live client. The reset holds
+    /// the NATS lock from before its stop until after its disconnect, so a
+    /// listener tracked meanwhile is stopped while it waits for that lock.
+    /// With the stop outside the lock, the stop would find no listener and
+    /// this one would subscribe before the disconnect.
+    #[tokio::test]
+    async fn a_listener_spawned_during_a_reset_never_subscribes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let state = Arc::new(AppState::new());
+        let subscribed = Arc::new(AtomicBool::new(false));
+        // Something else holds the NATS lock, so the reset queues for it.
+        let busy = state.nats.lock().await;
+        let reset = {
+            let state = state.clone();
+            tokio::spawn(async move { stop_listener_and_disconnect(&state).await })
+        };
+        tokio::task::yield_now().await;
+        // A listener is spawned and tracked, and queues to subscribe.
+        let (state2, subscribed2) = (state.clone(), subscribed.clone());
+        *state.listener_handle.lock().await = Some(tokio::spawn(async move {
+            let _nats = state2.nats.lock().await;
+            subscribed2.store(true, Ordering::SeqCst);
+        }));
+        tokio::task::yield_now().await;
+        drop(busy);
+        reset.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!subscribed.load(Ordering::SeqCst), "it never subscribed");
+        assert!(state.listener_handle.lock().await.is_none());
     }
 
     /// The store step of log-out, without deleting the real keyring key.
