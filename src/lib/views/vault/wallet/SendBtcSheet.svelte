@@ -17,6 +17,10 @@
   // we listen for `vault:operation-pending-approval` to capture the
   // request_id so the user can stop waiting for a request in flight.
 
+  // #42: owner-approved, 2026-11-02. The vault still has the request.
+  const STOPPED_WAITING_SEND =
+    "This desktop stopped waiting for this transaction. If your phone still shows it, approving it there will still send the bitcoin. Check your wallet's history before you send again.";
+
   interface WalletItem {
     wallet_id: string;
     label: string;
@@ -278,18 +282,15 @@
           ? 'You denied the transaction on your phone.'
           : 'The transaction was not completed.');
       // #42: the vault still has the request, so the bitcoin can still go.
-      if (errorMessage.includes('stopped waiting'))
-        errorMessage =
-          "This desktop stopped waiting for this transaction. If your phone still shows it, approving it there will still send the bitcoin. Check your wallet's history before you send again.";
+      if (resp?.error_code === 'stopped_waiting') errorMessage = STOPPED_WAITING_SEND;
     } catch (e) {
       clearPending();
       const msg = String(e);
       if (msg.includes('Phone approval timed out'))
         errorMessage = 'Phone approval timed out. Try again when you have your phone handy.';
-      // #42: the vault still has the request, so the bitcoin can still go.
-      else if (msg.includes('stopped waiting'))
-        errorMessage =
-          "This desktop stopped waiting for this transaction. If your phone still shows it, approving it there will still send the bitcoin. Check your wallet's history before you send again.";
+      // Thrown only on an IPC failure; phone-approval errors come back in
+      // `resp.error` above.
+      else if (msg.includes('stopped waiting')) errorMessage = STOPPED_WAITING_SEND;
       else if (msg.includes('did not acknowledge'))
         errorMessage = 'Vault is not responding — try again in a moment.';
       else errorMessage = msg;

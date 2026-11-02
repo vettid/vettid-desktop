@@ -119,6 +119,9 @@ pub enum OperationError {
 }
 
 /// Shown when the desktop stopped waiting for a request's answer (#42).
+/// The send sheet and the secrets chip show their own texts for it; they
+/// match on [`OperationError::code`] (`"stopped_waiting"`), and on this
+/// text's "stopped waiting" only for an error thrown over IPC.
 pub const STOPPED_WAITING_NOTICE: &str =
     "This desktop stopped waiting for an answer. If your phone still shows the request, approving it there will still carry it out.";
 
@@ -139,6 +142,16 @@ impl fmt::Display for OperationError {
 }
 
 impl std::error::Error for OperationError {}
+
+impl OperationError {
+    /// A stable code for errors the frontend words for itself (#42).
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::StoppedWaiting => Some("stopped_waiting"),
+            _ => None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Execute a vault operation via NATS
@@ -397,6 +410,20 @@ mod tests {
         tx.send(json!({"status": "pending_approval"})).unwrap();
         tx.send(json!({"status": "executed", "n": 2})).unwrap();
         assert_eq!(await_response(&mut rx, 5, 5, "r4").await.unwrap()["n"], 2);
+    }
+
+    /// #42: the person's Stop waiting (`cancel`) wakes the waiter with
+    /// StoppedWaiting, coded for the frontend.
+    #[tokio::test]
+    async fn stop_waiting_wakes_the_waiter() {
+        let state = crate::state::AppState::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.pending_responses.lock().await.insert("r7".into(), tx);
+        assert!(cancel(&state, "r7").await);
+        let err = await_response(&mut rx, 5, 5, "r7").await.unwrap_err();
+        assert!(matches!(err, OperationError::StoppedWaiting));
+        assert_eq!(err.code(), Some("stopped_waiting"));
+        assert!(!cancel(&state, "r7").await, "already gone");
     }
 
     /// Timeouts are told apart from stopping: no answer at all, and an

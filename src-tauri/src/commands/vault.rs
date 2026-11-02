@@ -9,6 +9,10 @@ pub struct VaultOpResponse {
     pub success: bool,
     pub data: Option<serde_json::Value>,
     pub error: Option<String>,
+    /// A stable code for errors the frontend words for itself, so it
+    /// doesn't match on `error`'s text (#42). `"stopped_waiting"`: the
+    /// desktop stopped waiting, and the phone may still carry it out.
+    pub error_code: Option<&'static str>,
     pub pending_approval: bool,
 }
 
@@ -19,11 +23,13 @@ impl VaultOpResponse {
                 success: resp.success,
                 data: resp.data,
                 error: resp.error,
+                error_code: None,
                 pending_approval: resp.pending_phone_approval,
             },
             Err(e) => Self {
                 success: false,
                 data: None,
+                error_code: e.code(),
                 error: Some(e.to_string()),
                 pending_approval: false,
             },

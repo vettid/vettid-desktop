@@ -18,6 +18,10 @@
   // own (SecretsUnlockedUntil). A future enclave change can add an
   // explicit `secret.lock-session` op for a hard server-side revoke.
 
+  // #42: owner-approved, 2026-11-02. The vault still has the request.
+  const STOPPED_WAITING_UNLOCK =
+    'This desktop stopped waiting for your approval. If you approve on your phone, your secrets will still unlock.';
+
   let pending = $state(false);
   let pendingRequestId = $state<string | null>(null);
   let pendingStartedAt = $state(0);
@@ -140,15 +144,16 @@
         ? 'You denied the approval on your phone.'
         : 'Approval did not complete.');
       // #42: the vault still has the request; approving still unlocks.
-      if (errMsg.includes('stopped waiting')) errMsg = 'This desktop stopped waiting for your approval. If you approve on your phone, your secrets will still unlock.';
+      if (resp?.error_code === 'stopped_waiting') errMsg = STOPPED_WAITING_UNLOCK;
       secretsUnlockStore.update((s) => ({ ...s, pending: false, error: errMsg }));
     } catch (e) {
       clearPendingState();
       const msg = String(e);
       let friendly = msg;
       if (msg.includes('Phone approval timed out')) friendly = 'Phone approval timed out. Try again when you have your phone handy.';
-      // #42: the vault still has the request; approving still unlocks.
-      else if (msg.includes('stopped waiting')) friendly = 'This desktop stopped waiting for your approval. If you approve on your phone, your secrets will still unlock.';
+      // Thrown only on an IPC failure; phone-approval errors come back in
+      // `resp.error` above.
+      else if (msg.includes('stopped waiting')) friendly = STOPPED_WAITING_UNLOCK;
       else if (msg.includes('did not acknowledge')) friendly = 'Vault is not responding — try again in a moment.';
       secretsUnlockStore.update((s) => ({ ...s, pending: false, error: friendly }));
     } finally {
@@ -162,7 +167,7 @@
     clearPendingState();
     try { await invoke('cancel_pending_operation', { requestId: rid }); } catch (_) {}
     // #42: this only stops waiting; the vault isn't told.
-    secretsUnlockStore.update((s) => ({ ...s, pending: false, error: 'This desktop stopped waiting for your approval. If you approve on your phone, your secrets will still unlock.' }));
+    secretsUnlockStore.update((s) => ({ ...s, pending: false, error: STOPPED_WAITING_UNLOCK }));
     pending = false;
   }
 
