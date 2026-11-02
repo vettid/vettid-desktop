@@ -47,9 +47,13 @@ pub fn spawn_heartbeat(
             }
 
             if remaining <= 0 {
-                // #43: the whole End session reset, not only the state.
-                // This task isn't the listener, so it can await it.
-                crate::commands::auth::end_session_from_vault(&state, false).await;
+                // #43: the whole End session reset, not only the state, for
+                // the session this check was about: checked again under
+                // session_op, so a newer one is left alone. This task isn't
+                // the listener, so it can await it.
+                if let Some(id) = crate::commands::auth::current_session_id(&state).await {
+                    crate::commands::auth::end_session_from_vault_if_current(&state, false, &id).await;
+                }
                 let _ = app_handle.emit("vault:session-update", &serde_json::json!({
                     "status": "expired",
                     "reason": "session TTL elapsed",

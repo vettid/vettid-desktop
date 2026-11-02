@@ -243,7 +243,9 @@ async fn handle_response_message(
             let current = crate::commands::auth::current_session_id(state).await;
             let ended = session_update_ends(&payload_data, current.as_deref());
             if let Some(status) = payload_data.get("status").and_then(|v| v.as_str()) {
-                if ended.is_some() || matches!(status, "suspended" | "active") {
+                // Any status, suspended and active included, only for the
+                // current session: a stale or replayed one changes nothing.
+                if names_current_session(&payload_data, current.as_deref()) {
                     let mut session = state.session.write().await;
                     match status {
                         "suspended" => session.suspend(),
@@ -290,8 +292,16 @@ fn session_update_ends(payload: &serde_json::Value, current_session_id: Option<&
         Some("revoked") => true,
         _ => return None,
     };
-    let named = payload.get("session_id").and_then(|v| v.as_str())?;
-    (Some(named) == current_session_id).then_some(revoked)
+    names_current_session(payload, current_session_id).then_some(revoked)
+}
+
+/// #43: whether a `session_update` names the session in memory. One that
+/// names none, or another, is about no session this desktop holds.
+fn names_current_session(payload: &serde_json::Value, current_session_id: Option<&str>) -> bool {
+    match (payload.get("session_id").and_then(|v| v.as_str()), current_session_id) {
+        (Some(named), Some(current)) => named == current,
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +524,18 @@ mod tests {
         assert_eq!(ends(&json!({"status": "expired"}), Some("s1")), None, "no session named");
         assert_eq!(ends(&json!({"status": "revoked", "session_id": "s1"}), None), None, "no session in memory");
         assert_eq!(ends(&json!({"status": "suspended", "session_id": "s1"}), Some("s1")), None);
+    }
+
+    /// #43: any status, suspended and active included, applies only to the
+    /// session it names, and only if that is the current one.
+    #[test]
+    fn only_an_update_naming_the_current_session_applies() {
+        use serde_json::json;
+        let names = super::names_current_session;
+        assert!(names(&json!({"status": "active", "session_id": "s1"}), Some("s1")));
+        assert!(!names(&json!({"status": "active", "session_id": "old"}), Some("s1")));
+        assert!(!names(&json!({"status": "suspended"}), Some("s1")), "no session named");
+        assert!(!names(&json!({"status": "active", "session_id": "s1"}), None), "no session in memory");
     }
 
     /// #40: stopping the listener ends its task (dropping what it holds,
