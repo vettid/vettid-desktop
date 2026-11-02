@@ -1,0 +1,26 @@
+# gitleaks configuration for vettid-desktop. It keeps every default rule
+# and allows only the public, deterministic data below; anything else is
+# still a finding. (.gitleaksignore keeps its own reviewed fingerprint.)
+
+title = "vettid-desktop"
+
+[extend]
+useDefault = true
+
+# Known-answer test vectors copied verbatim from vettid-vault
+# `testdata/vectors`: public values derived from fixed TEST seeds
+# (VAULT-MESSAGING §16), pinned by SHA-256 in tests/vectors/SOURCE.md.
+# generic-api-key reads names like "shared_secret_hex" as secrets.
+[[allowlists]]
+description = "vettid-vms public test vectors"
+paths = ['''^src-tauri/crates/vettid-vms/tests/vectors/[^/]+\.json$''']
+
+# Cargo.lock holds package names, versions and checksums only. A crate
+# whose name contains "secret" or "key" trips generic-api-key, so these
+# line shapes, in this file only, are allowed.
+[[allowlists]]
+description = "Cargo.lock package names, dependency lines and checksums"
+condition = "AND"
+paths = ['''^src-tauri/Cargo\.lock$''']
+regexTarget = "line"
+regexes = ['''^(checksum = "[0-9a-f]{64}"|name = "[A-Za-z0-9_.+-]+"|\s*"[A-Za-z0-9_.+-]+( [0-9][^"]*)?",?)$''']
