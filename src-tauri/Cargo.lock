@@ -6761,7 +6761,7 @@ dependencies = [
  "subtle",
  "vettid-relay",
  "x-wing",
- "x25519-dalek 2.0.1",
+ "x25519-dalek 3.0.0",
  "zeroize",
 ]
 

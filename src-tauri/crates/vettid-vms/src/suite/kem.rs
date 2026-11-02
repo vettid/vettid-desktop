@@ -6,10 +6,12 @@
 //! the low-order X25519 check below.
 //!
 //! **Low-order X25519.** `x-wing` accepts non-contributory X25519 inputs;
-//! the vault (Go `crypto/ecdh`) and Android (BouncyCastle) refuse them.
-//! So that all clients agree on what is valid, a public key or an `enc`
-//! whose X25519 part has low order is refused here. VAULT-MESSAGING is
-//! silent on this; confidentiality rests on ML-KEM either way.
+//! the vault (Go `crypto/ecdh`) and Android (BouncyCastle) refuse them when
+//! the X25519 step runs: sealing to a key whose X25519 half has low order,
+//! or opening an `enc` whose `ct_X` has low order. So that all clients
+//! agree, [`super::hpke`] refuses both at that same point; parsing a key
+//! accepts it, as Go and Kotlin do. VAULT-MESSAGING is silent on this;
+//! confidentiality rests on ML-KEM either way.
 //!
 //! **Secret copies.** The seed is `Zeroizing`, and `x-wing`'s key wipes
 //! itself, but `x-wing` re-expands the seed on every decapsulation and
@@ -49,14 +51,11 @@ pub struct PublicKey {
 impl PublicKey {
     /// Parse an encapsulation key: the right size, accepted by the crate
     /// and re-encoding to the same bytes (FIPS 203's modulus check, so the
-    /// ML-KEM half has one spelling), and an X25519 half that isn't of low
-    /// order. Any other 32 bytes are accepted as the X25519 half, as Go
-    /// does (bit 255 set or u >= p included).
+    /// ML-KEM half has one spelling). Any 32 bytes are accepted as the
+    /// X25519 half, as Go and Kotlin do (bit 255 set, u >= p, and low order
+    /// included; a low-order one is refused when sealing to it).
     pub fn parse(ek: &[u8]) -> Result<Self, SuiteError> {
         let raw: [u8; EK_SIZE] = ek.try_into().map_err(|_| SuiteError::KeySize)?;
-        if x25519_low_order(raw[PK_M_SIZE..].try_into().expect("size")) {
-            return Err(SuiteError::BadKey);
-        }
         let inner = XPublic::from_bytes(&raw).map_err(|_| SuiteError::BadKey)?;
         if !super::ct_eq(inner.to_bytes().as_slice(), &raw) {
             return Err(SuiteError::BadKey);
@@ -74,6 +73,11 @@ impl PublicKey {
 
     pub(crate) fn inner(&self) -> &XPublic {
         &self.inner
+    }
+
+    /// Whether the X25519 half has low order (sealing to it is refused).
+    pub(crate) fn x25519_low_order(&self) -> bool {
+        x25519_low_order(self.raw[PK_M_SIZE..].try_into().expect("size"))
     }
 
     /// Constant-time equality of the encoded keys.
@@ -150,17 +154,17 @@ mod tests {
         }
     }
 
-    /// A low-order X25519 half is refused, as Go and Kotlin do; an
-    /// over-long key too.
+    /// A low-order X25519 half parses, as in Go and Kotlin, and is marked
+    /// so sealing to it is refused; an over-long key is refused.
     #[test]
-    fn low_order_x25519_keys_are_refused() {
+    fn low_order_x25519_keys_parse_but_are_marked() {
         let v = vectors::load("keys");
         let ek = vectors::b64(&v["vault"]["ek_b64"]);
         // u = 0 and u = 1, both of low order.
         for u in [[0u8; 32], { let mut one = [0u8; 32]; one[0] = 1; one }] {
             let mut bad = ek.clone();
             bad[PK_M_SIZE..].copy_from_slice(&u);
-            assert!(matches!(PublicKey::parse(&bad), Err(SuiteError::BadKey)));
+            assert!(PublicKey::parse(&bad).unwrap().x25519_low_order());
         }
         let mut long = ek.clone();
         long.push(0);

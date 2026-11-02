@@ -29,13 +29,13 @@ pub struct Sender {
     used: bool,
 }
 
-/// A receiving context, for exactly one message. Prints nothing. It
-/// exports only after its message opened (anyone can encapsulate to a
-/// public key, so nothing derived is trusted before that).
+/// A receiving context, for exactly one message. Prints nothing. It can
+/// export at once, with no message opened, as RFC 9180 allows and calls
+/// need (VM §10: `Export("vettid/vms/2/call-key", 32)` right after setup);
+/// in base mode an open wouldn't authenticate the sender anyway.
 pub struct Recipient {
     ctx: AeadCtxR<Aead, Kdf, XWing>,
     used: bool,
-    opened: bool,
 }
 
 /// `SetupBaseS(pk, info)` with fresh OS randomness: `(enc, ctx)`.
@@ -43,6 +43,11 @@ pub struct Recipient {
 /// If the operating system's random source fails, the crate panics rather
 /// than encapsulate with weak randomness; nothing has been sealed then.
 pub fn setup_sender(pk: &PublicKey, info: &[u8]) -> Result<([u8; ENC_SIZE], Sender), SuiteError> {
+    // A key whose X25519 half has low order is refused here, where Go's
+    // NewSender and Kotlin refuse it (see kem).
+    if pk.x25519_low_order() {
+        return Err(SuiteError::BadKey);
+    }
     let (enc, ctx) = hpke::setup_sender::<Aead, Kdf, XWing>(&OpModeS::Base, pk.inner(), info).map_err(|_| SuiteError::BadKey)?;
     Ok((enc_bytes(&enc)?, Sender { ctx, used: false }))
 }
@@ -58,7 +63,7 @@ pub fn setup_recipient(enc: &[u8], sk: &PrivateKey, info: &[u8]) -> Result<Recip
     }
     let enc = EncappedKey::from_bytes(enc).map_err(|_| SuiteError::BadKey)?;
     let ctx = hpke::setup_receiver::<Aead, Kdf, XWing>(&OpModeR::Base, sk.inner(), &enc, info).map_err(|_| SuiteError::Decrypt)?;
-    Ok(Recipient { ctx, used: false, opened: false })
+    Ok(Recipient { ctx, used: false })
 }
 
 fn enc_bytes(enc: &EncappedKey) -> Result<[u8; ENC_SIZE], SuiteError> {
@@ -83,16 +88,11 @@ impl Recipient {
     /// Open the context's one message.
     pub fn open(&mut self, aad: &[u8], ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, SuiteError> {
         take(&mut self.used)?;
-        let plaintext = self.ctx.open(ciphertext, aad).map(Zeroizing::new).map_err(|_| SuiteError::Decrypt)?;
-        self.opened = true;
-        Ok(plaintext)
+        self.ctx.open(ciphertext, aad).map(Zeroizing::new).map_err(|_| SuiteError::Decrypt)
     }
 
-    /// `Export(exporter_context, L)`, only after the message opened.
+    /// `Export(exporter_context, L)`, at any time after setup.
     pub fn export(&self, exporter_context: &[u8], out: &mut [u8]) -> Result<(), SuiteError> {
-        if !self.opened {
-            return Err(SuiteError::NotOpened);
-        }
         self.ctx.export(exporter_context, out).map_err(|_| SuiteError::ExportLength)
     }
 }
@@ -205,10 +205,9 @@ pub(crate) mod tests {
         let sk = PrivateKey::from_seed(&vectors::seed(&keys["vault"]["kem_seed_hex"])).unwrap();
         let mut recipient = setup_recipient(&enc, &sk, INFO_SEALED.as_bytes()).unwrap();
         let mut theirs = [0u8; 32];
-        assert!(matches!(recipient.export(b"ctx", &mut theirs), Err(SuiteError::NotOpened)), "not before it opens");
-        assert_eq!(&recipient.open(b"aad", &ct).unwrap()[..], b"hello vault");
         recipient.export(b"ctx", &mut theirs).unwrap();
-        assert_eq!(theirs, want);
+        assert_eq!(theirs, want, "exported at once, before any open (as calls do)");
+        assert_eq!(&recipient.open(b"aad", &ct).unwrap()[..], b"hello vault");
     }
 
     /// One message per context; a wrong AAD, info, key or ciphertext fails.
@@ -249,15 +248,17 @@ pub(crate) mod tests {
         enc[17] ^= 0x01;
         let mut r = setup_recipient(&enc, &sk, b"info").unwrap();
         assert!(matches!(r.open(b"aad", &ct), Err(SuiteError::Decrypt)));
-        let mut out = [0u8; 32];
-        assert!(matches!(r.export(b"ctx", &mut out), Err(SuiteError::NotOpened)), "nor after a failed open");
     }
 
-    /// An `enc` whose X25519 part has low order is refused (Go and Kotlin
-    /// refuse it too); an over-long export after a good open is refused.
+    /// Low-order X25519 is refused where Go and Kotlin refuse it: sealing
+    /// to such a key, and opening such an `enc`; an over-long export too.
     #[test]
     fn low_order_enc_and_long_exports_are_refused() {
         let sk = PrivateKey::generate().unwrap();
+        let mut low_ek = *sk.public().as_bytes();
+        low_ek[1184..].copy_from_slice(&[0u8; 32]);
+        let low = PublicKey::parse(&low_ek).unwrap();
+        assert!(matches!(setup_sender(&low, b"info"), Err(SuiteError::BadKey)));
         let (enc, mut sender) = setup_sender(sk.public(), b"info").unwrap();
         let ct = sender.seal(b"aad", b"m").unwrap();
         for u in [[0u8; 32], { let mut one = [0u8; 32]; one[0] = 1; one }] {

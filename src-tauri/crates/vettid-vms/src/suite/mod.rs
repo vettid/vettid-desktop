@@ -79,10 +79,6 @@ pub enum SuiteError {
     Encrypt,
     /// An HPKE export of a length the KDF can't produce.
     ExportLength,
-    /// A receiving context exported before its message opened: anyone can
-    /// encapsulate to a public key, so nothing derived is trusted until the
-    /// message authenticates.
-    NotOpened,
     /// The system's random source failed.
     Random,
 }
@@ -99,7 +95,6 @@ impl std::fmt::Display for SuiteError {
             Self::Signature => "signature verification failed",
             Self::Encrypt => "encryption failed",
             Self::ExportLength => "export length not supported",
-            Self::NotOpened => "export before the message opened",
             Self::Random => "randomness unavailable",
         })
     }
