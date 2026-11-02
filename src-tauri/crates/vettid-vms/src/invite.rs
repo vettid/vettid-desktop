@@ -5,8 +5,9 @@
 //! `t`, its `exp` against `e`, and expiry.
 //!
 //! A desktop scans; the vault creates invitations, so sealing a bundle is
-//! here only for the known-answer test. Bundle members of a phone's
-//! transfer (`capabilities`, `time_scale`, kind `app` only) are refused.
+//! here only for the known-answer test. A phone's transfer (`t` = `p`,
+//! kind `app`, with its `capabilities` and `time_scale`) is refused: a
+//! desktop never takes one.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -27,8 +28,9 @@ pub const BUNDLE_VERSION: u64 = 1;
 pub const CLAIM_ID_LEN: usize = 26;
 /// The longest `hint.name` kept (the vault's bound).
 pub const MAX_HINT_NAME: usize = 128;
-/// The longest link payload decoded.
+/// The longest link payload decoded, and its base64url length.
 pub const MAX_LINK_PAYLOAD: usize = 1024;
+const MAX_LINK_LEN: usize = 1366;
 
 const EXP_FORMAT: &str = "%Y-%m-%dT%H:%M:%SZ";
 
@@ -143,7 +145,8 @@ fn decode_raw_url(s: &str, n: Option<usize>) -> Option<Vec<u8>> {
 
 impl Qr {
     fn validate(&self) -> Result<(), InviteError> {
-        if !valid_relay_url(&self.relay) || !valid_claim_id(&self.claim_id) || self.exp == 0 {
+        // A transfer to a new phone is never for a desktop.
+        if self.kind == Kind::App || !valid_relay_url(&self.relay) || !valid_claim_id(&self.claim_id) || self.exp == 0 {
             return Err(InviteError::Qr);
         }
         Ok(())
@@ -190,6 +193,10 @@ impl Qr {
 
     /// Parse a link payload (unpadded base64url of the compact JSON).
     pub fn parse_link(s: &str) -> Result<Self, InviteError> {
+        // The length is checked before decoding anything.
+        if s.len() > MAX_LINK_LEN {
+            return Err(InviteError::Qr);
+        }
         let b = decode_raw_url(s, None).ok_or(InviteError::Qr)?;
         if b.len() > MAX_LINK_PAYLOAD {
             return Err(InviteError::Qr);
@@ -388,7 +395,8 @@ mod tests {
         assert_eq!((b.kind, b.hint_name.as_deref(), b.remote, b.service), (Purpose::Connection, Some("Test Vault"), false, false));
         let keys = vectors::load("keys");
         assert_eq!(b.vault.kem.as_bytes().to_vec(), vectors::b64(&keys["vault"]["ek_b64"]));
-        assert!(!format!("{b:?}").contains("v4.public") && !format!("{qr:?}").contains("FBQU"));
+        assert_eq!(format!("{qr:?}"), r#"Qr { kind: Connection, relay: "https://relay.vettid.org", exp: 1790856600, .. }"#);
+        assert_eq!(format!("{b:?}"), r#"Bundle { kind: Connection, invite_id: "01JB2Z6V9K3M4N5P6Q7R8S9T0V", exp: 2026-10-01T12:10:00Z, .. }"#);
     }
 
     #[test]
@@ -432,10 +440,17 @@ mod tests {
             format!("{link}="),
             format!("{link}!"),
             String::new(),
-            URL_SAFE_NO_PAD.encode(vec![b'x'; 1025]),
+            format!("vettid://connect/#{link}"),
         ] {
             assert_eq!(Qr::parse_any(&bad).unwrap_err(), InviteError::Qr, "{bad}");
         }
+        // The cap: a valid payload padded (with JSON whitespace) to 1,024
+        // bytes is read, one byte more is not.
+        let json = s(&v["qr_json"]);
+        let padded = |n: usize| URL_SAFE_NO_PAD.encode(format!("{json}{}", " ".repeat(n - json.len())));
+        assert_eq!(Qr::parse_link(&padded(MAX_LINK_PAYLOAD)).unwrap(), qr);
+        assert_eq!(padded(MAX_LINK_PAYLOAD).len(), MAX_LINK_LEN);
+        assert_eq!(Qr::parse_link(&padded(MAX_LINK_PAYLOAD + 1)).unwrap_err(), InviteError::Qr);
     }
 
     #[test]
@@ -456,6 +471,7 @@ mod tests {
             ("v", json!(1)),
             ("t", json!("x")),
             ("t", json!("C")),
+            ("t", json!("p")),
             ("r", json!("http://relay.vettid.org")),
             ("c", json!("TESTCLAIMIDAAAAAAAAAAAAAAA")),
             ("c", json!("short")),
@@ -481,24 +497,28 @@ mod tests {
         };
         use serde_json::json;
         type Edit = Box<dyn Fn(&mut serde_json::Value)>;
-        let cases: Vec<(&str, Edit)> = vec![
-            ("v 2", Box::new(|m| m["v"] = json!(2))),
-            ("unknown kind", Box::new(|m| m["kind"] = json!("rekey"))),
-            ("remote pairing", Box::new(|m| { m["kind"] = json!("desktop"); m["remote"] = json!(true); })),
-            ("bad invite id", Box::new(|m| m["invite_id"] = json!("x"))),
-            ("bad token", Box::new(|m| m["token"] = json!("v4.local.x"))),
-            ("exp with millis", Box::new(|m| m["exp"] = json!("2026-10-01T12:10:00.000Z"))),
-            ("exp with offset", Box::new(|m| m["exp"] = json!("2026-10-01T12:10:00+00:00"))),
-            ("hint name too long", Box::new(|m| m["hint"]["name"] = json!("n".repeat(129)))),
-            ("hint not an object", Box::new(|m| m["hint"] = json!("x"))),
-            ("capabilities", Box::new(|m| m["capabilities"] = json!([]))),
-            ("time_scale", Box::new(|m| m["time_scale"] = json!(1))),
-            ("remote not bool", Box::new(|m| m["remote"] = json!(0))),
-            ("vault mailbox mismatch", Box::new(|m| m["vault"]["relay"]["mailbox"] = json!("aaaaaaaaaaaaaaaaaaaaaaaaaa"))),
+        let cases: Vec<(&str, InviteError, Edit)> = vec![
+            ("v 2", InviteError::Bundle, Box::new(|m| m["v"] = json!(2))),
+            ("unknown kind", InviteError::Bundle, Box::new(|m| m["kind"] = json!("rekey"))),
+            ("remote pairing", InviteError::Bundle, Box::new(|m| { m["kind"] = json!("desktop"); m["remote"] = json!(true); })),
+            ("bad invite id", InviteError::Bundle, Box::new(|m| m["invite_id"] = json!("x"))),
+            ("bad token", InviteError::Bundle, Box::new(|m| m["token"] = json!("v4.local.x"))),
+            ("exp with millis", InviteError::Bundle, Box::new(|m| m["exp"] = json!("2026-10-01T12:10:00.000Z"))),
+            ("exp with offset", InviteError::Bundle, Box::new(|m| m["exp"] = json!("2026-10-01T12:10:00+00:00"))),
+            ("hint name too long", InviteError::Bundle, Box::new(|m| m["hint"]["name"] = json!("n".repeat(129)))),
+            ("hint not an object", InviteError::Bundle, Box::new(|m| m["hint"] = json!("x"))),
+            ("hint name null", InviteError::Bundle, Box::new(|m| m["hint"]["name"] = json!(null))),
+            ("capabilities", InviteError::Bundle, Box::new(|m| m["capabilities"] = json!([]))),
+            ("time_scale", InviteError::Bundle, Box::new(|m| m["time_scale"] = json!(1))),
+            ("remote not bool", InviteError::Bundle, Box::new(|m| m["remote"] = json!(0))),
+            ("vault mailbox mismatch", InviteError::Bundle, Box::new(|m| m["vault"]["relay"]["mailbox"] = json!("aaaaaaaaaaaaaaaaaaaaaaaaaa"))),
         ];
-        for (why, f) in cases {
-            assert!(with(&*f).is_err(), "{why}");
+        for (why, want, f) in cases {
+            assert_eq!(with(&*f).unwrap_err(), want, "{why}");
         }
+        // The edges that are allowed.
+        assert_eq!(with(&|m| m["hint"]["name"] = json!("n".repeat(128))).unwrap().hint_name.map(|n| n.len()), Some(128));
+        assert!(with(&|m| m["remote"] = json!(true)).unwrap().remote, "remote on a connection");
         assert_eq!(with(&|m| m["suite"] = json!(1)).unwrap_err(), InviteError::Suite(SuiteError::Suite1));
         // peer_kind: only "service" on a connection counts; anything else is ignored.
         assert!(with(&|m| m["peer_kind"] = json!("service")).unwrap().service);
