@@ -208,10 +208,10 @@ pub(crate) mod tests {
     /// §4.1: the empty body hashes as given, and headers carry millisecond
     /// timestamps, so two requests within a second sign differently.
     ///
-    /// This is the only test that signs through `SignedHeaders::new`, and
-    /// so the only user of the process-wide `LAST_SIGNED_MS`; the stepping
-    /// rule itself is tested as `step` (`step_edges`). Keep it that way, or
-    /// a parallel test could land between `a` and `b`.
+    /// The client's tests also sign through `SignedHeaders::new`, at the
+    /// real time, so `a` and `b` here use the real time too: any request
+    /// signed between them can only push `b` later. The stepping rule
+    /// itself is tested as `step` (`step_edges`).
     #[test]
     fn headers_use_millisecond_timestamps() {
         assert_eq!(hex::encode(body_hash(b"")), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
@@ -219,8 +219,9 @@ pub(crate) mod tests {
         let t1 = t0 + chrono::Duration::milliseconds(1);
         assert_eq!(timestamp(t0), "2026-06-10T12:00:00.000Z");
         assert_eq!(timestamp(t1), "2026-06-10T12:00:00.001Z");
-        let a = SignedHeaders::new(&sender(), "GET", "/v1/mailbox", b"", t0);
-        let b = SignedHeaders::new(&sender(), "GET", "/v1/mailbox", b"", t0);
+        let now = chrono::Utc::now();
+        let a = SignedHeaders::new(&sender(), "GET", "/v1/mailbox", b"", now);
+        let b = SignedHeaders::new(&sender(), "GET", "/v1/mailbox", b"", now);
         // Both signed "at" the same millisecond: the second moves on, so
         // the relay's replay cache doesn't refuse it.
         assert!(b.timestamp > a.timestamp, "{} then {}", a.timestamp, b.timestamp);
