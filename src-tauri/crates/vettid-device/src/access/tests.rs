@@ -296,56 +296,190 @@ async fn an_unanswered_named_end_is_sent_again() {
 }
 
 /// The end named s-1, and vault.status shows s-2: that end changes nothing
-/// any more, and s-2 is current.
+/// any more, and s-2 is current. SPEC: asked of the owner whether this
+/// should end s-2 instead (the `// SPEC:` comment in `settle`).
 #[tokio::test]
-async fn an_unanswered_named_end_of_a_replaced_session() {
+async fn spec_question_named_end_of_a_replaced_session_is_moot() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    record_end(&mut s, &mut store, Some("s-1"), 0);
+    let vault_side = async {
+        ends(&mut vault, END_ATTEMPTS, r#"{"session_id":"s-1"}"#).await;
+        answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(Some("s-2")))).await;
+    };
+    let (got, ()) = tokio::join!(a.settle(&mut s, &mut store), vault_side);
+    assert_eq!(got, Ok(Settled::Moot));
+    assert_eq!(a.current().map(|c| c.session_id.as_str()), Some("s-2"));
+    assert!(a.active_at(Utc::now()));
+    assert!(s.access_end().is_none());
+    assert_eq!(vault.waiting(), 0, "s-2 isn't ended");
+}
+
+/// Store an unanswered end (as if sent `attempts` times); returns its id.
+fn record_end(s: &mut S, store: &mut MemStore, session_id: Option<&str>, attempts: u32) -> String {
+    let id = s.new_id().unwrap();
+    s.set_access_end(store, Some(PendingEnd { id: id.clone(), session_id: session_id.map(str::to_string), attempts })).unwrap();
+    id
+}
+
+/// Take `n` ends, checking their body; returns them.
+async fn ends(vault: &mut Vault, n: u32, body: &str) -> Vec<Inner> {
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let e = receive(vault).await;
+        assert_eq!((e.kind.as_str(), e.body.as_str()), (TYPE_END, body));
+        out.push(e);
+    }
+    out
+}
+
+/// An unnamed end, unanswered, while vault.status shows s-1: sent again
+/// under a new id naming s-1 (§6.8 "If it names a session", read as
+/// vault.status's); answered, the end is done.
+#[tokio::test]
+async fn an_unanswered_unnamed_end_is_sent_again_naming_the_session() {
     let (relay, mut vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store);
     let mut a = access();
     let vault_side = async {
-        for _ in 0..END_ATTEMPTS {
-            receive(&mut vault).await;
-        }
-        answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(Some("s-2")))).await;
+        let first = ends(&mut vault, END_ATTEMPTS, "{}").await;
+        assert!(first.iter().all(|e| e.id == first[0].id), "retries reuse the id");
+        answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(Some("s-1")))).await;
+        let again = answer(&mut vault, TYPE_END, Status::Ok, "{}").await;
+        assert_eq!(again.body.as_str(), r#"{"session_id":"s-1"}"#);
+        assert_ne!(again.id, first[0].id, "a new id");
     };
-    let (got, ()) = tokio::join!(a.settle_after_end(&mut s, &mut store, "s-1"), vault_side);
-    assert_eq!(got, Ok(Settled::Moot));
-    assert_eq!(a.current().map(|c| c.session_id.as_str()), Some("s-2"));
+    let (got, ()) = tokio::join!(a.end(&mut s, &mut store, None), vault_side);
+    assert_eq!(got, Ok(EndOutcome::Ended));
+    assert!(!a.active_at(Utc::now()), "s-1 wasn't taken as current while its end waited");
     assert!(s.access_end().is_none());
 }
 
-impl Access {
-    /// Record an end of `id` without sending it, then settle.
-    async fn settle_after_end(&mut self, s: &mut S, store: &mut MemStore, id: &str) -> Result<Settled, AccessError> {
-        let pid = s.new_id().unwrap();
-        s.set_access_end(store, Some(PendingEnd { id: pid, session_id: Some(id.into()), attempts: 0 })).unwrap();
-        self.settle(s, store).await
-    }
+/// A second end() finding an unnamed end with its attempts spent doesn't
+/// just read vault.status: it sends the end again, naming the session.
+#[tokio::test]
+async fn a_second_end_after_the_attempts_are_spent() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    record_end(&mut s, &mut store, None, END_ATTEMPTS);
+    let vault_side = async {
+        answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(Some("s-1")))).await;
+        answer(&mut vault, TYPE_END, Status::Ok, "{}").await
+    };
+    let (got, end) = tokio::join!(a.end(&mut s, &mut store, None), vault_side);
+    assert_eq!(got, Ok(EndOutcome::Ended));
+    assert_eq!(end.body.as_str(), r#"{"session_id":"s-1"}"#);
+    assert!(s.access_end().is_none());
 }
 
-/// An unanswered end that names no session, while vault.status shows one:
-/// the request waits, and nothing is sent for it. After a restart, the
-/// stored end still holds it back; once vault.status reads null it goes.
+/// While an unnamed end waits, a new end (named or not) is that end again,
+/// under its id.
+#[tokio::test]
+async fn end_reuses_a_pending_unnamed_end() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    let id = record_end(&mut s, &mut store, None, 0);
+    let (got, end) = tokio::join!(a.end(&mut s, &mut store, Some("s-1")), answer(&mut vault, TYPE_END, Status::Ok, "{}"));
+    assert_eq!(got, Ok(EndOutcome::Ended));
+    assert_eq!((end.id.as_str(), end.body.as_str()), (id.as_str(), "{}"));
+}
+
+/// An unnamed end replaces a waiting named one, under a new id.
+#[tokio::test]
+async fn an_unnamed_end_replaces_a_named_one() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    let id = record_end(&mut s, &mut store, Some("s-1"), 1);
+    let (got, end) = tokio::join!(a.end(&mut s, &mut store, None), answer(&mut vault, TYPE_END, Status::Ok, "{}"));
+    assert_eq!(got, Ok(EndOutcome::Ended));
+    assert_ne!(end.id, id);
+    assert_eq!(end.body.as_str(), "{}");
+}
+
+/// An `ok` answer with a body other than `{}`: the end counts as answered
+/// (the request may go), and the body is reported malformed.
+#[tokio::test]
+async fn an_ok_end_answer_with_a_malformed_body() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    let (got, _) = tokio::join!(a.end(&mut s, &mut store, None), answer(&mut vault, TYPE_END, Status::Ok, r#"{"ended":true}"#));
+    assert_eq!(got, Err(AccessError::Malformed));
+    assert!(s.access_end().is_none());
+    assert!(!a.active_at(Utc::now()));
+}
+
+/// The resent named end gets no answer either, and vault.status still
+/// shows the session: EndUnconfirmed, the end still stored. A late answer
+/// to the first id is ignored; one to the stored id settles it.
+#[tokio::test]
+async fn a_resent_end_still_unanswered() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    let named = r#"{"session_id":"s-1"}"#;
+    let vault_side = async {
+        let first = ends(&mut vault, END_ATTEMPTS, named).await;
+        answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(Some("s-1")))).await;
+        let again = ends(&mut vault, END_ATTEMPTS, named).await;
+        answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(Some("s-1")))).await;
+        (first[0].clone(), again[0].clone())
+    };
+    let (got, (first, again)) = tokio::join!(a.end(&mut s, &mut store, Some("s-1")), vault_side);
+    assert_eq!(got, Err(AccessError::EndUnconfirmed));
+    assert_ne!(first.id, again.id);
+    let stored = s.access_end().cloned().unwrap();
+    assert_eq!((stored.id.as_str(), stored.session_id.as_deref(), stored.attempts), (again.id.as_str(), Some("s-1"), END_ATTEMPTS));
+    assert_eq!(vault.waiting(), 0, "no request");
+
+    // A late answer to the first id: not the stored end's, ignored.
+    deposit(&mut vault, response(&first, Status::Ok, "{}")).await;
+    let msgs = s.poll(&mut store).await.unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(a.observe(&mut s, &mut store, &msgs[0]), Ok(None));
+    assert_eq!(s.access_end(), Some(&stored), "still waiting");
+
+    // One to the stored id settles it.
+    deposit(&mut vault, response(&again, Status::Ok, "{}")).await;
+    let msgs = s.poll(&mut store).await.unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(a.observe(&mut s, &mut store, &msgs[0]), Ok(Some(AccessEvent::EndAnswered)));
+    assert!(s.access_end().is_none());
+}
+
+/// An unanswered end holds the request back, also across a restart; once
+/// vault.status reads null, it goes.
 #[tokio::test]
 async fn an_unanswered_end_holds_the_request_across_a_restart() {
     let (relay, mut vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store);
     let mut a = access();
+    let named = r#"{"session_id":"s-1"}"#;
     let vault_side = async {
-        for _ in 0..END_ATTEMPTS {
-            receive(&mut vault).await;
-        }
+        ends(&mut vault, END_ATTEMPTS, "{}").await;
+        answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(Some("s-1")))).await;
+        ends(&mut vault, END_ATTEMPTS, named).await;
         answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(Some("s-1")))).await;
     };
     let (got, ()) = tokio::join!(a.end(&mut s, &mut store, None), vault_side);
     assert_eq!(got, Err(AccessError::EndUnconfirmed));
     assert!(!a.active_at(Utc::now()), "a session its own end will end isn't current");
-    // The app asks again: still held back, and no request goes out.
-    let (got, _) = tokio::join!(a.request(&mut s, &mut store, None), answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(Some("s-1")))));
+    // The app asks again: still held back (the end goes again), and no
+    // request goes out.
+    let vault_side = async {
+        answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(Some("s-1")))).await;
+        ends(&mut vault, END_ATTEMPTS, named).await;
+        answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(Some("s-1")))).await;
+    };
+    let (got, ()) = tokio::join!(a.request(&mut s, &mut store, None), vault_side);
     assert_eq!(got, Err(AccessError::EndUnconfirmed));
     assert_eq!(vault.waiting(), 0, "no request");
     let stored = s.access_end().cloned().unwrap();
-    assert_eq!((stored.session_id.as_deref(), stored.attempts), (None, END_ATTEMPTS));
+    assert_eq!((stored.session_id.as_deref(), stored.attempts), (Some("s-1"), END_ATTEMPTS));
 
     // The app stops and starts again.
     drop(s);
@@ -367,52 +501,87 @@ async fn an_unanswered_end_holds_the_request_across_a_restart() {
 async fn a_restart_carries_on_the_retries() {
     let (relay, mut vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store);
-    s.set_access_end(&mut store, Some(PendingEnd { id: "01JB2Z6V9K3M4N5P6Q7R8S9T0Z".into(), session_id: None, attempts: 2 })).unwrap();
+    let id = record_end(&mut s, &mut store, None, 2);
     drop(s);
     let mut s = session(&relay, &faults, &mut store);
     let mut a = access();
     let (got, end) = tokio::join!(a.settle(&mut s, &mut store), answer(&mut vault, TYPE_END, Status::Ok, "{}"));
     assert_eq!(got, Ok(Settled::Answered));
-    assert_eq!(end.id, "01JB2Z6V9K3M4N5P6Q7R8S9T0Z");
+    assert_eq!(end.id, id);
 }
 
-/// A late answer to the end, collected by a poll, settles it too.
+/// A stored end that doesn't read is taken as an unnamed end with its
+/// attempts spent, and the session says so; an old state has none.
 #[tokio::test]
-async fn a_late_end_answer_through_poll() {
+async fn a_malformed_stored_end() {
     let (relay, mut vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store);
+    let id = record_end(&mut s, &mut store, Some("s-1"), 2);
+    drop(s);
+    let json = String::from_utf8(store.data.as_ref().unwrap().to_vec()).unwrap();
+    let member = format!(r#""access_end":{{"id":"{id}","session_id":"s-1","attempts":2}}"#);
+    assert_eq!(json.matches(&member).count(), 1);
+    let good = DeviceState::from_json(json.as_bytes()).unwrap();
+    assert_eq!(good.access_end.as_ref().map(|p| p.attempts), Some(2));
+    assert!(!good.access_end_unreadable);
+
+    let old = json.replace(&format!("{member},"), "");
+    let old = DeviceState::from_json(old.as_bytes()).unwrap();
+    assert!(old.access_end.is_none() && !old.access_end_unreadable, "an old state has none");
+
+    for bad in [
+        format!(r#""access_end":{{"id":"{id}","session_id":"s-1","attempts":2,"extra":1}}"#),
+        r#""access_end":{"id":"","attempts":2}"#.to_string(),
+        format!(r#""access_end":{{"id":"{id}","session_id":"","attempts":2}}"#),
+        r#""access_end":null"#.to_string(),
+        format!(r#""access_end":{{"id":"{id}","attempts":256}}"#),
+        format!(r#""access_end":{{"id":"{id}","session_id":7,"attempts":1}}"#),
+        format!(r#""access_end":{{"id":"{id}"}}"#),
+    ] {
+        let st = DeviceState::from_json(json.replace(&member, &bad).as_bytes()).unwrap();
+        let p = st.access_end.as_ref().unwrap();
+        assert_eq!((p.session_id.as_deref(), p.attempts), (None, END_ATTEMPTS), "{bad}");
+        assert!(!p.id.is_empty() && st.access_end_unreadable, "{bad}");
+    }
+
+    // It still holds the request back, and settles through vault.status.
+    store.data = Some(Zeroizing::new(json.replace(&member, r#""access_end":null"#).into_bytes()));
+    let mut s = session(&relay, &faults, &mut store);
+    assert!(s.access_end_unreadable());
     let mut a = access();
     let vault_side = async {
-        let mut last = None;
-        for _ in 0..END_ATTEMPTS {
-            last = Some(receive(&mut vault).await);
-        }
-        answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(Some("s-1")))).await;
-        last.unwrap()
+        answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(None))).await;
+        answer(&mut vault, TYPE_REQUEST, Status::Ok, requested_body()).await;
     };
-    let (got, end) = tokio::join!(a.end(&mut s, &mut store, None), vault_side);
-    assert_eq!(got, Err(AccessError::EndUnconfirmed));
-    deposit(&mut vault, response(&end, Status::Ok, "{}")).await;
-    let msgs = s.poll(&mut store).await.unwrap();
-    assert_eq!(msgs.len(), 1);
-    assert_eq!(a.observe(&mut s, &mut store, &msgs[0]), Ok(Some(AccessEvent::EndAnswered)));
+    let (got, ()) = tokio::join!(a.request(&mut s, &mut store, None), vault_side);
+    assert!(got.is_ok());
     assert!(s.access_end().is_none());
 }
 
+/// A `vault.status` answer with no session, from a minute ago: the
+/// baseline a grant needs to be reported active.
+fn baseline(a: &mut Access, s: &mut S, store: &mut MemStore) {
+    let mut st = response(&event(TYPE_STATUS, "{}"), Status::Ok, r#"{"session":null}"#);
+    st.ts = Utc::now() - TimeDelta::minutes(1);
+    assert_eq!(a.observe(s, store, &st), Ok(Some(AccessEvent::Status(StatusSession::None))));
+}
+
 /// Grants replace the session; a denied renewal leaves it running; an end
-/// stops it; and it expires on its own.
+/// stops it; and it expires on its own, a margin early.
 #[tokio::test]
 async fn grants_denials_ends_and_expiry() {
     let (relay, _vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store);
     let mut a = access();
+    baseline(&mut a, &mut s, &mut store);
     let now = Utc::now();
     let exp = now + TimeDelta::minutes(10);
     let g = a.observe(&mut s, &mut store, &event(TYPE_GRANTED, &session_body("s-1", exp))).unwrap();
     assert!(matches!(g, Some(AccessEvent::Granted(ref x)) if x.session_id == "s-1"));
     assert!(a.active_at(now));
-    // Expiry: active up to, not at, expires_at.
-    assert!(a.active_at(exp - TimeDelta::milliseconds(1)) && !a.active_at(exp));
+    // Expiry: active until EXPIRY_MARGIN before expires_at.
+    let edge = exp - EXPIRY_MARGIN;
+    assert!(a.active_at(edge - TimeDelta::milliseconds(1)) && !a.active_at(edge) && !a.active_at(exp));
     // A renewal denied (0.77.0): s-1 runs on.
     assert_eq!(a.observe(&mut s, &mut store, &event(TYPE_ENDED, r#"{"reason":"denied"}"#)), Ok(Some(AccessEvent::Denied)));
     assert!(a.active_at(now));
@@ -426,6 +595,43 @@ async fn grants_denials_ends_and_expiry() {
     assert_eq!(a.observe(&mut s, &mut store, &event("test.event", "{}")), Ok(None));
 }
 
+/// The clock margin: a session with less than EXPIRY_MARGIN left is not
+/// active.
+#[tokio::test]
+async fn a_session_close_to_its_end_is_not_active() {
+    let (relay, _vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    baseline(&mut a, &mut s, &mut store);
+    a.observe(&mut s, &mut store, &event(TYPE_GRANTED, &session_body("s-1", Utc::now() + TimeDelta::seconds(30)))).unwrap();
+    assert!(a.current().is_some());
+    assert!(!a.active_at(Utc::now()), "30 s left, under the margin");
+    assert!(AccessSession { session_id: "s".into(), expires_at: Utc::now() + TimeDelta::seconds(90) }.active_at(Utc::now()));
+}
+
+/// After a start, a grant that comes before any vault.status answer (or
+/// answered end) is recorded, not reported active.
+#[tokio::test]
+async fn a_grant_before_a_baseline_is_not_active() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    let exp = Utc::now() + TimeDelta::hours(1);
+    a.observe(&mut s, &mut store, &event(TYPE_GRANTED, &session_body("s-1", exp))).unwrap();
+    assert_eq!(a.current().map(|c| c.session_id.as_str()), Some("s-1"));
+    assert!(!a.active_at(Utc::now()), "no baseline yet");
+    let (st, _) = tokio::join!(a.read_status(&mut s, &mut store), answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(Some("s-1")))));
+    assert!(st.is_ok());
+    assert!(a.active_at(Utc::now()));
+
+    // An answered end is a baseline too.
+    let mut b = access();
+    b.observe(&mut s, &mut store, &event(TYPE_GRANTED, &session_body("s-2", exp))).unwrap();
+    let (got, _) = tokio::join!(b.end(&mut s, &mut store, Some("s-1")), answer(&mut vault, TYPE_END, Status::Ok, "{}"));
+    assert_eq!(got, Ok(EndOutcome::Ended));
+    assert!(b.active_at(Utc::now()), "s-2 is not the session ended, and the end's answer is a baseline");
+}
+
 /// What the vault said is applied in the vault's order: an older
 /// vault.status answer doesn't bring back a session an end stopped.
 #[tokio::test]
@@ -433,10 +639,12 @@ async fn the_vaults_order_wins() {
     let (relay, _vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store);
     let mut a = access();
+    baseline(&mut a, &mut s, &mut store);
     let t = Utc::now();
     let mut grant = event(TYPE_GRANTED, &session_body("s-1", t + TimeDelta::hours(1)));
     grant.ts = t;
     a.observe(&mut s, &mut store, &grant).unwrap();
+    assert!(a.active_at(t));
     let mut ended = event(TYPE_ENDED, r#"{"reason":"ended"}"#);
     ended.ts = t + TimeDelta::seconds(2);
     a.observe(&mut s, &mut store, &ended).unwrap();
@@ -446,6 +654,36 @@ async fn the_vaults_order_wins() {
     assert!(!a.active_at(t), "the older answer is ignored");
 }
 
+/// At the same `ts`, "no session" wins over a grant, in either order of
+/// arrival.
+#[tokio::test]
+async fn at_the_same_ts_the_end_wins() {
+    let (relay, _vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let t = Utc::now();
+    let mut grant = event(TYPE_GRANTED, &session_body("s-1", t + TimeDelta::hours(1)));
+    grant.ts = t;
+    let mut ended = event(TYPE_ENDED, r#"{"reason":"ended"}"#);
+    ended.ts = t;
+    let mut null = response(&event(TYPE_STATUS, "{}"), Status::Ok, &status_body(Some(None)));
+    null.ts = t;
+    for (first, second) in [(&grant, &ended), (&ended, &grant), (&grant, &null), (&null, &grant)] {
+        let mut a = access();
+        baseline(&mut a, &mut s, &mut store);
+        a.observe(&mut s, &mut store, first).unwrap();
+        a.observe(&mut s, &mut store, second).unwrap();
+        assert!(!a.active_at(t), "{} then {}", first.kind, second.kind);
+    }
+    // Two grants at the same ts: the later to arrive stands.
+    let mut a = access();
+    baseline(&mut a, &mut s, &mut store);
+    let mut other = event(TYPE_GRANTED, &session_body("s-2", t + TimeDelta::hours(1)));
+    other.ts = t;
+    a.observe(&mut s, &mut store, &grant).unwrap();
+    a.observe(&mut s, &mut store, &other).unwrap();
+    assert_eq!(a.current().unwrap().session_id, "s-2");
+}
+
 /// A session event that doesn't check out drops the session (fail
 /// secure), and so does an unreadable vault.status.
 #[tokio::test]
@@ -453,11 +691,14 @@ async fn malformed_messages_drop_the_session() {
     let (relay, _vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store);
     let mut a = access();
+    baseline(&mut a, &mut s, &mut store);
     let exp = Utc::now() + TimeDelta::hours(1);
     a.observe(&mut s, &mut store, &event(TYPE_GRANTED, &session_body("s-1", exp))).unwrap();
+    assert!(a.active_at(Utc::now()));
     assert_eq!(a.observe(&mut s, &mut store, &event(TYPE_ENDED, r#"{"reason":"paused"}"#)), Err(AccessError::Malformed));
     assert!(!a.active_at(Utc::now()));
     a.observe(&mut s, &mut store, &event(TYPE_GRANTED, &session_body("s-2", exp))).unwrap();
+    assert!(a.active_at(Utc::now()));
     let bad = response(&event(TYPE_STATUS, "{}"), Status::Ok, r#"{"session":{"session_id":"s-2"}}"#);
     assert_eq!(a.observe(&mut s, &mut store, &bad), Err(AccessError::Malformed));
     assert!(!a.active_at(Utc::now()));
@@ -470,8 +711,21 @@ async fn a_grant_while_an_end_waits() {
     let (relay, _vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store);
     let mut a = access();
-    let pid = s.new_id().unwrap();
-    s.set_access_end(&mut store, Some(PendingEnd { id: pid, session_id: None, attempts: END_ATTEMPTS })).unwrap();
+    baseline(&mut a, &mut s, &mut store);
+    record_end(&mut s, &mut store, None, END_ATTEMPTS);
     a.observe(&mut s, &mut store, &event(TYPE_GRANTED, &session_body("s-1", Utc::now() + TimeDelta::hours(1)))).unwrap();
     assert!(!a.active_at(Utc::now()));
+}
+
+/// `Debug` shows only the start of ids, and the vault's code filtered.
+#[test]
+fn debug_hides_ids_and_filters_vault_text() {
+    let s = AccessSession { session_id: "01JB2Z6V9K3M4N5P6Q7R8S9T0Z".into(), expires_at: Utc::now() };
+    let d = format!("{s:?}");
+    assert!(d.contains("01JB2Z..") && !d.contains("01JB2Z6V9K"), "{d}");
+    let p = PendingEnd { id: "01JB2Z6V9K3M4N5P6Q7R8S9T0Z".into(), session_id: Some("abcdefghij".into()), attempts: 1 };
+    let d = format!("{p:?}");
+    assert!(d.contains("abcdef..") && !d.contains("abcdefg") && !d.contains("01JB2Z6V"), "{d}");
+    let e = format!("{:?}", AccessError::Vault("bad\ncode\u{1b}[31m".into()));
+    assert!(!e.contains('\n') && !e.contains('\u{1b}'), "{e}");
 }

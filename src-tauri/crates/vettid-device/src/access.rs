@@ -6,9 +6,11 @@
 //!
 //! **Fail secure.** [`Access::active_at`] is true only for a session the
 //! vault named (in a grant or in `vault.status`) whose `expires_at` is
-//! still ahead. Nothing here guesses one into being:
-//! - after a restart there is none until `vault.status` is read (the
-//!   vault is the only source, §6.8 "A device's own session");
+//! more than [`EXPIRY_MARGIN`] ahead. Nothing here guesses one into being:
+//! - after a start there is none until `vault.status` has answered, or an
+//!   end has been answered (the vault is the only source, §6.8 "A device's
+//!   own session"): a grant that arrives first is recorded, not reported
+//!   active (it may be older than an end this device doesn't know of);
 //! - ending one drops it here at once, before the vault answers;
 //! - a session event that doesn't check out drops it too (only the vault
 //!   can seal one, so something changed that this device can't read):
@@ -16,7 +18,7 @@
 //! - what the vault said is applied in the order the vault said it (its
 //!   inner `ts`), not in the order it arrived: messages arrive in no order
 //!   (§8.4), and a `vault.status` answer from before an end must not bring
-//!   the ended session back.
+//!   the ended session back. At the same `ts`, no session wins over one.
 //!
 //! **The ordering rule** (§6.8 "Ending", 0.82.5): no
 //! `device.session.request` is sent while this device's last
@@ -25,15 +27,17 @@
 //! [`Access::settle`] sends it, and retries it twice under the same `id`
 //! (§8.6); when no answer comes, it reads `vault.status`:
 //! - `session: null`: the request may go;
-//! - the session the end named: the end is sent again under a new `id`;
+//! - the session the end named, or any session when it named none: the end
+//!   is sent again under a new `id`, naming that session (the vault ends
+//!   all of a device's access for an end of its current session);
 //! - no `session` member (an old vault: the member came with 0.41.0, the
 //!   spec's "a vault before this change"): the request may go, the
 //!   retries being spent;
 //! - another session than the one the end named: that end can no longer
 //!   change anything (the vault answers an end of a session that isn't
 //!   current `{}` and changes nothing), so the request may go;
-//! - a session, and the end named none: the request waits (until the end
-//!   is answered or that session reads `null`).
+//! - the same again after that resend: the request waits (until the end is
+//!   answered or the session reads `null`).
 //!
 //! Missed events are recovered by reading `vault.status`, as §6.8 says:
 //! they are not stored in the inbox.
@@ -46,7 +50,7 @@ use vettid_vms::strict_json::{self, Builder, Object};
 
 use crate::pairing::Clock;
 use crate::session::{Session, SessionError, REQUEST_TIMEOUT};
-use crate::store::{PendingEnd, Persist};
+use crate::store::{short_id, PendingEnd, Persist};
 use crate::transport::Transport;
 
 /// The shortest access session a device may ask for (§10.3).
@@ -59,6 +63,10 @@ pub const END_ATTEMPTS: u32 = 3;
 /// The longest `session_id` this device sends or accepts (the vault's
 /// bound on a string member).
 pub const MAX_SESSION_ID: usize = 4096;
+/// A session counts as ended this long before its `expires_at`: this
+/// desktop's clock may be behind the vault's, and acting on a session the
+/// vault has already ended is the unsafe side.
+pub const EXPIRY_MARGIN: TimeDelta = TimeDelta::seconds(60);
 
 pub const TYPE_REQUEST: &str = "device.session.request";
 pub const TYPE_END: &str = "device.session.end";
@@ -66,17 +74,25 @@ pub const TYPE_GRANTED: &str = "device.session.granted";
 pub const TYPE_ENDED: &str = "device.session.ended";
 pub const TYPE_STATUS: &str = "vault.status";
 
-/// An access session the vault named.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An access session the vault named. `Debug` shows only the start of
+/// its id.
+#[derive(Clone, PartialEq, Eq)]
 pub struct AccessSession {
     pub session_id: String,
     pub expires_at: DateTime<Utc>,
 }
 
+impl std::fmt::Debug for AccessSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessSession").field("session_id", &short_id(&self.session_id)).field("expires_at", &self.expires_at).finish()
+    }
+}
+
 impl AccessSession {
-    /// Whether it is still running at `t`.
+    /// Whether it is still running at `t`, by this desktop's clock: up to
+    /// [`EXPIRY_MARGIN`] before its `expires_at`.
     pub fn active_at(&self, t: DateTime<Utc>) -> bool {
-        t < self.expires_at
+        t + EXPIRY_MARGIN < self.expires_at
     }
 }
 
@@ -148,8 +164,9 @@ pub enum AccessEvent {
     Status(StatusSession),
 }
 
-/// Why an access operation failed. Carries no secret.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Why an access operation failed. Carries no secret; `Debug` filters
+/// the vault's code as `Display` does.
+#[derive(Clone, PartialEq, Eq)]
 pub enum AccessError {
     /// The session engine failed (relay, store, refused, timed out).
     Session(SessionError),
@@ -179,6 +196,19 @@ impl std::fmt::Display for AccessError {
             // The code is the vault's: printable ASCII only, bounded.
             Self::Vault(code) => write!(f, "access: the vault answered {}", printable(code)),
             Self::EndUnconfirmed => f.write_str("access: the last end isn't confirmed yet"),
+        }
+    }
+}
+
+impl std::fmt::Debug for AccessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Session(e) => f.debug_tuple("Session").field(e).finish(),
+            Self::BadSeconds => f.write_str("BadSeconds"),
+            Self::BadSessionId => f.write_str("BadSessionId"),
+            Self::Malformed => f.write_str("Malformed"),
+            Self::Vault(code) => f.debug_tuple("Vault").field(&printable(code)).finish(),
+            Self::EndUnconfirmed => f.write_str("EndUnconfirmed"),
         }
     }
 }
@@ -306,6 +336,12 @@ pub struct Access {
     current: Option<AccessSession>,
     /// The vault's `ts` of the last thing applied to `current`.
     learned: Option<DateTime<Utc>>,
+    /// Whether that last thing said "no session" (at the same `ts`, it
+    /// wins over a grant).
+    learned_none: bool,
+    /// A `vault.status` answer, or an answer to an end, has come since this
+    /// started: before it, a grant isn't reported active.
+    baseline: bool,
     /// How long each attempt waits for its answer.
     timeout: TimeDelta,
 }
@@ -319,7 +355,7 @@ impl Default for Access {
 impl Access {
     /// No session known (as after a start: read `vault.status`).
     pub fn new() -> Self {
-        Access { current: None, learned: None, timeout: REQUEST_TIMEOUT }
+        Access { current: None, learned: None, learned_none: false, baseline: false, timeout: REQUEST_TIMEOUT }
     }
 
     /// The same, waiting `timeout` for each answer.
@@ -332,9 +368,11 @@ impl Access {
         self.current.as_ref()
     }
 
-    /// Whether this desktop has an access session at `t`.
+    /// Whether this desktop has an access session at `t`: one the vault
+    /// named, more than [`EXPIRY_MARGIN`] from its end, and known since
+    /// `vault.status` (or an end) answered.
     pub fn active_at(&self, t: DateTime<Utc>) -> bool {
-        self.current.as_ref().is_some_and(|s| s.active_at(t))
+        self.baseline && self.current.as_ref().is_some_and(|s| s.active_at(t))
     }
 
     /// Apply what the vault said at `at`: `Some` a session, `None` none.
@@ -342,10 +380,14 @@ impl Access {
     /// unanswered end will end (the one it names, or any if it names none)
     /// doesn't become current.
     fn learn(&mut self, at: DateTime<Utc>, session: Option<AccessSession>, pending: Option<&PendingEnd>) {
-        if self.learned.is_some_and(|l| at < l) {
-            return;
+        if let Some(l) = self.learned {
+            // Older: ignored. As old as a "no session": the safer one wins.
+            if at < l || (at == l && self.learned_none && session.is_some()) {
+                return;
+            }
         }
         self.learned = Some(at);
+        self.learned_none = session.is_none();
         self.current = match (session, pending) {
             (Some(s), Some(p)) if p.session_id.as_ref().is_none_or(|n| *n == s.session_id) => None,
             (s, _) => s,
@@ -377,6 +419,7 @@ impl Access {
                 return Err(e);
             }
         };
+        self.baseline = true;
         match &status {
             StatusSession::Session(x) => self.learn(answer.ts, Some(x.clone()), s.access_end()),
             StatusSession::None => self.learn(answer.ts, None, s.access_end()),
@@ -464,22 +507,33 @@ impl Access {
                     s.set_access_end(store, None)?;
                     return Ok(Settled::OldVault);
                 }
-                (StatusSession::Session(cur), Some(named)) if cur.session_id == *named => {
-                    if reissued {
-                        return Err(AccessError::EndUnconfirmed);
-                    }
-                    // Sent again under a new id, naming the same session.
-                    reissued = true;
-                    let id = s.new_id()?;
-                    s.set_access_end(store, Some(PendingEnd { id, session_id: Some(named.clone()), attempts: 0 }))?;
-                }
-                // Another session is current (read_status applied it): the
-                // end of the one it replaced changes nothing any more.
-                (StatusSession::Session(_), Some(_)) => {
+                // SPEC: §6.8 "Ending" (0.82.5) says what to do when the
+                // unanswered end names the session vault.status shows, not
+                // when it names S1 and vault.status shows another, S2. Here
+                // the request is released and S2 is left running: an end of
+                // S1 can't change anything any more (the vault answers an end
+                // of a session that isn't current `{}`). Asked of the owner:
+                // should this end S2 instead? (test
+                // `spec_question_named_end_of_a_replaced_session_is_moot`)
+                (StatusSession::Session(cur), Some(named)) if *named != cur.session_id => {
                     s.set_access_end(store, None)?;
                     return Ok(Settled::Moot);
                 }
-                (StatusSession::Session(_), None) => return Err(AccessError::EndUnconfirmed),
+                // The session it named is still current, or it named none and
+                // one is current (§6.8 "If it names a session", read as
+                // vault.status's session): sent again under a new id, naming
+                // that session. The vault ends all of the device's access for
+                // an end of its current session (vault/access.go
+                // hSessionEnd), and a named end, if delayed, can't end a later
+                // session.
+                (StatusSession::Session(cur), _) => {
+                    if reissued {
+                        return Err(AccessError::EndUnconfirmed);
+                    }
+                    reissued = true;
+                    let id = s.new_id()?;
+                    s.set_access_end(store, Some(PendingEnd { id, session_id: Some(cur.session_id), attempts: 0 }))?;
+                }
             }
         }
     }
@@ -498,10 +552,12 @@ impl Access {
         if ok.is_ok() || ok == Err(AccessError::Malformed) {
             // Ended (or never current): from the vault's ts of the answer,
             // what it named isn't current. A malformed `ok` is still an ok.
+            self.baseline = true;
+            self.forget(p.session_id.as_deref());
             if self.learned.is_none_or(|l| answer.ts >= l) {
                 self.learned = Some(answer.ts);
+                self.learned_none = self.current.is_none();
             }
-            self.forget(p.session_id.as_deref());
         }
         ok
     }
