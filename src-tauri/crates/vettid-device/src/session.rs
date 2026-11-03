@@ -41,10 +41,20 @@
 //!     retransmitted `hs.init` is skipped while its answer is queued, and
 //!     after;
 //!   - the waiting responders are stored (at most [`MAX_AWAITING`]; the
-//!     oldest is aborted), and aborted after 16 days;
+//!     oldest is aborted), and aborted after 16 days. Aborting one takes its
+//!     `hs.resp` out of the outbox if it is still there, and an `hs.resp`
+//!     that leaves the outbox unsent (refused, evicted, expired) aborts its
+//!     responder. A responder aborted at the cap **after** its `hs.resp`
+//!     went out can strand that rekey (the vault would finish an epoch this
+//!     device no longer holds the keys of); that is safe while the vault
+//!     starts a new rekey only after the last one has ended, as it does;
 //!   - **a message of the new epoch before its `hs.fin` is left unacked,
 //!     and not marked seen** (§6.3, 0.23.0): the relay delivers it again
-//!     once `hs.fin` has established the epoch;
+//!     once `hs.fin` has established the epoch. So is an `hs.fin` refused
+//!     only because its `ts` is ahead of this device's clock
+//!     (`ClockFuture`): only the vault can make it, and it doesn't send it
+//!     again. **This is stricter than the vault's Go device client**, which
+//!     acks and drops it; other clients should do the same as here;
 //!   - `hs.fin` (once `sig_I` verifies) makes the new epoch current: the
 //!     old one's send key and `rk` are deleted, and its receive key is
 //!     kept 16 days for late messages. An `hs.fin` or `hs.resp` that
@@ -265,11 +275,9 @@ impl<T: Transport, C: Clock> Session<T, C> {
         let now = clock.now();
         let ring = fit_ring(KeyringState { current: state.epoch.clone(), retired: state.retired.clone() }, now);
         let keys = Keyring::restore(ring, now).map_err(|_| StoreError::Corrupt)?;
-        let mut awaiting = state.awaiting.iter().cloned().map(|w| fit_waiting(w, now)).collect::<Result<Vec<_>, _>>().map_err(|_| StoreError::Corrupt)?;
+        let awaiting = state.awaiting.iter().cloned().map(|w| fit_waiting(w, now)).collect::<Result<Vec<_>, _>>().map_err(|_| StoreError::Corrupt)?;
         // At most the newest MAX_AWAITING.
-        let excess = awaiting.len().saturating_sub(MAX_AWAITING);
-        awaiting.drain(..excess);
-        Ok(Some(Session {
+        let mut s = Session {
             transport: make_transport(relay_key.clone()),
             clock,
             state,
@@ -283,7 +291,30 @@ impl<T: Transport, C: Clock> Session<T, C> {
             hold_until: now,
             outbox_backoff: OUTBOX_BACKOFF,
             refresh_sent: None,
-        }))
+        };
+        // At most the newest MAX_AWAITING, the others aborted (their queued
+        // hs.resp taken out of the outbox).
+        s.trim_awaiting();
+        Ok(Some(s))
+    }
+
+    /// Abort the oldest waiting rekeys past [`MAX_AWAITING`].
+    fn trim_awaiting(&mut self) {
+        while self.awaiting.len() > MAX_AWAITING {
+            let oldest = self.awaiting[0].init.clone();
+            self.abort_waiting(|w| w.init == oldest);
+        }
+    }
+
+    /// An outbox entry that leaves unsent (evicted, refused for good,
+    /// expired): reported, and if it is an `hs.resp`, its rekey can't be
+    /// finished and stops waiting (the `hs.init` is left to be answered
+    /// again).
+    fn lost(&mut self, e: OutboxEntry) {
+        if let Some(init) = &e.re {
+            self.abort_waiting(|w| w.init == *init);
+        }
+        self.dropped.push(e.kind);
     }
 
     /// The device id the vault assigned.
@@ -411,7 +442,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
         self.state.outbox.push(entry);
         while self.state.outbox.len() > OUTBOX_CAP {
             let evicted = self.state.outbox.remove(0);
-            self.dropped.push(evicted.kind);
+            self.lost(evicted);
         }
         self.dirty = true;
     }
@@ -587,7 +618,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
         while let Some(e) = self.state.outbox.first().cloned() {
             if now - e.created > OUTBOX_MAX_AGE || e.exp.is_some_and(|x| now > x) {
                 self.state.outbox.remove(0);
-                self.dropped.push(e.kind);
+                self.lost(e);
                 changed = true;
                 continue;
             }
@@ -614,23 +645,17 @@ impl<T: Transport, C: Clock> Session<T, C> {
                         self.maybe_sent.push(e.kind.clone());
                         true
                     }
-                    _ => {
-                        self.dropped.push(e.kind.clone());
-                        false
-                    }
+                    _ => false,
                 },
             };
             self.state.outbox.remove(0);
             // An hs.resp the relay took (or may have): its hs.init is
             // handled now, and a retransmission of it is skipped. One that
-            // was dropped can't be finished: its rekey stops waiting, and
-            // the hs.init is left to be answered again.
-            match (taken, &e.re) {
-                (true, Some(init)) => {
-                    self.state.seen_inner.insert(init.clone(), now + SEEN_KEEP);
-                }
-                (false, Some(init)) => self.abort_waiting(|w| w.init == *init),
-                _ => {}
+            // was refused for good is lost (see `lost`).
+            if !taken {
+                self.lost(e);
+            } else if let Some(init) = &e.re {
+                self.state.seen_inner.insert(init.clone(), now + SEEN_KEEP);
             }
             changed = true;
         }
@@ -797,10 +822,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
         let Ok((responder, resp)) = answer_rekey(raw, inner, self.keys.current(), &cfg) else { return };
         self.push_outbox(OutboxEntry { kind: TYPE_RESP.into(), payload: resp, created: now, exp: None, re: Some(inner.id.clone()) });
         self.awaiting.push(Waiting { responder, init: inner.id.clone() });
-        if self.awaiting.len() > MAX_AWAITING {
-            let oldest = self.awaiting[0].init.clone();
-            self.abort_waiting(|w| w.init == oldest);
-        }
+        self.trim_awaiting();
     }
 
     /// Abort the rekeys whose `hs.fin` can't come any more (16 days): their

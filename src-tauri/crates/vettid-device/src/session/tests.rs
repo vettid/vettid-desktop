@@ -774,3 +774,49 @@ async fn no_rekey_from_a_retired_epoch() {
     assert_eq!((vault.waiting(), s.awaiting.len()), (0, 0));
     assert_eq!(vault.device_waiting(), 0, "acked and dropped");
 }
+
+/// An hs.resp evicted from a full outbox ends its rekey (it can't be
+/// finished).
+#[tokio::test]
+async fn an_evicted_resp_ends_its_rekey() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    faults.lock().unwrap().temporary = 1000;
+    vault.start_rekey().await;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!((s.awaiting.len(), s.outbox_len()), (1, 1));
+    for _ in 0..OUTBOX_CAP {
+        s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+    }
+    assert_eq!((s.awaiting.len(), s.outbox_len()), (0, OUTBOX_CAP));
+    assert_eq!(s.take_dropped(), ["hs.resp"]);
+}
+
+/// A stored state with more than MAX_AWAITING waiting rekeys opens with the
+/// newest, and the others' queued hs.resp don't go out.
+#[tokio::test]
+async fn open_trims_the_waiting_rekeys() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    {
+        let mut s = session(&relay, &faults, &mut store, Ticking::new());
+        faults.lock().unwrap().temporary = 1000;
+        for _ in 0..MAX_AWAITING {
+            vault.start_rekey().await;
+        }
+        s.poll(&mut store).await.unwrap();
+        assert_eq!((s.awaiting.len(), s.outbox_len()), (MAX_AWAITING, MAX_AWAITING));
+    }
+    // One more, older than the rest, with its queued answer.
+    let mut v: serde_json::Value = serde_json::from_slice(&store.inner.data.clone().unwrap()).unwrap();
+    let mut extra = v["awaiting"][0].clone();
+    extra["init"] = serde_json::json!("01JB2Z6V9K3M4N5P6Q7R8S9T0Z");
+    v["awaiting"].as_array_mut().unwrap().insert(0, extra);
+    let mut resp = v["outbox"][0].clone();
+    resp["re"] = serde_json::json!("01JB2Z6V9K3M4N5P6Q7R8S9T0Z");
+    v["outbox"].as_array_mut().unwrap().push(resp);
+    store.inner.data = Some(Zeroizing::new(serde_json::to_vec(&v).unwrap()));
+    let s = session(&relay, &faults, &mut store, Ticking::new());
+    assert_eq!(s.awaiting.len(), MAX_AWAITING);
+    assert!(s.awaiting.iter().all(|w| w.init != "01JB2Z6V9K3M4N5P6Q7R8S9T0Z"));
+    assert_eq!(s.outbox_len(), MAX_AWAITING, "its answer is out of the outbox");
+}
