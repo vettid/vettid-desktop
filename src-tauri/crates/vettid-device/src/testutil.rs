@@ -13,8 +13,8 @@ use vettid_relay::client::{DepositError, Limits, Message, Registration, RelayErr
 use vettid_relay::token::Token;
 use vettid_vms::envelope::{new_ulid, open_sealed, Envelope, Inner, Mode, Sealer};
 use vettid_vms::handshake::{
-    check_sas_commit, sas, sign_resp, th, th1, verify_fin, Epoch, Fin, Init, Principal, Purpose, RelayAddr, Resp, Role, Schedule,
-    POLICY_VAULT_TO_DEVICE, TYPE_FIN, TYPE_RESP,
+    check_sas_commit, epoch_ctx, sas, sign_fin, sign_resp, th, th1, verify_fin, verify_resp, Epoch, Fin, Init, Principal, Purpose, RelayAddr,
+    Resp, Role, Schedule, POLICY_VAULT_TO_DEVICE, TYPE_FIN, TYPE_INIT, TYPE_RESP,
 };
 use vettid_vms::invite::{Bundle, Kind, Qr};
 use vettid_vms::strict_json::Builder;
@@ -205,6 +205,10 @@ pub(crate) struct Vault {
     pub(crate) kem: PrivateKey,
     pub(crate) ik: SigningKey,
     pub(crate) handshake: Option<(Schedule, Epoch, Init, [u8; 32])>,
+    /// A rekey this vault started: its ephemeral key, `hs.init` and `K_s`.
+    pub(crate) rekey: Option<(PrivateKey, Vec<u8>, Zeroizing<[u8; 32]>)>,
+    /// The epoch before the last rekey.
+    pub(crate) old: Option<Epoch>,
 }
 
 impl Vault {
@@ -213,7 +217,14 @@ impl Vault {
         let v = &k["vault"];
         let mem = Mem { relay: relay.clone(), key: SigningKey::from_bytes(&seed(&v["relay_seed_hex"])), name: "vault", faults: Default::default() };
         relay.lock().unwrap().mailboxes.entry(mem.mailbox()).or_default();
-        Vault { mem, kem: PrivateKey::from_seed(&seed(&v["kem_seed_hex"])).unwrap(), ik: SigningKey::from_bytes(&seed(&v["ik_seed_hex"])), handshake: None }
+        Vault {
+            mem,
+            kem: PrivateKey::from_seed(&seed(&v["kem_seed_hex"])).unwrap(),
+            ik: SigningKey::from_bytes(&seed(&v["ik_seed_hex"])),
+            handshake: None,
+            rekey: None,
+            old: None,
+        }
     }
 
     pub(crate) fn principal(&self) -> Principal {
@@ -334,6 +345,76 @@ impl Vault {
 
     pub(crate) fn device_relay_key(&self) -> ed25519_dalek::VerifyingKey {
         self.handshake.as_ref().unwrap().2.from.relay.pk
+    }
+
+    /// Deposit `env` as it is to the desktop, from the vault's relay key.
+    pub(crate) async fn deposit_raw(&self, env: &[u8]) {
+        let to = self.device_mailbox();
+        self.mem.deposit(URL, &to, &Token::from_received("x".into()), env).await.unwrap();
+    }
+
+    /// Start a rekey (§6.2, §6.5), as the vault does on an unlock: an
+    /// `hs.init` of purpose rekey under the current epoch, deposited.
+    /// Returns its envelope.
+    pub(crate) async fn start_rekey(&mut self) -> Vec<u8> {
+        let principal = self.principal();
+        let (_, epoch, _, _) = self.handshake.as_mut().unwrap();
+        let ks = epoch.snapshot().rk.expect("the current epoch's rk");
+        let eph = PrivateKey::generate().unwrap();
+        let body = Init {
+            purpose: Purpose::Rekey,
+            ctx: epoch_ctx(&epoch.id()),
+            from: principal,
+            eph: eph.public().clone(),
+            token: None,
+            reconnect_token: None,
+            suites: vec![2],
+            profile: None,
+            sas_commit: None,
+        }
+        .marshal()
+        .unwrap();
+        let env = self.seal(TYPE_INIT, body);
+        self.deposit_raw(&env).await;
+        self.rekey = Some((eph, env.clone(), ks));
+        env
+    }
+
+    /// Take the desktop's `hs.resp` from the vault's mailbox, check it as
+    /// §6.3 says, switch to the new epoch (the old one is kept in `old`),
+    /// and return `hs.fin`, sealed in it but not deposited.
+    pub(crate) async fn finish_rekey(&mut self) -> Vec<u8> {
+        let m = self.next().await;
+        let (eph, init_env, ks) = self.rekey.take().expect("a rekey started");
+        let env = Envelope::parse(&m.payload).unwrap();
+        let (padded, ctx) = open_sealed(&env, &eph).unwrap();
+        let mut ke = [0u8; 32];
+        ctx.export(LABEL_HS_KE.as_bytes(), &mut ke).unwrap();
+        let inner = Inner::decode(&padded, Mode::Sealed).unwrap();
+        assert_eq!(inner.kind, TYPE_RESP);
+        let resp = Resp::parse(&inner.body, Purpose::Rekey).unwrap();
+        let t = th(&init_env, env.header());
+        let device_ik = self.handshake.as_ref().unwrap().2.from.ik;
+        verify_resp(&device_ik, &t, &resp.sig).unwrap();
+        let sched = Schedule::derive(&ks, &ke, th1(&init_env), t);
+        let mut epoch = Epoch::new(&sched, Role::Initiator, 2, POLICY_VAULT_TO_DEVICE, Utc::now());
+        epoch.activate(Utc::now());
+        let body = Fin { sig: sign_fin(&self.ik, &t), sas_nonce: None }.marshal(Purpose::Rekey).unwrap();
+        let mut fin = Inner { id: new_ulid(Utc::now()).unwrap(), kind: TYPE_FIN.into(), ts: Utc::now(), seq: None, response: None, exp: None, body: Zeroizing::new(body) };
+        let out = epoch.seal(&mut fin).unwrap();
+        let old = std::mem::replace(&mut self.handshake.as_mut().unwrap().1, epoch);
+        self.old = Some(old);
+        out
+    }
+
+    /// How many messages wait in the vault's mailbox.
+    pub(crate) fn waiting(&self) -> usize {
+        self.mem.relay.lock().unwrap().mailboxes.get(&self.mem.mailbox()).map_or(0, Vec::len)
+    }
+
+    /// How many messages wait in the desktop's mailbox.
+    pub(crate) fn device_waiting(&self) -> usize {
+        self.mem.relay.lock().unwrap().mailboxes.get(&self.device_mailbox()).map_or(0, Vec::len)
     }
 }
 

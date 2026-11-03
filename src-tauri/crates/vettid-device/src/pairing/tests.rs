@@ -229,9 +229,16 @@ fn stored_state_round_trips() {
         device_id: None,
         vault_id: Some("vault-1".into()),
         epoch: epoch.snapshot(),
+        retired: vec![({
+            let mut old = epoch.snapshot();
+            old.send = None;
+            old.rk = None;
+            old
+        }, vettid_vms::envelope::parse_ts("2026-10-17T12:00:00.000Z").unwrap())],
+        awaiting: Vec::new(),
         seen: [("01JB2Z6V9K3M4N5P6Q7R8S9T0V".to_string(), vettid_vms::envelope::parse_ts("2026-10-01T12:00:00.000Z").unwrap())].into(),
         seen_inner: Default::default(),
-        outbox: vec![crate::store::OutboxEntry { kind: "test.ping".into(), payload: vec![1, 2, 3], created: vettid_vms::envelope::parse_ts("2026-10-01T12:00:00.000Z").unwrap(), exp: vettid_vms::envelope::parse_ts("2026-10-01T12:01:00.000Z") }],
+        outbox: vec![crate::store::OutboxEntry { kind: "test.ping".into(), payload: vec![1, 2, 3], created: vettid_vms::envelope::parse_ts("2026-10-01T12:00:00.000Z").unwrap(), exp: vettid_vms::envelope::parse_ts("2026-10-01T12:01:00.000Z"), re: Some("01JB2Z6V9K3M4N5P6Q7R8S9T0X".into()) }],
         asked: [("01JB2Z6V9K3M4N5P6Q7R8S9T0W".to_string(), vettid_vms::envelope::parse_ts("2026-10-02T12:00:00.000Z").unwrap())].into(),
         asked_kinds: [("01JB2Z6V9K3M4N5P6Q7R8S9T0W".to_string(), "test.ask".to_string())].into(),
         refused: true,
