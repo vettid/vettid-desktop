@@ -915,11 +915,11 @@ async fn unlinked_edge_cases() {
     assert_eq!(s.state.inbox.len(), INBOX_CAP);
     let env = vault_deposit(&mut vault, event("device.unlinked", r#"{"reason":"removed"}"#), None).await;
     s.poll(&mut store).await.unwrap();
-    assert_eq!((s.unlinked(), vault.device_waiting(), s.state.inbox.len()), (Some("removed"), 0, INBOX_CAP + 1));
+    assert_eq!((s.unlinked(), vault.device_waiting(), s.state.inbox.len()), (Some("removed"), 0, 1), "the waiting rotations are dropped");
     vault.deposit_raw(&env).await;
     vault_deposit(&mut vault, event("device.unlinked", r#"{"reason":"other"}"#), None).await;
     s.poll(&mut store).await.unwrap();
-    assert_eq!((s.unlinked(), vault.device_waiting(), s.state.inbox.len()), (Some("removed"), 0, INBOX_CAP + 1));
+    assert_eq!((s.unlinked(), vault.device_waiting(), s.state.inbox.len()), (Some("removed"), 0, 1), "the waiting rotations are dropped");
 }
 
 /// Unlinking ends a waiting rekey and takes its queued answer out; a
@@ -1007,4 +1007,55 @@ async fn a_state_from_before_the_inbox_opens() {
     store.inner.data = Some(Zeroizing::new(serde_json::to_vec(&v).unwrap()));
     let s = session(&relay, &faults, &mut store, Ticking::new());
     assert_eq!((s.unlinked(), s.state.inbox.len()), (None, 0));
+}
+
+/// Once unlinked, other inbox events are acked and dropped; a body over
+/// INBOX_MAX_BODY is left unacked, except a removal, which unlinks and is
+/// kept with its reason only; a raw reason out of bounds is kept empty;
+/// pending_inbox lists what waits.
+#[tokio::test]
+async fn inbox_limits_and_a_removed_device() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    let big = format!(r#"{{"pad":"{}"}}"#, "x".repeat(INBOX_MAX_BODY));
+    vault_deposit(&mut vault, event("identity.rotate", &big), None).await;
+    vault_deposit(&mut vault, event("identity.rotate", "{}"), None).await;
+    let got = s.poll(&mut store).await.unwrap();
+    assert_eq!((got.len(), vault.device_waiting()), (1, 1), "the large one waits at the relay");
+    assert_eq!(s.pending_inbox().len(), 1);
+    // A removal with a large body and an odd reason: unlinks.
+    let odd = format!(r#"{{"reason":"{}","pad":"{}"}}"#, "r".repeat(100), "x".repeat(INBOX_MAX_BODY));
+    vault_deposit(&mut vault, event("device.unlinked", &odd), None).await;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.unlinked(), Some(""), "a reason out of bounds is kept empty");
+    // It came first in that batch (still linked then); the next takes it.
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(vault.device_waiting(), 0, "the large rotation is acked and dropped once removed");
+    let kinds: Vec<_> = s.pending_inbox().iter().map(|e| (e.kind.as_str(), e.body.as_str())).collect();
+    assert_eq!(kinds, [("device.unlinked", r#"{"reason":""}"#)]);
+    vault_deposit(&mut vault, event("identity.rotate", "{}"), None).await;
+    assert!(s.poll(&mut store).await.unwrap().is_empty());
+    assert_eq!((vault.device_waiting(), s.pending_inbox().len()), (0, 1));
+}
+
+/// An inbox entry that no longer parses is dropped on load, and the keys
+/// are kept.
+#[tokio::test]
+async fn a_broken_inbox_entry_is_dropped_on_load() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    {
+        let mut s = session(&relay, &faults, &mut store, Ticking::new());
+        vault_deposit(&mut vault, event("identity.rotate", "{}"), None).await;
+        vault_deposit(&mut vault, event("identity.rotate", r#"{"n":2}"#), None).await;
+        s.poll(&mut store).await.unwrap();
+        assert_eq!(s.pending_inbox().len(), 2);
+    }
+    let mut v: serde_json::Value = serde_json::from_slice(&store.inner.data.clone().unwrap()).unwrap();
+    v["inbox"][0]["inner"] = serde_json::json!("not an inner");
+    store.inner.data = Some(Zeroizing::new(serde_json::to_vec(&v).unwrap()));
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    assert_eq!(s.pending_inbox().len(), 1);
+    assert_eq!(s.pending_inbox()[0].body.as_str(), r#"{"n":2}"#);
+    s.send(&mut store, "test.after", "{}", false).await.unwrap();
+    assert_eq!(vault_receive(&mut vault).await.kind, "test.after", "the keys survived");
 }

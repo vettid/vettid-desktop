@@ -76,7 +76,11 @@
 //!   (nothing more is sent, the outbox is dropped and reported, waiting
 //!   rekeys end, and a [`Session::request`] in progress returns `Refused`)
 //!   and [`Session::unlinked`] says so from then on, with the reason. A
-//!   later one is acked and dropped. The engine **doesn't erase**
+//!   later one, and any other inbox event (`identity.rotate`, also those
+//!   already waiting), is acked and dropped: the app never acts on a
+//!   removed device. **The reason comes from the vault: the app maps it to
+//!   the known values (none for a plain unlink, `transferred`,
+//!   `replaced`, `vault_deleted`) and never shows it raw.** The engine **doesn't erase**
 //!   anything: the app decides, by the reason, what to erase and what to
 //!   tell the person (§6.7.1; §12.5 adds a confirmation for
 //!   `vault_deleted` on a phone). The app checks [`Session::unlinked`]
@@ -159,6 +163,13 @@ pub const VAULT_LOCK_MAX_EXP: TimeDelta = TimeDelta::seconds(60);
 pub const INBOX_TYPES: &[&str] = &["device.unlinked", "identity.rotate"];
 /// The most events the inbox holds; past it, one more is left unacked.
 pub const INBOX_CAP: usize = 64;
+/// The largest body an inbox event may have; a larger one is left unacked,
+/// like one over the cap (a `device.unlinked` still unlinks, kept with its
+/// reason only).
+pub const INBOX_MAX_BODY: usize = 16 * 1024;
+/// The longest `reason` kept; a longer one (or one not printable ASCII) is
+/// kept as empty.
+const MAX_REASON: usize = 64;
 const DEVICE_UNLINKED: &str = "device.unlinked";
 
 /// The most rekeys waiting for `hs.fin` at once; past it, the oldest is
@@ -364,6 +375,13 @@ impl<T: Transport, C: Clock> Session<T, C> {
     /// app erases its state and says so.
     pub fn unlinked(&self) -> Option<&str> {
         self.state.unlinked.as_deref()
+    }
+
+    /// The inbox events waiting to be handled, in order (also those already
+    /// returned by a poll): for an app that lost track after a failed
+    /// handle.
+    pub fn pending_inbox(&self) -> &[Inner] {
+        &self.state.inbox
     }
 
     /// The caller has acted on the inbox event `id`: it is removed, and
@@ -927,7 +945,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
     /// An opened message of an established epoch, other than a handshake
     /// message. Returns whether to ack it: all but an inbox event that
     /// finds the inbox full.
-    fn handle_inner(&mut self, inner: Inner, now: DateTime<Utc>, events: &mut Vec<Inner>) -> bool {
+    fn handle_inner(&mut self, mut inner: Inner, now: DateTime<Utc>, events: &mut Vec<Inner>) -> bool {
         // §8.4, §8.5: by the type's class (an ephemeral type without exp
         // is refused).
         if inner.check_time(now, durable(&inner.kind)).is_err() {
@@ -941,10 +959,16 @@ impl<T: Transport, C: Clock> Session<T, C> {
         }
         let for_inbox = inner.response.is_none() && INBOX_TYPES.contains(&inner.kind.as_str());
         let unlinking = for_inbox && inner.kind == DEVICE_UNLINKED;
-        // The removal is never held back by the cap (it is terminal: at most
-        // one is kept).
-        if for_inbox && !unlinking && self.state.inbox.len() >= INBOX_CAP {
-            return false;
+        if for_inbox && !unlinking {
+            // A removed device acts on nothing more.
+            if self.state.unlinked.is_some() {
+                return true;
+            }
+            // Too many or too large: left for the relay. (The removal is
+            // never held back: it is terminal, and at most one is kept.)
+            if self.state.inbox.len() >= INBOX_CAP || inner.body.len() > INBOX_MAX_BODY {
+                return false;
+            }
         }
         let keep = match inner.exp {
             Some(exp) => (now + EPHEMERAL_KEEP).max(exp + MAX_CLOCK_SKEW_FUTURE),
@@ -974,7 +998,10 @@ impl<T: Transport, C: Clock> Session<T, C> {
                 if self.state.unlinked.is_some() {
                     return true; // already removed: a later notice adds nothing
                 }
-                self.unlink(&inner.body);
+                let reason = self.unlink(&inner.body);
+                if inner.body.len() > INBOX_MAX_BODY {
+                    inner.body = Zeroizing::new(Builder::new().string("reason", &reason).finish());
+                }
             }
             // Only what the store can write back (it can't fail for a parsed
             // event; dropped otherwise rather than lose the state).
@@ -1005,13 +1032,20 @@ impl<T: Transport, C: Clock> Session<T, C> {
     /// The vault says this device was removed (§7.4): refused from now on,
     /// and what waits in the outbox is dropped and reported. Nothing is
     /// erased here: the app does that, and tells the person.
-    fn unlink(&mut self, body: &str) {
-        let reason = strict_json::parse_object(body.as_bytes()).ok().and_then(|o| o.opt_string("reason").ok().flatten()).unwrap_or_default();
-        self.state.unlinked.get_or_insert(reason);
+    fn unlink(&mut self, body: &str) -> String {
+        let reason = strict_json::parse_object(body.as_bytes())
+            .ok()
+            .and_then(|o| o.opt_string("reason").ok().flatten())
+            .filter(|r| r.len() <= MAX_REASON && r.bytes().all(|b| b.is_ascii_graphic() || b == b' '))
+            .unwrap_or_default();
+        self.state.unlinked.get_or_insert(reason.clone());
+        // Nothing else waiting in the inbox is acted on any more.
+        self.state.inbox.retain(|e| e.kind == DEVICE_UNLINKED);
         self.state.refused = true;
         let lost: Vec<String> = self.state.outbox.drain(..).map(|o| o.kind).collect();
         self.dropped.extend(lost);
         self.abort_waiting(|_| true);
+        reason
     }
 
     /// A fresh standing token for the vault, as a `{kind, token}` body;

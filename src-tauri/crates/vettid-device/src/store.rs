@@ -265,7 +265,9 @@ impl DeviceState {
         let outbox: usize = self.outbox.iter().map(|o| o.payload.len() * 4 / 3 + o.kind.len() + 96).sum();
         let kinds: usize = self.asked_kinds.iter().map(|(k, v)| k.len() + v.len() + 8).sum();
         let epochs = (1 + self.retired.len() + self.awaiting.len()) * (EPOCH_JSON + 256);
-        let inbox: usize = self.inbox.iter().map(|i| (i.body.len() + i.id.len() + i.kind.len() + 512) * 6).sum();
+        // Stored as a JSON string: escaping at most doubles compact JSON
+        // (it holds no raw control characters; U+2028 is 3 bytes, 6 escaped).
+        let inbox: usize = self.inbox.iter().map(|i| (i.body.len() + i.id.len() + i.kind.len() + 512) * 2 + 32).sum();
         let unlinked = self.unlinked.as_ref().map_or(0, |r| r.len() * 6 + 32);
         16 * 1024 + self.vault_token.len() + outbox + kinds + epochs + inbox + unlinked + (self.seen.len() + self.seen_inner.len() + self.asked.len()) * 64
     }
@@ -317,7 +319,7 @@ impl DeviceState {
                 let m = i.marshal(Mode::Session);
                 debug_assert!(m.is_ok(), "an inbox event marshals");
                 let m = Zeroizing::new(m.ok()?);
-                Some(Zeroizing::new(Builder::with_capacity(m.len() * 6 + 16).string("inner", &m).finish()))
+                Some(Zeroizing::new(Builder::with_capacity(m.len() * 2 + 16).string("inner", &m).finish()))
             })
             .collect();
         let (retired, awaiting, inbox) = (join(&retired_parts), join(&awaiting_parts), join(&inbox_parts));
@@ -491,19 +493,18 @@ impl DeviceState {
             // An unlinked device is refused, whatever was stored.
             refused: o.has("unlinked") || if o.has("refused") { o.bool("refused").map_err(c)? } else { false },
             unlinked: o.opt_string("unlinked").map_err(c)?,
-            inbox: match o.get("inbox") {
-                None => Vec::new(),
-                Some(_) => o
-                    .array("inbox")
-                    .map_err(c)?
-                    .into_iter()
-                    .map(|raw| {
-                        let e = strict_json::parse_object(raw.as_bytes()).map_err(|_| StoreError::Corrupt)?;
-                        let inner = Zeroizing::new(e.string("inner").map_err(|_| StoreError::Corrupt)?);
-                        Inner::parse(inner.as_bytes(), Mode::Session).map_err(|_| StoreError::Corrupt)
-                    })
-                    .collect::<Result<Vec<_>, StoreError>>()?,
-            },
+            // An inbox entry this build can't read is dropped, rather than
+            // lose the keys with a state refused as corrupt.
+            inbox: o
+                .array("inbox")
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|raw| {
+                    let e = strict_json::parse_object(raw.as_bytes()).ok()?;
+                    let inner = Zeroizing::new(e.string("inner").ok()?);
+                    Inner::parse(inner.as_bytes(), Mode::Session).ok()
+                })
+                .collect(),
         })
     }
 
