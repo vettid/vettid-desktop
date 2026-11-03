@@ -28,6 +28,7 @@ use vettid_device::session::Session;
 use vettid_device::store::{Persist, StoreError};
 use vettid_device::transport::Http;
 use vettid_relay::dev::DevRelay;
+use vettid_vms::envelope::Status;
 use zeroize::Zeroizing;
 
 /// The device state, in memory only (nothing of the test is kept).
@@ -126,5 +127,8 @@ async fn pairs_and_collects_on_the_dev_stack() {
     let answer = s.request(&mut store, "vault.status", "{}", TimeDelta::seconds(60)).await.expect("the vault's response");
     println!("vault.status: {:?} {}", answer.response.as_ref().map(|r| &r.status), answer.body.as_str());
     assert_eq!(answer.kind, "vault.status");
+    assert_eq!(answer.response.as_ref().map(|r| &r.status), Some(&Status::Ok), "an ok answer");
+    let body: Value = serde_json::from_str(&answer.body).unwrap();
+    assert_eq!(body["vault_id"].as_str(), paired.vault_id.as_deref(), "the vault it paired with");
     assert!(!s.is_refused());
 }

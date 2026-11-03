@@ -18,8 +18,11 @@
 //!   and no real certificate chains to the test root;
 //! - uses no proxy and follows no redirect.
 //!
-//! The root is never read from anywhere but a loopback control port, and
-//! the front must be a loopback address.
+//! The root is never read from anywhere but a loopback control port (an
+//! IP literal: `127.0.0.0/8` or `::1`, never a name a hosts file could
+//! point elsewhere), it must be exactly one certificate that parses, and
+//! the front must be a loopback address. The stack must also name its
+//! relay `https://relay.vettid.test`.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -41,7 +44,7 @@ const MAX_CONTROL_BODY: usize = 64 * 1024;
 #[derive(Clone)]
 pub struct DevRelay {
     front: SocketAddr,
-    root_pem: Vec<u8>,
+    root: reqwest::Certificate,
 }
 
 impl std::fmt::Debug for DevRelay {
@@ -50,12 +53,13 @@ impl std::fmt::Debug for DevRelay {
     }
 }
 
-/// A control-port URL: `http://` on a loopback address (`127.0.0.1`, `::1`
-/// or `localhost`), with a port, and no user, path, query or fragment.
+/// A control-port URL: `http://` on a loopback IP literal (`127.0.0.0/8`
+/// or `[::1]`; not `localhost`, which a hosts file could point elsewhere),
+/// with an explicit port other than 80 (the URL parser drops a default
+/// port), and no user, path, query or fragment. Returns its origin.
 fn check_control_url(ctl: &str) -> Result<String, RelayError> {
     let u = reqwest::Url::parse(ctl).map_err(|_| RelayError::Invalid)?;
     let loopback = match u.host_str() {
-        Some("localhost") => true,
         Some(h) => h.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().is_ok_and(|a| a.is_loopback()),
         None => false,
     };
@@ -70,7 +74,19 @@ fn check_control_url(ctl: &str) -> Result<String, RelayError> {
     {
         return Err(RelayError::Invalid);
     }
-    Ok(ctl.trim_end_matches('/').to_string())
+    Ok(u.origin().ascii_serialization())
+}
+
+/// A body read up to `limit` bytes, checked while reading.
+async fn read_capped(mut r: reqwest::Response, limit: usize) -> Result<Vec<u8>, RelayError> {
+    let mut out = Vec::new();
+    while let Some(chunk) = r.chunk().await.map_err(|_| RelayError::Transport)? {
+        if out.len() + chunk.len() > limit {
+            return Err(RelayError::TooLarge);
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 impl DevRelay {
@@ -91,11 +107,7 @@ impl DevRelay {
                 if r.status() != 200 {
                     return Err(RelayError::Malformed);
                 }
-                let b = r.bytes().await.map_err(|_| RelayError::Transport)?;
-                if b.len() > MAX_CONTROL_BODY {
-                    return Err(RelayError::TooLarge);
-                }
-                Ok(b)
+                read_capped(r, MAX_CONTROL_BODY).await
             }
         };
         #[derive(Deserialize)]
@@ -105,20 +117,31 @@ impl DevRelay {
         #[derive(Deserialize)]
         struct Trust {
             tls_root_pem: String,
+            relay_url: String,
         }
         let info: Info = serde_json::from_slice(&get("/dev/info").await?).map_err(|_| RelayError::Malformed)?;
         let trust: Trust = serde_json::from_slice(&get("/dev/trust").await?).map_err(|_| RelayError::Malformed)?;
+        if trust.relay_url.trim_end_matches('/') != DEV_RELAY_URL {
+            return Err(RelayError::Invalid); // a stack that names its relay otherwise
+        }
         let front: SocketAddr = info.relay_tls.parse().map_err(|_| RelayError::Malformed)?;
-        Self::new(front, trust.tls_root_pem.into_bytes())
+        Self::new(front, trust.tls_root_pem.as_bytes())
     }
 
-    /// From a front (a loopback address) and one PEM certificate.
-    fn new(front: SocketAddr, root_pem: Vec<u8>) -> Result<Self, RelayError> {
+    /// From a front (a loopback address) and exactly one PEM certificate
+    /// that parses as a trust anchor.
+    fn new(front: SocketAddr, root_pem: &[u8]) -> Result<Self, RelayError> {
         if !front.ip().is_loopback() || front.port() == 0 {
             return Err(RelayError::Invalid);
         }
-        let d = Self { front, root_pem };
-        d.root()?;
+        // Split as the root store reads it: exactly one certificate.
+        let mut certs = reqwest::Certificate::from_pem_bundle(root_pem).map_err(|_| RelayError::Invalid)?;
+        if certs.len() != 1 {
+            return Err(RelayError::Invalid);
+        }
+        let d = Self { front, root: certs.remove(0) };
+        // It parses as a trust anchor (the store refuses it otherwise).
+        d.builder().build().map_err(|_| RelayError::Invalid)?;
         Ok(d)
     }
 
@@ -127,25 +150,26 @@ impl DevRelay {
         self.front
     }
 
-    pub(crate) fn root(&self) -> Result<reqwest::Certificate, RelayError> {
-        // Exactly one certificate.
-        let n = self.root_pem.windows(27).filter(|w| *w == b"-----BEGIN CERTIFICATE-----").count();
-        if n != 1 {
-            return Err(RelayError::Invalid);
-        }
-        reqwest::Certificate::from_pem(&self.root_pem).map_err(|_| RelayError::Invalid)
-    }
-
     /// A client builder for the dev relay only (see the module doc).
-    pub(crate) fn builder(&self) -> Result<reqwest::ClientBuilder, RelayError> {
-        Ok(reqwest::Client::builder()
+    pub(crate) fn builder(&self) -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
             .tls_built_in_root_certs(false)
-            .add_root_certificate(self.root()?)
+            .add_root_certificate(self.root.clone())
             .resolve(DEV_RELAY_HOST, self.front)
             .https_only(true)
-            .no_proxy())
+            .no_proxy()
+    }
+
+    /// A dev relay for tests: the front and the test fixture's root.
+    #[cfg(test)]
+    pub(crate) fn fixture(front: SocketAddr) -> Result<Self, RelayError> {
+        Self::new(front, FIXTURE_ROOT.as_bytes())
     }
 }
+
+/// A TEST-ONLY self-signed CA certificate (no key was kept), for the tests.
+#[cfg(test)]
+pub(crate) const FIXTURE_ROOT: &str = include_str!("testdata_fixture_root.pem");
 
 #[cfg(test)]
 mod tests {
@@ -153,8 +177,13 @@ mod tests {
 
     #[test]
     fn control_urls_must_be_loopback_http() {
-        for ok in ["http://127.0.0.1:18082", "http://127.0.0.1:18082/", "http://localhost:1", "http://[::1]:18082"] {
-            assert!(check_control_url(ok).is_ok(), "{ok}");
+        for (ok, origin) in [
+            ("http://127.0.0.1:18082", "http://127.0.0.1:18082"),
+            ("http://127.0.0.1:18082/", "http://127.0.0.1:18082"),
+            ("http://127.0.0.2:1", "http://127.0.0.2:1"),
+            ("http://[::1]:18082", "http://[::1]:18082"),
+        ] {
+            assert_eq!(check_control_url(ok).unwrap(), origin, "{ok}");
         }
         for bad in [
             "https://127.0.0.1:18082",
@@ -166,6 +195,8 @@ mod tests {
             "http://127.0.0.1:18082/?x",
             "http://127.0.0.1:18082/#x",
             "http://localhost.example.com:1",
+            "http://localhost:18082",
+            "http://127.0.0.1:80",
             "file:///tmp/ca.pem",
         ] {
             assert_eq!(check_control_url(bad).unwrap_err(), RelayError::Invalid, "{bad}");
@@ -174,12 +205,19 @@ mod tests {
 
     #[test]
     fn the_front_must_be_loopback_and_the_root_one_certificate() {
-        let pem = b"-----BEGIN CERTIFICATE-----\nnot a certificate\n-----END CERTIFICATE-----\n".to_vec();
-        assert_eq!(DevRelay::new("10.0.0.1:443".parse().unwrap(), pem.clone()).unwrap_err(), RelayError::Invalid);
-        assert_eq!(DevRelay::new("127.0.0.1:0".parse().unwrap(), pem.clone()).unwrap_err(), RelayError::Invalid);
-        assert_eq!(DevRelay::new("127.0.0.1:1".parse().unwrap(), Vec::new()).unwrap_err(), RelayError::Invalid, "no certificate");
-        let two = [pem.clone(), pem].concat();
-        assert_eq!(DevRelay::new("127.0.0.1:1".parse().unwrap(), two).unwrap_err(), RelayError::Invalid, "two");
+        let front = "127.0.0.1:1".parse().unwrap();
+        let root = FIXTURE_ROOT.as_bytes();
+        assert!(DevRelay::new(front, root).is_ok(), "one real certificate");
+        assert_eq!(DevRelay::new("10.0.0.1:443".parse().unwrap(), root).unwrap_err(), RelayError::Invalid);
+        assert_eq!(DevRelay::new("127.0.0.1:0".parse().unwrap(), root).unwrap_err(), RelayError::Invalid);
+        assert_eq!(DevRelay::new(front, b"").unwrap_err(), RelayError::Invalid, "no certificate");
+        let two = [root, root].concat();
+        assert_eq!(DevRelay::new(front, &two).unwrap_err(), RelayError::Invalid, "two");
+        // The loose form the PEM reader also takes counts as a second one.
+        let loose = FIXTURE_ROOT.replace("-----BEGIN CERTIFICATE-----", "-----BEGIN CERTIFICATE--- --");
+        assert_eq!(DevRelay::new(front, [root, loose.as_bytes()].concat().as_slice()).unwrap_err(), RelayError::Invalid, "a loose second");
+        let garbage = b"-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n";
+        assert_eq!(DevRelay::new(front, garbage).unwrap_err(), RelayError::Invalid, "not a certificate");
     }
 
     #[tokio::test]

@@ -91,15 +91,24 @@ jobs:
         run: |
           cargo test --manifest-path src-tauri/Cargo.toml -p vettid-relay --features dev-relay --locked
           cargo clippy --manifest-path src-tauri/Cargo.toml -p vettid-relay -p vettid-device --features vettid-relay/dev-relay,vettid-device/dev-relay --all-targets --locked -- -D warnings
+          # build.rs refuses release and optimized builds; a build without
+          # debug assertions reaches lib.rs's compile_error!. vettid-device's
+          # feature turns on vettid-relay's, whose checks fire first: the
+          # refusal is redundant there, by design.
           for pkg in vettid-relay vettid-device; do
-            for env in "" "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true"; do
-              if env $env cargo check --manifest-path src-tauri/Cargo.toml -p $pkg --features dev-relay --release --locked 2> release.log; then
-                echo "a release build of $pkg accepted the dev-relay feature ($env)"; exit 1
+            for env in "--release" "--release CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true" "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false"; do
+              set -- $env
+              flags=""; vars=""
+              for w in "$@"; do case $w in --*) flags="$flags $w";; *) vars="$vars $w";; esac; done
+              if env $vars cargo check --manifest-path src-tauri/Cargo.toml -p $pkg --features dev-relay $flags --locked 2> release.log; then
+                echo "a build of $pkg ($env) accepted the dev-relay feature"; exit 1
               fi
               grep -q "for development builds only" release.log
             done
           done
           tree=$(cargo tree --manifest-path src-tauri/Cargo.toml -p vettid-desktop -e features --all-features --locked)
+          # (The app doesn't depend on these crates yet; this guards the day
+          # it does.)
           if grep -Eq "dev-relay|devstack" <<< "$tree"; then
             echo "the app can enable the dev-relay feature"; exit 1
           fi
