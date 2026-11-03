@@ -122,6 +122,8 @@ pub struct DeviceState {
     /// Requests sent and waiting for their response, and until when
     /// (stored, so a restart doesn't drop the answers).
     pub asked: BTreeMap<String, DateTime<Utc>>,
+    /// The `type` of each waiting request (its response must have it).
+    pub asked_kinds: BTreeMap<String, String>,
     /// The vault's mailbox refused this device (`token_revoked`): it has
     /// been unlinked; nothing more is sent.
     pub refused: bool,
@@ -155,7 +157,8 @@ impl DeviceState {
     /// (a reallocation would leave an unwiped copy of the secrets).
     fn capacity(&self) -> usize {
         let outbox: usize = self.outbox.iter().map(|o| o.payload.len() * 4 / 3 + o.kind.len() + 96).sum();
-        16 * 1024 + self.vault_token.len() + outbox + (self.seen.len() + self.seen_inner.len()) * 64
+        let kinds: usize = self.asked_kinds.iter().map(|(k, v)| k.len() + v.len() + 8).sum();
+        16 * 1024 + self.vault_token.len() + outbox + kinds + (self.seen.len() + self.seen_inner.len() + self.asked.len()) * 64
     }
 
     /// The stored form: strict JSON, secret (wiped when dropped).
@@ -218,15 +221,24 @@ impl DeviceState {
         if let Some(v) = &self.vault_id {
             b = b.string("vault_id", v);
         }
-        Zeroizing::new(
+        let capacity = self.capacity();
+        let out = Zeroizing::new(
             b.raw("epoch", &epoch)
                 .raw("seen", &times(&self.seen))
                 .raw("seen_inner", &times(&self.seen_inner))
                 .raw("outbox", &format!("[{}]", outbox.join(",")))
                 .raw("asked", &times(&self.asked))
+                .raw(
+                    "asked_kinds",
+                    &self.asked_kinds.iter().fold(Builder::with_capacity(self.asked_kinds.len() * 64 + 16), |b, (k, v)| b.string(k, v)).finish(),
+                )
                 .bool("refused", self.refused)
                 .finish(),
-        )
+        );
+        // The builder never outgrew its capacity, so it left no unwiped
+        // copy behind.
+        debug_assert!(out.len() <= capacity, "state of {} bytes, capacity {capacity}", out.len());
+        out
     }
 
     /// Read the stored form back.
@@ -332,6 +344,14 @@ impl DeviceState {
                     .collect::<Result<Vec<_>, StoreError>>()?,
             },
             asked: times(&o, "asked")?,
+            asked_kinds: if o.has("asked_kinds") {
+                let m = o.object("asked_kinds", 1).map_err(c)?;
+                m.names()
+                    .map(|k| Ok((k.to_string(), strict_json::as_string(m.get(k).expect("a name of m")).map_err(c)?)))
+                    .collect::<Result<BTreeMap<_, _>, StoreError>>()?
+            } else {
+                BTreeMap::new()
+            },
             refused: if o.has("refused") { o.bool("refused").map_err(c)? } else { false },
         })
     }

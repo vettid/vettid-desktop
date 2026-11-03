@@ -33,7 +33,17 @@
 //!
 //! The responder side (the vault's rekeys, new-epoch messages before
 //! `hs.fin`, key retention) comes in the next part; until then a rekey
-//! `hs.init` is dropped like any message this engine can't open.
+//! `hs.init` is dropped like any message this engine can't open. **This
+//! engine must not reach members before that part**: the vault rekeys on
+//! every unlock, and a new epoch's messages must then stay unacked until
+//! `hs.fin`.
+//!
+//! Not yet done: `seq` gap tracking (a receiver may use `seq` to see gaps
+//! and order one sender's messages for display, §8.4; nothing reads it
+//! here yet), and a stored inbox for durable events that change the
+//! desktop's state (`device.unlinked`): today they are handed to the
+//! caller after their batch is acked, so a crash before the caller acts
+//! loses them.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -95,6 +105,9 @@ pub fn outbox_allowed(kind: &str) -> bool {
     durable(kind) && kind != "vault.lock"
 }
 
+/// The longest `exp` ahead of now a `vault.lock` may carry (§8.6).
+pub const VAULT_LOCK_MAX_EXP: TimeDelta = TimeDelta::seconds(60);
+
 const RELAY_TOKEN_ISSUED: &str = "relay.token.issued";
 const RELAY_TOKEN_REFRESH: &str = "relay.token.refresh";
 /// The outbox label of a refresh request (its reply is labelled
@@ -119,6 +132,9 @@ pub enum SessionError {
     /// This type may not wait in the stored outbox (an ephemeral type, or
     /// `vault.lock`): use [`Session::send_once`].
     NotQueueable,
+    /// `send_once` takes an ephemeral type with an `exp` in the future, or
+    /// `vault.lock` with an `exp` at most 60 s ahead (§8.5, §8.6).
+    BadExp,
 }
 
 impl std::fmt::Display for SessionError {
@@ -130,6 +146,7 @@ impl std::fmt::Display for SessionError {
             Self::Seal(e) => write!(f, "session: {e}"),
             Self::TimedOut => f.write_str("session: no response in time"),
             Self::NotQueueable => f.write_str("session: this message type is sent once, not queued"),
+            Self::BadExp => f.write_str("session: this message type needs a valid exp"),
         }
     }
 }
@@ -157,14 +174,20 @@ pub struct Session<T: Transport, C: Clock> {
     epoch: Epoch,
     relay_key: SigningKey,
     /// Messages for the caller not yet returned (from inside `request`).
-    /// Already stored and acked: never dropped.
+    /// Their batch is already stored and acked: they aren't dropped by an
+    /// error here, but a crash before the caller acts loses them.
     held: Vec<Inner>,
     /// Outbox entries dropped without delivery (evicted, refused by the
     /// relay for good, or expired), by `type`, until taken.
     dropped: Vec<String>,
+    /// Outbox entries removed after a failure after which they may have
+    /// been stored (`possibly_delivered`), by `type`, until taken.
+    maybe_sent: Vec<String>,
     /// Something changed that must be stored with the batch.
     dirty: bool,
-    outbox_next: DateTime<Utc>,
+    /// The outbox isn't tried before this (a backoff, or the relay's
+    /// `retry_after`, §8.6): no send or poll moves it earlier.
+    hold_until: DateTime<Utc>,
     outbox_backoff: TimeDelta,
     refresh_sent: Option<DateTime<Utc>>,
 }
@@ -201,8 +224,9 @@ impl<T: Transport, C: Clock> Session<T, C> {
             relay_key,
             held: Vec::new(),
             dropped: Vec::new(),
+            maybe_sent: Vec::new(),
             dirty: false,
-            outbox_next: now,
+            hold_until: now,
             outbox_backoff: OUTBOX_BACKOFF,
             refresh_sent: None,
         }))
@@ -230,6 +254,13 @@ impl<T: Transport, C: Clock> Session<T, C> {
         std::mem::take(&mut self.dropped)
     }
 
+    /// The `type`s of outbox entries whose deposit failed in a way after
+    /// which they may have been stored, since the last call: the caller can
+    /// show them as "may have been sent" (the vault dedupes a resend).
+    pub fn take_maybe_sent(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.maybe_sent)
+    }
+
     fn own_pk(&self) -> VerifyingKey {
         self.relay_key.verifying_key()
     }
@@ -252,6 +283,8 @@ impl<T: Transport, C: Clock> Session<T, C> {
         self.state.seen.retain(|_, t| now - *t <= SEEN_KEEP);
         self.state.seen_inner.retain(|_, until| *until >= now);
         self.state.asked.retain(|_, until| *until >= now);
+        let asked = &self.state.asked;
+        self.state.asked_kinds.retain(|id, _| asked.contains_key(id));
         self.state.epoch = self.epoch.snapshot();
         self.state.save(store)?;
         self.dirty = false;
@@ -288,12 +321,13 @@ impl<T: Transport, C: Clock> Session<T, C> {
     /// Arm a request's id for its response, until the earlier of
     /// [`ASKED_KEEP`] and its `exp` plus the clock skew. Stored with the
     /// state, so a restart doesn't drop the answer.
-    fn arm(&mut self, id: &str, exp: Option<DateTime<Utc>>) {
+    fn arm(&mut self, id: &str, kind: &str, exp: Option<DateTime<Utc>>) {
         let mut until = self.clock.now() + ASKED_KEEP;
         if let Some(e) = exp {
             until = until.min(e + MAX_CLOCK_SKEW_FUTURE);
         }
         self.state.asked.insert(id.to_string(), until);
+        self.state.asked_kinds.insert(id.to_string(), kind.to_string());
         self.dirty = true;
     }
 
@@ -312,13 +346,12 @@ impl<T: Transport, C: Clock> Session<T, C> {
         let cp = self.checkpoint();
         self.queue(&kind, inner)?;
         if request {
-            self.arm(&id, exp);
+            self.arm(&id, &kind, exp);
         }
         if let Err(e) = self.save(store) {
             self.rollback(cp);
             return Err(e.into());
         }
-        self.outbox_next = self.clock.now();
         // Stored: a temporary failure or a store error after the deposit
         // doesn't change the answer. Only a refusal does: the device was
         // removed, and this message won't go (it is reported as dropped).
@@ -348,10 +381,21 @@ impl<T: Transport, C: Clock> Session<T, C> {
     /// Deposit an ephemeral message or `vault.lock` once, from memory, not
     /// through the stored outbox (§8.5, §8.6): if it isn't accepted now,
     /// it isn't sent, and the error says so. The epoch's `seq` is stored
-    /// first.
+    /// first. Only those types: an ephemeral type needs an `exp` in the
+    /// future (§8.5), and `vault.lock` one at most 60 seconds ahead (§8.6);
+    /// both are checked before anything is sealed.
     pub async fn send_once(&mut self, store: &mut impl Persist, kind: &str, body: &str, exp: Option<DateTime<Utc>>) -> Result<String, SessionError> {
         if self.state.refused {
             return Err(SessionError::Refused);
+        }
+        let now = self.clock.now();
+        let exp_ok = match (kind, exp) {
+            ("vault.lock", Some(e)) => e > now && e - now <= VAULT_LOCK_MAX_EXP,
+            (k, Some(e)) if !durable(k) => e > now,
+            _ => false,
+        };
+        if !exp_ok {
+            return Err(SessionError::BadExp);
         }
         let mut inner = self.inner(None, kind, body.to_string(), None, exp)?;
         let cp = self.checkpoint();
@@ -426,7 +470,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
         if self.state.refused {
             return Err(SessionError::Refused);
         }
-        if self.state.outbox.is_empty() || now < self.outbox_next {
+        if self.state.outbox.is_empty() || now < self.hold_until {
             return Ok(());
         }
         let to = self.state.vault.relay.clone();
@@ -458,7 +502,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
                         temporary = Some((err.clone(), None));
                         break;
                     }
-                    _ if d.possibly_delivered => {} // stored: done
+                    _ if d.possibly_delivered => self.maybe_sent.push(e.kind.clone()),
                     _ => self.dropped.push(e.kind.clone()),
                 }
             }
@@ -470,7 +514,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
         }
         match temporary {
             Some((err, wait)) => {
-                self.outbox_next = now + wait.unwrap_or(self.outbox_backoff).max(self.outbox_backoff);
+                self.hold_until = now + wait.unwrap_or(self.outbox_backoff).max(self.outbox_backoff);
                 self.outbox_backoff = (self.outbox_backoff * 2).min(OUTBOX_MAX_BACKOFF);
                 Err(SessionError::Relay(err))
             }
@@ -482,10 +526,12 @@ impl<T: Transport, C: Clock> Session<T, C> {
     }
 
     /// The messages for the caller: those held from inside
-    /// [`Session::request`] if there are any (returned at once, never
-    /// lost), otherwise one collected batch: events and requests from the
-    /// vault, and responses to this device's requests, all already
-    /// stored. Also deposits the outbox and keeps the tokens fresh. A
+    /// [`Session::request`] if there are any (returned at once, not lost to
+    /// an error here), otherwise one collected batch: events and requests
+    /// from the vault, and responses to this device's requests. Their
+    /// batch is stored and acked before they are returned, so the engine's
+    /// own effects survive a crash, but the caller's handling of them does
+    /// not (see the module doc). Also deposits the outbox and keeps the tokens fresh. A
     /// refused device still collects (`device.unlinked`, §8.6); check
     /// [`Session::is_refused`].
     pub async fn poll(&mut self, store: &mut impl Persist) -> Result<Vec<Inner>, SessionError> {
@@ -518,7 +564,6 @@ impl<T: Transport, C: Clock> Session<T, C> {
             // Best effort: what isn't acked comes again, and is a duplicate.
             let _ = self.transport.ack(&self.state.relay_url, &m.msg_id).await;
         }
-        self.outbox_next = self.outbox_next.min(self.clock.now());
         match self.flush(store).await {
             Ok(()) | Err(SessionError::Relay(_)) | Err(SessionError::Refused) => {}
             Err(e) => return Err(e),
@@ -565,10 +610,14 @@ impl<T: Transport, C: Clock> Session<T, C> {
         };
         self.state.seen_inner.insert(inner.id.clone(), keep);
         if let Some(r) = &inner.response {
-            // §8.1: a response to no pending request is dropped.
-            if self.state.asked.remove(&r.re).is_none() {
+            // §8.1: a response to no pending request is dropped, and so is
+            // one whose type isn't its request's (a response has its
+            // request's type).
+            let kind_ok = self.state.asked_kinds.get(&r.re).is_none_or(|k| *k == inner.kind);
+            if !kind_ok || self.state.asked.remove(&r.re).is_none() {
                 return;
             }
+            self.state.asked_kinds.remove(&r.re);
             if inner.kind == RELAY_TOKEN_REFRESH {
                 self.store_vault_token(&inner.body, now);
                 return;
@@ -641,7 +690,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
             if let Ok(i) = self.inner(None, RELAY_TOKEN_REFRESH, "{}".into(), None, None) {
                 let id = i.id.clone();
                 if self.queue(REFRESH_REQUEST, i).is_ok() {
-                    self.arm(&id, None);
+                    self.arm(&id, RELAY_TOKEN_REFRESH, None);
                     self.refresh_sent = Some(now);
                 }
             }

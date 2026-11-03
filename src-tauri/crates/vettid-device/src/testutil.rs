@@ -94,7 +94,7 @@ impl Transport for Mem {
             }
             if f.quota > 0 {
                 f.quota -= 1;
-                let error = RelayError::Relay { status: 429, code: "quota_exceeded".into(), retry_after: None, quota: Some("mailbox".into()) };
+                let error = RelayError::Relay { status: 429, code: "quota_exceeded".into(), retry_after: Some(600), quota: Some("mailbox".into()) };
                 return Err(DepositError { error, possibly_delivered: false });
             }
             if f.temporary > 0 {

@@ -245,7 +245,9 @@ async fn held_messages_survive_a_failing_poll() {
     assert!(s.poll(&mut store).await.is_err(), "now the collect fails");
 }
 
-/// Any 429 (a full mailbox too) keeps the entry in the outbox (§8.6).
+/// Any 429 (a full mailbox too) keeps the entry in the outbox (§8.6), and
+/// its retry_after (600 s here) holds: neither another send nor a poll
+/// tries it early.
 #[tokio::test]
 async fn a_quota_429_keeps_the_entry() {
     let (relay, mut vault, faults, mut store) = paired().await;
@@ -253,10 +255,34 @@ async fn a_quota_429_keeps_the_entry() {
     faults.lock().unwrap().quota = 1;
     s.send(&mut store, "test.ping", "{}", false).await.unwrap();
     assert_eq!((s.outbox_len(), s.take_dropped().len()), (1, 0));
-    s.outbox_next = Utc::now() - TimeDelta::seconds(1);
+    let tried = faults.lock().unwrap().deposits_seen;
+    s.send(&mut store, "test.two", "{}", false).await.unwrap();
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(faults.lock().unwrap().deposits_seen, tried, "held: not tried again yet");
+    assert_eq!(s.outbox_len(), 2);
+    s.hold_until = Utc::now() - TimeDelta::seconds(1);
     s.poll(&mut store).await.unwrap();
     assert_eq!(s.outbox_len(), 0);
     assert_eq!(vault_receive(&mut vault).await.kind, "test.ping");
+    assert_eq!(vault_receive(&mut vault).await.kind, "test.two");
+}
+
+/// A response must have its request's type; one of another type is
+/// dropped and the request keeps waiting.
+#[tokio::test]
+async fn a_response_has_its_requests_type() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    let id = s.send(&mut store, "test.ask", "{}", true).await.unwrap();
+    vault_receive(&mut vault).await;
+    let mut wrong = event("test.other", "{}");
+    wrong.response = Some(Response { re: id.clone(), status: Status::Ok });
+    vault_deposit(&mut vault, wrong, None).await;
+    assert!(s.poll(&mut store).await.unwrap().is_empty());
+    let mut right = event("test.ask", "{}");
+    right.response = Some(Response { re: id.clone(), status: Status::Ok });
+    vault_deposit(&mut vault, right, None).await;
+    assert_eq!(s.poll(&mut store).await.unwrap().len(), 1);
 }
 
 /// Ephemeral types and vault.lock never enter the stored outbox; they go
@@ -270,8 +296,21 @@ async fn ephemeral_and_lock_messages_are_sent_once() {
     }
     s.send_once(&mut store, "presence.ping", "{}", Some(Utc::now() + TimeDelta::minutes(1))).await.unwrap();
     assert_eq!(vault_receive(&mut vault).await.kind, "presence.ping");
+    // The exp rules, before anything is sealed: an ephemeral type needs one
+    // in the future, vault.lock one at most 60 s ahead; durable types go
+    // through send().
+    let soon = Some(Utc::now() + TimeDelta::seconds(30));
+    for (kind, exp) in [
+        ("presence.ping", None),
+        ("presence.ping", Some(Utc::now() - TimeDelta::seconds(1))),
+        ("vault.lock", None),
+        ("vault.lock", Some(Utc::now() + TimeDelta::minutes(5))),
+        ("test.ping", soon),
+    ] {
+        assert_eq!(s.send_once(&mut store, kind, "{}", exp).await.unwrap_err(), SessionError::BadExp, "{kind} {exp:?}");
+    }
     faults.lock().unwrap().temporary = 1;
-    assert!(s.send_once(&mut store, "vault.lock", "{}", None).await.is_err(), "not delivered, and not queued");
+    assert!(s.send_once(&mut store, "vault.lock", "{}", soon).await.is_err(), "not delivered, and not queued");
     assert_eq!(s.outbox_len(), 0);
     // An entry past its exp is dropped unsent.
     let mut late = s.inner(None, "test.ping", "{}".into(), None, Some(Utc::now() - TimeDelta::seconds(1))).unwrap();
@@ -332,7 +371,7 @@ async fn the_outbox_cap_and_token_entries() {
     // The vault's token to us runs low: a refresh request goes out (once
     // per hour), and the answer's token is kept.
     s.state.vault_token_exp = Utc::now() + TimeDelta::days(2);
-    s.outbox_next = Utc::now() - TimeDelta::seconds(1);
+    s.hold_until = Utc::now() - TimeDelta::seconds(1);
     s.poll(&mut store).await.unwrap();
     let ask = vault_receive(&mut vault).await;
     assert_eq!(ask.kind, "relay.token.refresh");

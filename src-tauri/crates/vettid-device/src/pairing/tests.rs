@@ -233,6 +233,7 @@ fn stored_state_round_trips() {
         seen_inner: Default::default(),
         outbox: vec![crate::store::OutboxEntry { kind: "test.ping".into(), payload: vec![1, 2, 3], created: vettid_vms::envelope::parse_ts("2026-10-01T12:00:00.000Z").unwrap(), exp: vettid_vms::envelope::parse_ts("2026-10-01T12:01:00.000Z") }],
         asked: [("01JB2Z6V9K3M4N5P6Q7R8S9T0W".to_string(), vettid_vms::envelope::parse_ts("2026-10-02T12:00:00.000Z").unwrap())].into(),
+        asked_kinds: [("01JB2Z6V9K3M4N5P6Q7R8S9T0W".to_string(), "test.ask".to_string())].into(),
         refused: true,
     };
     let json = state.to_json();
