@@ -112,6 +112,10 @@ impl Transport for Mem {
         mb.push(Message { msg_id: id.clone(), deposited_at: "t".into(), sender: encode_key(&self.key.verifying_key()), jti: None, payload: payload.to_vec() });
         Ok(id)
     }
+    /// Every waiting message, up to `max`, each time: unlike the real
+    /// relay there is no lease, so an unacked message comes back on the
+    /// next collect (and `max` or more unacked messages would hide the
+    /// rest).
     async fn collect(&self, _base: &str, _wait: u64, max: u32) -> Result<Vec<Message>, RelayError> {
         {
             let mut f = self.faults.lock().unwrap();

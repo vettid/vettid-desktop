@@ -62,10 +62,10 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use vettid_relay::auth::decode_key;
 use vettid_relay::client::{Message, RelayError};
 use vettid_relay::token::Token;
-use vettid_vms::envelope::{new_ulid, Envelope, Inner, Mode, Response, Status, MAX_CLOCK_SKEW_FUTURE};
+use vettid_vms::envelope::{new_ulid, Envelope, EnvelopeError, Inner, Mode, Response, Status, MAX_CLOCK_SKEW_FUTURE};
 use vettid_vms::handshake::{
     answer_rekey, HandshakeError, Keyring, KeyringState, RekeyConfig, Responder, ResponderState, POLICY_VAULT_TO_DEVICE, TYPE_FIN,
-    TYPE_INIT, TYPE_RESP,
+    RECEIVE_KEY_RETENTION, TYPE_INIT, TYPE_RESP,
 };
 use vettid_vms::strict_json::{self, Builder};
 use zeroize::Zeroizing;
@@ -193,8 +193,8 @@ pub struct Session<T: Transport, C: Clock> {
     state: DeviceState,
     /// The current epoch and the previous ones' receive keys.
     keys: Keyring,
-    /// Rekeys answered, waiting for `hs.fin`.
-    awaiting: Vec<Responder>,
+    /// Rekeys answered, waiting for `hs.fin`, oldest first.
+    awaiting: Vec<Waiting>,
     relay_key: SigningKey,
     /// Messages for the caller not yet returned (from inside `request`).
     /// Their batch is already stored and acked: they aren't dropped by an
@@ -221,12 +221,36 @@ impl<T: Transport, C: Clock> std::fmt::Debug for Session<T, C> {
     }
 }
 
+/// A rekey answered and waiting for `hs.fin`.
+struct Waiting {
+    responder: Responder,
+    /// The inner id of the `hs.init` it answers (its `hs.resp` in the
+    /// outbox carries it as `re`).
+    init: String,
+}
+
+/// Stored times fitted to `now`, so that a clock that went back (it was
+/// fast when they were stored) leaves the state readable instead of
+/// refused: a retired receive key is kept at most the retention from now,
+/// and a waiting rekey counts as answered no later than now.
+fn fit_ring(mut ring: KeyringState, now: DateTime<Utc>) -> KeyringState {
+    for (_, until) in &mut ring.retired {
+        *until = (*until).min(now + RECEIVE_KEY_RETENTION);
+    }
+    ring
+}
+
+fn fit_waiting((mut r, init): (ResponderState, String), now: DateTime<Utc>) -> Result<Waiting, HandshakeError> {
+    r.since = r.since.min(now);
+    Ok(Waiting { responder: Responder::restore(r, now)?, init })
+}
+
 /// What the engine keeps across an operation, to roll back if storing
 /// fails.
 struct Checkpoint {
     state: DeviceState,
     keys: KeyringState,
-    awaiting: Vec<ResponderState>,
+    awaiting: Vec<(ResponderState, String)>,
     refresh_sent: Option<DateTime<Utc>>,
     dropped: usize,
 }
@@ -239,14 +263,12 @@ impl<T: Transport, C: Clock> Session<T, C> {
         let Some(state) = DeviceState::load_paired(store)? else { return Ok(None) };
         let relay_key = SigningKey::from_bytes(&state.relay_seed);
         let now = clock.now();
-        let ring = KeyringState { current: state.epoch.clone(), retired: state.retired.clone() };
+        let ring = fit_ring(KeyringState { current: state.epoch.clone(), retired: state.retired.clone() }, now);
         let keys = Keyring::restore(ring, now).map_err(|_| StoreError::Corrupt)?;
-        let awaiting = state
-            .awaiting
-            .iter()
-            .map(|r| Responder::restore(r.clone(), now))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| StoreError::Corrupt)?;
+        let mut awaiting = state.awaiting.iter().cloned().map(|w| fit_waiting(w, now)).collect::<Result<Vec<_>, _>>().map_err(|_| StoreError::Corrupt)?;
+        // At most the newest MAX_AWAITING.
+        let excess = awaiting.len().saturating_sub(MAX_AWAITING);
+        awaiting.drain(..excess);
         Ok(Some(Session {
             transport: make_transport(relay_key.clone()),
             clock,
@@ -297,8 +319,28 @@ impl<T: Transport, C: Clock> Session<T, C> {
         self.relay_key.verifying_key()
     }
 
-    fn awaiting_states(&self) -> Vec<ResponderState> {
-        self.awaiting.iter().filter_map(|r| r.snapshot().ok()).collect()
+    fn awaiting_states(&self) -> Vec<(ResponderState, String)> {
+        self.awaiting.iter().filter_map(|w| Some((w.responder.snapshot().ok()?, w.init.clone()))).collect()
+    }
+
+    /// Stop waiting for the rekeys `drop` picks: each is aborted, and its
+    /// `hs.resp`, if still queued, is taken out of the outbox (an answer
+    /// whose keys are gone must not go out).
+    fn abort_waiting(&mut self, drop: impl Fn(&Waiting) -> bool) {
+        let mut gone = Vec::new();
+        self.awaiting.retain_mut(|w| {
+            if drop(w) {
+                w.responder.abort();
+                gone.push(std::mem::take(&mut w.init));
+                false
+            } else {
+                true
+            }
+        });
+        if !gone.is_empty() {
+            self.state.outbox.retain(|o| o.re.as_ref().is_none_or(|re| !gone.contains(re)));
+            self.dirty = true;
+        }
     }
 
     fn checkpoint(&self) -> Checkpoint {
@@ -314,15 +356,20 @@ impl<T: Transport, C: Clock> Session<T, C> {
     fn rollback(&mut self, c: Checkpoint) {
         let now = self.clock.now();
         self.state = c.state;
-        // A snapshot of a valid keyring and of waiting responders restores
-        // (the time only moved forward); should one not, the session keeps
-        // what it has rather than lose its keys.
-        let restored = Keyring::restore(c.keys, now);
+        // The snapshots, fitted to the clock (which may have gone back),
+        // restore: they were taken from a valid keyring and responders.
+        // Should one not, the session keeps what it has rather than lose
+        // keys.
+        let restored = Keyring::restore(fit_ring(c.keys, now), now);
         debug_assert!(restored.is_ok(), "a keyring snapshot restores");
         if let Ok(k) = restored {
             self.keys = k;
         }
-        self.awaiting = c.awaiting.into_iter().filter_map(|r| Responder::restore(r, now).ok()).collect();
+        let waiting: Result<Vec<_>, _> = c.awaiting.into_iter().map(|w| fit_waiting(w, now)).collect();
+        debug_assert!(waiting.is_ok(), "a responder snapshot restores");
+        if let Ok(w) = waiting {
+            self.awaiting = w;
+        }
         self.refresh_sent = c.refresh_sent;
         self.dropped.truncate(c.dropped);
         self.dirty = false;
@@ -573,13 +620,18 @@ impl<T: Transport, C: Clock> Session<T, C> {
                     }
                 },
             };
+            self.state.outbox.remove(0);
             // An hs.resp the relay took (or may have): its hs.init is
             // handled now, and a retransmission of it is skipped. One that
-            // was dropped leaves the hs.init to be answered again.
-            if let (true, Some(init)) = (taken, &e.re) {
-                self.state.seen_inner.insert(init.clone(), now + SEEN_KEEP);
+            // was dropped can't be finished: its rekey stops waiting, and
+            // the hs.init is left to be answered again.
+            match (taken, &e.re) {
+                (true, Some(init)) => {
+                    self.state.seen_inner.insert(init.clone(), now + SEEN_KEEP);
+                }
+                (false, Some(init)) => self.abort_waiting(|w| w.init == *init),
+                _ => {}
             }
-            self.state.outbox.remove(0);
             changed = true;
         }
         if changed {
@@ -655,6 +707,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
             return true;
         }
         let now = self.clock.now();
+        let was_dirty = self.dirty;
         self.state.seen.insert(m.msg_id.clone(), now);
         self.dirty = true;
         // §6.3: only the vault's relay key may send to this device.
@@ -664,9 +717,15 @@ impl<T: Transport, C: Clock> Session<T, C> {
         if env.mode() != Mode::Session {
             return true;
         }
-        self.prune_awaiting(now);
+        let pruned = self.prune_awaiting(now);
         let Ok((inner, current)) = self.keys.open(&env, now) else {
-            return self.handle_new_epoch(m, &env, &sender, now);
+            let ack = self.handle_new_epoch(m, &env, &sender, now);
+            if !ack {
+                // Left as it was: nothing of it is stored (as Go's
+                // handleBatch), so its redeliveries don't rewrite the state.
+                self.dirty = was_dirty || pruned;
+            }
+            return ack;
         };
         match inner.kind.as_str() {
             TYPE_INIT => {
@@ -685,23 +744,31 @@ impl<T: Transport, C: Clock> Session<T, C> {
     /// A message no epoch of the keyring opens: an `hs.fin` for a waiting
     /// rekey, a message of its new epoch that came first, or junk.
     fn handle_new_epoch(&mut self, m: &Message, env: &Envelope, sender: &VerifyingKey, now: DateTime<Utc>) -> bool {
-        let Some(i) = self.awaiting.iter().position(|r| r.addressed(env)) else { return true };
-        match self.awaiting[i].handle_fin(&m.payload, sender, now) {
+        let Some(i) = self.awaiting.iter().position(|w| w.responder.addressed(env)) else { return true };
+        match self.awaiting[i].responder.handle_fin(&m.payload, sender, now) {
             Ok(done) => {
-                if self.keys.activate(done.epoch, now).is_ok() {
-                    self.awaiting.remove(i);
-                    self.state.seen_inner.insert(done.inner.id.clone(), now + SEEN_KEEP);
-                }
+                // handle_fin gives an active epoch, which activate takes.
+                let activated = self.keys.activate(done.epoch, now);
+                debug_assert!(activated.is_ok(), "an established rekey activates");
+                // Every other waiting rekey came from the epoch just
+                // retired, which may no longer be rekeyed (§6.5): they stop
+                // waiting, and their queued answers don't go out. (A
+                // repeated hs.fin then opens under the new epoch and is
+                // ignored.)
+                self.abort_waiting(|_| true);
                 true
             }
-            Err(HandshakeError::Type) => {
-                // §6.3 (0.23.0): the new epoch isn't established yet. Leave
-                // it unacked and unseen, without handling it: the relay
-                // delivers it again after hs.fin.
+            // §6.3 (0.23.0): the new epoch isn't established yet. Leave it
+            // unacked and unseen, without handling it: the relay delivers
+            // it again after hs.fin. So too an hs.fin refused only because
+            // its `ts` is ahead of this device's clock (which may be slow):
+            // only the vault can make a message that decrypts under these
+            // keys, and the vault doesn't send hs.fin again.
+            Err(HandshakeError::Type) | Err(HandshakeError::Envelope(EnvelopeError::ClockFuture)) => {
                 self.state.seen.remove(&m.msg_id);
                 false
             }
-            // Not a valid hs.fin (stale, forged): the rekey still waits.
+            // Not a valid hs.fin (forged, stale): the rekey still waits.
             Err(_) => true,
         }
     }
@@ -729,20 +796,20 @@ impl<T: Transport, C: Clock> Session<T, C> {
         };
         let Ok((responder, resp)) = answer_rekey(raw, inner, self.keys.current(), &cfg) else { return };
         self.push_outbox(OutboxEntry { kind: TYPE_RESP.into(), payload: resp, created: now, exp: None, re: Some(inner.id.clone()) });
-        self.awaiting.push(responder);
-        while self.awaiting.len() > MAX_AWAITING {
-            self.awaiting.remove(0).abort();
+        self.awaiting.push(Waiting { responder, init: inner.id.clone() });
+        if self.awaiting.len() > MAX_AWAITING {
+            let oldest = self.awaiting[0].init.clone();
+            self.abort_waiting(|w| w.init == oldest);
         }
     }
 
     /// Abort the rekeys whose `hs.fin` can't come any more (16 days): their
-    /// epoch's messages must not stay unacked for it (§6.5).
-    fn prune_awaiting(&mut self, now: DateTime<Utc>) {
+    /// epoch's messages must not stay unacked for it (§6.5). Says whether
+    /// any went.
+    fn prune_awaiting(&mut self, now: DateTime<Utc>) -> bool {
         let before = self.awaiting.len();
-        self.awaiting.retain(|r| !r.expired(now));
-        if self.awaiting.len() != before {
-            self.dirty = true;
-        }
+        self.abort_waiting(|w| w.responder.expired(now));
+        self.awaiting.len() != before
     }
 
     /// An opened message of an established epoch, other than a handshake

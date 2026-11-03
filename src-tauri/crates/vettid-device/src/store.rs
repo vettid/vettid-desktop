@@ -118,8 +118,9 @@ pub struct DeviceState {
     /// Previous epochs (receive key only) and when each is deleted (§6.5:
     /// 16 days).
     pub retired: Vec<(EpochState, DateTime<Utc>)>,
-    /// Rekeys answered and waiting for `hs.fin` (§6.5).
-    pub awaiting: Vec<ResponderState>,
+    /// Rekeys answered and waiting for `hs.fin` (§6.5), each with the inner
+    /// id of the `hs.init` it answers.
+    pub awaiting: Vec<(ResponderState, String)>,
     /// Relay `msg_id`s handled, and when (§8.2, kept 16 days).
     pub seen: BTreeMap<String, DateTime<Utc>>,
     /// Inner `id`s handled from the vault, and until when they are kept
@@ -272,14 +273,15 @@ impl DeviceState {
         let awaiting_parts: Vec<Zeroizing<String>> = self
             .awaiting
             .iter()
-            .map(|r| {
+            .map(|(r, init)| {
                 Zeroizing::new(
-                    Builder::with_capacity(EPOCH_JSON + 256)
+                    Builder::with_capacity(EPOCH_JSON + 256 + init.len())
                         .raw("pending", &epoch_json(&r.pending))
                         .base64("th", &r.th)
                         .base64("verify_ik", r.verify_ik.as_bytes())
                         .base64("sender", r.sender.as_bytes())
                         .string("since", &format_ts(r.since))
+                        .string("init", init)
                         .finish(),
                 )
             })
@@ -403,13 +405,14 @@ impl DeviceState {
         // Absent (a state stored before F3) is none.
         let retired = list(&o, "retired", |r| Ok((parse_epoch(&r.object("epoch", 1).map_err(c)?, 1)?, time(r, "until")?)))?;
         let awaiting = list(&o, "awaiting", |r| {
-            Ok(ResponderState {
+            let state = ResponderState {
                 pending: parse_epoch(&r.object("pending", 1).map_err(c)?, 1)?,
                 th: *key32(r, "th")?,
                 verify_ik: verifying(r, "verify_ik")?,
                 sender: verifying(r, "sender")?,
                 since: time(r, "since")?,
-            })
+            };
+            Ok((state, r.string("init").map_err(c)?))
         })?;
         Ok(DeviceState {
             ik_seed: seed(&o, "ik_seed")?,
