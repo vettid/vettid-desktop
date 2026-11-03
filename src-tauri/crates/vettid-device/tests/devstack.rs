@@ -135,7 +135,8 @@ async fn pairs_and_collects_on_the_dev_stack() {
     let d = dev.clone();
     let mut s = Session::open(&mut store, move |k| Http::dev(k, d), SystemClock).unwrap().expect("a paired session");
     let answer = s.request(&mut store, "vault.status", "{}", TimeDelta::seconds(60)).await.expect("the vault's response");
-    println!("vault.status: {:?} {}", answer.response.as_ref().map(|r| &r.status), answer.body.as_str());
+    // The status only: the body carries ids (unlock_id, session_id) that a log has no use for.
+    println!("vault.status: {:?}", answer.response.as_ref().map(|r| &r.status));
     assert_eq!(answer.kind, "vault.status");
     assert_eq!(answer.response.as_ref().map(|r| &r.status), Some(&Status::Ok), "an ok answer");
     let body: Value = serde_json::from_str(&answer.body).unwrap();
