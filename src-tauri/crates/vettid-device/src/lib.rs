@@ -17,6 +17,9 @@
 //!   only, behind the `dev-file-store` feature, which a release build
 //!   refuses to compile.
 //! - [`pairing`]: the flow itself.
+//! - [`access`]: access sessions (§6.8): requesting, ending, the
+//!   ordering rule between them, and what `vault.status` and the vault's
+//!   `device.session.*` events say.
 //! - [`display`]: what the desktop may show of what the vault's side
 //!   wrote.
 //!
@@ -28,6 +31,7 @@ compile_error!("the dev-file-store feature writes keys to a plain file: it is fo
 #[cfg(all(feature = "dev-relay", not(debug_assertions)))]
 compile_error!("the dev-relay feature trusts the dev stack's TEST-ONLY TLS root: it is for development builds only");
 
+pub mod access;
 pub mod display;
 pub mod pairing;
 pub mod session;
