@@ -153,12 +153,17 @@ fn negotiate(offered: &[u64], pinned: u8) -> Result<u8, HandshakeError> {
     last
 }
 
-/// Answer a rekey `hs.init` (raw envelope `raw`, inner plaintext `inner`)
-/// that opened under `current`, which **must** be the session's current
-/// epoch (a rekey is accepted only there, §6.2), and active: a pending
-/// epoch (a pairing the owner hasn't approved) is never rekeyed (§6.5).
-/// `raw` must name `current`'s receive kid. Returns the responder awaiting
-/// `hs.fin`, and `hs.resp` to deposit.
+/// Answer a rekey `hs.init` that opened under `current`, which **must** be
+/// the session's current epoch (a rekey is accepted only there, §6.2), and
+/// active: a pending epoch (a pairing the owner hasn't approved) is never
+/// rekeyed (§6.5).
+///
+/// `inner` **must** be what [`Keyring::open`](super::Keyring::open) gave
+/// for exactly `raw`, with `true` (current): `th1` and `th` are taken over
+/// `raw`, and only `inner` is checked. (`raw` must name `current`'s receive
+/// kid, which is checked; that `inner` came from it can't be, short of
+/// decrypting again.) Returns the responder awaiting `hs.fin`, and
+/// `hs.resp` to deposit.
 pub fn answer_rekey(raw: &[u8], inner: &Inner, current: &Epoch, cfg: &RekeyConfig) -> Result<(Responder, Vec<u8>), HandshakeError> {
     answer_rekey_with(raw, inner, current, cfg, &mut Os)
 }
@@ -497,7 +502,7 @@ mod tests {
         let early = Envelope::parse(&env(&s, "message_i2r")).unwrap();
         assert_eq!(ring.open(&early, s.now).unwrap_err(), HandshakeError::Envelope(EnvelopeError::Kid));
         let done = r.handle_fin(&env(&s, "fin"), &s.vault_relay, s.now).unwrap();
-        ring.activate(done.epoch, s.now);
+        ring.activate(done.epoch, s.now).unwrap();
         assert_eq!(ring.current().id().to_vec(), vectors::hex(&s.v["new_epoch"]["epoch_id_hex"]));
         assert!(ring.open(&early, s.now).unwrap().1, "the new epoch is current");
         // A late message of the old epoch still opens, as retired.
@@ -513,6 +518,32 @@ mod tests {
         assert!(ring.open(&Envelope::parse(&raw).unwrap(), s.now + TimeDelta::days(16)).is_ok());
         assert_eq!(ring.open(&Envelope::parse(&raw).unwrap(), later).unwrap_err(), HandshakeError::Envelope(EnvelopeError::Kid));
         assert!(ring.snapshot().retired.is_empty(), "open prunes");
+    }
+
+    /// Only an active epoch is installed; the retired list is capped, and
+    /// a stored one past the cap is refused.
+    #[test]
+    fn keyring_activation_rules() {
+        use crate::handshake::MAX_RETIRED;
+        let s = setup();
+        let mut ring = Keyring::new(epoch(&s.v["old_epoch"], Role::Initiator, true, s.now));
+        let mut pending = epoch(&s.v["new_epoch"], Role::Responder, true, s.now).snapshot();
+        pending.active = false;
+        assert_eq!(ring.activate(Epoch::restore(pending), s.now).unwrap_err(), HandshakeError::Inactive);
+        assert_eq!(ring.current().id().to_vec(), vectors::hex(&s.v["old_epoch"]["epoch_id_hex"]), "nothing changed");
+        assert!(ring.snapshot().retired.is_empty());
+        for _ in 0..MAX_RETIRED + 3 {
+            ring.activate(epoch(&s.v["new_epoch"], Role::Responder, true, s.now), s.now).unwrap();
+        }
+        let mut snap = ring.snapshot();
+        assert_eq!(snap.retired.len(), MAX_RETIRED, "the oldest went");
+        assert!(Keyring::restore(snap.clone(), s.now).is_ok());
+        let extra = snap.retired[0].clone();
+        snap.retired.push(extra);
+        assert_eq!(Keyring::restore(snap.clone(), s.now).unwrap_err(), HandshakeError::Config);
+        // Restore deletes what has expired first: then it fits.
+        snap.retired[0].1 = s.now - TimeDelta::seconds(1);
+        assert_eq!(Keyring::restore(snap, s.now).unwrap().snapshot().retired.len(), MAX_RETIRED);
     }
 
     /// A forged envelope that names the current epoch fails without

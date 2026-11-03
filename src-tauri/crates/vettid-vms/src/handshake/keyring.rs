@@ -13,6 +13,12 @@ use crate::envelope::{Envelope, EnvelopeError, Inner, MAX_CLOCK_SKEW_FUTURE};
 /// How long a previous epoch's receive key is kept (§6.5).
 pub const RECEIVE_KEY_RETENTION: TimeDelta = TimeDelta::days(16);
 
+/// The most retired epochs kept. The vault rekeys on every unlock and
+/// every 7 days (§6.5), so this allows 16 rekeys a day for the whole
+/// retention; past it, the oldest receive key goes early, and a stored
+/// keyring with more is refused.
+pub const MAX_RETIRED: usize = 256;
+
 /// The current epoch and the retired ones. `Debug` prints no key.
 pub struct Keyring {
     current: Epoch,
@@ -58,14 +64,24 @@ impl Keyring {
         &mut self.current
     }
 
-    /// Make `e` the current epoch. The previous one's send key and `rk`
+    /// Make `e`, which must be active (an established rekey), the current
+    /// epoch: an inactive one (a pairing the owner hasn't approved) is
+    /// refused, and nothing changes. The previous one's send key and `rk`
     /// are deleted now; its receive key is kept for
-    /// [`RECEIVE_KEY_RETENTION`].
-    pub fn activate(&mut self, e: Epoch, now: DateTime<Utc>) {
+    /// [`RECEIVE_KEY_RETENTION`] (at most [`MAX_RETIRED`] of them).
+    pub fn activate(&mut self, e: Epoch, now: DateTime<Utc>) -> Result<(), HandshakeError> {
+        if !e.is_active() {
+            return Err(HandshakeError::Inactive);
+        }
         let mut old = std::mem::replace(&mut self.current, e);
         old.retire_send();
         self.retired.push((old, now + RECEIVE_KEY_RETENTION));
         self.prune(now);
+        if self.retired.len() > MAX_RETIRED {
+            let excess = self.retired.len() - MAX_RETIRED;
+            self.retired.drain(..excess);
+        }
+        Ok(())
     }
 
     /// Delete the retired receive keys past their retention.
@@ -101,14 +117,20 @@ impl Keyring {
         KeyringState { current: self.current.snapshot(), retired: self.retired.iter().map(|(e, until)| (e.snapshot(), *until)).collect() }
     }
 
-    /// A keyring from its stored form, at `now`. A retired epoch that still
-    /// holds a send key or `rk`, or whose deletion is further ahead than
-    /// the retention (plus the clock skew), is refused.
+    /// A keyring from its stored form, at `now`; retired keys past their
+    /// retention are deleted. A retired epoch that still holds a send key
+    /// or `rk`, or whose deletion is further ahead than the retention (plus
+    /// the clock skew), or more than [`MAX_RETIRED`] of them, is refused.
     pub fn restore(s: KeyringState, now: DateTime<Utc>) -> Result<Self, HandshakeError> {
         let latest = now + RECEIVE_KEY_RETENTION + MAX_CLOCK_SKEW_FUTURE;
         if s.retired.iter().any(|(e, until)| e.send.is_some() || e.rk.is_some() || *until > latest) {
             return Err(HandshakeError::Config);
         }
-        Ok(Keyring { current: Epoch::restore(s.current), retired: s.retired.into_iter().map(|(e, until)| (Epoch::restore(e), until)).collect() })
+        let mut ring = Keyring { current: Epoch::restore(s.current), retired: s.retired.into_iter().map(|(e, until)| (Epoch::restore(e), until)).collect() };
+        ring.prune(now);
+        if ring.retired.len() > MAX_RETIRED {
+            return Err(HandshakeError::Config);
+        }
+        Ok(ring)
     }
 }
