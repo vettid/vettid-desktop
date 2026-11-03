@@ -24,7 +24,22 @@
 //!   once the epoch is established.
 //!
 //! Rekeys carry no SAS, no rotations and no attestation. Other purposes
-//! (reconnects, pairings answered by this side) aren't here.
+//! (reconnects, pairings answered by this side) aren't here: the stored
+//! form assumes a rekey.
+//!
+//! **What the caller must do** (the session engine), as the vault's
+//! device client does:
+//! - Open messages through its keyring, and pass `answer_rekey` an
+//!   `hs.init` only from the vault's relay key; route a message to
+//!   [`Responder::handle_fin`] only when its collect sender is the vault.
+//! - Deposit `hs.resp` through its stored outbox, so a retry resends the
+//!   same bytes (§6.3: one `hs.resp` per `hs.init`); `ResponderState`
+//!   doesn't keep them. Record the `hs.init`'s inner id only once
+//!   `hs.resp` is deposited or queued.
+//! - Store the waiting responders, and abort one once
+//!   [`Responder::expired`].
+//! - After [`Keyring::activate`](super::Keyring::activate), store the
+//!   keyring: an older stored form still holds the old send key and `rk`.
 
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -35,9 +50,9 @@ use super::initiator::{Os, Randomness};
 use super::messages::{Fin, Init, Resp};
 use super::schedule::{sign_resp, th, th1, verify_fin, Schedule};
 use super::{check_chosen, validate_offer, HandshakeError, Purpose, TYPE_FIN, TYPE_INIT, TYPE_RESP};
-use crate::envelope::{new_ulid, Envelope, EnvelopeError, Inner, Mode, MAX_DURABLE_AGE};
+use crate::envelope::{new_ulid, Envelope, EnvelopeError, Inner, Mode, MAX_CLOCK_SKEW_FUTURE, MAX_DURABLE_AGE};
 use crate::suite::kid::{Kid, ANONYMOUS};
-use crate::suite::{KEY_SIZE, LABEL_HS_KE};
+use crate::suite::{check_suite, KEY_SIZE, LABEL_HS_KE};
 
 /// The `ctx` of a rekey `hs.init`: the standard base64 of the current
 /// epoch's id (§6.2).
@@ -75,7 +90,7 @@ impl std::fmt::Debug for RekeyConfig {
 /// themselves; `Debug` prints nothing secret.
 pub struct Responder {
     /// The new epoch, not yet established: inactive, this side's role.
-    pending: Option<EpochState>,
+    pending: Option<Epoch>,
     th: [u8; 32],
     /// `sig_I` must verify under this (`from.ik`).
     verify_ik: VerifyingKey,
@@ -140,8 +155,10 @@ fn negotiate(offered: &[u64], pinned: u8) -> Result<u8, HandshakeError> {
 
 /// Answer a rekey `hs.init` (raw envelope `raw`, inner plaintext `inner`)
 /// that opened under `current`, which **must** be the session's current
-/// epoch (a rekey is accepted only there, §6.2). Returns the responder
-/// awaiting `hs.fin`, and `hs.resp` to deposit.
+/// epoch (a rekey is accepted only there, §6.2), and active: a pending
+/// epoch (a pairing the owner hasn't approved) is never rekeyed (§6.5).
+/// `raw` must name `current`'s receive kid. Returns the responder awaiting
+/// `hs.fin`, and `hs.resp` to deposit.
 pub fn answer_rekey(raw: &[u8], inner: &Inner, current: &Epoch, cfg: &RekeyConfig) -> Result<(Responder, Vec<u8>), HandshakeError> {
     answer_rekey_with(raw, inner, current, cfg, &mut Os)
 }
@@ -155,6 +172,13 @@ pub(super) fn answer_rekey_with(
 ) -> Result<(Responder, Vec<u8>), HandshakeError> {
     if cfg.policy.max_age <= chrono::TimeDelta::zero() && cfg.policy.max_messages == 0 {
         return Err(HandshakeError::Config);
+    }
+    if !current.is_active() {
+        return Err(HandshakeError::Inactive);
+    }
+    let env = Envelope::parse(raw)?;
+    if env.mode() != Mode::Session || !env.recipient_kid().ct_eq(&current.recv_kid()) {
+        return Err(EnvelopeError::Kid.into());
     }
     if inner.kind != TYPE_INIT {
         return Err(HandshakeError::Type);
@@ -198,7 +222,7 @@ pub(super) fn answer_rekey_with(
     };
     let padded = Zeroizing::new(resp_inner.encode(Mode::Sealed)?);
     let out = sealer.seal(&padded)?;
-    let pending = Epoch::new(&sched, Role::Responder, chosen, cfg.policy, cfg.now).snapshot();
+    let pending = Epoch::new(&sched, Role::Responder, chosen, cfg.policy, cfg.now);
     Ok((Responder { pending: Some(pending), th: t, verify_ik: body.from.ik, sender: body.from.relay.pk, since: cfg.now }, out))
 }
 
@@ -207,7 +231,7 @@ impl Responder {
     /// of the new epoch to this side carry, so the caller can route one
     /// to this responder. `None` once done.
     pub fn kids(&self) -> Option<(Kid, Kid)> {
-        self.pending.as_ref().map(|p| (p.recv.1, p.recv.2))
+        self.pending.as_ref().map(Epoch::recv_kids)
     }
 
     /// Whether `env` is addressed to the new epoch (by its kids, in
@@ -240,17 +264,30 @@ impl Responder {
 
     /// The stored form, while waiting.
     pub fn snapshot(&self) -> Result<ResponderState, HandshakeError> {
-        let pending = self.pending.clone().ok_or(HandshakeError::Done)?;
+        let pending = self.pending.as_ref().ok_or(HandshakeError::Done)?.snapshot();
         Ok(ResponderState { pending, th: self.th, verify_ik: self.verify_ik, sender: self.sender, since: self.since })
     }
 
-    /// A waiting responder from its stored form.
-    pub fn restore(s: ResponderState) -> Result<Self, HandshakeError> {
+    /// A waiting responder from its stored form, at `now`. Refused unless
+    /// the pending epoch is inactive, this side's, with both keys and
+    /// `rk`, mirrored kids, a supported suite and a bound, and was made no
+    /// later than the clock skew allows (so [`Responder::expired`] isn't
+    /// put off).
+    pub fn restore(s: ResponderState, now: DateTime<Utc>) -> Result<Self, HandshakeError> {
         let p = &s.pending;
-        if p.role != Role::Responder || p.active || p.send.is_none() || p.rk.is_none() {
+        let mirrored = p.send.as_ref().is_some_and(|(_, r, snd)| r.ct_eq(&p.recv.2) && snd.ct_eq(&p.recv.1));
+        if p.role != Role::Responder
+            || p.active
+            || !mirrored
+            || p.rk.is_none()
+            || check_suite(p.suite).is_err()
+            || (p.policy.max_age <= chrono::TimeDelta::zero() && p.policy.max_messages == 0)
+            || s.since - now > MAX_CLOCK_SKEW_FUTURE
+        {
             return Err(HandshakeError::Config);
         }
-        Ok(Responder { pending: Some(s.pending), th: s.th, verify_ik: s.verify_ik, sender: s.sender, since: s.since })
+        let pending = Epoch::restore(s.pending);
+        Ok(Responder { pending: Some(pending), th: s.th, verify_ik: s.verify_ik, sender: s.sender, since: s.since })
     }
 
     /// Process a message collected with relay `sender` `collect_sender`
@@ -273,9 +310,11 @@ impl Responder {
         if env.mode() != Mode::Session {
             return Err(EnvelopeError::WrongMode.into());
         }
-        // A copy, used to decrypt and check: the stored state is kept as
-        // it is until hs.fin verifies.
-        let mut epoch = Epoch::restore(pending.clone());
+        // A copy, used to decrypt and check: the pending state is kept as
+        // it is until hs.fin verifies. Activated before it opens hs.fin, so
+        // that hs.fin counts as received (as in the vault's).
+        let mut epoch = pending.duplicate();
+        epoch.activate(now);
         let inner = epoch.open(&env)?;
         if inner.kind != TYPE_FIN {
             return Err(HandshakeError::Type);
@@ -284,7 +323,6 @@ impl Responder {
         let fin = Fin::parse(&inner.body, Purpose::Rekey)?;
         verify_fin(&self.verify_ik, &self.th, &fin.sig)?;
         self.pending = None;
-        epoch.activate(now);
         Ok(Established { epoch, inner })
     }
 }
@@ -292,7 +330,7 @@ impl Responder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handshake::{Keyring, POLICY_VAULT_TO_DEVICE};
+    use crate::handshake::{Keyring, KeyringState, POLICY_VAULT_TO_DEVICE, RECEIVE_KEY_RETENTION};
     use crate::suite::hpke::tests::{setup_sender_with, FixedRng};
     use crate::suite::kem::{PrivateKey, PublicKey};
     use crate::suite::sign::identity_from_seed;
@@ -429,6 +467,7 @@ mod tests {
         assert_eq!((done.inner.kind.as_str(), done.inner.seq), (TYPE_FIN, Some(1)));
         assert_eq!(e.id().to_vec(), vectors::hex(&s.v["new_epoch"]["epoch_id_hex"]));
         assert!(e.is_active() && e.role() == Role::Responder);
+        assert_eq!(e.counts(), (0, 1), "hs.fin counts as received, as in the vault's");
         assert_eq!(e.rk().unwrap().to_vec(), vectors::hex(&s.v["new_epoch"]["rk_hex"]));
 
         // Redelivered, the early message now opens, with seq 2.
@@ -470,11 +509,57 @@ mod tests {
         assert!(snap.retired[0].0.send.is_none() && snap.retired[0].0.rk.is_none());
         // The receive key goes after 16 days.
         let later = s.now + TimeDelta::days(16) + TimeDelta::seconds(1);
-        let mut ring = Keyring::restore(snap).unwrap();
+        let mut ring = Keyring::restore(snap, s.now).unwrap();
         assert!(ring.open(&Envelope::parse(&raw).unwrap(), s.now + TimeDelta::days(16)).is_ok());
         assert_eq!(ring.open(&Envelope::parse(&raw).unwrap(), later).unwrap_err(), HandshakeError::Envelope(EnvelopeError::Kid));
-        ring.prune(later);
-        assert!(ring.snapshot().retired.is_empty());
+        assert!(ring.snapshot().retired.is_empty(), "open prunes");
+    }
+
+    /// A forged envelope that names the current epoch fails without
+    /// touching its counts.
+    #[test]
+    fn keyring_forgery_changes_nothing() {
+        let mut s = setup();
+        let (raw, _) = open_init(&mut s);
+        let mut ring = Keyring::new(epoch(&s.v["old_epoch"], Role::Initiator, true, s.now));
+        let before = ring.current().counts();
+        let mut forged = raw.clone();
+        let n = forged.len();
+        forged[n - 1] ^= 1;
+        assert_eq!(ring.open(&Envelope::parse(&forged).unwrap(), s.now).unwrap_err(), HandshakeError::Envelope(EnvelopeError::Decrypt));
+        assert_eq!(ring.current().counts(), before);
+    }
+
+    /// A stored keyring whose retired epoch still holds a send key or rk,
+    /// or whose retention runs further than 16 days, is refused.
+    #[test]
+    fn keyring_restore_checks() {
+        let s = setup();
+        let current = epoch(&s.v["new_epoch"], Role::Responder, true, s.now).snapshot();
+        let old = |rk: bool| epoch(&s.v["old_epoch"], Role::Initiator, rk, s.now).snapshot();
+        let mut no_send = old(false);
+        no_send.send = None;
+        let ok = KeyringState { current: current.clone(), retired: vec![(no_send.clone(), s.now + RECEIVE_KEY_RETENTION)] };
+        assert!(Keyring::restore(ok, s.now).is_ok());
+        for (why, retired) in [
+            ("send key", (old(false), s.now + TimeDelta::days(1))),
+            ("rk", ({ let mut e = old(true); e.send = None; e }, s.now + TimeDelta::days(1))),
+            ("too long", (no_send, s.now + RECEIVE_KEY_RETENTION + TimeDelta::minutes(6))),
+        ] {
+            let st = KeyringState { current: current.clone(), retired: vec![retired] };
+            assert_eq!(Keyring::restore(st, s.now).unwrap_err(), HandshakeError::Config, "{why}");
+        }
+    }
+
+    #[test]
+    fn negotiation() {
+        assert_eq!(negotiate(&[2], 0), Ok(2));
+        assert_eq!(negotiate(&[2], 2), Ok(2));
+        assert_eq!(negotiate(&[2, 3], 0), Ok(2), "3 isn't supported");
+        assert!(negotiate(&[3], 0).is_err());
+        assert!(negotiate(&[2], 3).is_err(), "below the pin");
+        assert_eq!(negotiate(&[1, 2], 0), Err(HandshakeError::Suite(crate::suite::SuiteError::Suite1)));
+        assert_eq!(negotiate(&[], 0), Err(HandshakeError::Body));
     }
 
     /// A rekey is accepted only from the vault on record, for the current
@@ -486,20 +571,31 @@ mod tests {
             ("collect sender", HandshakeError::Sender),
             ("relay key on record", HandshakeError::Sender),
             ("identity on record", HandshakeError::Identity),
-            ("another epoch", HandshakeError::Ctx),
+            ("another ctx", HandshakeError::Ctx),
+            ("inactive epoch", HandshakeError::Inactive),
+            ("raw of another epoch", HandshakeError::Envelope(EnvelopeError::Kid)),
             ("retired epoch", HandshakeError::EpochRetired),
             ("stale", HandshakeError::Envelope(EnvelopeError::ClockPast)),
             ("not hs.init", HandshakeError::Type),
             ("pinned above", HandshakeError::Suite(crate::suite::SuiteError::UnsupportedSuite)),
         ] {
             let mut s = setup();
-            let (raw, mut inner) = open_init(&mut s);
+            let (mut raw, mut inner) = open_init(&mut s);
             let mut current = epoch(&s.v["old_epoch"], Role::Initiator, true, s.now);
             match why {
+                "inactive epoch" => {
+                    let mut st = current.snapshot();
+                    st.active = false;
+                    current = Epoch::restore(st);
+                }
+                "raw of another epoch" => raw = env(&s, "message_i2r"),
                 "collect sender" => s.cfg.collect_sender = stranger,
                 "relay key on record" => s.cfg.peer_relay_key = stranger,
                 "identity on record" => s.cfg.peer_ik = stranger,
-                "another epoch" => current = epoch(&s.v["new_epoch"], Role::Initiator, true, s.now),
+                "another ctx" => {
+                    let ctx = epoch_ctx(&vectors::hex(&s.v["old_epoch"]["epoch_id_hex"]));
+                    inner.body = Zeroizing::new(inner.body.replace(&ctx, &epoch_ctx(&[0; 16])));
+                }
                 "retired epoch" => current = epoch(&s.v["old_epoch"], Role::Initiator, false, s.now),
                 "stale" => s.cfg.now = s.now + TimeDelta::days(17),
                 "not hs.init" => inner.kind = "hs.fin".into(),
@@ -507,12 +603,15 @@ mod tests {
             }
             assert_eq!(answer_rekey_with(&raw, &inner, &current, &s.cfg, &mut s.rng).unwrap_err(), want, "{why}");
         }
-        // Another purpose under the session: refused.
+        // Another (well-formed) purpose under the session: refused.
         let mut s = setup();
         let (raw, mut inner) = open_init(&mut s);
-        let body = inner.body.replace(r#""purpose":"rekey""#, r#""purpose":"reconnect""#);
-        inner.body = Zeroizing::new(body);
-        assert!(answer_rekey_with(&raw, &inner, &s.old, &s.cfg, &mut s.rng).is_err());
+        let mut body: serde_json::Value = serde_json::from_str(&inner.body).unwrap();
+        body["purpose"] = serde_json::json!("agent");
+        body["token"] = serde_json::json!("v4.public.eA");
+        body["sas_commit"] = serde_json::json!(epoch_ctx(&[0; 32]));
+        inner.body = Zeroizing::new(serde_json::to_string(&body).unwrap());
+        assert_eq!(answer_rekey_with(&raw, &inner, &s.old, &s.cfg, &mut s.rng).unwrap_err(), HandshakeError::Purpose);
     }
 
     /// Nothing but a verifying hs.fin from the vault's relay key ends the
@@ -530,6 +629,12 @@ mod tests {
         let n = tampered.len();
         tampered[n - 1] ^= 1;
         assert!(r.handle_fin(&tampered, &s.vault_relay, s.now).is_err());
+        // Old-epoch and other-direction messages aren't the new epoch's:
+        // they say Kid, never Type (which would leave them unacked).
+        assert_eq!(r.handle_fin(&raw, &s.vault_relay, s.now).unwrap_err(), HandshakeError::Envelope(EnvelopeError::Kid));
+        assert_eq!(r.handle_fin(&env(&s, "message_r2i"), &s.vault_relay, s.now).unwrap_err(), HandshakeError::Envelope(EnvelopeError::Kid));
+        // An early new-epoch message from another relay key: Sender.
+        assert_eq!(r.handle_fin(&env(&s, "message_i2r"), &stranger, s.now).unwrap_err(), HandshakeError::Sender);
         // An hs.fin of the new epoch whose sig_I doesn't verify.
         let mut vault_side = epoch(&s.v["new_epoch"], Role::Initiator, true, s.now);
         let forged_body = Fin { sig: [1; 64], sas_nonce: None }.marshal(Purpose::Rekey).unwrap();
@@ -541,7 +646,7 @@ mod tests {
         assert!(!r.is_done());
         assert!(!r.expired(s.now + TimeDelta::days(16)) && r.expired(s.now + TimeDelta::days(16) + TimeDelta::seconds(1)));
         // A stored and restored responder still takes the real one.
-        let mut r = Responder::restore(r.snapshot().unwrap()).unwrap();
+        let mut r = Responder::restore(r.snapshot().unwrap(), s.now).unwrap();
         assert!(r.handle_fin(&fin, &s.vault_relay, s.now).is_ok());
         assert_eq!(r.snapshot().unwrap_err(), HandshakeError::Done);
         assert_eq!(format!("{r:?}"), "Responder { done: true, .. }");
@@ -552,10 +657,25 @@ mod tests {
         let mut s = setup();
         let (raw, inner) = open_init(&mut s);
         let (mut r, _) = answer_rekey_with(&raw, &inner, &s.old, &s.cfg, &mut s.rng).unwrap();
-        let mut bad = r.snapshot().unwrap();
-        assert_eq!(format!("{bad:?}"), "ResponderState(..)");
-        bad.pending.active = true;
-        assert_eq!(Responder::restore(bad).unwrap_err(), HandshakeError::Config);
+        let good = r.snapshot().unwrap();
+        assert_eq!(format!("{good:?}"), "ResponderState(..)");
+        assert!(Responder::restore(good.clone(), s.now).is_ok());
+        assert!(Responder::restore(good.clone(), s.now - TimeDelta::minutes(5)).is_ok(), "within the skew");
+        for why in ["active", "no send key", "no rk", "initiator", "unmirrored", "suite", "unbounded", "future"] {
+            let mut bad = good.clone();
+            let mut now = s.now;
+            match why {
+                "active" => bad.pending.active = true,
+                "no send key" => bad.pending.send = None,
+                "no rk" => bad.pending.rk = None,
+                "initiator" => bad.pending.role = Role::Initiator,
+                "unmirrored" => bad.pending.recv.1 = Kid([0; 8]),
+                "suite" => bad.pending.suite = 3,
+                "unbounded" => bad.pending.policy = Policy { max_age: TimeDelta::zero(), max_messages: 0 },
+                _ => now = s.now - TimeDelta::minutes(6),
+            }
+            assert_eq!(Responder::restore(bad, now).unwrap_err(), HandshakeError::Config, "{why}");
+        }
         r.abort();
         assert!(r.is_done() && r.kids().is_none());
         assert_eq!(r.handle_fin(&env(&s, "fin"), &s.vault_relay, s.now).unwrap_err(), HandshakeError::Done);

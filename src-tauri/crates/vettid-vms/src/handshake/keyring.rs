@@ -8,7 +8,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 
 use super::epoch::{Epoch, EpochState};
 use super::HandshakeError;
-use crate::envelope::{Envelope, EnvelopeError, Inner};
+use crate::envelope::{Envelope, EnvelopeError, Inner, MAX_CLOCK_SKEW_FUTURE};
 
 /// How long a previous epoch's receive key is kept (§6.5).
 pub const RECEIVE_KEY_RETENTION: TimeDelta = TimeDelta::days(16);
@@ -76,7 +76,9 @@ impl Keyring {
     /// Open a session-mode envelope in the one epoch whose receive kid it
     /// names (§4.4: no other epoch is tried), and say whether that is the
     /// current epoch. Every candidate is compared in constant time.
+    /// Retired keys past their retention are deleted first.
     pub fn open(&mut self, env: &Envelope, now: DateTime<Utc>) -> Result<(Inner, bool), HandshakeError> {
+        self.prune(now);
         let kid = env.recipient_kid();
         let mut found: Option<usize> = None;
         let current = kid.ct_eq(&self.current.recv_kid());
@@ -99,10 +101,12 @@ impl Keyring {
         KeyringState { current: self.current.snapshot(), retired: self.retired.iter().map(|(e, until)| (e.snapshot(), *until)).collect() }
     }
 
-    /// A keyring from its stored form. A retired epoch that still holds a
-    /// send key or `rk` is refused.
-    pub fn restore(s: KeyringState) -> Result<Self, HandshakeError> {
-        if s.retired.iter().any(|(e, _)| e.send.is_some() || e.rk.is_some()) {
+    /// A keyring from its stored form, at `now`. A retired epoch that still
+    /// holds a send key or `rk`, or whose deletion is further ahead than
+    /// the retention (plus the clock skew), is refused.
+    pub fn restore(s: KeyringState, now: DateTime<Utc>) -> Result<Self, HandshakeError> {
+        let latest = now + RECEIVE_KEY_RETENTION + MAX_CLOCK_SKEW_FUTURE;
+        if s.retired.iter().any(|(e, until)| e.send.is_some() || e.rk.is_some() || *until > latest) {
             return Err(HandshakeError::Config);
         }
         Ok(Keyring { current: Epoch::restore(s.current), retired: s.retired.into_iter().map(|(e, until)| (Epoch::restore(e), until)).collect() })

@@ -37,8 +37,24 @@ pub struct Policy {
 /// Vault ↔ device: 7 days (and every unlock, which the vault starts).
 pub const POLICY_VAULT_TO_DEVICE: Policy = Policy { max_age: TimeDelta::days(7), max_messages: 0 };
 
+/// A key on the heap, so that moving an epoch (into a keyring's list,
+/// out of a handshake) copies only the pointer and leaves no unwiped copy
+/// of the key behind.
+type HeapKey = Box<Zeroizing<[u8; KEY_SIZE]>>;
+
+/// A heap copy of `k`, written in place (no copy on the stack).
+fn heap(k: &[u8; KEY_SIZE]) -> HeapKey {
+    let mut b = Box::new(Zeroizing::new([0u8; KEY_SIZE]));
+    b.copy_from_slice(k);
+    b
+}
+
+fn bytes(k: &HeapKey) -> &[u8; KEY_SIZE] {
+    k
+}
+
 struct Direction {
-    key: Zeroizing<[u8; KEY_SIZE]>,
+    key: HeapKey,
     /// The header's `recipient_kid`.
     recipient_kid: Kid,
     /// The header's `sender_kid`.
@@ -55,7 +71,7 @@ pub struct Epoch {
     active: bool,
     send: Option<Direction>,
     recv: Direction,
-    rk: Option<Zeroizing<[u8; KEY_SIZE]>>,
+    rk: Option<HeapKey>,
     last_seq: u64,
     sent: u64,
     received: u64,
@@ -104,7 +120,7 @@ impl std::fmt::Debug for EpochState {
 impl Epoch {
     /// Everything the epoch holds, to store (secret).
     pub fn snapshot(&self) -> EpochState {
-        let dir = |d: &Direction| (d.key.clone(), d.recipient_kid, d.sender_kid);
+        let dir = |d: &Direction| (Zeroizing::new(*bytes(&d.key)), d.recipient_kid, d.sender_kid);
         EpochState {
             id: self.id,
             role: self.role,
@@ -114,7 +130,7 @@ impl Epoch {
             active: self.active,
             send: self.send.as_ref().map(dir),
             recv: dir(&self.recv),
-            rk: self.rk.clone(),
+            rk: self.rk.as_ref().map(|k| Zeroizing::new(*bytes(k))),
             last_seq: self.last_seq,
             sent: self.sent,
             received: self.received,
@@ -123,7 +139,7 @@ impl Epoch {
 
     /// An epoch from a stored [`EpochState`].
     pub fn restore(s: EpochState) -> Self {
-        let dir = |(key, recipient_kid, sender_kid): (Zeroizing<[u8; KEY_SIZE]>, Kid, Kid)| Direction { key, recipient_kid, sender_kid };
+        let dir = |(key, recipient_kid, sender_kid): (Zeroizing<[u8; KEY_SIZE]>, Kid, Kid)| Direction { key: heap(&key), recipient_kid, sender_kid };
         Epoch {
             id: s.id,
             role: s.role,
@@ -133,7 +149,7 @@ impl Epoch {
             active: s.active,
             send: s.send.map(dir),
             recv: dir(s.recv),
-            rk: s.rk,
+            rk: s.rk.as_deref().map(heap),
             last_seq: s.last_seq,
             sent: s.sent,
             received: s.received,
@@ -144,8 +160,8 @@ impl Epoch {
     /// `recipient_kid = kid_i2r` and `sender_kid = kid_r2i`; r2i mirrors it
     /// (§6.3).
     pub fn new(s: &Schedule, role: Role, suite: u8, policy: Policy, now: DateTime<Utc>) -> Self {
-        let i2r = || Direction { key: s.k_i2r.clone(), recipient_kid: s.kid_i2r, sender_kid: s.kid_r2i };
-        let r2i = || Direction { key: s.k_r2i.clone(), recipient_kid: s.kid_r2i, sender_kid: s.kid_i2r };
+        let i2r = || Direction { key: heap(&s.k_i2r), recipient_kid: s.kid_i2r, sender_kid: s.kid_r2i };
+        let r2i = || Direction { key: heap(&s.k_r2i), recipient_kid: s.kid_r2i, sender_kid: s.kid_i2r };
         let (send, recv) = match role {
             Role::Initiator => (i2r(), r2i()),
             Role::Responder => (r2i(), i2r()),
@@ -159,7 +175,7 @@ impl Epoch {
             active: false,
             send: Some(send),
             recv,
-            rk: Some(s.rk.clone()),
+            rk: Some(heap(&s.rk)),
             last_seq: 0,
             sent: 0,
             received: 0,
@@ -225,7 +241,32 @@ impl Epoch {
 
     /// `rk`, the `K_s` of the next rekey (§6.2).
     pub(crate) fn rk(&self) -> Result<&[u8; KEY_SIZE], HandshakeError> {
-        self.rk.as_deref().ok_or(HandshakeError::EpochRetired)
+        self.rk.as_ref().map(bytes).ok_or(HandshakeError::EpochRetired)
+    }
+
+    /// A copy whose keys go straight from heap to heap, for a trial that
+    /// must leave this epoch as it is (a responder checking `hs.fin`).
+    pub(crate) fn duplicate(&self) -> Epoch {
+        let dir = |d: &Direction| Direction { key: heap(bytes(&d.key)), recipient_kid: d.recipient_kid, sender_kid: d.sender_kid };
+        Epoch {
+            id: self.id,
+            role: self.role,
+            suite: self.suite,
+            policy: self.policy,
+            created: self.created,
+            active: self.active,
+            send: self.send.as_ref().map(dir),
+            recv: dir(&self.recv),
+            rk: self.rk.as_ref().map(|k| heap(bytes(k))),
+            last_seq: self.last_seq,
+            sent: self.sent,
+            received: self.received,
+        }
+    }
+
+    /// The receive kids: (`recipient_kid`, `sender_kid`).
+    pub(crate) fn recv_kids(&self) -> (Kid, Kid) {
+        (self.recv.recipient_kid, self.recv.sender_kid)
     }
 
     /// Delete the send key and `rk` (they wipe themselves), when a newer
