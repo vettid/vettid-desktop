@@ -106,7 +106,7 @@ use vettid_vms::strict_json::{self, Builder};
 use zeroize::Zeroizing;
 
 use crate::pairing::Clock;
-use crate::store::{DeviceState, OutboxEntry, Persist, StoreError};
+use crate::store::{DeviceState, OutboxEntry, PendingEnd, Persist, StoreError};
 use crate::token::{check_from_vault, mint_for_vault};
 use crate::transport::Transport;
 
@@ -398,6 +398,28 @@ impl<T: Transport, C: Clock> Session<T, C> {
         Ok(())
     }
 
+    /// This device's `device.session.end` waiting for its answer, if any
+    /// (stored; see [`crate::access`]).
+    pub fn access_end(&self) -> Option<&PendingEnd> {
+        self.state.access_end.as_ref()
+    }
+
+    /// Record (or clear) the unanswered `device.session.end`, and store it.
+    pub(crate) fn set_access_end(&mut self, store: &mut impl Persist, end: Option<PendingEnd>) -> Result<(), SessionError> {
+        let cp = self.checkpoint();
+        self.state.access_end = end;
+        if let Err(e) = self.save(store) {
+            self.rollback(cp);
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    /// A new inner `id` (a ULID by this session's clock).
+    pub(crate) fn new_id(&self) -> Result<String, SessionError> {
+        new_ulid(self.clock.now()).map_err(|e| SessionError::Seal(HandshakeError::Suite(e)))
+    }
+
     /// How many deposits wait in the outbox.
     pub fn outbox_len(&self) -> usize {
         self.state.outbox.len()
@@ -642,6 +664,19 @@ impl<T: Transport, C: Clock> Session<T, C> {
     /// same id rather than sending a new one.
     pub async fn request(&mut self, store: &mut impl Persist, kind: &str, body: &str, timeout: TimeDelta) -> Result<Inner, SessionError> {
         let id = self.send(store, kind, body, true).await?;
+        self.wait_for(store, id, timeout).await
+    }
+
+    /// [`Session::request`] again under the same inner `id` (an
+    /// application retry, §8.6): the vault answers it from its cache
+    /// instead of acting twice.
+    pub async fn request_again(&mut self, store: &mut impl Persist, id: &str, kind: &str, body: &str, timeout: TimeDelta) -> Result<Inner, SessionError> {
+        let id = self.resend(store, id, kind, body, true).await?;
+        self.wait_for(store, id, timeout).await
+    }
+
+    /// Poll until the response to `id` arrives, up to `timeout`.
+    async fn wait_for(&mut self, store: &mut impl Persist, id: String, timeout: TimeDelta) -> Result<Inner, SessionError> {
         let deadline = self.clock.now() + timeout;
         loop {
             let left = (deadline - self.clock.now()).num_seconds().clamp(1, POLL_WAIT_SECS) as u64;
