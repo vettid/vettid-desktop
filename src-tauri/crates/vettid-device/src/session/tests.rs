@@ -444,3 +444,379 @@ fn a_store_with_nothing_paired_has_no_session() {
     let faults = Arc::default();
     assert!(Session::open(&mut store, mem(&relay, &faults), Ticking::new()).unwrap().is_none());
 }
+
+/// Poll up to `n` times; every event the desktop gets.
+async fn poll_all(s: &mut Session<Mem, Ticking>, store: &mut impl Persist, n: usize) -> Vec<Inner> {
+    let mut all = Vec::new();
+    for _ in 0..n {
+        all.extend(s.poll(store).await.unwrap());
+    }
+    all
+}
+
+/// The vault rekeys (§6.5): the desktop answers once; the vault's first
+/// message of the new epoch, deposited before hs.fin, stays unacked (and
+/// unseen) until hs.fin establishes the epoch, then arrives once. Both
+/// sides then use the new epoch, and a late message of the old one still
+/// opens.
+#[tokio::test]
+async fn a_vault_rekey_and_its_early_message() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    let old_id = s.keys.current().id();
+    vault.start_rekey().await;
+    assert!(s.poll(&mut store).await.unwrap().is_empty());
+    assert_eq!(vault.waiting(), 1, "one hs.resp");
+    assert_eq!(s.awaiting.len(), 1);
+    let fin = vault.finish_rekey().await;
+
+    // The early message, before hs.fin.
+    vault.send("test.early", r#"{"n":1}"#.into()).await;
+    for _ in 0..3 {
+        assert!(s.poll(&mut store).await.unwrap().is_empty());
+    }
+    assert_eq!(vault.device_waiting(), 1, "left unacked");
+    let early_id = relay.lock().unwrap().mailboxes[&vault.device_mailbox()][0].msg_id.clone();
+    assert!(!s.state.seen.contains_key(&early_id), "not marked seen");
+    assert_eq!(s.keys.current().id(), old_id, "not established yet");
+
+    vault.deposit_raw(&fin).await;
+    let got = poll_all(&mut s, &mut store, 3).await;
+    assert_eq!(got.iter().filter(|e| e.kind == "test.early").count(), 1, "delivered once, after hs.fin");
+    assert_eq!(got.len(), 1);
+    assert_eq!(vault.device_waiting(), 0);
+    assert!(s.awaiting.is_empty());
+    assert_ne!(s.keys.current().id(), old_id, "the new epoch is current");
+    assert_eq!(s.keys.snapshot().retired.len(), 1);
+
+    // The desktop sends in the new epoch (its first message there).
+    s.send(&mut store, "test.after", "{}", false).await.unwrap();
+    let m = vault_receive(&mut vault).await;
+    assert_eq!((m.kind.as_str(), m.seq), ("test.after", Some(1)));
+
+    // A late message of the old epoch still opens.
+    let mut late = event("test.late", "{}");
+    let env = vault.old.as_mut().unwrap().seal(&mut late).unwrap();
+    vault.deposit_raw(&env).await;
+    let got = s.poll(&mut store).await.unwrap();
+    assert_eq!(got.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), ["test.late"]);
+
+    // hs.fin deposited again: ignored, and acked.
+    vault.deposit_raw(&fin).await;
+    assert!(s.poll(&mut store).await.unwrap().is_empty());
+    assert_eq!(vault.device_waiting(), 0);
+    assert_eq!(s.keys.snapshot().retired.len(), 1, "no second activation");
+}
+
+/// A restart between hs.resp and hs.fin: the waiting rekey is stored, and
+/// the reopened session takes hs.fin and the new epoch's messages.
+#[tokio::test]
+async fn a_rekey_survives_a_restart() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    {
+        let mut s = session(&relay, &faults, &mut store, Ticking::new());
+        vault.start_rekey().await;
+        s.poll(&mut store).await.unwrap();
+    }
+    let fin = vault.finish_rekey().await;
+    vault.send("test.early", "{}".into()).await;
+    vault.deposit_raw(&fin).await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    assert_eq!(s.awaiting.len(), 1, "restored");
+    let got = poll_all(&mut s, &mut store, 3).await;
+    assert_eq!(got.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), ["test.early"]);
+    // The established keyring is stored too.
+    drop(s);
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    assert!(s.awaiting.is_empty());
+    s.send(&mut store, "test.after", "{}", false).await.unwrap();
+    assert_eq!(vault_receive(&mut vault).await.kind, "test.after");
+}
+
+/// One hs.resp per hs.init (§6.3): a retransmission is skipped while the
+/// answer waits in the outbox, and after it went out.
+#[tokio::test]
+async fn a_retransmitted_init_is_answered_once() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    let init = vault.start_rekey().await;
+    faults.lock().unwrap().temporary = 1;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.outbox_len(), 1, "hs.resp queued");
+    let init_id = s.state.outbox[0].re.clone().expect("tagged with its hs.init");
+    assert!(!s.state.seen_inner.contains_key(&init_id), "not handled until the relay takes hs.resp");
+    vault.deposit_raw(&init).await;
+    s.hold_until = Utc::now() - TimeDelta::seconds(1);
+    s.poll(&mut store).await.unwrap();
+    assert_eq!((s.outbox_len(), vault.waiting(), s.awaiting.len()), (0, 1, 1), "the queued answer went, once");
+    assert!(s.state.seen_inner.contains_key(&init_id));
+    vault.deposit_raw(&init).await;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!((vault.waiting(), s.awaiting.len()), (1, 1), "after it went: skipped");
+    // And the one answer finishes the rekey.
+    let fin = vault.finish_rekey().await;
+    vault.deposit_raw(&fin).await;
+    s.poll(&mut store).await.unwrap();
+    assert!(s.awaiting.is_empty());
+}
+
+/// An hs.resp the relay refuses for good leaves its hs.init unhandled, so
+/// the vault's retransmission is answered.
+#[tokio::test]
+async fn a_dropped_resp_lets_the_init_be_answered_again() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    let init = vault.start_rekey().await;
+    let next = faults.lock().unwrap().deposits_seen;
+    faults.lock().unwrap().deposit = Some(next);
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.take_dropped(), ["hs.resp"]);
+    assert_eq!((vault.waiting(), s.awaiting.len()), (0, 0), "it can't finish: it stops waiting");
+    vault.deposit_raw(&init).await;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!((vault.waiting(), s.awaiting.len()), (1, 1), "answered this time");
+}
+
+/// If the batch can't be stored, nothing of the rekey happens: no ack, no
+/// hs.resp, no waiting responder; it's answered when storing works again.
+#[tokio::test]
+async fn a_rekey_batch_rolls_back() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    vault.start_rekey().await;
+    store.fail = true;
+    assert!(matches!(s.poll(&mut store).await, Err(SessionError::Store(_))));
+    assert_eq!((vault.device_waiting(), vault.waiting(), s.awaiting.len(), s.outbox_len()), (1, 0, 0, 0));
+    store.fail = false;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!((vault.device_waiting(), vault.waiting(), s.awaiting.len()), (0, 1, 1));
+}
+
+/// The waiting rekeys are capped; the oldest is aborted. A rekey under a
+/// retired epoch isn't answered.
+#[tokio::test]
+async fn waiting_rekeys_are_capped() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    for _ in 0..MAX_AWAITING + 2 {
+        vault.start_rekey().await;
+    }
+    poll_all(&mut s, &mut store, 2).await;
+    assert_eq!(s.awaiting.len(), MAX_AWAITING);
+    // The two oldest were aborted in the same batch, before their answers
+    // went out: those don't go at all.
+    assert_eq!((vault.waiting(), s.outbox_len()), (MAX_AWAITING, 0));
+}
+
+/// Finishing one rekey ends the others answered under the old epoch:
+/// they stop waiting.
+#[tokio::test]
+async fn an_established_rekey_ends_the_others() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    vault.start_rekey().await;
+    s.poll(&mut store).await.unwrap();
+    vault.next().await; // the vault abandons that one
+    vault.start_rekey().await;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.awaiting.len(), 2);
+    let fin = vault.finish_rekey().await;
+    vault.deposit_raw(&fin).await;
+    s.poll(&mut store).await.unwrap();
+    assert!(s.awaiting.is_empty());
+    s.send(&mut store, "test.after", "{}", false).await.unwrap();
+    assert_eq!(vault_receive(&mut vault).await.kind, "test.after");
+}
+
+/// A clock that goes back (it was fast at the rekey) leaves the stored
+/// state readable; an hs.fin that is ahead of the slow clock stays unacked
+/// like the new epoch's messages, and both are handled once the clock is
+/// right.
+#[tokio::test]
+async fn a_clock_that_goes_back() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    {
+        let mut s = session(&relay, &faults, &mut store, Ticking::new());
+        vault.start_rekey().await;
+        s.poll(&mut store).await.unwrap();
+    }
+    let fin = vault.finish_rekey().await;
+    vault.send("test.early", "{}".into()).await;
+    vault.deposit_raw(&fin).await;
+    {
+        let mut s = session(&relay, &faults, &mut store, Ticking::offset(-7200));
+        assert_eq!(s.awaiting.len(), 1, "opened, not refused");
+        assert!(poll_all(&mut s, &mut store, 2).await.is_empty());
+        assert_eq!(vault.device_waiting(), 2, "hs.fin and the early message wait");
+        assert_eq!(s.awaiting.len(), 1);
+    }
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    let got = poll_all(&mut s, &mut store, 3).await;
+    assert_eq!(got.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), ["test.early"]);
+    assert!(s.awaiting.is_empty());
+    drop(s);
+    // With a retired epoch stored, a slow clock still opens the state.
+    let mut s = session(&relay, &faults, &mut store, Ticking::offset(-7200));
+    assert_eq!(s.keys.snapshot().retired.len(), 1);
+    s.send(&mut store, "test.after", "{}", false).await.unwrap();
+}
+
+/// A batch whose hs.fin activated the epoch, but couldn't be stored, rolls
+/// back to waiting; hs.fin comes again and establishes it.
+#[tokio::test]
+async fn an_activation_rolls_back() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    let old_id = s.keys.current().id();
+    vault.start_rekey().await;
+    s.poll(&mut store).await.unwrap();
+    let fin = vault.finish_rekey().await;
+    vault.deposit_raw(&fin).await;
+    store.fail = true;
+    assert!(s.poll(&mut store).await.is_err());
+    assert_eq!((s.keys.current().id(), s.awaiting.len(), vault.device_waiting()), (old_id, 1, 1));
+    store.fail = false;
+    s.poll(&mut store).await.unwrap();
+    assert_ne!(s.keys.current().id(), old_id);
+    assert!(s.awaiting.is_empty());
+}
+
+/// Junk addressed to the waiting rekey's keys (a tampered hs.fin) is acked
+/// and changes nothing; the real hs.fin still finishes it.
+#[tokio::test]
+async fn junk_for_a_waiting_rekey() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    vault.start_rekey().await;
+    s.poll(&mut store).await.unwrap();
+    let fin = vault.finish_rekey().await;
+    let mut junk = fin.clone();
+    let n = junk.len();
+    junk[n - 1] ^= 1;
+    vault.deposit_raw(&junk).await;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!((vault.device_waiting(), s.awaiting.len()), (0, 1));
+    vault.deposit_raw(&fin).await;
+    s.poll(&mut store).await.unwrap();
+    assert!(s.awaiting.is_empty());
+}
+
+/// After 16 days a waiting rekey is dropped, and its epoch's message is
+/// acked instead of waiting for ever.
+#[tokio::test]
+async fn a_rekey_that_never_finishes() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    {
+        let mut s = session(&relay, &faults, &mut store, Ticking::new());
+        vault.start_rekey().await;
+        s.poll(&mut store).await.unwrap();
+    }
+    vault.finish_rekey().await;
+    vault.send("test.early", "{}".into()).await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::offset(17 * 24 * 3600));
+    assert!(s.poll(&mut store).await.unwrap().is_empty());
+    assert_eq!((vault.device_waiting(), s.awaiting.len()), (0, 0));
+}
+
+/// A refused device answers no rekey.
+#[tokio::test]
+async fn a_refused_device_answers_no_rekey() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    faults.lock().unwrap().revoked = true;
+    assert_eq!(s.send(&mut store, "test.ping", "{}", false).await.unwrap_err(), SessionError::Refused);
+    vault.start_rekey().await;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!((vault.waiting(), s.awaiting.len(), s.outbox_len()), (0, 0, 0));
+}
+
+/// A state stored before rekeys (no retired epochs, waiting rekeys or
+/// outbox `re`) still opens.
+#[tokio::test]
+async fn a_state_from_before_rekeys_opens() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    {
+        let mut s = session(&relay, &faults, &mut store, Ticking::new());
+        faults.lock().unwrap().temporary = 1;
+        s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+        assert_eq!(s.outbox_len(), 1);
+    }
+    let data = store.inner.data.clone().unwrap();
+    let mut v: serde_json::Value = serde_json::from_slice(&data).unwrap();
+    let o = v.as_object_mut().unwrap();
+    assert!(o.remove("retired").is_some() && o.remove("awaiting").is_some());
+    o["outbox"][0].as_object_mut().unwrap().remove("re");
+    store.inner.data = Some(Zeroizing::new(serde_json::to_vec(&v).unwrap()));
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    assert_eq!((s.outbox_len(), s.awaiting.len()), (1, 0));
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(vault_receive(&mut vault).await.kind, "test.ping");
+}
+
+/// A rekey hs.init sealed under the old epoch after the new one is up:
+/// not answered (only the current epoch may be rekeyed).
+#[tokio::test]
+async fn no_rekey_from_a_retired_epoch() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    vault.start_rekey().await;
+    s.poll(&mut store).await.unwrap();
+    let fin = vault.finish_rekey().await;
+    vault.deposit_raw(&fin).await;
+    s.poll(&mut store).await.unwrap();
+    // The vault's old epoch starts another rekey.
+    let current = vault.handshake.as_mut().unwrap().1.snapshot();
+    let old = vault.old.take().unwrap();
+    vault.handshake.as_mut().unwrap().1 = old;
+    vault.start_rekey().await;
+    vault.handshake.as_mut().unwrap().1 = vettid_vms::handshake::Epoch::restore(current);
+    s.poll(&mut store).await.unwrap();
+    assert_eq!((vault.waiting(), s.awaiting.len()), (0, 0));
+    assert_eq!(vault.device_waiting(), 0, "acked and dropped");
+}
+
+/// An hs.resp evicted from a full outbox ends its rekey (it can't be
+/// finished).
+#[tokio::test]
+async fn an_evicted_resp_ends_its_rekey() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    faults.lock().unwrap().temporary = 1000;
+    vault.start_rekey().await;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!((s.awaiting.len(), s.outbox_len()), (1, 1));
+    for _ in 0..OUTBOX_CAP {
+        s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+    }
+    assert_eq!((s.awaiting.len(), s.outbox_len()), (0, OUTBOX_CAP));
+    assert_eq!(s.take_dropped(), ["hs.resp"]);
+}
+
+/// A stored state with more than MAX_AWAITING waiting rekeys opens with the
+/// newest, and the others' queued hs.resp don't go out.
+#[tokio::test]
+async fn open_trims_the_waiting_rekeys() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    {
+        let mut s = session(&relay, &faults, &mut store, Ticking::new());
+        faults.lock().unwrap().temporary = 1000;
+        for _ in 0..MAX_AWAITING {
+            vault.start_rekey().await;
+        }
+        s.poll(&mut store).await.unwrap();
+        assert_eq!((s.awaiting.len(), s.outbox_len()), (MAX_AWAITING, MAX_AWAITING));
+    }
+    // One more, older than the rest, with its queued answer.
+    let mut v: serde_json::Value = serde_json::from_slice(&store.inner.data.clone().unwrap()).unwrap();
+    let mut extra = v["awaiting"][0].clone();
+    extra["init"] = serde_json::json!("01JB2Z6V9K3M4N5P6Q7R8S9T0Z");
+    v["awaiting"].as_array_mut().unwrap().insert(0, extra);
+    let mut resp = v["outbox"][0].clone();
+    resp["re"] = serde_json::json!("01JB2Z6V9K3M4N5P6Q7R8S9T0Z");
+    v["outbox"].as_array_mut().unwrap().push(resp);
+    store.inner.data = Some(Zeroizing::new(serde_json::to_vec(&v).unwrap()));
+    let s = session(&relay, &faults, &mut store, Ticking::new());
+    assert_eq!(s.awaiting.len(), MAX_AWAITING);
+    assert!(s.awaiting.iter().all(|w| w.init != "01JB2Z6V9K3M4N5P6Q7R8S9T0Z"));
+    assert_eq!(s.outbox_len(), MAX_AWAITING, "its answer is out of the outbox");
+}

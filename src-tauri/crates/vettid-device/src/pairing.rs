@@ -348,6 +348,8 @@ pub async fn start<T: Transport, C: Clock>(
         device_id: None,
         vault_id: None,
         epoch: out.epoch.snapshot(),
+        retired: Vec::new(),
+        awaiting: Vec::new(),
         seen: Default::default(),
         seen_inner: Default::default(),
         outbox: Vec::new(),

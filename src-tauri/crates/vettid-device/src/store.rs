@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, TimeDelta, Utc};
 use ed25519_dalek::VerifyingKey;
 use vettid_vms::envelope::{format_ts, parse_ts};
-use vettid_vms::handshake::{EpochState, Policy, RelayAddr, Role};
+use vettid_vms::handshake::{EpochState, Policy, RelayAddr, ResponderState, Role};
 use vettid_vms::strict_json::{self, Builder, Object};
 use vettid_vms::suite::kem::PublicKey;
 use vettid_vms::suite::kid::Kid;
@@ -79,6 +79,9 @@ pub struct OutboxEntry {
     pub created: DateTime<Utc>,
     /// Its inner `exp`, if any: after it, it is dropped unsent.
     pub exp: Option<DateTime<Utc>>,
+    /// For an `hs.resp`: the inner id of the `hs.init` it answers, recorded
+    /// as handled only once the relay has taken it.
+    pub re: Option<String>,
 }
 
 /// What this device knows of its vault.
@@ -112,6 +115,12 @@ pub struct DeviceState {
     pub device_id: Option<String>,
     pub vault_id: Option<String>,
     pub epoch: EpochState,
+    /// Previous epochs (receive key only) and when each is deleted (§6.5:
+    /// 16 days).
+    pub retired: Vec<(EpochState, DateTime<Utc>)>,
+    /// Rekeys answered and waiting for `hs.fin` (§6.5), each with the inner
+    /// id of the `hs.init` it answers.
+    pub awaiting: Vec<(ResponderState, String)>,
     /// Relay `msg_id`s handled, and when (§8.2, kept 16 days).
     pub seen: BTreeMap<String, DateTime<Utc>>,
     /// Inner `id`s handled from the vault, and until when they are kept
@@ -144,12 +153,102 @@ fn role_name(r: Role) -> &'static str {
 
 fn direction(key: &[u8; 32], recipient: Kid, sender: Kid) -> Zeroizing<String> {
     Zeroizing::new(
-        Builder::new()
+        Builder::with_capacity(160)
             .base64("key", key)
             .string("recipient_kid", &hex::encode(recipient.0))
             .string("sender_kid", &hex::encode(sender.0))
             .finish(),
     )
+}
+
+/// The room one stored epoch takes, at most.
+const EPOCH_JSON: usize = 1024;
+
+/// An epoch's stored form (secret).
+fn epoch_json(e: &EpochState) -> Zeroizing<String> {
+    let mut eb = Builder::with_capacity(EPOCH_JSON)
+        .base64("id", &e.id)
+        .string("role", role_name(e.role))
+        .uint("suite", u64::from(e.suite))
+        .uint("max_age_secs", e.policy.max_age.num_seconds().max(0) as u64)
+        .uint("max_messages", e.policy.max_messages)
+        .string("created", &format_ts(e.created))
+        .bool("active", e.active);
+    if let Some((k, r, s)) = &e.send {
+        eb = eb.raw("send", &direction(k, *r, *s));
+    }
+    eb = eb.raw("recv", &direction(&e.recv.0, e.recv.1, e.recv.2));
+    if let Some(rk) = &e.rk {
+        eb = eb.base64("rk", &rk[..]);
+    }
+    Zeroizing::new(eb.uint("last_seq", e.last_seq).uint("sent", e.sent).uint("received", e.received).finish())
+}
+
+fn corrupt<E>(_: E) -> StoreError {
+    StoreError::Corrupt
+}
+
+fn key32(o: &Object<'_>, n: &str) -> Result<Zeroizing<[u8; 32]>, StoreError> {
+    let b = Zeroizing::new(o.base64(n, Some(32)).map_err(corrupt)?);
+    Ok(Zeroizing::new(b[..].try_into().expect("checked length")))
+}
+
+fn time(o: &Object<'_>, n: &str) -> Result<DateTime<Utc>, StoreError> {
+    parse_ts(&o.string(n).map_err(corrupt)?).ok_or(StoreError::Corrupt)
+}
+
+fn verifying(o: &Object<'_>, n: &str) -> Result<VerifyingKey, StoreError> {
+    let b: [u8; 32] = o.base64(n, Some(32)).map_err(corrupt)?.try_into().map_err(corrupt)?;
+    VerifyingKey::from_bytes(&b).map_err(corrupt)
+}
+
+/// An epoch from its stored form, at nesting `level`.
+fn parse_epoch(e: &Object<'_>, level: usize) -> Result<EpochState, StoreError> {
+    let c = corrupt;
+    let dir = |name: &str| -> Result<Option<Direction>, StoreError> {
+        if !e.has(name) {
+            return Ok(None);
+        }
+        let d = e.object(name, level + 1).map_err(c)?;
+        let kid = |n: &str| Kid::parse_hex(&d.string(n).map_err(c)?).ok_or(StoreError::Corrupt);
+        Ok(Some((key32(&d, "key")?, kid("recipient_kid")?, kid("sender_kid")?)))
+    };
+    Ok(EpochState {
+        id: e.base64("id", Some(16)).map_err(c)?.try_into().map_err(|_| StoreError::Corrupt)?,
+        role: match e.string("role").map_err(c)?.as_str() {
+            "initiator" => Role::Initiator,
+            "responder" => Role::Responder,
+            _ => return Err(StoreError::Corrupt),
+        },
+        suite: e.uint("suite", 2, 255).map_err(c)? as u8,
+        policy: Policy {
+            max_age: TimeDelta::seconds(e.uint("max_age_secs", 0, i64::MAX as u64).map_err(c)? as i64),
+            max_messages: e.uint("max_messages", 0, strict_json::MAX_SAFE_INTEGER).map_err(c)?,
+        },
+        created: time(e, "created")?,
+        active: e.bool("active").map_err(c)?,
+        send: dir("send")?,
+        recv: dir("recv")?.ok_or(StoreError::Corrupt)?,
+        rk: if e.has("rk") { Some(key32(e, "rk")?) } else { None },
+        last_seq: e.uint("last_seq", 0, strict_json::MAX_SAFE_INTEGER).map_err(c)?,
+        sent: e.uint("sent", 0, strict_json::MAX_SAFE_INTEGER).map_err(c)?,
+        received: e.uint("received", 0, strict_json::MAX_SAFE_INTEGER).map_err(c)?,
+    })
+}
+
+/// The elements of the array `n` (absent: none), each parsed by `f`.
+fn list<T>(o: &Object<'_>, n: &str, f: impl Fn(&Object<'_>) -> Result<T, StoreError>) -> Result<Vec<T>, StoreError> {
+    if o.get(n).is_none() {
+        return Ok(Vec::new());
+    }
+    o.array(n)
+        .map_err(corrupt)?
+        .into_iter()
+        .map(|raw| {
+            let e = strict_json::parse_object(raw.as_bytes()).map_err(corrupt)?;
+            f(&e)
+        })
+        .collect()
 }
 
 impl DeviceState {
@@ -158,28 +257,48 @@ impl DeviceState {
     fn capacity(&self) -> usize {
         let outbox: usize = self.outbox.iter().map(|o| o.payload.len() * 4 / 3 + o.kind.len() + 96).sum();
         let kinds: usize = self.asked_kinds.iter().map(|(k, v)| k.len() + v.len() + 8).sum();
-        16 * 1024 + self.vault_token.len() + outbox + kinds + (self.seen.len() + self.seen_inner.len() + self.asked.len()) * 64
+        let epochs = (1 + self.retired.len() + self.awaiting.len()) * (EPOCH_JSON + 256);
+        16 * 1024 + self.vault_token.len() + outbox + kinds + epochs + (self.seen.len() + self.seen_inner.len() + self.asked.len()) * 64
     }
 
     /// The stored form: strict JSON, secret (wiped when dropped).
     pub fn to_json(&self) -> Zeroizing<String> {
-        let e = &self.epoch;
-        let mut eb = Builder::with_capacity(2048)
-            .base64("id", &e.id)
-            .string("role", role_name(e.role))
-            .uint("suite", u64::from(e.suite))
-            .uint("max_age_secs", e.policy.max_age.num_seconds().max(0) as u64)
-            .uint("max_messages", e.policy.max_messages)
-            .string("created", &format_ts(e.created))
-            .bool("active", e.active);
-        if let Some((k, r, s)) = &e.send {
-            eb = eb.raw("send", &direction(k, *r, *s));
-        }
-        eb = eb.raw("recv", &direction(&e.recv.0, e.recv.1, e.recv.2));
-        if let Some(rk) = &e.rk {
-            eb = eb.base64("rk", &rk[..]);
-        }
-        let epoch = Zeroizing::new(eb.uint("last_seq", e.last_seq).uint("sent", e.sent).uint("received", e.received).finish());
+        let epoch = epoch_json(&self.epoch);
+        // Each list's parts, kept (and wiped) until the list is built.
+        let retired_parts: Vec<Zeroizing<String>> = self
+            .retired
+            .iter()
+            .map(|(e, until)| Zeroizing::new(Builder::with_capacity(EPOCH_JSON + 96).raw("epoch", &epoch_json(e)).string("until", &format_ts(*until)).finish()))
+            .collect();
+        let awaiting_parts: Vec<Zeroizing<String>> = self
+            .awaiting
+            .iter()
+            .map(|(r, init)| {
+                Zeroizing::new(
+                    Builder::with_capacity(EPOCH_JSON + 256 + init.len())
+                        .raw("pending", &epoch_json(&r.pending))
+                        .base64("th", &r.th)
+                        .base64("verify_ik", r.verify_ik.as_bytes())
+                        .base64("sender", r.sender.as_bytes())
+                        .string("since", &format_ts(r.since))
+                        .string("init", init)
+                        .finish(),
+                )
+            })
+            .collect();
+        let join = |parts: &[Zeroizing<String>]| {
+            let mut out = Zeroizing::new(String::with_capacity(parts.iter().map(|p| p.len() + 1).sum::<usize>() + 2));
+            out.push('[');
+            for (i, p) in parts.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(p);
+            }
+            out.push(']');
+            out
+        };
+        let (retired, awaiting) = (join(&retired_parts), join(&awaiting_parts));
         let relay = Builder::new()
             .string("url", &self.vault.relay.url)
             .string("mailbox", &self.vault.relay.mailbox)
@@ -193,11 +312,14 @@ impl DeviceState {
             .outbox
             .iter()
             .map(|o| {
-                let b = Builder::new().string("kind", &o.kind).base64("payload", &o.payload).string("created", &format_ts(o.created));
-                match o.exp {
-                    Some(e) => b.string("exp", &format_ts(e)).finish(),
-                    None => b.finish(),
+                let mut b = Builder::new().string("kind", &o.kind).base64("payload", &o.payload).string("created", &format_ts(o.created));
+                if let Some(e) = o.exp {
+                    b = b.string("exp", &format_ts(e));
                 }
+                if let Some(re) = &o.re {
+                    b = b.string("re", re);
+                }
+                b.finish()
             })
             .collect();
         let mut b = Builder::with_capacity(self.capacity())
@@ -224,6 +346,8 @@ impl DeviceState {
         let capacity = self.capacity();
         let out = Zeroizing::new(
             b.raw("epoch", &epoch)
+                .raw("retired", &retired)
+                .raw("awaiting", &awaiting)
                 .raw("seen", &times(&self.seen))
                 .raw("seen_inner", &times(&self.seen_inner))
                 .raw("outbox", &format!("[{}]", outbox.join(",")))
@@ -277,36 +401,19 @@ impl DeviceState {
             kem: PublicKey::parse(&v.base64("kem", Some(EK_SIZE)).map_err(c)?).map_err(|_| StoreError::Corrupt)?,
             relay,
         };
-        let e = o.object("epoch", 1).map_err(c)?;
-        let dir = |name: &str| -> Result<Option<Direction>, StoreError> {
-            if !e.has(name) {
-                return Ok(None);
-            }
-            let d = e.object(name, 2).map_err(c)?;
-            let kid = |n: &str| Kid::parse_hex(&d.string(n).map_err(c)?).ok_or(StoreError::Corrupt);
-            Ok(Some((seed(&d, "key")?, kid("recipient_kid")?, kid("sender_kid")?)))
-        };
-        let epoch = EpochState {
-            id: e.base64("id", Some(16)).map_err(c)?.try_into().map_err(|_| StoreError::Corrupt)?,
-            role: match e.string("role").map_err(c)?.as_str() {
-                "initiator" => Role::Initiator,
-                "responder" => Role::Responder,
-                _ => return Err(StoreError::Corrupt),
-            },
-            suite: e.uint("suite", 2, 255).map_err(c)? as u8,
-            policy: Policy {
-                max_age: TimeDelta::seconds(e.uint("max_age_secs", 0, i64::MAX as u64).map_err(c)? as i64),
-                max_messages: e.uint("max_messages", 0, strict_json::MAX_SAFE_INTEGER).map_err(c)?,
-            },
-            created: ts(&e, "created")?,
-            active: e.bool("active").map_err(c)?,
-            send: dir("send")?,
-            recv: dir("recv")?.ok_or(StoreError::Corrupt)?,
-            rk: if e.has("rk") { Some(seed(&e, "rk")?) } else { None },
-            last_seq: e.uint("last_seq", 0, strict_json::MAX_SAFE_INTEGER).map_err(c)?,
-            sent: e.uint("sent", 0, strict_json::MAX_SAFE_INTEGER).map_err(c)?,
-            received: e.uint("received", 0, strict_json::MAX_SAFE_INTEGER).map_err(c)?,
-        };
+        let epoch = parse_epoch(&o.object("epoch", 1).map_err(c)?, 1)?;
+        // Absent (a state stored before F3) is none.
+        let retired = list(&o, "retired", |r| Ok((parse_epoch(&r.object("epoch", 1).map_err(c)?, 1)?, time(r, "until")?)))?;
+        let awaiting = list(&o, "awaiting", |r| {
+            let state = ResponderState {
+                pending: parse_epoch(&r.object("pending", 1).map_err(c)?, 1)?,
+                th: *key32(r, "th")?,
+                verify_ik: verifying(r, "verify_ik")?,
+                sender: verifying(r, "sender")?,
+                since: time(r, "since")?,
+            };
+            Ok((state, r.string("init").map_err(c)?))
+        })?;
         Ok(DeviceState {
             ik_seed: seed(&o, "ik_seed")?,
             kem_seed: seed(&o, "kem_seed")?,
@@ -325,6 +432,8 @@ impl DeviceState {
             device_id: o.opt_string("device_id").map_err(c)?,
             vault_id: o.opt_string("vault_id").map_err(c)?,
             epoch,
+            retired,
+            awaiting,
             seen: times(&o, "seen")?,
             seen_inner: times(&o, "seen_inner")?,
             outbox: match o.get("outbox") {
@@ -339,7 +448,8 @@ impl DeviceState {
                             Some(x) => Some(parse_ts(&x).ok_or(StoreError::Corrupt)?),
                             None => None,
                         };
-                        Ok(OutboxEntry { kind: e.string("kind").map_err(c)?, payload: e.base64("payload", None).map_err(c)?, created: ts(&e, "created")?, exp })
+                        let re = e.opt_string("re").map_err(c)?;
+                        Ok(OutboxEntry { kind: e.string("kind").map_err(c)?, payload: e.base64("payload", None).map_err(c)?, created: ts(&e, "created")?, exp, re })
                     })
                     .collect::<Result<Vec<_>, StoreError>>()?,
             },
