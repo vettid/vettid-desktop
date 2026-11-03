@@ -3,20 +3,25 @@
 //! epoch they establish, as the vault's `vms/handshake` builds them.
 //!
 //! This client is the **initiator** of a pairing (`desktop`, and the other
-//! purposes that pair or connect: `app`, `agent`, `connection`). The
-//! responder side, which the desktop needs when its vault rekeys (§6.5),
-//! comes with the device engine, as do rekeys, reconnects, rotation
-//! chains and key retention.
+//! purposes that pair or connect: `app`, `agent`, `connection`), and the
+//! **responder** of a rekey, which its vault starts on every unlock and
+//! every 7 days (§6.5). The [`Keyring`] holds the current epoch and the
+//! previous ones' receive keys. Reconnects and rotation chains aren't
+//! here.
 //!
 //! Errors carry no key material, plaintext or input.
 
 mod epoch;
 mod initiator;
+mod keyring;
 mod messages;
+mod responder;
 mod schedule;
 
 pub use epoch::{Epoch, EpochState, Policy, Role, POLICY_VAULT_TO_DEVICE};
 pub use initiator::{Initiator, InitiatorConfig, Outcome};
+pub use keyring::{Keyring, KeyringState, RECEIVE_KEY_RETENTION};
+pub use responder::{answer_rekey, epoch_ctx, Established, RekeyConfig, Responder, ResponderState};
 pub use messages::{valid_ctx, valid_relay_url, valid_token, Fin, Init, Principal, RelayAddr, Resp};
 pub use schedule::{check_sas_commit, sas, sas_commit, sign_fin, sign_resp, th, th1, verify_fin, verify_resp, Schedule};
 
@@ -107,8 +112,15 @@ pub enum HandshakeError {
     Suite(SuiteError),
     /// The `hs.resp` `sender_kid` isn't all zero.
     SenderKid,
-    /// The relay collect `sender` isn't the responder's relay key.
+    /// The relay collect `sender` isn't the peer's relay key (on record,
+    /// or in `from.relay.pk`).
     Sender,
+    /// A rekey's `from.ik` isn't the identity on record.
+    Identity,
+    /// A session-mode `hs.init` whose purpose isn't `rekey`.
+    Purpose,
+    /// A rekey's `ctx` isn't the current epoch's id.
+    Ctx,
     /// `sig_R` didn't verify: the handshake is aborted.
     SigResp,
     /// `sig_I` didn't verify. A responder drops the `hs.fin` and keeps the
@@ -134,6 +146,9 @@ impl std::fmt::Display for HandshakeError {
             Self::Suite(e) => write!(f, "handshake: {e}"),
             Self::SenderKid => f.write_str("handshake: sender kid does not match"),
             Self::Sender => f.write_str("handshake: relay sender does not match"),
+            Self::Identity => f.write_str("handshake: identity does not match the record"),
+            Self::Purpose => f.write_str("handshake: unexpected purpose"),
+            Self::Ctx => f.write_str("handshake: ctx is not the current epoch"),
             Self::SigResp => f.write_str("handshake: sig_R verification failed"),
             Self::SigFin => f.write_str("handshake: sig_I verification failed"),
             Self::Inactive => f.write_str("handshake: epoch not active yet"),

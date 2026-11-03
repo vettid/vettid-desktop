@@ -146,6 +146,7 @@ pub(crate) mod vectors {
             "envelope_sealed" => include_str!("../../tests/vectors/envelope_sealed.json"),
             "handshake" => include_str!("../../tests/vectors/handshake.json"),
             "invite" => include_str!("../../tests/vectors/invite.json"),
+            "rekey" => include_str!("../../tests/vectors/rekey.json"),
             _ => panic!("no vector file {name}"),
         };
         serde_json::from_str(text).expect("vector JSON")
@@ -200,6 +201,7 @@ mod vendored {
             ("envelope_sealed.json", include_bytes!("../../tests/vectors/envelope_sealed.json").as_slice()),
             ("handshake.json", include_bytes!("../../tests/vectors/handshake.json").as_slice()),
             ("invite.json", include_bytes!("../../tests/vectors/invite.json").as_slice()),
+            ("rekey.json", include_bytes!("../../tests/vectors/rekey.json").as_slice()),
         ] {
             assert!(!text.contains(&b'\r'), "{name}: LF line endings, as in the vault");
             let hash = hex::encode(Sha256::digest(text));

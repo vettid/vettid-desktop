@@ -91,7 +91,7 @@ pub(super) trait Randomness {
     fn session_nonce(&mut self) -> Result<[u8; XNONCE_SIZE], HandshakeError>;
 }
 
-struct Os;
+pub(super) struct Os;
 
 impl Randomness for Os {
     fn ephemeral(&mut self) -> Result<PrivateKey, HandshakeError> {

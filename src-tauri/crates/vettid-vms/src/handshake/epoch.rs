@@ -1,9 +1,9 @@
 //! An epoch (§6.3, §6.5): a send and a receive direction, each with its
 //! key and kids, the per-direction `seq`, and the rekey secret `rk`.
-//! Rekey, retention of previous epochs and persistence come with the
-//! device engine, and so do the receive-side rules this type doesn't
-//! apply: `seq` as an ordering hint and gap detector (§5.3), and the
-//! dedupe of relay `msg_id`s and inner `id`s that catches replays (§8.2).
+//! Retention of previous epochs is the [`Keyring`](super::Keyring)'s. The
+//! device engine applies the receive-side rules this type doesn't: `seq`
+//! as an ordering hint and gap detector (§5.3), and the dedupe of relay
+//! `msg_id`s and inner `id`s that catches replays (§8.2).
 //!
 //! An epoch starts **inactive** unless its handshake activates it at
 //! once: a pairing's or connection's epoch activates only at approval
@@ -55,8 +55,6 @@ pub struct Epoch {
     active: bool,
     send: Option<Direction>,
     recv: Direction,
-    // Read by rekeys, which come with the device engine.
-    #[allow(dead_code)]
     rk: Option<Zeroizing<[u8; KEY_SIZE]>>,
     last_seq: u64,
     sent: u64,
@@ -226,9 +224,15 @@ impl Epoch {
     }
 
     /// `rk`, the `K_s` of the next rekey (§6.2).
-    #[allow(dead_code)]
     pub(crate) fn rk(&self) -> Result<&[u8; KEY_SIZE], HandshakeError> {
         self.rk.as_deref().ok_or(HandshakeError::EpochRetired)
+    }
+
+    /// Delete the send key and `rk` (they wipe themselves), when a newer
+    /// epoch activates (§6.5). The receive key stays.
+    pub(crate) fn retire_send(&mut self) {
+        self.send = None;
+        self.rk = None;
     }
 
     /// Seal an inner plaintext in session mode with a fresh nonce,
