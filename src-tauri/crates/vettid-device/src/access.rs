@@ -19,7 +19,9 @@
 //! - what the vault said is applied in the order the vault said it (its
 //!   inner `ts`), not in the order it arrived: messages arrive in no order
 //!   (§8.4), and a `vault.status` answer from before an end must not bring
-//!   the ended session back. At the same `ts`, no session wins over one.
+//!   the ended session back. The vault stamps a batch with one `ts`: at
+//!   the same `ts`, the vault's `seq` (§8.4, per epoch and direction)
+//!   decides, and without one on both, the later to arrive stands.
 //!
 //! **The ordering rule** (§6.8 "Ending", 0.82.5): no
 //! `device.session.request` is sent while this device's last
@@ -129,6 +131,17 @@ pub enum RequestOutcome {
     TooSoon { allowed_after: DateTime<Utc> },
 }
 
+/// What [`Access::read_status`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusRead {
+    /// `vault.status`'s `session`.
+    pub session: StatusSession,
+    /// An end of this device's is stored and unanswered (after a restart,
+    /// it isn't sent again until [`Access::settle`], [`Access::request`] or
+    /// [`Access::end`] runs): call [`Access::settle`].
+    pub end_pending: bool,
+}
+
 /// How an end came out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EndOutcome {
@@ -138,6 +151,10 @@ pub enum EndOutcome {
     /// `session` member): the person must not be told it ended. Requests
     /// may go again (the retries are spent).
     Unconfirmed,
+    /// No answer, and the session it named was replaced by another, which
+    /// `vault.status` shows current and which runs on (owner decision
+    /// 2026-11-03): this desktop still has access, and says so.
+    Replaced,
 }
 
 /// How [`Access::settle`] left the ordering rule.
@@ -346,7 +363,9 @@ fn empty_ok(answer: &Inner) -> Result<(), AccessError> {
 /// **The app calls [`Access::read_status`] after opening the session**
 /// (and whenever it may have missed events): until this `Access` has had
 /// an answer to its own `vault.status` (or to an end), no session is
-/// reported active.
+/// reported active. **Then, if it says `end_pending`, the app calls
+/// [`Access::settle`]**: an end stored before a restart is sent again only
+/// by `settle` (or `request`, `end`).
 #[derive(Debug)]
 pub struct Access {
     current: Option<AccessSession>,
@@ -355,9 +374,8 @@ pub struct Access {
     margin: TimeDelta,
     /// The vault's `ts` of the last thing applied to `current`.
     learned: Option<DateTime<Utc>>,
-    /// Whether that last thing said "no session" (at the same `ts`, it
-    /// wins over a grant).
-    learned_none: bool,
+    /// Its `seq`, if it had one: at the same `ts`, a lower `seq` is older.
+    learned_seq: Option<u64>,
     /// An answer to a `vault.status` this `Access` sent, or to an end, has
     /// come: before it, a grant isn't reported active. (An answer collected
     /// by a poll may be to a request sent before a restart: it doesn't
@@ -376,7 +394,7 @@ impl Default for Access {
 impl Access {
     /// No session known (as after a start: read `vault.status`).
     pub fn new() -> Self {
-        Access { current: None, margin: EXPIRY_MARGIN, learned: None, learned_none: false, baseline: false, timeout: REQUEST_TIMEOUT }
+        Access { current: None, margin: EXPIRY_MARGIN, learned: None, learned_seq: None, baseline: false, timeout: REQUEST_TIMEOUT }
     }
 
     /// The same, waiting `timeout` for each answer.
@@ -396,19 +414,21 @@ impl Access {
         self.baseline && self.current.as_ref().is_some_and(|s| s.active_at(t, self.margin))
     }
 
-    /// Apply what the vault said at `at`: `Some` a session, `None` none.
-    /// Older than what is already applied: ignored. A session that the
+    /// Apply what the vault said at `at` (its `ts`) with `seq`: `Some` a
+    /// session, `None` none. Older than what is already applied: ignored.
+    /// At the same `ts` (one batch of the vault's), the lower `seq` is the
+    /// older; without a `seq` on both, the later to arrive stands. (`seq`
+    /// counts per epoch: two messages of one millisecond across a rekey
+    /// would compare wrongly; the vault starts a rekey only between
+    /// batches.) A session that the
     /// unanswered end will end (the one it names, or any if it names none)
     /// doesn't become current.
-    fn learn(&mut self, at: DateTime<Utc>, session: Option<AccessSession>, pending: Option<&PendingEnd>) {
-        if let Some(l) = self.learned {
-            // Older: ignored. As old as a "no session": the safer one wins.
-            if at < l || (at == l && self.learned_none && session.is_some()) {
-                return;
-            }
+    fn learn(&mut self, at: DateTime<Utc>, seq: Option<u64>, session: Option<AccessSession>, pending: Option<&PendingEnd>) {
+        if !self.newer(at, seq) {
+            return;
         }
         self.learned = Some(at);
-        self.learned_none = session.is_none();
+        self.learned_seq = seq;
         let before = self.current.as_ref().map(|c| c.session_id.clone());
         self.current = match (session, pending) {
             (Some(s), Some(p)) if p.session_id.as_ref().is_none_or(|n| *n == s.session_id) => None,
@@ -424,6 +444,19 @@ impl Access {
         }
     }
 
+    /// Whether what the vault said at `at` with `seq` is not older than what
+    /// was applied last.
+    fn newer(&self, at: DateTime<Utc>, seq: Option<u64>) -> bool {
+        match self.learned {
+            None => true,
+            Some(l) if at != l => at > l,
+            Some(_) => match (self.learned_seq, seq) {
+                (Some(prev), Some(n)) => n >= prev,
+                _ => true,
+            },
+        }
+    }
+
     /// Drop the current session if `named` (or any, if `None`) is it.
     fn forget(&mut self, named: Option<&str>) {
         if named.is_none_or(|n| self.current.as_ref().is_some_and(|c| c.session_id == n)) {
@@ -433,11 +466,11 @@ impl Access {
 
     /// Ask `vault.status` and apply its `session`. Its answer (to this
     /// request, sent now) is the baseline [`Access::active_at`] needs.
-    pub async fn read_status<T: Transport, C: Clock>(&mut self, s: &mut Session<T, C>, store: &mut impl Persist) -> Result<StatusSession, AccessError> {
+    pub async fn read_status<T: Transport, C: Clock>(&mut self, s: &mut Session<T, C>, store: &mut impl Persist) -> Result<StatusRead, AccessError> {
         let answer = s.request(store, TYPE_STATUS, "{}", self.timeout).await?;
-        let status = self.status_answer(s, &answer)?;
+        let session = self.status_answer(s, &answer)?;
         self.baseline = true;
-        Ok(status)
+        Ok(StatusRead { session, end_pending: s.access_end().is_some() })
     }
 
     fn status_answer<T: Transport, C: Clock>(&mut self, s: &Session<T, C>, answer: &Inner) -> Result<StatusSession, AccessError> {
@@ -453,8 +486,8 @@ impl Access {
             }
         };
         match &status {
-            StatusSession::Session(x) => self.learn(answer.ts, Some(x.clone()), s.access_end()),
-            StatusSession::None => self.learn(answer.ts, None, s.access_end()),
+            StatusSession::Session(x) => self.learn(answer.ts, answer.seq, Some(x.clone()), s.access_end()),
+            StatusSession::None => self.learn(answer.ts, answer.seq, None, s.access_end()),
             // A vault before 0.41.0 says nothing: what a grant said stands.
             StatusSession::Absent => {}
         }
@@ -506,7 +539,8 @@ impl Access {
         }
         match self.settle(s, store).await? {
             Settled::OldVault => Ok(EndOutcome::Unconfirmed),
-            _ => Ok(EndOutcome::Ended),
+            Settled::Moot => Ok(EndOutcome::Replaced),
+            Settled::Clear | Settled::Answered | Settled::StatusNull => Ok(EndOutcome::Ended),
         }
     }
 
@@ -529,7 +563,7 @@ impl Access {
                 }
             }
             // The retries are spent: vault.status decides.
-            let status = self.read_status(s, store).await?;
+            let status = self.read_status(s, store).await?.session;
             match (status, &p.session_id) {
                 (StatusSession::None, _) => {
                     s.set_access_end(store, None)?;
@@ -588,9 +622,9 @@ impl Access {
             // what it named isn't current. A malformed `ok` is still an ok.
             self.baseline = true;
             self.forget(p.session_id.as_deref());
-            if self.learned.is_none_or(|l| answer.ts >= l) {
+            if self.newer(answer.ts, answer.seq) {
                 self.learned = Some(answer.ts);
-                self.learned_none = self.current.is_none();
+                self.learned_seq = answer.seq;
             }
         }
         ok
@@ -617,8 +651,8 @@ impl Access {
         }
         let Some(event) = parse_event(m) else { return Ok(None) };
         match &event {
-            Ok(AccessEvent::Granted(g)) => self.learn(m.ts, Some(g.clone()), s.access_end()),
-            Ok(AccessEvent::Ended) => self.learn(m.ts, None, s.access_end()),
+            Ok(AccessEvent::Granted(g)) => self.learn(m.ts, m.seq, Some(g.clone()), s.access_end()),
+            Ok(AccessEvent::Ended) => self.learn(m.ts, m.seq, None, s.access_end()),
             // A renewal denied: the current session runs on (0.77.0).
             Ok(_) => {}
             // Something changed that can't be read: nothing is assumed.

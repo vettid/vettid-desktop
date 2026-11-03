@@ -146,7 +146,7 @@ async fn pairs_and_collects_on_the_dev_stack() {
     // 6. Access sessions (§6.8, the V6 exit flow). The pairing granted
     //    one (session_seconds: 600): vault.status shows it.
     let mut access = Access::with_timeout(TimeDelta::seconds(60));
-    let first = match access.read_status(&mut s, &mut store).await.expect("vault.status") {
+    let first = match access.read_status(&mut s, &mut store).await.expect("vault.status").session {
         StatusSession::Session(x) => x,
         other => panic!("no session after a pairing with session_seconds: {other:?}"),
     };
@@ -156,7 +156,7 @@ async fn pairs_and_collects_on_the_dev_stack() {
     // 7. End it by its session_id: vault.status reads null.
     assert_eq!(access.end(&mut s, &mut store, Some(&first.session_id)).await, Ok(EndOutcome::Ended));
     assert!(!access.active_at(Utc::now()));
-    assert_eq!(access.read_status(&mut s, &mut store).await, Ok(StatusSession::None), "ended by its id");
+    assert_eq!(access.read_status(&mut s, &mut store).await.map(|r| r.session), Ok(StatusSession::None), "ended by its id");
     println!("ended by session_id; vault.status session: null");
 
     // 8. Ask for a new one.
@@ -196,14 +196,14 @@ async fn pairs_and_collects_on_the_dev_stack() {
     assert_eq!(granted.session_id, approved_id);
     assert_ne!(granted.session_id, first.session_id);
     assert!(access.active_at(Utc::now()));
-    match access.read_status(&mut s, &mut store).await.expect("vault.status") {
+    match access.read_status(&mut s, &mut store).await.expect("vault.status").session {
         StatusSession::Session(x) => assert_eq!(x, granted),
         other => panic!("vault.status doesn't show the grant: {other:?}"),
     }
 
     // 11. End without a session_id (the person's End access): null.
     assert_eq!(access.end(&mut s, &mut store, None).await, Ok(EndOutcome::Ended));
-    assert_eq!(access.read_status(&mut s, &mut store).await, Ok(StatusSession::None), "all access ended");
+    assert_eq!(access.read_status(&mut s, &mut store).await.map(|r| r.session), Ok(StatusSession::None), "all access ended");
     assert!(!access.active_at(Utc::now()));
     assert!(s.access_end().is_none());
     println!("ended without session_id; vault.status session: null");

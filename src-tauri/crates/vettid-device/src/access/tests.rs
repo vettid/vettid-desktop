@@ -195,7 +195,7 @@ async fn an_answered_end_lets_the_request_go() {
     let mut a = access();
     assert!(!a.active_at(Utc::now()), "nothing known before vault.status");
     let (st, _) = tokio::join!(a.read_status(&mut s, &mut store), answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(Some("s-1")))));
-    assert!(matches!(st, Ok(StatusSession::Session(ref x)) if x.session_id == "s-1"));
+    assert!(matches!(st.map(|r| r.session), Ok(StatusSession::Session(ref x)) if x.session_id == "s-1"));
     assert!(a.active_at(Utc::now()));
     let (got, end) = tokio::join!(a.end(&mut s, &mut store, Some("s-1")), answer(&mut vault, TYPE_END, Status::Ok, "{}"));
     assert_eq!(got, Ok(EndOutcome::Ended));
@@ -570,7 +570,7 @@ async fn baseline(a: &mut Access, s: &mut S, store: &mut MemStore, vault: &mut V
         deposit(vault, r).await;
     };
     let (st, ()) = tokio::join!(a.read_status(s, store), vault_side);
-    assert_eq!(st, Ok(StatusSession::None));
+    assert_eq!(st.map(|r| r.session), Ok(StatusSession::None));
 }
 
 /// Grants replace the session; a denied renewal leaves it running; an end
@@ -751,34 +751,109 @@ async fn the_vaults_order_wins() {
     assert!(!a.active_at(t), "the older answer is ignored");
 }
 
-/// At the same `ts`, "no session" wins over a grant, in either order of
-/// arrival.
+/// At the same `ts` (one batch of the vault's), the vault's `seq` decides,
+/// whatever the order of arrival; without a `seq` on both, the later to
+/// arrive stands.
 #[tokio::test]
-async fn at_the_same_ts_the_end_wins() {
+async fn at_the_same_ts_seq_decides() {
     let (relay, mut vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store);
     let t = Utc::now();
-    let mut grant = event(TYPE_GRANTED, &session_body("s-1", t + TimeDelta::hours(1)));
-    grant.ts = t;
-    let mut ended = event(TYPE_ENDED, r#"{"reason":"ended"}"#);
-    ended.ts = t;
-    let mut null = response(&event(TYPE_STATUS, "{}"), Status::Ok, &status_body(Some(None)));
-    null.ts = t;
-    for (first, second) in [(&grant, &ended), (&ended, &grant), (&grant, &null), (&null, &grant)] {
+    let at = |mut m: Inner, seq: Option<u64>| {
+        m.ts = t;
+        m.seq = seq;
+        m
+    };
+    let grant = |seq| at(event(TYPE_GRANTED, &session_body("s-1", t + TimeDelta::hours(1))), seq);
+    let ended = |seq| at(event(TYPE_ENDED, r#"{"reason":"ended"}"#), seq);
+    let null = |seq| at(response(&event(TYPE_STATUS, "{}"), Status::Ok, &status_body(Some(None))), seq);
+    for (first, second, active) in [
+        // The later seq stands, in either order of arrival.
+        (grant(Some(5)), ended(Some(6)), false),
+        (ended(Some(6)), grant(Some(5)), false),
+        (ended(Some(5)), grant(Some(6)), true),
+        (grant(Some(6)), ended(Some(5)), true),
+        (null(Some(5)), grant(Some(6)), true),
+        (grant(Some(5)), null(Some(6)), false),
+        (grant(Some(6)), null(Some(5)), true),
+        // No seq on one of them: the later to arrive.
+        (grant(None), ended(Some(1)), false),
+        (ended(None), grant(None), true),
+        (grant(Some(9)), null(None), false),
+    ] {
         let mut a = access();
         baseline(&mut a, &mut s, &mut store, &mut vault).await;
-        a.observe(&mut s, &mut store, first).unwrap();
-        a.observe(&mut s, &mut store, second).unwrap();
-        assert!(!a.active_at(t), "{} then {}", first.kind, second.kind);
+        a.observe(&mut s, &mut store, &first).unwrap();
+        a.observe(&mut s, &mut store, &second).unwrap();
+        assert_eq!(a.active_at(t), active, "{} {:?} then {} {:?}", first.kind, first.seq, second.kind, second.seq);
     }
-    // Two grants at the same ts: the later to arrive stands.
+}
+
+/// The same batch through the engine: the vault answers `vault.status`
+/// with `null` and grants a session in the same millisecond (one `ts`),
+/// the grant sealed after: the grant stands.
+#[tokio::test]
+async fn a_grant_in_the_same_batch_as_a_null_status() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
     let mut a = access();
-    baseline(&mut a, &mut s, &mut store, &mut vault).await;
-    let mut other = event(TYPE_GRANTED, &session_body("s-2", t + TimeDelta::hours(1)));
-    other.ts = t;
-    a.observe(&mut s, &mut store, &grant).unwrap();
-    a.observe(&mut s, &mut store, &other).unwrap();
+    let t = parse_ts(&format_ts(Utc::now())).unwrap();
+    let vault_side = async {
+        let req = receive(&mut vault).await;
+        let mut r = response(&req, Status::Ok, &status_body(Some(None)));
+        r.ts = t;
+        deposit(&mut vault, r).await;
+        let mut g = event(TYPE_GRANTED, &session_body("s-1", t + TimeDelta::hours(1)));
+        g.ts = t;
+        deposit(&mut vault, g).await;
+    };
+    let (st, ()) = tokio::join!(a.read_status(&mut s, &mut store), vault_side);
+    assert_eq!(st.map(|r| r.session), Ok(StatusSession::None));
+    let msgs = s.poll(&mut store).await.unwrap();
+    assert_eq!(msgs.len(), 1, "the grant, held from the request's batch");
+    assert!(msgs[0].seq.is_some(), "the vault's seq");
+    assert!(matches!(a.observe(&mut s, &mut store, &msgs[0]), Ok(Some(AccessEvent::Granted(_)))));
+    assert!(a.active_at(t), "the grant came after the null in the batch");
+}
+
+/// An end of s-1 that vault.status shows replaced by s-2: `Replaced`, not
+/// `Ended`, and s-2 is active.
+#[tokio::test]
+async fn an_end_of_a_replaced_session_says_replaced() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    let vault_side = async {
+        ends(&mut vault, END_ATTEMPTS, r#"{"session_id":"s-1"}"#).await;
+        answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(Some("s-2")))).await;
+    };
+    let (got, ()) = tokio::join!(a.end(&mut s, &mut store, Some("s-1")), vault_side);
+    assert_eq!(got, Ok(EndOutcome::Replaced));
+    assert!(a.active_at(Utc::now()));
     assert_eq!(a.current().unwrap().session_id, "s-2");
+    assert!(s.access_end().is_none());
+}
+
+/// After a restart, read_status says an end is pending; settle then sends
+/// it again under its id.
+#[tokio::test]
+async fn read_status_reports_a_pending_end() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let id = record_end(&mut s, &mut store, None, 1);
+    drop(s);
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    let (st, _) = tokio::join!(a.read_status(&mut s, &mut store), answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(Some("s-1")))));
+    let st = st.unwrap();
+    assert!(st.end_pending);
+    assert!(!a.active_at(Utc::now()), "its own end will end s-1");
+    assert_eq!(vault.waiting(), 0, "read_status sends no end");
+    let (got, end) = tokio::join!(a.settle(&mut s, &mut store), answer(&mut vault, TYPE_END, Status::Ok, "{}"));
+    assert_eq!(got, Ok(Settled::Answered));
+    assert_eq!(end.id, id);
+    let (st, _) = tokio::join!(a.read_status(&mut s, &mut store), answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(None))));
+    assert_eq!(st, Ok(StatusRead { session: StatusSession::None, end_pending: false }));
 }
 
 /// A session event that doesn't check out drops the session (fail
