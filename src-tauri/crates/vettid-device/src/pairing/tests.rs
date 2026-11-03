@@ -242,6 +242,12 @@ fn stored_state_round_trips() {
         asked: [("01JB2Z6V9K3M4N5P6Q7R8S9T0W".to_string(), vettid_vms::envelope::parse_ts("2026-10-02T12:00:00.000Z").unwrap())].into(),
         asked_kinds: [("01JB2Z6V9K3M4N5P6Q7R8S9T0W".to_string(), "test.ask".to_string())].into(),
         refused: true,
+        unlinked: Some("removed".into()),
+        inbox: vec![vettid_vms::envelope::Inner::parse(
+            br#"{"v":1,"id":"01JB2Z6V9K3M4N5P6Q7R8S9T0Y","type":"device.unlinked","ts":"2026-10-01T12:00:00.000Z","seq":3,"body":{"reason":"removed"}}"#,
+            vettid_vms::envelope::Mode::Session,
+        )
+        .unwrap()],
     };
     let json = state.to_json();
     let back = DeviceState::from_json(json.as_bytes()).unwrap();

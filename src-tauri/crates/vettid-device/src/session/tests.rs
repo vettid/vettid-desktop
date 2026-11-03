@@ -820,3 +820,191 @@ async fn open_trims_the_waiting_rekeys() {
     assert!(s.awaiting.iter().all(|w| w.init != "01JB2Z6V9K3M4N5P6Q7R8S9T0Z"));
     assert_eq!(s.outbox_len(), MAX_AWAITING, "its answer is out of the outbox");
 }
+
+/// `device.unlinked` (§7.4): stored before its ack, returned again after a
+/// restart until handled, and the device is refused from then on, with
+/// the reason. Nothing is erased by the engine.
+#[tokio::test]
+async fn unlinked_is_kept_until_handled() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    {
+        let mut s = session(&relay, &faults, &mut store, Ticking::new());
+        faults.lock().unwrap().temporary = 1;
+        s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+        assert_eq!(s.outbox_len(), 1);
+        vault_deposit(&mut vault, event("device.unlinked", r#"{"reason":"removed"}"#), None).await;
+        let got = s.poll(&mut store).await.unwrap();
+        assert_eq!(got.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), ["device.unlinked"]);
+        assert_eq!(vault.device_waiting(), 0, "acked once stored");
+        assert!(s.is_refused());
+        assert_eq!(s.unlinked(), Some("removed"));
+        assert_eq!((s.outbox_len(), s.take_dropped()), (0, vec!["test.ping".to_string()]));
+        assert!(s.poll(&mut store).await.unwrap().is_empty(), "returned once per session");
+        assert_eq!(s.send(&mut store, "test.ping", "{}", false).await.unwrap_err(), SessionError::Refused);
+    }
+    // A crash before the app acted: it comes again.
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    assert_eq!(s.unlinked(), Some("removed"));
+    let got = s.poll(&mut store).await.unwrap();
+    assert_eq!(got.len(), 1);
+    s.handled(&mut store, &got[0].id).unwrap();
+    assert!(store.inner.data.is_some(), "not erased by the engine");
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    assert!(s.poll(&mut store).await.unwrap().is_empty());
+    assert_eq!((s.unlinked(), s.is_refused()), (Some("removed"), true), "still removed");
+}
+
+/// If the batch can't be stored, `device.unlinked` isn't acked and nothing
+/// changes; a failed `handled` keeps the event.
+#[tokio::test]
+async fn unlinked_rolls_back() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    vault_deposit(&mut vault, event("device.unlinked", "{}"), None).await;
+    store.fail = true;
+    assert!(s.poll(&mut store).await.is_err());
+    assert_eq!((vault.device_waiting(), s.is_refused(), s.unlinked()), (1, false, None));
+    store.fail = false;
+    let got = s.poll(&mut store).await.unwrap();
+    assert_eq!(s.unlinked(), Some(""), "no reason given");
+    store.fail = true;
+    assert!(s.handled(&mut store, &got[0].id).is_err());
+    store.fail = false;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    assert_eq!(s.poll(&mut store).await.unwrap().len(), 1, "still in the inbox");
+}
+
+/// The inbox holds at most INBOX_CAP events: one more is left unacked
+/// (not dropped), and taken once the app has handled one.
+#[tokio::test]
+async fn the_inbox_is_capped() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    for n in 0..INBOX_CAP + 1 {
+        vault_deposit(&mut vault, event("identity.rotate", &format!(r#"{{"n":{n}}}"#)), None).await;
+    }
+    let mut got = Vec::new();
+    for _ in 0..4 {
+        got.extend(s.poll(&mut store).await.unwrap());
+    }
+    assert_eq!((got.len(), s.state.inbox.len(), vault.device_waiting()), (INBOX_CAP, INBOX_CAP, 1));
+    assert!(!s.is_refused(), "identity.rotate doesn't refuse");
+    s.handled(&mut store, &got[0].id).unwrap();
+    let more = s.poll(&mut store).await.unwrap();
+    assert_eq!((more.len(), vault.device_waiting()), (1, 0));
+    assert_eq!(more[0].body.as_str(), format!(r#"{{"n":{}}}"#, INBOX_CAP));
+}
+
+/// `device.unlinked` isn't held back by a full inbox; a repeat (the same
+/// notice again) and a later one add nothing; one as a response doesn't
+/// unlink.
+#[tokio::test]
+async fn unlinked_edge_cases() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    // As a response to nothing asked: dropped, not an unlink.
+    let mut as_response = event("device.unlinked", "{}");
+    as_response.response = Some(Response { re: "01JB2Z6V9K3M4N5P6Q7R8S9T0V".into(), status: Status::Ok });
+    vault_deposit(&mut vault, as_response, None).await;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.unlinked(), None);
+    for n in 0..INBOX_CAP {
+        vault_deposit(&mut vault, event("identity.rotate", &format!(r#"{{"n":{n}}}"#)), None).await;
+    }
+    poll_all(&mut s, &mut store, 3).await;
+    assert_eq!(s.state.inbox.len(), INBOX_CAP);
+    let env = vault_deposit(&mut vault, event("device.unlinked", r#"{"reason":"removed"}"#), None).await;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!((s.unlinked(), vault.device_waiting(), s.state.inbox.len()), (Some("removed"), 0, INBOX_CAP + 1));
+    vault.deposit_raw(&env).await;
+    vault_deposit(&mut vault, event("device.unlinked", r#"{"reason":"other"}"#), None).await;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!((s.unlinked(), vault.device_waiting(), s.state.inbox.len()), (Some("removed"), 0, INBOX_CAP + 1));
+}
+
+/// Unlinking ends a waiting rekey and takes its queued answer out; a
+/// request in progress returns Refused, and the notice waits for the next
+/// poll.
+#[tokio::test]
+async fn unlinked_ends_rekeys_and_requests() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    faults.lock().unwrap().temporary = 1;
+    vault.start_rekey().await;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!((s.awaiting.len(), s.outbox_len()), (1, 1));
+    s.hold_until = Utc::now() - TimeDelta::seconds(1);
+    faults.lock().unwrap().temporary = 1000;
+    vault_deposit(&mut vault, event("device.unlinked", "{}"), None).await;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!((s.awaiting.len(), s.outbox_len()), (0, 0));
+    // A request: refused at once now.
+    assert_eq!(s.request(&mut store, "test.ask", "{}", REQUEST_TIMEOUT).await.unwrap_err(), SessionError::Refused);
+}
+
+#[tokio::test]
+async fn a_request_interrupted_by_an_unlink() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    vault_deposit(&mut vault, event("device.unlinked", r#"{"reason":"removed"}"#), None).await;
+    assert_eq!(s.request(&mut store, "test.ask", "{}", REQUEST_TIMEOUT).await.unwrap_err(), SessionError::Refused);
+    let got = s.poll(&mut store).await.unwrap();
+    assert_eq!(got.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), ["device.unlinked"]);
+}
+
+/// After a restart with the relay out of reach, the stored inbox is still
+/// returned.
+#[tokio::test]
+async fn the_inbox_without_the_relay() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    {
+        let mut s = session(&relay, &faults, &mut store, Ticking::new());
+        vault_deposit(&mut vault, event("device.unlinked", "{}"), None).await;
+        s.poll(&mut store).await.unwrap();
+    }
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    faults.lock().unwrap().collects = 2;
+    assert_eq!(s.poll(&mut store).await.unwrap().len(), 1);
+    assert!(s.poll(&mut store).await.is_err(), "nothing more to return: the relay error");
+}
+
+/// Inbox events come first in a poll's result.
+#[tokio::test]
+async fn inbox_events_come_first() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    vault_deposit(&mut vault, event("test.before", "{}"), None).await;
+    vault_deposit(&mut vault, event("identity.rotate", "{}"), None).await;
+    let got = s.poll(&mut store).await.unwrap();
+    assert_eq!(got.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), ["identity.rotate", "test.before"]);
+}
+
+/// A deeply nested inbox body doesn't make the stored state unreadable.
+#[tokio::test]
+async fn a_deep_inbox_body_still_loads() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let depth = 29;
+    let body = format!("{}{}", r#"{"a":"#.repeat(depth), "1".to_string() + &"}".repeat(depth));
+    {
+        let mut s = session(&relay, &faults, &mut store, Ticking::new());
+        vault_deposit(&mut vault, event("identity.rotate", &body), None).await;
+        assert_eq!(s.poll(&mut store).await.unwrap().len(), 1);
+    }
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    let got = s.poll(&mut store).await.unwrap();
+    assert_eq!(got[0].body.as_str(), body);
+}
+
+/// A state stored before the inbox opens.
+#[tokio::test]
+async fn a_state_from_before_the_inbox_opens() {
+    let (relay, _vault, faults, mut store) = paired().await;
+    drop(session(&relay, &faults, &mut store, Ticking::new()));
+    let mut v: serde_json::Value = serde_json::from_slice(&store.inner.data.clone().unwrap()).unwrap();
+    let o = v.as_object_mut().unwrap();
+    assert!(o.remove("inbox").is_some());
+    assert!(o.remove("unlinked").is_none(), "absent while linked");
+    store.inner.data = Some(Zeroizing::new(serde_json::to_vec(&v).unwrap()));
+    let s = session(&relay, &faults, &mut store, Ticking::new());
+    assert_eq!((s.unlinked(), s.state.inbox.len()), (None, 0));
+}
