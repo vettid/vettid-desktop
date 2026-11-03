@@ -645,6 +645,41 @@ async fn the_margin_fits_the_session() {
     assert_eq!(margin_for(&past, t0 + TimeDelta::seconds(1)), TimeDelta::zero());
 }
 
+/// The same session named again late in its life keeps the larger margin
+/// (a shrinking one would show it past its end on a desktop clock that is
+/// behind); a different session gets its own.
+#[tokio::test]
+async fn a_late_re_read_keeps_the_margin() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    baseline(&mut a, &mut s, &mut store, &mut vault).await;
+    let t0 = parse_ts(&format_ts(Utc::now())).unwrap();
+    let exp = t0 + TimeDelta::seconds(60);
+    let mut g = event(TYPE_GRANTED, &session_body("s-1", exp));
+    g.ts = t0;
+    a.observe(&mut s, &mut store, &g).unwrap(); // 60 s: a 15 s margin
+    // vault.status names s-1 again, 40 s in: alone it would be 5 s.
+    let vault_side = async {
+        let req = receive(&mut vault).await;
+        let mut r = response(&req, Status::Ok, &format!(r#"{{"session":{}}}"#, session_body("s-1", exp)));
+        r.ts = t0 + TimeDelta::seconds(40);
+        deposit(&mut vault, r).await;
+    };
+    let (st, ()) = tokio::join!(a.read_status(&mut s, &mut store), vault_side);
+    assert!(st.is_ok());
+    let fifteen = exp - TimeDelta::seconds(15);
+    assert!(a.active_at(fifteen - TimeDelta::milliseconds(1)));
+    assert!(!a.active_at(fifteen), "still 15 s early, not 5");
+    // A different session, named 40 s before its end: its own 10 s.
+    let exp2 = exp + TimeDelta::seconds(60);
+    let mut g2 = event(TYPE_GRANTED, &session_body("s-2", exp2));
+    g2.ts = exp2 - TimeDelta::seconds(40);
+    a.observe(&mut s, &mut store, &g2).unwrap();
+    let ten = exp2 - TimeDelta::seconds(10);
+    assert!(a.active_at(ten - TimeDelta::milliseconds(1)) && !a.active_at(ten));
+}
+
 /// The engine keeps a request armed across a restart, so the answer to a
 /// vault.status sent before it can arrive after it: it is applied, but it
 /// is not the baseline. A later grant isn't reported active until this

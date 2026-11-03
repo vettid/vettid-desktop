@@ -409,12 +409,18 @@ impl Access {
         }
         self.learned = Some(at);
         self.learned_none = session.is_none();
+        let before = self.current.as_ref().map(|c| c.session_id.clone());
         self.current = match (session, pending) {
             (Some(s), Some(p)) if p.session_id.as_ref().is_none_or(|n| *n == s.session_id) => None,
             (s, _) => s,
         };
         if let Some(c) = &self.current {
-            self.margin = margin_for(c, at);
+            let new = margin_for(c, at);
+            // The same session named again late in its life must not shrink
+            // the margin (a desktop clock that is behind would then show it
+            // past its end): keep the larger one. A different session gets
+            // its own.
+            self.margin = if before.as_deref() == Some(c.session_id.as_str()) { self.margin.max(new) } else { new };
         }
     }
 
