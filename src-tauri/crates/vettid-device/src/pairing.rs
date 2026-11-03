@@ -348,6 +348,10 @@ pub async fn start<T: Transport, C: Clock>(
         device_id: None,
         vault_id: None,
         epoch: out.epoch.snapshot(),
+        seen: Default::default(),
+        seen_inner: Default::default(),
+        outbox: Vec::new(),
+        refused: false,
     };
     // Stored before hs.fin goes out and before hs.resp is acked; from here
     // on, any failure removes it again.

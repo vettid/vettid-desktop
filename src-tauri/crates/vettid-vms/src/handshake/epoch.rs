@@ -77,7 +77,8 @@ impl std::fmt::Debug for Epoch {
 
 /// Everything an epoch holds, for storing it and restoring it later (the
 /// device engine's persistence). It is secret: its keys wipe themselves,
-/// and `Debug` prints nothing.
+/// and `Debug` prints nothing. A clone is as secret, and wipes itself too.
+#[derive(Clone)]
 pub struct EpochState {
     pub id: [u8; EPOCH_ID_SIZE],
     pub role: Role,

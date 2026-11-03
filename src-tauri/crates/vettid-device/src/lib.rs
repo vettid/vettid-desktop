@@ -4,8 +4,9 @@
 //! member compares on their phone, and the owner's approval
 //! (`device.paired`) or rejection (`device.pair.rejected`).
 //!
-//! The session engine (dedupe, ack after persist, the outbox) and the
-//! responder side (the vault's rekeys) follow in later parts.
+//! [`session`] runs a paired desktop's session: sending through an outbox,
+//! collecting with both dedupe layers, storing before acking, and keeping
+//! tokens fresh. The responder side (the vault's rekeys) follows.
 //!
 //! - [`transport`]: the relay operations the engine needs, over
 //!   `vettid-relay`'s client.
@@ -26,6 +27,7 @@ compile_error!("the dev-file-store feature writes keys to a plain file: it is fo
 
 pub mod display;
 pub mod pairing;
+pub mod session;
 pub mod store;
 pub mod token;
 pub mod transport;

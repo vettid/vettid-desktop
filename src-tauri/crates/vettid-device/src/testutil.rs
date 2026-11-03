@@ -51,6 +51,10 @@ pub(crate) struct Faults {
     pub(crate) acks: usize,
     /// Fail the deposit with this index (0-based), certainly undelivered.
     pub(crate) deposit: Option<usize>,
+    /// Fail this many deposits temporarily (no connection: not delivered).
+    pub(crate) temporary: usize,
+    /// Answer every deposit token_revoked.
+    pub(crate) revoked: bool,
     pub(crate) deposits_seen: usize,
 }
 
@@ -81,6 +85,14 @@ impl Transport for Mem {
             if f.deposit == Some(n) {
                 let error = RelayError::Relay { status: 400, code: "bad_request".into(), retry_after: None, quota: None };
                 return Err(DepositError { error, possibly_delivered: false });
+            }
+            if f.revoked {
+                let error = RelayError::Relay { status: 403, code: "token_revoked".into(), retry_after: None, quota: None };
+                return Err(DepositError { error, possibly_delivered: false });
+            }
+            if f.temporary > 0 {
+                f.temporary -= 1;
+                return Err(DepositError { error: RelayError::Connect, possibly_delivered: false });
             }
         }
         let id = new_ulid(Utc::now()).unwrap();
@@ -115,7 +127,9 @@ impl Transport for Mem {
                 return Err(RelayError::Transport);
             }
         }
-        if let Some(mb) = self.relay.lock().unwrap().mailboxes.get_mut(&self.mailbox()) {
+        let mut r = self.relay.lock().unwrap();
+        r.log.push(format!("{} ack", self.name));
+        if let Some(mb) = r.mailboxes.get_mut(&self.mailbox()) {
             mb.retain(|m| m.msg_id != msg_id);
         }
         Ok(())

@@ -35,7 +35,7 @@ async fn pairs_end_to_end() {
     assert_eq!(paired, Paired { device_id: "dev-1".into(), vault_id: Some("vault-1".into()) });
     // The order: hs.init out, stored, hs.fin out; the vault's device.paired
     // in, stored.
-    let log: Vec<String> = relay.lock().unwrap().log.iter().filter(|l| *l != "vault deposit").cloned().collect();
+    let log: Vec<String> = relay.lock().unwrap().log.iter().filter(|l| !l.starts_with("vault") && !l.ends_with(" ack")).cloned().collect();
     assert_eq!(log, ["desktop deposit", "save", "desktop deposit", "save"]);
     let stored = DeviceState::load_paired(&mut store).unwrap().unwrap();
     assert_eq!((stored.phase, stored.epoch.active, stored.device_id.as_deref()), (Phase::Paired, true, Some("dev-1")));
@@ -229,6 +229,10 @@ fn stored_state_round_trips() {
         device_id: None,
         vault_id: Some("vault-1".into()),
         epoch: epoch.snapshot(),
+        seen: [("01JB2Z6V9K3M4N5P6Q7R8S9T0V".to_string(), vettid_vms::envelope::parse_ts("2026-10-01T12:00:00.000Z").unwrap())].into(),
+        seen_inner: Default::default(),
+        outbox: vec![crate::store::OutboxEntry { kind: "test.ping".into(), payload: vec![1, 2, 3], created: vettid_vms::envelope::parse_ts("2026-10-01T12:00:00.000Z").unwrap() }],
+        refused: true,
     };
     let json = state.to_json();
     let back = DeviceState::from_json(json.as_bytes()).unwrap();
