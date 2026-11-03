@@ -24,9 +24,11 @@ tokio = { version = "1", features = ["time"] }
 rand = "0.8"
 
 [features]
-# The local dev stack's relay is plain HTTP on 127.0.0.1. Off by default:
-# no release build may talk to a relay without TLS.
-devstack = []
+# DEVELOPMENT ONLY: reach the local dev stack's relay (relay.vettid.test
+# at its loopback TLS front, trusting only the stack's TEST-ONLY root).
+# lib.rs and build.rs refuse it in any release or optimized build, and CI
+# checks that and that the app can't enable it.
+dev-relay = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

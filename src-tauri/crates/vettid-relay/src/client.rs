@@ -11,9 +11,9 @@
 //!   any other (a 3xx included: redirects are off) is `Malformed`.
 //! - The User-Agent is `VettID-Desktop` on every request (VM §13.6).
 //! - Ids that go into a URL path are checked for shape first.
-//! - The base URL must be `https://`. Only tests, and builds with the
-//!   non-default `devstack` feature (the local dev stack's plain-HTTP
-//!   relay), may use `http://`.
+//! - The base URL must be `https://`. Only this crate's own tests may use
+//!   `http://`. The local dev stack's relay is reached over TLS, through
+//!   [`RelayClient::new_dev`] (development builds only, `dev-relay`).
 //! - Every response body is read with a size cap, checked while reading,
 //!   so a hostile or broken relay can't make the client buffer without
 //!   bound.
@@ -369,6 +369,20 @@ impl RelayClient {
         Ok(Self { base_url, key, http, max_attempts: 3, max_payload_bytes: DEFAULT_MAX_PAYLOAD })
     }
 
+    /// **DEVELOPMENT ONLY** (`dev-relay`): a client for the dev stack's
+    /// relay, `https://relay.vettid.test` and nothing else, resolved to its
+    /// loopback front and trusting only the stack's TEST-ONLY root
+    /// ([`crate::dev`]).
+    #[cfg(feature = "dev-relay")]
+    pub fn new_dev(base_url: &str, key: SigningKey, dev: &crate::dev::DevRelay) -> Result<Self, RelayError> {
+        let base_url = check_base_url(base_url, false)?;
+        if base_url != crate::dev::DEV_RELAY_URL {
+            return Err(RelayError::Invalid);
+        }
+        let http = dev.builder()?.user_agent(USER_AGENT).redirect(reqwest::redirect::Policy::none()).build().map_err(|_| RelayError::Invalid)?;
+        Ok(Self { base_url, key, http, max_attempts: 3, max_payload_bytes: DEFAULT_MAX_PAYLOAD })
+    }
+
     /// This client's mailbox id (§3.2).
     pub fn mailbox_id(&self) -> String {
         auth::mailbox_id(&self.key.verifying_key())
@@ -630,7 +644,7 @@ fn retry_delay(attempt: u32, last: &RelayError) -> Duration {
 
 /// Whether a plain-HTTP relay is allowed: tests, and the dev stack only.
 const fn http_allowed() -> bool {
-    cfg!(test) || cfg!(feature = "devstack")
+    cfg!(test)
 }
 
 /// A relay base URL as an origin (`scheme://host[:port]`): `https`, or

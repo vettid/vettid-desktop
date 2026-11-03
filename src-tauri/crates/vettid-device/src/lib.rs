@@ -25,6 +25,9 @@
 #[cfg(all(feature = "dev-file-store", not(debug_assertions)))]
 compile_error!("the dev-file-store feature writes keys to a plain file: it is for development builds only");
 
+#[cfg(all(feature = "dev-relay", not(debug_assertions)))]
+compile_error!("the dev-relay feature trusts the dev stack's TEST-ONLY TLS root: it is for development builds only");
+
 pub mod display;
 pub mod pairing;
 pub mod session;

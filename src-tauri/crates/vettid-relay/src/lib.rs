@@ -11,6 +11,13 @@
 //! Nothing here logs, and no error carries key, signature, token or payload
 //! material.
 
+#[cfg(all(feature = "dev-relay", not(debug_assertions)))]
+compile_error!("the dev-relay feature trusts the dev stack's TEST-ONLY TLS root: it is for development builds only");
+
 pub mod auth;
 pub mod client;
 pub mod token;
+
+/// The local dev stack's relay (development builds only).
+#[cfg(feature = "dev-relay")]
+pub mod dev;

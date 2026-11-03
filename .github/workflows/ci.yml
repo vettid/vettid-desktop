@@ -86,6 +86,24 @@ jobs:
             echo "a profile in src-tauri/Cargo.toml enables debug-assertions"; exit 1
           fi
 
+      - name: dev relay gate (vettid-relay, vettid-device)
+        shell: bash
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml -p vettid-relay --features dev-relay --locked
+          cargo clippy --manifest-path src-tauri/Cargo.toml -p vettid-relay -p vettid-device --features vettid-relay/dev-relay,vettid-device/dev-relay --all-targets --locked -- -D warnings
+          for pkg in vettid-relay vettid-device; do
+            for env in "" "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true"; do
+              if env $env cargo check --manifest-path src-tauri/Cargo.toml -p $pkg --features dev-relay --release --locked 2> release.log; then
+                echo "a release build of $pkg accepted the dev-relay feature ($env)"; exit 1
+              fi
+              grep -q "for development builds only" release.log
+            done
+          done
+          tree=$(cargo tree --manifest-path src-tauri/Cargo.toml -p vettid-desktop -e features --all-features --locked)
+          if grep -Eq "dev-relay|devstack" <<< "$tree"; then
+            echo "the app can enable the dev-relay feature"; exit 1
+          fi
+
   gitleaks:
     # Pinned binary over the FULL history (the gitleaks-action fails on a
     # branch's first push, where there is no "before" commit).
