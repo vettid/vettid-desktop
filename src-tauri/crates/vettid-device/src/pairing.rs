@@ -99,6 +99,9 @@ pub enum PairError {
     Store(StoreError),
     /// Fresh keys couldn't be made.
     Keys,
+    /// This desktop is already paired: a new pairing would overwrite its
+    /// keys. Unpair it first.
+    AlreadyPaired,
     /// The owner rejected the pairing on their phone.
     Rejected,
     /// The pairing window ended without an answer.
@@ -121,6 +124,7 @@ impl std::fmt::Display for PairError {
             Self::BadAnswer => f.write_str("pairing: the vault's answer did not check out"),
             Self::Store(e) => write!(f, "pairing: {e}"),
             Self::Keys => f.write_str("pairing: keys could not be made"),
+            Self::AlreadyPaired => f.write_str("pairing: this desktop is already paired"),
             Self::Rejected => f.write_str(crate::display::REJECTED_ON_PHONE),
             Self::TimedOut => f.write_str(crate::display::NOT_CONFIRMED),
             Self::NotCleared(e) => write!(f, "{e}; and the pairing's stored keys could not be removed"),
@@ -199,25 +203,46 @@ where
     }
 }
 
-/// The long-poll wait: at most 25 s, and no longer than the window.
+/// The long-poll wait: 1–25 s, and no longer than the window (the floor
+/// keeps collect from spinning near the end).
 fn wait_secs(clock: &impl Clock, deadline: DateTime<Utc>) -> u64 {
-    (deadline - clock.now()).num_seconds().clamp(0, COLLECT_WAIT_SECS) as u64
+    (deadline - clock.now()).num_seconds().clamp(1, COLLECT_WAIT_SECS) as u64
 }
 
 /// Deposit, treating "maybe delivered" as sent (the receiver dedupes) and
-/// "certainly not delivered" as a failure.
-async fn deposit(t: &impl Transport, to: &RelayAddr, token: &Token, payload: &[u8]) -> Result<(), PairError> {
-    match t.deposit(&to.url, &to.mailbox, token, payload).await {
-        Ok(_) => Ok(()),
-        Err(e) if e.possibly_delivered => Ok(()),
-        Err(e) => Err(PairError::NotSent(e.error)),
+/// "certainly not delivered" as a failure. A temporary failure that
+/// certainly didn't deliver (a connection that never opened, say) is
+/// retried with backoff until `deadline`; one that may have delivered is
+/// not resent (an open token is single use).
+async fn deposit(
+    t: &impl Transport,
+    clock: &impl Clock,
+    deadline: DateTime<Utc>,
+    to: &RelayAddr,
+    token: &Token,
+    payload: &[u8],
+) -> Result<(), PairError> {
+    let mut delay = BACKOFF_START_MS;
+    loop {
+        match t.deposit(&to.url, &to.mailbox, token, payload).await {
+            Ok(_) => return Ok(()),
+            Err(e) if e.possibly_delivered => return Ok(()),
+            Err(e) if e.error.retryable() && clock.now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                delay = (delay * 2).min(BACKOFF_MAX_MS);
+            }
+            Err(e) => return Err(PairError::NotSent(e.error)),
+        }
     }
 }
 
 /// Start pairing from `code`: steps 1–5 above. `device_name` is this
 /// desktop's name, sent to the vault (the member sees it on their phone).
 /// `make_transport` gets this device's new relay key. On any error nothing
-/// is left in `store` (or [`PairError::NotCleared`] says otherwise).
+/// is left in `store` (or [`PairError::NotCleared`] says otherwise). A
+/// desktop that is already paired is refused (`AlreadyPaired`) before
+/// anything is spent: its keys are never overwritten. A pending state left
+/// by an earlier, interrupted pairing is removed first.
 pub async fn start<T: Transport, C: Clock>(
     code: &str,
     device_name: &str,
@@ -225,6 +250,9 @@ pub async fn start<T: Transport, C: Clock>(
     store: &mut impl Persist,
     clock: C,
 ) -> Result<Pairing<T, C>, PairError> {
+    if DeviceState::load_paired(store)?.is_some() {
+        return Err(PairError::AlreadyPaired);
+    }
     let now = clock.now();
     let qr = Qr::parse_any(code).map_err(PairError::Code)?;
     if qr.kind != Kind::Desktop {
@@ -240,8 +268,10 @@ pub async fn start<T: Transport, C: Clock>(
     let own_pk = relay_key.verifying_key();
     let transport = make_transport(relay_key.clone());
     let own_url = qr.relay.clone();
-    // The code's own expiry bounds these steps.
-    let code_deadline = DateTime::from_timestamp(qr.exp as i64, 0).unwrap_or(now);
+    // The code's own expiry bounds these steps, and never more than a
+    // pairing window from now.
+    let code_exp = i64::try_from(qr.exp).ok().and_then(|e| DateTime::from_timestamp(e, 0)).unwrap_or(now);
+    let code_deadline = code_exp.min(now + PAIRING_WINDOW);
     let registration = retrying(&clock, code_deadline, || transport.register(&own_url)).await?;
     // Not retried: a claim is single-fetch, and a lost answer means it is gone.
     let blob = transport.get_claim(&qr.relay, &qr.claim_id).await?;
@@ -274,7 +304,7 @@ pub async fn start<T: Transport, C: Clock>(
     })
     .map_err(PairError::Handshake)?;
     let deadline = now + PAIRING_WINDOW;
-    deposit(&transport, &vault.relay, &Token::from_received(bundle.token.clone()), initiator.envelope()).await?;
+    deposit(&transport, &clock, deadline, &vault.relay, &Token::from_received(bundle.token.clone()), initiator.envelope()).await?;
 
     // Step 5: hs.resp. Anything that isn't it is acked and dropped.
     let (out, resp_msg) = 'resp: loop {
@@ -322,7 +352,7 @@ pub async fn start<T: Transport, C: Clock>(
     // Stored before hs.fin goes out and before hs.resp is acked; from here
     // on, any failure removes it again.
     state.save(store)?;
-    if let Err(e) = deposit(&transport, &vault.relay, &Token::from_received(request), &out.fin).await {
+    if let Err(e) = deposit(&transport, &clock, deadline, &vault.relay, &Token::from_received(request), &out.fin).await {
         return Err(cleared(store, e));
     }
     // Best effort: the state is stored, so a redelivered hs.resp is only a
@@ -359,6 +389,12 @@ impl<T: Transport, C: Clock> Pairing<T, C> {
     /// When the pairing window ends.
     pub fn deadline(&self) -> DateTime<Utc> {
         self.state.pairing_deadline
+    }
+
+    /// Give up (the person cancelled): the pending pairing and its keys
+    /// are removed. The vault drops its side when its window ends.
+    pub fn cancel(self, store: &mut impl Persist) -> Result<(), PairError> {
+        store.clear().map_err(|_| PairError::NotCleared(Box::new(PairError::TimedOut)))
     }
 
     /// Wait for the owner's answer (step 6). On `Ok` the device is paired

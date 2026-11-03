@@ -480,6 +480,36 @@ async fn a_pending_state_after_restart_is_not_a_pairing() {
     assert!(store.data.is_none(), "removed, keys included");
 }
 
+/// A paired desktop is never re-paired over its keys: refused before
+/// anything is spent. A pending state left behind is removed, and pairing
+/// proceeds.
+#[tokio::test]
+async fn an_already_paired_desktop_is_not_overwritten() {
+    let (relay, mut vault, faults) = setup();
+    let mut store = MemStore::default();
+    let pairing = handshake_done(&relay, &mut vault, &faults, &mut store, Ticking::new()).await;
+    let body = vault.paired_body(&vault.device_relay_key());
+    vault.send(DEVICE_PAIRED, body).await;
+    pairing.wait_for_approval(&mut store).await.unwrap();
+    let before = store.data.clone().unwrap();
+    let code = vault.invite(Kind::Desktop, Utc::now() + TimeDelta::minutes(10), None);
+    let fetches = relay.lock().unwrap().fetches;
+    assert_eq!(start(&code, "x", mem(&relay, &faults), &mut store, Ticking::new()).await.unwrap_err(), PairError::AlreadyPaired);
+    assert_eq!(relay.lock().unwrap().fetches, fetches, "no claim spent");
+    assert_eq!(store.data.as_ref().map(|d| d.as_slice()), Some(before.as_slice()), "the pairing is untouched");
+}
+
+/// Cancelling a pending pairing removes it.
+#[tokio::test]
+async fn cancel_removes_the_pending_pairing() {
+    let (relay, mut vault, faults) = setup();
+    let mut store = MemStore::default();
+    let pairing = handshake_done(&relay, &mut vault, &faults, &mut store, Ticking::new()).await;
+    assert!(store.data.is_some());
+    pairing.cancel(&mut store).unwrap();
+    assert!(store.data.is_none());
+}
+
 #[tokio::test]
 async fn codes_are_checked_before_anything_is_spent() {
     let (relay, vault, faults) = setup();
