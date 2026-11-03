@@ -147,10 +147,16 @@ pub struct DeviceState {
     /// answer (§6.8 "Ending"): no `device.session.request` goes out until
     /// it is settled, also after a restart (see `access`).
     pub access_end: Option<PendingEnd>,
+    /// Not stored: the stored `access_end` didn't read, and was taken as an
+    /// end that names no session with its attempts spent (it still holds
+    /// requests back, and settles through `vault.status`). The app may log
+    /// that this happened; nothing here logs.
+    pub access_end_unreadable: bool,
 }
 
-/// A `device.session.end` sent and not yet answered (§6.8).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A `device.session.end` sent and not yet answered (§6.8). `Debug` shows
+/// only the start of its ids.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PendingEnd {
     /// Its inner `id` (a retry reuses it, §8.6).
     pub id: String,
@@ -160,8 +166,52 @@ pub struct PendingEnd {
     pub attempts: u32,
 }
 
+impl std::fmt::Debug for PendingEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingEnd")
+            .field("id", &short_id(&self.id))
+            .field("session_id", &self.session_id.as_deref().map(short_id))
+            .field("attempts", &self.attempts)
+            .finish()
+    }
+}
+
+/// The start of an id, for `Debug`: at most 6 printable ASCII characters,
+/// and `..` when there was more.
+pub(crate) fn short_id(id: &str) -> String {
+    let mut out: String = id.chars().filter(|c| c.is_ascii_graphic()).take(6).collect();
+    if id.len() > out.len() {
+        out.push_str("..");
+    }
+    out
+}
+
 /// The most attempts a stored [`PendingEnd`] may record.
 const MAX_STORED_ATTEMPTS: u64 = 255;
+
+/// The stored `access_end`, if present: `Err` if it doesn't read.
+fn parse_access_end(raw: &str) -> Result<PendingEnd, StoreError> {
+    let c = corrupt;
+    let e = strict_json::parse_object(raw.as_bytes()).map_err(c)?;
+    if e.names().any(|n| !["id", "session_id", "attempts"].contains(&n)) {
+        return Err(StoreError::Corrupt);
+    }
+    let id = e.string("id").map_err(c)?;
+    let session_id = e.opt_string("session_id").map_err(c)?;
+    if id.is_empty() || session_id.as_ref().is_some_and(String::is_empty) {
+        return Err(StoreError::Corrupt);
+    }
+    Ok(PendingEnd { id, session_id, attempts: e.uint("attempts", 0, MAX_STORED_ATTEMPTS).map_err(c)? as u32 })
+}
+
+/// What an unreadable stored `access_end` is taken as: an end that names
+/// no session, its attempts spent. It still holds requests back, and
+/// settles through `vault.status` (its id is never sent: past its
+/// attempts, a new end gets a new id).
+fn unreadable_end() -> PendingEnd {
+    let id = vettid_vms::envelope::new_ulid(chrono::Utc::now()).unwrap_or_else(|_| "unreadable".into());
+    PendingEnd { id, session_id: None, attempts: crate::access::END_ATTEMPTS }
+}
 
 impl std::fmt::Debug for DeviceState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -476,6 +526,16 @@ impl DeviceState {
             };
             Ok((state, r.string("init").map_err(c)?))
         })?;
+        // Absent (a state stored before access sessions) is none. One that
+        // doesn't read is not dropped (that would lift the ordering rule it
+        // enforces), nor does it make the whole state corrupt.
+        let (access_end, access_end_unreadable) = match o.get("access_end") {
+            None => (None, false),
+            Some(raw) => match parse_access_end(raw) {
+                Ok(p) => (Some(p), false),
+                Err(_) => (Some(unreadable_end()), true),
+            },
+        };
         Ok(DeviceState {
             ik_seed: seed(&o, "ik_seed")?,
             kem_seed: seed(&o, "kem_seed")?,
@@ -539,23 +599,8 @@ impl DeviceState {
                     Inner::parse(inner.as_bytes(), Mode::Session).ok()
                 })
                 .collect(),
-            // Absent (a state stored before access sessions) is none. One
-            // that doesn't read is corrupt, not dropped: dropping it would
-            // lift the ordering rule it enforces.
-            access_end: if o.has("access_end") {
-                let e = o.object("access_end", 1).map_err(c)?;
-                if e.names().any(|n| !["id", "session_id", "attempts"].contains(&n)) {
-                    return Err(StoreError::Corrupt);
-                }
-                let id = e.string("id").map_err(c)?;
-                let session_id = e.opt_string("session_id").map_err(c)?;
-                if id.is_empty() || session_id.as_ref().is_some_and(String::is_empty) {
-                    return Err(StoreError::Corrupt);
-                }
-                Some(PendingEnd { id, session_id, attempts: e.uint("attempts", 0, MAX_STORED_ATTEMPTS).map_err(c)? as u32 })
-            } else {
-                None
-            },
+            access_end,
+            access_end_unreadable,
         })
     }
 

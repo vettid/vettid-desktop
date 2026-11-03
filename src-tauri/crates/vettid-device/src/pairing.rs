@@ -359,6 +359,7 @@ pub async fn start<T: Transport, C: Clock>(
         unlinked: None,
         inbox: Vec::new(),
         access_end: None,
+        access_end_unreadable: false,
     };
     // Stored before hs.fin goes out and before hs.resp is acked; from here
     // on, any failure removes it again.

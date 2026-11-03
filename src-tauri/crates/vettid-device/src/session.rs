@@ -404,6 +404,14 @@ impl<T: Transport, C: Clock> Session<T, C> {
         self.state.access_end.as_ref()
     }
 
+    /// Whether the stored unanswered end didn't read when this session
+    /// opened, and was taken as an end of everything with its attempts
+    /// spent (see [`DeviceState::access_end_unreadable`]). For the app to
+    /// log; it carries no stored value.
+    pub fn access_end_unreadable(&self) -> bool {
+        self.state.access_end_unreadable
+    }
+
     /// Record (or clear) the unanswered `device.session.end`, and store it.
     pub(crate) fn set_access_end(&mut self, store: &mut impl Persist, end: Option<PendingEnd>) -> Result<(), SessionError> {
         let cp = self.checkpoint();
