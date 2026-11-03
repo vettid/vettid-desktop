@@ -6,7 +6,8 @@
 //!
 //! **Fail secure.** [`Access::active_at`] is true only for a session the
 //! vault named (in a grant or in `vault.status`) whose `expires_at` is
-//! more than [`EXPIRY_MARGIN`] ahead. Nothing here guesses one into being:
+//! more than its margin ahead (see [`margin_for`]). Nothing here guesses
+//! one into being:
 //! - after a start there is none until `vault.status` has answered, or an
 //!   end has been answered (the vault is the only source, §6.8 "A device's
 //!   own session"): a grant that arrives first is recorded, not reported
@@ -63,10 +64,20 @@ pub const END_ATTEMPTS: u32 = 3;
 /// The longest `session_id` this device sends or accepts (the vault's
 /// bound on a string member).
 pub const MAX_SESSION_ID: usize = 4096;
-/// A session counts as ended this long before its `expires_at`: this
+/// A session counts as ended up to this long before its `expires_at`: this
 /// desktop's clock may be behind the vault's, and acting on a session the
-/// vault has already ended is the unsafe side.
+/// vault has already ended is the unsafe side. A short session gets less
+/// ([`margin_for`]).
 pub const EXPIRY_MARGIN: TimeDelta = TimeDelta::seconds(60);
+
+/// The margin of a session the vault named at `at` (its `ts`):
+/// [`EXPIRY_MARGIN`], but at most a quarter of what was left of it then, so
+/// that a short session (60 s is valid) is active for most of its life.
+/// Recomputed whenever the vault names it again (a `vault.status` read).
+pub fn margin_for(session: &AccessSession, at: DateTime<Utc>) -> TimeDelta {
+    let left = (session.expires_at - at).max(TimeDelta::zero());
+    EXPIRY_MARGIN.min(left / 4)
+}
 
 pub const TYPE_REQUEST: &str = "device.session.request";
 pub const TYPE_END: &str = "device.session.end";
@@ -89,10 +100,10 @@ impl std::fmt::Debug for AccessSession {
 }
 
 impl AccessSession {
-    /// Whether it is still running at `t`, by this desktop's clock: up to
-    /// [`EXPIRY_MARGIN`] before its `expires_at`.
-    pub fn active_at(&self, t: DateTime<Utc>) -> bool {
-        t + EXPIRY_MARGIN < self.expires_at
+    /// Whether it is still running at `t`, by this desktop's clock, ended
+    /// `margin` before its `expires_at`.
+    pub fn active_at(&self, t: DateTime<Utc>, margin: TimeDelta) -> bool {
+        t + margin < self.expires_at
     }
 }
 
@@ -331,16 +342,26 @@ fn empty_ok(answer: &Inner) -> Result<(), AccessError> {
 
 /// The desktop's view of its access session. Held in memory beside the
 /// [`Session`]; the unanswered end is in the session's stored state.
+///
+/// **The app calls [`Access::read_status`] after opening the session**
+/// (and whenever it may have missed events): until this `Access` has had
+/// an answer to its own `vault.status` (or to an end), no session is
+/// reported active.
 #[derive(Debug)]
 pub struct Access {
     current: Option<AccessSession>,
+    /// The current session's margin ([`margin_for`]), from when the vault
+    /// last named it.
+    margin: TimeDelta,
     /// The vault's `ts` of the last thing applied to `current`.
     learned: Option<DateTime<Utc>>,
     /// Whether that last thing said "no session" (at the same `ts`, it
     /// wins over a grant).
     learned_none: bool,
-    /// A `vault.status` answer, or an answer to an end, has come since this
-    /// started: before it, a grant isn't reported active.
+    /// An answer to a `vault.status` this `Access` sent, or to an end, has
+    /// come: before it, a grant isn't reported active. (An answer collected
+    /// by a poll may be to a request sent before a restart: it doesn't
+    /// count.)
     baseline: bool,
     /// How long each attempt waits for its answer.
     timeout: TimeDelta,
@@ -355,7 +376,7 @@ impl Default for Access {
 impl Access {
     /// No session known (as after a start: read `vault.status`).
     pub fn new() -> Self {
-        Access { current: None, learned: None, learned_none: false, baseline: false, timeout: REQUEST_TIMEOUT }
+        Access { current: None, margin: EXPIRY_MARGIN, learned: None, learned_none: false, baseline: false, timeout: REQUEST_TIMEOUT }
     }
 
     /// The same, waiting `timeout` for each answer.
@@ -369,10 +390,10 @@ impl Access {
     }
 
     /// Whether this desktop has an access session at `t`: one the vault
-    /// named, more than [`EXPIRY_MARGIN`] from its end, and known since
-    /// `vault.status` (or an end) answered.
+    /// named, more than its margin ([`margin_for`]) from its end, and known
+    /// since this `Access`'s own `vault.status` (or an end) answered.
     pub fn active_at(&self, t: DateTime<Utc>) -> bool {
-        self.baseline && self.current.as_ref().is_some_and(|s| s.active_at(t))
+        self.baseline && self.current.as_ref().is_some_and(|s| s.active_at(t, self.margin))
     }
 
     /// Apply what the vault said at `at`: `Some` a session, `None` none.
@@ -392,6 +413,9 @@ impl Access {
             (Some(s), Some(p)) if p.session_id.as_ref().is_none_or(|n| *n == s.session_id) => None,
             (s, _) => s,
         };
+        if let Some(c) = &self.current {
+            self.margin = margin_for(c, at);
+        }
     }
 
     /// Drop the current session if `named` (or any, if `None`) is it.
@@ -401,10 +425,13 @@ impl Access {
         }
     }
 
-    /// Ask `vault.status` and apply its `session`.
+    /// Ask `vault.status` and apply its `session`. Its answer (to this
+    /// request, sent now) is the baseline [`Access::active_at`] needs.
     pub async fn read_status<T: Transport, C: Clock>(&mut self, s: &mut Session<T, C>, store: &mut impl Persist) -> Result<StatusSession, AccessError> {
         let answer = s.request(store, TYPE_STATUS, "{}", self.timeout).await?;
-        self.status_answer(s, &answer)
+        let status = self.status_answer(s, &answer)?;
+        self.baseline = true;
+        Ok(status)
     }
 
     fn status_answer<T: Transport, C: Clock>(&mut self, s: &Session<T, C>, answer: &Inner) -> Result<StatusSession, AccessError> {
@@ -419,7 +446,6 @@ impl Access {
                 return Err(e);
             }
         };
-        self.baseline = true;
         match &status {
             StatusSession::Session(x) => self.learn(answer.ts, Some(x.clone()), s.access_end()),
             StatusSession::None => self.learn(answer.ts, None, s.access_end()),

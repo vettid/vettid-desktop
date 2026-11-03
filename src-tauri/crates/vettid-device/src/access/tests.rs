@@ -558,28 +558,36 @@ async fn a_malformed_stored_end() {
     assert!(s.access_end().is_none());
 }
 
-/// A `vault.status` answer with no session, from a minute ago: the
-/// baseline a grant needs to be reported active.
-fn baseline(a: &mut Access, s: &mut S, store: &mut MemStore) {
-    let mut st = response(&event(TYPE_STATUS, "{}"), Status::Ok, r#"{"session":null}"#);
-    st.ts = Utc::now() - TimeDelta::minutes(1);
-    assert_eq!(a.observe(s, store, &st), Ok(Some(AccessEvent::Status(StatusSession::None))));
+/// `read_status`, answered with no session stamped a minute ago (so that
+/// what the test sends next is newer): the baseline a grant needs to be
+/// reported active.
+async fn baseline(a: &mut Access, s: &mut S, store: &mut MemStore, vault: &mut Vault) {
+    let vault_side = async {
+        let req = receive(vault).await;
+        assert_eq!(req.kind, TYPE_STATUS);
+        let mut r = response(&req, Status::Ok, r#"{"session":null}"#);
+        r.ts = Utc::now() - TimeDelta::minutes(1);
+        deposit(vault, r).await;
+    };
+    let (st, ()) = tokio::join!(a.read_status(s, store), vault_side);
+    assert_eq!(st, Ok(StatusSession::None));
 }
 
 /// Grants replace the session; a denied renewal leaves it running; an end
 /// stops it; and it expires on its own, a margin early.
 #[tokio::test]
 async fn grants_denials_ends_and_expiry() {
-    let (relay, _vault, faults, mut store) = paired().await;
+    let (relay, mut vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store);
     let mut a = access();
-    baseline(&mut a, &mut s, &mut store);
+    baseline(&mut a, &mut s, &mut store, &mut vault).await;
     let now = Utc::now();
     let exp = now + TimeDelta::minutes(10);
     let g = a.observe(&mut s, &mut store, &event(TYPE_GRANTED, &session_body("s-1", exp))).unwrap();
     assert!(matches!(g, Some(AccessEvent::Granted(ref x)) if x.session_id == "s-1"));
     assert!(a.active_at(now));
-    // Expiry: active until EXPIRY_MARGIN before expires_at.
+    // Expiry: active until EXPIRY_MARGIN before expires_at (10 minutes left
+    // when granted: the full margin).
     let edge = exp - EXPIRY_MARGIN;
     assert!(a.active_at(edge - TimeDelta::milliseconds(1)) && !a.active_at(edge) && !a.active_at(exp));
     // A renewal denied (0.77.0): s-1 runs on.
@@ -595,18 +603,72 @@ async fn grants_denials_ends_and_expiry() {
     assert_eq!(a.observe(&mut s, &mut store, &event("test.event", "{}")), Ok(None));
 }
 
-/// The clock margin: a session with less than EXPIRY_MARGIN left is not
-/// active.
+/// The clock margin is at most a quarter of what was left when the vault
+/// named the session: a 60 s session is active for 45 s, a 2-minute one
+/// for 90 s, a 1-hour one until 60 s before its end; each ends before its
+/// `expires_at`. A vault.status re-read recomputes it.
 #[tokio::test]
-async fn a_session_close_to_its_end_is_not_active() {
-    let (relay, _vault, faults, mut store) = paired().await;
+async fn the_margin_fits_the_session() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    for (len, margin) in [(60, 15), (120, 30), (3600, 60)] {
+        let mut a = access();
+        baseline(&mut a, &mut s, &mut store, &mut vault).await;
+        let t0 = parse_ts(&format_ts(Utc::now())).unwrap();
+        let exp = t0 + TimeDelta::seconds(len);
+        let mut g = event(TYPE_GRANTED, &session_body("s-1", exp));
+        g.ts = t0;
+        a.observe(&mut s, &mut store, &g).unwrap();
+        let edge = exp - TimeDelta::seconds(margin);
+        assert!(a.active_at(t0), "{len} s");
+        assert!(a.active_at(edge - TimeDelta::milliseconds(1)), "{len} s: active until {margin} s before its end");
+        assert!(!a.active_at(edge) && !a.active_at(exp), "{len} s: ended {margin} s early");
+        assert_eq!(margin_for(a.current().unwrap(), t0), TimeDelta::seconds(margin));
+    }
+    // Re-read 40 s into a 60 s session: 20 s left, a 5 s margin.
+    let mut a = access();
+    let t0 = Utc::now();
+    let exp = parse_ts(&format_ts(t0 + TimeDelta::seconds(20))).unwrap();
+    let vault_side = async {
+        let req = receive(&mut vault).await;
+        let mut r = response(&req, Status::Ok, &format!(r#"{{"session":{}}}"#, session_body("s-1", exp)));
+        r.ts = exp - TimeDelta::seconds(20);
+        deposit(&mut vault, r).await;
+    };
+    let (st, ()) = tokio::join!(a.read_status(&mut s, &mut store), vault_side);
+    assert!(st.is_ok());
+    let five = exp - TimeDelta::seconds(5);
+    assert!(a.active_at(five - TimeDelta::milliseconds(1)) && !a.active_at(five));
+    // A session already past its end when named has no margin, and isn't
+    // active.
+    let past = AccessSession { session_id: "s".into(), expires_at: t0 };
+    assert_eq!(margin_for(&past, t0 + TimeDelta::seconds(1)), TimeDelta::zero());
+}
+
+/// The engine keeps a request armed across a restart, so the answer to a
+/// vault.status sent before it can arrive after it: it is applied, but it
+/// is not the baseline. A later grant isn't reported active until this
+/// Access's own read_status answers.
+#[tokio::test]
+async fn a_pre_restart_status_answer_is_no_baseline() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    s.send(&mut store, TYPE_STATUS, "{}", true).await.unwrap();
+    drop(s); // the app stops before the answer
     let mut s = session(&relay, &faults, &mut store);
     let mut a = access();
-    baseline(&mut a, &mut s, &mut store);
-    a.observe(&mut s, &mut store, &event(TYPE_GRANTED, &session_body("s-1", Utc::now() + TimeDelta::seconds(30)))).unwrap();
+    let req = receive(&mut vault).await;
+    deposit(&mut vault, response(&req, Status::Ok, &status_body(Some(None)))).await;
+    let msgs = s.poll(&mut store).await.unwrap();
+    assert_eq!(msgs.len(), 1, "the armed request's answer comes through");
+    assert_eq!(a.observe(&mut s, &mut store, &msgs[0]), Ok(Some(AccessEvent::Status(StatusSession::None))));
+    let exp = Utc::now() + TimeDelta::hours(1);
+    a.observe(&mut s, &mut store, &event(TYPE_GRANTED, &session_body("s-1", exp))).unwrap();
     assert!(a.current().is_some());
-    assert!(!a.active_at(Utc::now()), "30 s left, under the margin");
-    assert!(AccessSession { session_id: "s".into(), expires_at: Utc::now() + TimeDelta::seconds(90) }.active_at(Utc::now()));
+    assert!(!a.active_at(Utc::now()), "a stale answer is no baseline");
+    let (st, _) = tokio::join!(a.read_status(&mut s, &mut store), answer(&mut vault, TYPE_STATUS, Status::Ok, status_body(Some(Some("s-1")))));
+    assert!(st.is_ok());
+    assert!(a.active_at(Utc::now()));
 }
 
 /// After a start, a grant that comes before any vault.status answer (or
@@ -636,10 +698,10 @@ async fn a_grant_before_a_baseline_is_not_active() {
 /// vault.status answer doesn't bring back a session an end stopped.
 #[tokio::test]
 async fn the_vaults_order_wins() {
-    let (relay, _vault, faults, mut store) = paired().await;
+    let (relay, mut vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store);
     let mut a = access();
-    baseline(&mut a, &mut s, &mut store);
+    baseline(&mut a, &mut s, &mut store, &mut vault).await;
     let t = Utc::now();
     let mut grant = event(TYPE_GRANTED, &session_body("s-1", t + TimeDelta::hours(1)));
     grant.ts = t;
@@ -658,7 +720,7 @@ async fn the_vaults_order_wins() {
 /// arrival.
 #[tokio::test]
 async fn at_the_same_ts_the_end_wins() {
-    let (relay, _vault, faults, mut store) = paired().await;
+    let (relay, mut vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store);
     let t = Utc::now();
     let mut grant = event(TYPE_GRANTED, &session_body("s-1", t + TimeDelta::hours(1)));
@@ -669,14 +731,14 @@ async fn at_the_same_ts_the_end_wins() {
     null.ts = t;
     for (first, second) in [(&grant, &ended), (&ended, &grant), (&grant, &null), (&null, &grant)] {
         let mut a = access();
-        baseline(&mut a, &mut s, &mut store);
+        baseline(&mut a, &mut s, &mut store, &mut vault).await;
         a.observe(&mut s, &mut store, first).unwrap();
         a.observe(&mut s, &mut store, second).unwrap();
         assert!(!a.active_at(t), "{} then {}", first.kind, second.kind);
     }
     // Two grants at the same ts: the later to arrive stands.
     let mut a = access();
-    baseline(&mut a, &mut s, &mut store);
+    baseline(&mut a, &mut s, &mut store, &mut vault).await;
     let mut other = event(TYPE_GRANTED, &session_body("s-2", t + TimeDelta::hours(1)));
     other.ts = t;
     a.observe(&mut s, &mut store, &grant).unwrap();
@@ -688,10 +750,10 @@ async fn at_the_same_ts_the_end_wins() {
 /// secure), and so does an unreadable vault.status.
 #[tokio::test]
 async fn malformed_messages_drop_the_session() {
-    let (relay, _vault, faults, mut store) = paired().await;
+    let (relay, mut vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store);
     let mut a = access();
-    baseline(&mut a, &mut s, &mut store);
+    baseline(&mut a, &mut s, &mut store, &mut vault).await;
     let exp = Utc::now() + TimeDelta::hours(1);
     a.observe(&mut s, &mut store, &event(TYPE_GRANTED, &session_body("s-1", exp))).unwrap();
     assert!(a.active_at(Utc::now()));
@@ -708,10 +770,10 @@ async fn malformed_messages_drop_the_session() {
 /// session current: that end ends it.
 #[tokio::test]
 async fn a_grant_while_an_end_waits() {
-    let (relay, _vault, faults, mut store) = paired().await;
+    let (relay, mut vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store);
     let mut a = access();
-    baseline(&mut a, &mut s, &mut store);
+    baseline(&mut a, &mut s, &mut store, &mut vault).await;
     record_end(&mut s, &mut store, None, END_ATTEMPTS);
     a.observe(&mut s, &mut store, &event(TYPE_GRANTED, &session_body("s-1", Utc::now() + TimeDelta::hours(1)))).unwrap();
     assert!(!a.active_at(Utc::now()));
