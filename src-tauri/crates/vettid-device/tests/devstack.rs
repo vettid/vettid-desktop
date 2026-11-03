@@ -2,7 +2,9 @@
 //! real relay (development builds only: `dev-relay`). It pairs with the
 //! stack's peer vault, whose owner device the stack's control port drives,
 //! then runs a session: a request and its response, collected from the
-//! relay.
+//! relay. Then access sessions (§6.8): the one granted with the pairing
+//! ended by its id, a new one requested, approved on the peer and granted,
+//! and ended without an id.
 //!
 //! Run the stack (vettid-vault, on Linux, e.g. in WSL):
 //!
@@ -21,8 +23,9 @@
 
 use std::time::Duration;
 
-use chrono::TimeDelta;
+use chrono::{TimeDelta, Utc};
 use serde_json::{json, Value};
+use vettid_device::access::{Access, AccessEvent, EndOutcome, RequestOutcome, StatusSession};
 use vettid_device::pairing::{start, SystemClock};
 use vettid_device::session::Session;
 use vettid_device::store::{Persist, StoreError};
@@ -138,4 +141,69 @@ async fn pairs_and_collects_on_the_dev_stack() {
     let body: Value = serde_json::from_str(&answer.body).unwrap();
     assert_eq!(body["vault_id"].as_str(), paired.vault_id.as_deref(), "the vault it paired with");
     assert!(!s.is_refused());
+
+    // 6. Access sessions (§6.8, the V6 exit flow). The pairing granted
+    //    one (session_seconds: 600): vault.status shows it.
+    let mut access = Access::with_timeout(TimeDelta::seconds(60));
+    let first = match access.read_status(&mut s, &mut store).await.expect("vault.status") {
+        StatusSession::Session(x) => x,
+        other => panic!("no session after a pairing with session_seconds: {other:?}"),
+    };
+    println!("access session from the pairing, expires {}", first.expires_at);
+    assert!(access.active_at(Utc::now()));
+
+    // 7. End it by its session_id: vault.status reads null.
+    assert_eq!(access.end(&mut s, &mut store, Some(&first.session_id)).await, Ok(EndOutcome::Ended));
+    assert!(!access.active_at(Utc::now()));
+    assert_eq!(access.read_status(&mut s, &mut store).await, Ok(StatusSession::None), "ended by its id");
+    println!("ended by session_id; vault.status session: null");
+
+    // 8. Ask for a new one.
+    let request_id = match access.request(&mut s, &mut store, Some(300)).await.expect("device.session.request") {
+        RequestOutcome::Requested { request_id, exp } => {
+            println!("requested, until {exp}");
+            request_id
+        }
+        other => panic!("not requested: {other:?}"),
+    };
+
+    // 9. The owner's device is asked, and approves.
+    let pending = ctl.event("device.session.pending", json!({ "request_id": request_id })).await;
+    assert_eq!(pending["body"]["seconds"].as_u64(), Some(300));
+    let approved = ctl.request("device.session.approve", json!({ "request_id": request_id })).await;
+    let approved_id = approved["body"]["session_id"].as_str().expect("the approved session's id").to_string();
+
+    // 10. The desktop is told, and vault.status shows the new session.
+    let deadline = Utc::now() + TimeDelta::seconds(90);
+    let granted = 'wait: loop {
+        assert!(Utc::now() < deadline, "no device.session.granted");
+        let msgs = match s.poll(&mut store).await {
+            Ok(m) => m,
+            Err(e) => {
+                println!("poll: {e}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        for m in &msgs {
+            if let Ok(Some(AccessEvent::Granted(g))) = access.observe(&mut s, &mut store, m) {
+                break 'wait g;
+            }
+        }
+    };
+    println!("granted, expires {}", granted.expires_at);
+    assert_eq!(granted.session_id, approved_id);
+    assert_ne!(granted.session_id, first.session_id);
+    assert!(access.active_at(Utc::now()));
+    match access.read_status(&mut s, &mut store).await.expect("vault.status") {
+        StatusSession::Session(x) => assert_eq!(x, granted),
+        other => panic!("vault.status doesn't show the grant: {other:?}"),
+    }
+
+    // 11. End without a session_id (the person's End access): null.
+    assert_eq!(access.end(&mut s, &mut store, None).await, Ok(EndOutcome::Ended));
+    assert_eq!(access.read_status(&mut s, &mut store).await, Ok(StatusSession::None), "all access ended");
+    assert!(!access.active_at(Utc::now()));
+    assert!(s.access_end().is_none());
+    println!("ended without session_id; vault.status session: null");
 }
