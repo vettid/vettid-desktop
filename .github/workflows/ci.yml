@@ -86,6 +86,34 @@ jobs:
             echo "a profile in src-tauri/Cargo.toml enables debug-assertions"; exit 1
           fi
 
+      - name: dev relay gate (vettid-relay, vettid-device)
+        shell: bash
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml -p vettid-relay --features dev-relay --locked
+          cargo clippy --manifest-path src-tauri/Cargo.toml -p vettid-relay -p vettid-device --features vettid-relay/dev-relay,vettid-device/dev-relay --all-targets --locked -- -D warnings
+          # build.rs refuses release and optimized builds; a build without
+          # debug assertions reaches lib.rs's compile_error!. vettid-device's
+          # feature turns on vettid-relay's, whose checks fire first: the
+          # refusal is redundant there, by design.
+          for pkg in vettid-relay vettid-device; do
+            for env in "--release" "--release CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true" "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false"; do
+              set -- $env
+              flags=""; vars=""
+              for w in "$@"; do case $w in --*) flags="$flags $w";; *) vars="$vars $w";; esac; done
+              if env $vars cargo check --manifest-path src-tauri/Cargo.toml -p $pkg --features dev-relay $flags --locked 2> release.log; then
+                echo "a build of $pkg ($env) accepted the dev-relay feature"; exit 1
+              fi
+              grep -q "for development builds only" release.log
+            done
+          done
+          tree=$(cargo tree --manifest-path src-tauri/Cargo.toml -p vettid-desktop -e features --all-features --locked)
+          # (The app doesn't depend on these crates yet; this guards the day
+          # it does. `devstack`, the removed plain-HTTP feature, stays in the
+          # pattern on purpose, so it can't come back unnoticed.)
+          if grep -Eq "dev-relay|devstack" <<< "$tree"; then
+            echo "the app can enable the dev-relay feature"; exit 1
+          fi
+
   gitleaks:
     # Pinned binary over the FULL history (the gitleaks-action fails on a
     # branch's first push, where there is no "before" commit).

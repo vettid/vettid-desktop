@@ -27,6 +27,9 @@ pub trait Transport {
 /// The real relay, over HTTPS.
 pub struct Http {
     key: SigningKey,
+    /// The dev stack's relay instead (development builds only).
+    #[cfg(feature = "dev-relay")]
+    dev: Option<vettid_relay::dev::DevRelay>,
 }
 
 impl std::fmt::Debug for Http {
@@ -38,10 +41,26 @@ impl std::fmt::Debug for Http {
 impl Http {
     /// A transport signing as `key`, this device's relay key.
     pub fn new(key: SigningKey) -> Self {
-        Http { key }
+        Http {
+            key,
+            #[cfg(feature = "dev-relay")]
+            dev: None,
+        }
+    }
+
+    /// **DEVELOPMENT ONLY** (`dev-relay`): a transport that reaches only
+    /// the dev stack's relay (`https://relay.vettid.test`, see
+    /// `vettid_relay::dev`); any other base URL is refused.
+    #[cfg(feature = "dev-relay")]
+    pub fn dev(key: SigningKey, dev: vettid_relay::dev::DevRelay) -> Self {
+        Http { key, dev: Some(dev) }
     }
 
     fn client(&self, base: &str) -> Result<RelayClient, RelayError> {
+        #[cfg(feature = "dev-relay")]
+        if let Some(d) = &self.dev {
+            return RelayClient::new_dev(base, self.key.clone(), d);
+        }
         RelayClient::new(base, self.key.clone())
     }
 }
