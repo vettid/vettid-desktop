@@ -296,8 +296,8 @@ async fn an_unanswered_named_end_is_sent_again() {
 }
 
 /// The end named s-1, and vault.status shows s-2: that end changes nothing
-/// any more, and s-2 is current. SPEC: asked of the owner whether this
-/// should end s-2 instead (the `// SPEC:` comment in `settle`).
+/// any more, and s-2 is current: the request is released (owner decision
+/// 2026-11-03; the `// SPEC:` comment in `settle`).
 #[tokio::test]
 async fn spec_question_named_end_of_a_replaced_session_is_moot() {
     let (relay, mut vault, faults, mut store) = paired().await;

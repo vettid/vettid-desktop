@@ -507,14 +507,16 @@ impl Access {
                     s.set_access_end(store, None)?;
                     return Ok(Settled::OldVault);
                 }
-                // SPEC: §6.8 "Ending" (0.82.5) says what to do when the
-                // unanswered end names the session vault.status shows, not
-                // when it names S1 and vault.status shows another, S2. Here
-                // the request is released and S2 is left running: an end of
-                // S1 can't change anything any more (the vault answers an end
-                // of a session that isn't current `{}`). Asked of the owner:
-                // should this end S2 instead? (test
-                // `spec_question_named_end_of_a_replaced_session_is_moot`)
+                // SPEC: §6.8 "Ending" (0.82.5) covers an unanswered end that
+                // names the session vault.status shows, not one that names S1
+                // while vault.status shows another, S2. Owner decision
+                // 2026-11-03: a resend after a named end names only that same
+                // session; a different current session releases the request
+                // (the lead's next VAULT-MESSAGING erratum clarifies §6.8). So
+                // S2 is left running: an end of S1 can't change anything any
+                // more (the vault answers an end of a session that isn't
+                // current `{}`). Test:
+                // `spec_question_named_end_of_a_replaced_session_is_moot`.
                 (StatusSession::Session(cur), Some(named)) if *named != cur.session_id => {
                     s.set_access_end(store, None)?;
                     return Ok(Settled::Moot);
