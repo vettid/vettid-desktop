@@ -60,12 +60,37 @@
 //!     kept 16 days for late messages. An `hs.fin` or `hs.resp` that
 //!     arrives again later is ignored.
 //!
+//! - **The stored inbox**: events that change this device's state
+//!   ([`INBOX_TYPES`]: `device.unlinked`, `identity.rotate`) are stored in
+//!   the same batch, before their ack, and [`Session::poll`] returns each
+//!   of them (again after every restart) until the caller calls
+//!   [`Session::handled`]. At most [`INBOX_CAP`]: past it, such an event is
+//!   left unacked (the relay keeps it) rather than dropped. Other events
+//!   are acked, then returned, so a crash before the caller acts on them
+//!   loses them. Inbox events come first in what a poll returns, and they
+//!   are returned even when the relay can't be reached. An event left
+//!   unacked over the cap is kept only as long as the relay keeps it and
+//!   its epoch's receive key lasts (16 days); `device.unlinked` is never
+//!   held back by the cap.
+//! - **`device.unlinked`** (§7.4, §8.6): the device is refused at once
+//!   (nothing more is sent, the outbox is dropped and reported, waiting
+//!   rekeys end, and a [`Session::request`] in progress returns `Refused`)
+//!   and [`Session::unlinked`] says so from then on, with the reason. A
+//!   later one, and any other inbox event (`identity.rotate`, also those
+//!   already waiting), is acked and dropped: the app never acts on a
+//!   removed device. **The reason comes from the vault: the app maps it to
+//!   the known values (none for a plain unlink, `transferred`,
+//!   `replaced`, `vault_deleted`) and never shows it raw.** The engine **doesn't erase**
+//!   anything: the app decides, by the reason, what to erase and what to
+//!   tell the person (§6.7.1; §12.5 adds a confirmation for
+//!   `vault_deleted` on a phone). The app checks [`Session::unlinked`]
+//!   after [`Session::open`]. (`token_revoked` alone only refuses: it
+//!   offers an erase, never makes one, §8.6.)
+//!
 //! Not yet done: `seq` gap tracking (a receiver may use `seq` to see gaps
 //! and order one sender's messages for display, §8.4; nothing reads it
-//! here yet), and a stored inbox for durable events that change the
-//! desktop's state (`device.unlinked`): today they are handed to the
-//! caller after their batch is acked, so a crash before the caller acts
-//! loses them. The inbox comes in the next part.
+//! here yet), and following `identity.rotate` (it is only kept in the
+//! inbox for the caller).
 
 use chrono::{DateTime, TimeDelta, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -132,6 +157,20 @@ pub fn outbox_allowed(kind: &str) -> bool {
 
 /// The longest `exp` ahead of now a `vault.lock` may carry (§8.6).
 pub const VAULT_LOCK_MAX_EXP: TimeDelta = TimeDelta::seconds(60);
+
+/// The event types that change this device's state: stored in the inbox
+/// until the app has handled them.
+pub const INBOX_TYPES: &[&str] = &["device.unlinked", "identity.rotate"];
+/// The most events the inbox holds; past it, one more is left unacked.
+pub const INBOX_CAP: usize = 64;
+/// The largest body an inbox event may have; a larger one is left unacked,
+/// like one over the cap (a `device.unlinked` still unlinks, kept with its
+/// reason only).
+pub const INBOX_MAX_BODY: usize = 16 * 1024;
+/// The longest `reason` kept; a longer one (or one not printable ASCII) is
+/// kept as empty.
+const MAX_REASON: usize = 64;
+const DEVICE_UNLINKED: &str = "device.unlinked";
 
 /// The most rekeys waiting for `hs.fin` at once; past it, the oldest is
 /// aborted. The vault starts a new one only when the last is done or
@@ -205,6 +244,9 @@ pub struct Session<T: Transport, C: Clock> {
     keys: Keyring,
     /// Rekeys answered, waiting for `hs.fin`, oldest first.
     awaiting: Vec<Waiting>,
+    /// Inbox events already returned by this session (after a restart,
+    /// all of them are returned again).
+    returned: std::collections::HashSet<String>,
     relay_key: SigningKey,
     /// Messages for the caller not yet returned (from inside `request`).
     /// Their batch is already stored and acked: they aren't dropped by an
@@ -283,6 +325,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
             state,
             keys,
             awaiting,
+            returned: Default::default(),
             relay_key,
             held: Vec::new(),
             dropped: Vec::new(),
@@ -325,6 +368,34 @@ impl<T: Transport, C: Clock> Session<T, C> {
     /// Whether the vault has refused this device.
     pub fn is_refused(&self) -> bool {
         self.state.refused
+    }
+
+    /// `Some(reason)` once the vault's `device.unlinked` has arrived (the
+    /// reason is empty if it gave none): this device was removed, and the
+    /// app erases its state and says so.
+    pub fn unlinked(&self) -> Option<&str> {
+        self.state.unlinked.as_deref()
+    }
+
+    /// The inbox events waiting to be handled, in order (also those already
+    /// returned by a poll): for an app that lost track after a failed
+    /// handle.
+    pub fn pending_inbox(&self) -> &[Inner] {
+        &self.state.inbox
+    }
+
+    /// The caller has acted on the inbox event `id`: it is removed, and
+    /// that is stored. Unknown ids are ignored.
+    pub fn handled(&mut self, store: &mut impl Persist, id: &str) -> Result<(), SessionError> {
+        let Some(i) = self.state.inbox.iter().position(|e| e.id == id) else { return Ok(()) };
+        let cp = self.checkpoint();
+        self.state.inbox.remove(i);
+        if let Err(e) = self.save(store) {
+            self.rollback(cp);
+            return Err(e.into());
+        }
+        self.returned.remove(id);
+        Ok(())
     }
 
     /// How many deposits wait in the outbox.
@@ -586,6 +657,10 @@ impl<T: Transport, C: Clock> Session<T, C> {
                 Err(SessionError::Relay(e)) if e.retryable() => {}
                 Err(e) => return Err(e),
             }
+            if self.state.refused {
+                // Removed (or refused) meanwhile: no answer will come.
+                return Err(SessionError::Refused);
+            }
             if self.clock.now() >= deadline {
                 return Err(SessionError::TimedOut);
             }
@@ -696,7 +771,15 @@ impl<T: Transport, C: Clock> Session<T, C> {
             Ok(()) | Err(SessionError::Relay(_)) | Err(SessionError::Refused) => {}
             Err(e) => return Err(e),
         }
-        let msgs = self.transport.collect(&self.state.relay_url, wait_secs, POLL_MAX).await?;
+        let msgs = match self.transport.collect(&self.state.relay_url, wait_secs, POLL_MAX).await {
+            Ok(m) => m,
+            Err(e) => {
+                // The inbox is local and stored: what wasn't returned yet
+                // is returned now, even with the relay out of reach.
+                let pending = self.unreturned();
+                return if pending.is_empty() { Err(e.into()) } else { Ok(pending) };
+            }
+        };
         let cp = self.checkpoint();
         let mut events = Vec::new();
         let mut acks = Vec::with_capacity(msgs.len());
@@ -717,11 +800,31 @@ impl<T: Transport, C: Clock> Session<T, C> {
             // Best effort: what isn't acked comes again, and is a duplicate.
             let _ = self.transport.ack(&self.state.relay_url, id).await;
         }
-        match self.flush(store).await {
-            Ok(()) | Err(SessionError::Relay(_)) | Err(SessionError::Refused) => {}
-            Err(e) => return Err(e),
+        let flushed = self.flush(store).await;
+        // The inbox events not yet returned (stored, so not lost) come
+        // first, then the batch's other events.
+        let mut out = self.unreturned();
+        out.append(&mut events);
+        match flushed {
+            Ok(()) | Err(SessionError::Relay(_)) | Err(SessionError::Refused) => Ok(out),
+            Err(e) => {
+                // The batch is stored and acked: its events wait for the
+                // next poll rather than be lost to this error.
+                self.held.append(&mut out);
+                Err(e)
+            }
         }
-        Ok(events)
+    }
+
+    /// The inbox events this session hasn't returned yet, marked returned.
+    fn unreturned(&mut self) -> Vec<Inner> {
+        let mut out = Vec::new();
+        for e in &self.state.inbox {
+            if self.returned.insert(e.id.clone()) {
+                out.push(e.clone());
+            }
+        }
+        out
     }
 
     /// Handle one collected message; what is for the caller goes to
@@ -762,8 +865,13 @@ impl<T: Transport, C: Clock> Session<T, C> {
             TYPE_RESP | TYPE_FIN => return true,
             _ => {}
         }
-        self.handle_inner(inner, now, events);
-        true
+        let ack = self.handle_inner(inner, now, events);
+        if !ack {
+            // The inbox is full: left for the relay to deliver again.
+            self.state.seen.remove(&m.msg_id);
+            self.dirty = was_dirty || pruned;
+        }
+        ack
     }
 
     /// A message no epoch of the keyring opens: an `hs.fin` for a waiting
@@ -835,22 +943,38 @@ impl<T: Transport, C: Clock> Session<T, C> {
     }
 
     /// An opened message of an established epoch, other than a handshake
-    /// message.
-    fn handle_inner(&mut self, inner: Inner, now: DateTime<Utc>, events: &mut Vec<Inner>) {
+    /// message. Returns whether to ack it: all but an inbox event that
+    /// finds the inbox full.
+    fn handle_inner(&mut self, mut inner: Inner, now: DateTime<Utc>, events: &mut Vec<Inner>) -> bool {
         // §8.4, §8.5: by the type's class (an ephemeral type without exp
         // is refused).
         if inner.check_time(now, durable(&inner.kind)).is_err() {
-            return;
+            return true;
         }
         // §8.2, the inner id: a duplicate is dropped, unless it answers a
         // request still waiting (a resent request gets the cached answer).
         let waiting = inner.response.as_ref().is_some_and(|r| self.state.asked.contains_key(&r.re));
         if self.state.seen_inner.contains_key(&inner.id) && !waiting {
-            return;
+            return true;
+        }
+        let for_inbox = inner.response.is_none() && INBOX_TYPES.contains(&inner.kind.as_str());
+        let unlinking = for_inbox && inner.kind == DEVICE_UNLINKED;
+        if for_inbox && !unlinking {
+            // A removed device acts on nothing more.
+            if self.state.unlinked.is_some() {
+                return true;
+            }
+            // Too many or too large: left for the relay. (The removal is
+            // never held back: it is terminal, and at most one is kept.)
+            if self.state.inbox.len() >= INBOX_CAP || inner.body.len() > INBOX_MAX_BODY {
+                return false;
+            }
         }
         let keep = match inner.exp {
             Some(exp) => (now + EPHEMERAL_KEEP).max(exp + MAX_CLOCK_SKEW_FUTURE),
-            None => now + SEEN_KEEP,
+            // As long as the time check could pass it (a `ts` ahead of now
+            // by up to the skew stays fresh that much longer).
+            None => now.max(inner.ts) + SEEN_KEEP,
         };
         self.state.seen_inner.insert(inner.id.clone(), keep);
         if let Some(r) = &inner.response {
@@ -859,18 +983,37 @@ impl<T: Transport, C: Clock> Session<T, C> {
             // request's type).
             let kind_ok = self.state.asked_kinds.get(&r.re).is_none_or(|k| *k == inner.kind);
             if !kind_ok || self.state.asked.remove(&r.re).is_none() {
-                return;
+                return true;
             }
             self.state.asked_kinds.remove(&r.re);
             if inner.kind == RELAY_TOKEN_REFRESH {
                 self.store_vault_token(&inner.body, now);
-                return;
+                return true;
             }
             events.push(inner);
-            return;
+            return true;
+        }
+        if for_inbox {
+            if unlinking {
+                if self.state.unlinked.is_some() {
+                    return true; // already removed: a later notice adds nothing
+                }
+                let reason = self.unlink(&inner.body);
+                if inner.body.len() > INBOX_MAX_BODY {
+                    inner.body = Zeroizing::new(Builder::new().string("reason", &reason).finish());
+                }
+            }
+            // Only what the store can write back (it can't fail for a parsed
+            // event; dropped otherwise rather than lose the state).
+            if inner.marshal(Mode::Session).is_ok() {
+                // Returned with the batch, once it is stored and acked.
+                self.state.inbox.push(inner);
+            }
+            return true;
         }
         match inner.kind.as_str() {
             RELAY_TOKEN_ISSUED => self.store_vault_token(&inner.body, now),
+            RELAY_TOKEN_REFRESH if self.state.refused => {} // refused: nothing more is sent
             RELAY_TOKEN_REFRESH => {
                 // The vault asks for a fresh standing token: answer with one.
                 if let Some(body) = self.mint_body(now) {
@@ -883,6 +1026,26 @@ impl<T: Transport, C: Clock> Session<T, C> {
             "device.paired" | "device.pair.rejected" => {} // late: the pairing is done
             _ => events.push(inner),
         }
+        true
+    }
+
+    /// The vault says this device was removed (§7.4): refused from now on,
+    /// and what waits in the outbox is dropped and reported. Nothing is
+    /// erased here: the app does that, and tells the person.
+    fn unlink(&mut self, body: &str) -> String {
+        let reason = strict_json::parse_object(body.as_bytes())
+            .ok()
+            .and_then(|o| o.opt_string("reason").ok().flatten())
+            .filter(|r| r.len() <= MAX_REASON && r.bytes().all(|b| b.is_ascii_graphic() || b == b' '))
+            .unwrap_or_default();
+        self.state.unlinked.get_or_insert(reason.clone());
+        // Nothing else waiting in the inbox is acted on any more.
+        self.state.inbox.retain(|e| e.kind == DEVICE_UNLINKED);
+        self.state.refused = true;
+        let lost: Vec<String> = self.state.outbox.drain(..).map(|o| o.kind).collect();
+        self.dropped.extend(lost);
+        self.abort_waiting(|_| true);
+        reason
     }
 
     /// A fresh standing token for the vault, as a `{kind, token}` body;

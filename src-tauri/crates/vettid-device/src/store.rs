@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use ed25519_dalek::VerifyingKey;
-use vettid_vms::envelope::{format_ts, parse_ts};
+use vettid_vms::envelope::{format_ts, parse_ts, Inner, Mode};
 use vettid_vms::handshake::{EpochState, Policy, RelayAddr, ResponderState, Role};
 use vettid_vms::strict_json::{self, Builder, Object};
 use vettid_vms::suite::kem::PublicKey;
@@ -133,9 +133,16 @@ pub struct DeviceState {
     pub asked: BTreeMap<String, DateTime<Utc>>,
     /// The `type` of each waiting request (its response must have it).
     pub asked_kinds: BTreeMap<String, String>,
-    /// The vault's mailbox refused this device (`token_revoked`): it has
-    /// been unlinked; nothing more is sent.
+    /// The vault's mailbox refused this device (`token_revoked`), or the
+    /// vault said it was unlinked: nothing more is sent.
     pub refused: bool,
+    /// The vault's `device.unlinked` arrived, with its `reason` (empty if
+    /// none): the device was removed, and the app erases its state.
+    pub unlinked: Option<String>,
+    /// Events that change this device's state (`device.unlinked`,
+    /// `identity.rotate`), stored before their ack and kept until the app
+    /// has handled them, in order.
+    pub inbox: Vec<Inner>,
 }
 
 impl std::fmt::Debug for DeviceState {
@@ -258,7 +265,11 @@ impl DeviceState {
         let outbox: usize = self.outbox.iter().map(|o| o.payload.len() * 4 / 3 + o.kind.len() + 96).sum();
         let kinds: usize = self.asked_kinds.iter().map(|(k, v)| k.len() + v.len() + 8).sum();
         let epochs = (1 + self.retired.len() + self.awaiting.len()) * (EPOCH_JSON + 256);
-        16 * 1024 + self.vault_token.len() + outbox + kinds + epochs + (self.seen.len() + self.seen_inner.len() + self.asked.len()) * 64
+        // Stored as a JSON string: escaping at most doubles compact JSON
+        // (it holds no raw control characters; U+2028 is 3 bytes, 6 escaped).
+        let inbox: usize = self.inbox.iter().map(|i| (i.body.len() + i.id.len() + i.kind.len() + 512) * 2 + 32).sum();
+        let unlinked = self.unlinked.as_ref().map_or(0, |r| r.len() * 6 + 32);
+        16 * 1024 + self.vault_token.len() + outbox + kinds + epochs + inbox + unlinked + (self.seen.len() + self.seen_inner.len() + self.asked.len()) * 64
     }
 
     /// The stored form: strict JSON, secret (wiped when dropped).
@@ -298,7 +309,20 @@ impl DeviceState {
             out.push(']');
             out
         };
-        let (retired, awaiting) = (join(&retired_parts), join(&awaiting_parts));
+        // Each inbox event as a JSON string, so its body's nesting doesn't
+        // add to the state's (the parser's depth limit would refuse it).
+        let inbox_parts: Vec<Zeroizing<String>> = self
+            .inbox
+            .iter()
+            .filter_map(|i| {
+                // The session inboxes only events that marshal.
+                let m = i.marshal(Mode::Session);
+                debug_assert!(m.is_ok(), "an inbox event marshals");
+                let m = Zeroizing::new(m.ok()?);
+                Some(Zeroizing::new(Builder::with_capacity(m.len() * 2 + 16).string("inner", &m).finish()))
+            })
+            .collect();
+        let (retired, awaiting, inbox) = (join(&retired_parts), join(&awaiting_parts), join(&inbox_parts));
         let relay = Builder::new()
             .string("url", &self.vault.relay.url)
             .string("mailbox", &self.vault.relay.mailbox)
@@ -343,6 +367,9 @@ impl DeviceState {
         if let Some(v) = &self.vault_id {
             b = b.string("vault_id", v);
         }
+        if let Some(r) = &self.unlinked {
+            b = b.string("unlinked", r);
+        }
         let capacity = self.capacity();
         let out = Zeroizing::new(
             b.raw("epoch", &epoch)
@@ -357,6 +384,7 @@ impl DeviceState {
                     &self.asked_kinds.iter().fold(Builder::with_capacity(self.asked_kinds.len() * 64 + 16), |b, (k, v)| b.string(k, v)).finish(),
                 )
                 .bool("refused", self.refused)
+                .raw("inbox", &inbox)
                 .finish(),
         );
         // The builder never outgrew its capacity, so it left no unwiped
@@ -462,7 +490,21 @@ impl DeviceState {
             } else {
                 BTreeMap::new()
             },
-            refused: if o.has("refused") { o.bool("refused").map_err(c)? } else { false },
+            // An unlinked device is refused, whatever was stored.
+            refused: o.has("unlinked") || if o.has("refused") { o.bool("refused").map_err(c)? } else { false },
+            unlinked: o.opt_string("unlinked").map_err(c)?,
+            // An inbox entry this build can't read is dropped, rather than
+            // lose the keys with a state refused as corrupt.
+            inbox: o
+                .array("inbox")
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|raw| {
+                    let e = strict_json::parse_object(raw.as_bytes()).ok()?;
+                    let inner = Zeroizing::new(e.string("inner").ok()?);
+                    Inner::parse(inner.as_bytes(), Mode::Session).ok()
+                })
+                .collect(),
         })
     }
 

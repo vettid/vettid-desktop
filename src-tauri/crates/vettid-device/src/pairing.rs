@@ -356,6 +356,8 @@ pub async fn start<T: Transport, C: Clock>(
         asked: Default::default(),
         asked_kinds: Default::default(),
         refused: false,
+        unlinked: None,
+        inbox: Vec::new(),
     };
     // Stored before hs.fin goes out and before hs.resp is acked; from here
     // on, any failure removes it again.
