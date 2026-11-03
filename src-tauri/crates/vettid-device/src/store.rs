@@ -9,6 +9,8 @@
 //! has nothing to persist with, and so can't pair. The plain-file store
 //! (`dev_store`) is for development builds only.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, TimeDelta, Utc};
 use ed25519_dalek::VerifyingKey;
 use vettid_vms::envelope::{format_ts, parse_ts};
@@ -66,6 +68,19 @@ pub enum Phase {
     Paired,
 }
 
+/// One deposit to the vault waiting in the outbox: an envelope already
+/// sealed, deposited on the vault token held when it is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxEntry {
+    /// What it is (the inner `type`), for diagnosis and replacement.
+    pub kind: String,
+    /// The sealed envelope (ciphertext).
+    pub payload: Vec<u8>,
+    pub created: DateTime<Utc>,
+    /// Its inner `exp`, if any: after it, it is dropped unsent.
+    pub exp: Option<DateTime<Utc>>,
+}
+
 /// What this device knows of its vault.
 #[derive(Debug, Clone)]
 pub struct VaultRecord {
@@ -74,7 +89,9 @@ pub struct VaultRecord {
     pub relay: RelayAddr,
 }
 
-/// Everything the device keeps. Secret; `Debug` prints the phase only.
+/// Everything the device keeps. Secret; `Debug` prints the phase only. A
+/// clone is as secret (its keys wipe themselves too).
+#[derive(Clone)]
 pub struct DeviceState {
     pub ik_seed: Zeroizing<[u8; 32]>,
     pub kem_seed: Zeroizing<[u8; 32]>,
@@ -95,6 +112,21 @@ pub struct DeviceState {
     pub device_id: Option<String>,
     pub vault_id: Option<String>,
     pub epoch: EpochState,
+    /// Relay `msg_id`s handled, and when (§8.2, kept 16 days).
+    pub seen: BTreeMap<String, DateTime<Utc>>,
+    /// Inner `id`s handled from the vault, and until when they are kept
+    /// (§8.2).
+    pub seen_inner: BTreeMap<String, DateTime<Utc>>,
+    /// Deposits to the vault not yet accepted by the relay, in order.
+    pub outbox: Vec<OutboxEntry>,
+    /// Requests sent and waiting for their response, and until when
+    /// (stored, so a restart doesn't drop the answers).
+    pub asked: BTreeMap<String, DateTime<Utc>>,
+    /// The `type` of each waiting request (its response must have it).
+    pub asked_kinds: BTreeMap<String, String>,
+    /// The vault's mailbox refused this device (`token_revoked`): it has
+    /// been unlinked; nothing more is sent.
+    pub refused: bool,
 }
 
 impl std::fmt::Debug for DeviceState {
@@ -121,10 +153,18 @@ fn direction(key: &[u8; 32], recipient: Kid, sender: Kid) -> Zeroizing<String> {
 }
 
 impl DeviceState {
+    /// Room enough for the stored form, so its builders never reallocate
+    /// (a reallocation would leave an unwiped copy of the secrets).
+    fn capacity(&self) -> usize {
+        let outbox: usize = self.outbox.iter().map(|o| o.payload.len() * 4 / 3 + o.kind.len() + 96).sum();
+        let kinds: usize = self.asked_kinds.iter().map(|(k, v)| k.len() + v.len() + 8).sum();
+        16 * 1024 + self.vault_token.len() + outbox + kinds + (self.seen.len() + self.seen_inner.len() + self.asked.len()) * 64
+    }
+
     /// The stored form: strict JSON, secret (wiped when dropped).
     pub fn to_json(&self) -> Zeroizing<String> {
         let e = &self.epoch;
-        let mut eb = Builder::new()
+        let mut eb = Builder::with_capacity(2048)
             .base64("id", &e.id)
             .string("role", role_name(e.role))
             .uint("suite", u64::from(e.suite))
@@ -146,7 +186,21 @@ impl DeviceState {
             .base64("pk", self.vault.relay.pk.as_bytes())
             .finish();
         let vault = Builder::new().base64("ik", self.vault.ik.as_bytes()).base64("kem", self.vault.kem.as_bytes()).raw("relay", &relay).finish();
-        let mut b = Builder::new()
+        let times = |m: &BTreeMap<String, DateTime<Utc>>| {
+            m.iter().fold(Builder::with_capacity(m.len() * 64 + 16), |b, (k, t)| b.string(k, &format_ts(*t))).finish()
+        };
+        let outbox: Vec<String> = self
+            .outbox
+            .iter()
+            .map(|o| {
+                let b = Builder::new().string("kind", &o.kind).base64("payload", &o.payload).string("created", &format_ts(o.created));
+                match o.exp {
+                    Some(e) => b.string("exp", &format_ts(e)).finish(),
+                    None => b.finish(),
+                }
+            })
+            .collect();
+        let mut b = Builder::with_capacity(self.capacity())
             .uint("v", STATE_VERSION)
             .base64("ik_seed", &self.ik_seed[..])
             .base64("kem_seed", &self.kem_seed[..])
@@ -167,7 +221,24 @@ impl DeviceState {
         if let Some(v) = &self.vault_id {
             b = b.string("vault_id", v);
         }
-        Zeroizing::new(b.raw("epoch", &epoch).finish())
+        let capacity = self.capacity();
+        let out = Zeroizing::new(
+            b.raw("epoch", &epoch)
+                .raw("seen", &times(&self.seen))
+                .raw("seen_inner", &times(&self.seen_inner))
+                .raw("outbox", &format!("[{}]", outbox.join(",")))
+                .raw("asked", &times(&self.asked))
+                .raw(
+                    "asked_kinds",
+                    &self.asked_kinds.iter().fold(Builder::with_capacity(self.asked_kinds.len() * 64 + 16), |b, (k, v)| b.string(k, v)).finish(),
+                )
+                .bool("refused", self.refused)
+                .finish(),
+        );
+        // The builder never outgrew its capacity, so it left no unwiped
+        // copy behind.
+        debug_assert!(out.len() <= capacity, "state of {} bytes, capacity {capacity}", out.len());
+        out
     }
 
     /// Read the stored form back.
@@ -180,6 +251,19 @@ impl DeviceState {
             Ok(Zeroizing::new(b[..].try_into().expect("checked length")))
         };
         let ts = |o: &Object<'_>, n: &str| parse_ts(&o.string(n).map_err(c)?).ok_or(StoreError::Corrupt);
+        // A map of id to time; absent (a state stored before F2) is empty.
+        let times = |o: &Object<'_>, n: &str| -> Result<BTreeMap<String, DateTime<Utc>>, StoreError> {
+            if !o.has(n) {
+                return Ok(BTreeMap::new());
+            }
+            let m = o.object(n, 1).map_err(c)?;
+            m.names()
+                .map(|k| {
+                    let t = strict_json::as_string(m.get(k).expect("a name of m")).map_err(c)?;
+                    Ok((k.to_string(), parse_ts(&t).ok_or(StoreError::Corrupt)?))
+                })
+                .collect()
+        };
         let vk = |o: &Object<'_>, n: &str| -> Result<VerifyingKey, StoreError> {
             let b: [u8; 32] = o.base64(n, Some(32)).map_err(c)?.try_into().map_err(|_| StoreError::Corrupt)?;
             VerifyingKey::from_bytes(&b).map_err(|_| StoreError::Corrupt)
@@ -241,6 +325,34 @@ impl DeviceState {
             device_id: o.opt_string("device_id").map_err(c)?,
             vault_id: o.opt_string("vault_id").map_err(c)?,
             epoch,
+            seen: times(&o, "seen")?,
+            seen_inner: times(&o, "seen_inner")?,
+            outbox: match o.get("outbox") {
+                None => Vec::new(),
+                Some(_) => o
+                    .array("outbox")
+                    .map_err(c)?
+                    .into_iter()
+                    .map(|raw| {
+                        let e = strict_json::parse_object(raw.as_bytes()).map_err(c)?;
+                        let exp = match e.opt_string("exp").map_err(c)? {
+                            Some(x) => Some(parse_ts(&x).ok_or(StoreError::Corrupt)?),
+                            None => None,
+                        };
+                        Ok(OutboxEntry { kind: e.string("kind").map_err(c)?, payload: e.base64("payload", None).map_err(c)?, created: ts(&e, "created")?, exp })
+                    })
+                    .collect::<Result<Vec<_>, StoreError>>()?,
+            },
+            asked: times(&o, "asked")?,
+            asked_kinds: if o.has("asked_kinds") {
+                let m = o.object("asked_kinds", 1).map_err(c)?;
+                m.names()
+                    .map(|k| Ok((k.to_string(), strict_json::as_string(m.get(k).expect("a name of m")).map_err(c)?)))
+                    .collect::<Result<BTreeMap<_, _>, StoreError>>()?
+            } else {
+                BTreeMap::new()
+            },
+            refused: if o.has("refused") { o.bool("refused").map_err(c)? } else { false },
         })
     }
 

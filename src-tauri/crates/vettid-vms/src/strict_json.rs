@@ -325,6 +325,15 @@ impl Builder {
         Builder { out: String::from("{"), first: true }
     }
 
+    /// Start an object with room for `n` bytes, so that a builder of
+    /// secrets that stays within it never reallocates (a reallocation
+    /// leaves an unwiped copy behind).
+    pub fn with_capacity(n: usize) -> Self {
+        let mut out = String::with_capacity(n);
+        out.push('{');
+        Builder { out, first: true }
+    }
+
     fn name(&mut self, n: &str) {
         if !self.first {
             self.out.push(',');
