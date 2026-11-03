@@ -217,6 +217,12 @@ impl Initiator {
         &self.body
     }
 
+    /// Whether the handshake has ended (completed, or aborted after an
+    /// `hs.resp` decrypted and failed): no `hs.resp` is taken any more.
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
     /// Destroy the handshake's secrets; any later `handle_resp` fails.
     pub fn abort(&mut self) {
         self.done = true;

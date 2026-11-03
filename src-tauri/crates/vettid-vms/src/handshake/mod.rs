@@ -15,7 +15,7 @@ mod initiator;
 mod messages;
 mod schedule;
 
-pub use epoch::{Epoch, Policy, Role, POLICY_VAULT_TO_DEVICE};
+pub use epoch::{Epoch, EpochState, Policy, Role, POLICY_VAULT_TO_DEVICE};
 pub use initiator::{Initiator, InitiatorConfig, Outcome};
 pub use messages::{valid_ctx, valid_relay_url, valid_token, Fin, Init, Principal, RelayAddr, Resp};
 pub use schedule::{check_sas_commit, sas, sas_commit, sign_fin, sign_resp, th, th1, verify_fin, verify_resp, Schedule};
