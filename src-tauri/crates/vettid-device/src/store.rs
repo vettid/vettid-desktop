@@ -77,6 +77,8 @@ pub struct OutboxEntry {
     /// The sealed envelope (ciphertext).
     pub payload: Vec<u8>,
     pub created: DateTime<Utc>,
+    /// Its inner `exp`, if any: after it, it is dropped unsent.
+    pub exp: Option<DateTime<Utc>>,
 }
 
 /// What this device knows of its vault.
@@ -117,6 +119,9 @@ pub struct DeviceState {
     pub seen_inner: BTreeMap<String, DateTime<Utc>>,
     /// Deposits to the vault not yet accepted by the relay, in order.
     pub outbox: Vec<OutboxEntry>,
+    /// Requests sent and waiting for their response, and until when
+    /// (stored, so a restart doesn't drop the answers).
+    pub asked: BTreeMap<String, DateTime<Utc>>,
     /// The vault's mailbox refused this device (`token_revoked`): it has
     /// been unlinked; nothing more is sent.
     pub refused: bool,
@@ -184,7 +189,13 @@ impl DeviceState {
         let outbox: Vec<String> = self
             .outbox
             .iter()
-            .map(|o| Builder::new().string("kind", &o.kind).base64("payload", &o.payload).string("created", &format_ts(o.created)).finish())
+            .map(|o| {
+                let b = Builder::new().string("kind", &o.kind).base64("payload", &o.payload).string("created", &format_ts(o.created));
+                match o.exp {
+                    Some(e) => b.string("exp", &format_ts(e)).finish(),
+                    None => b.finish(),
+                }
+            })
             .collect();
         let mut b = Builder::with_capacity(self.capacity())
             .uint("v", STATE_VERSION)
@@ -212,6 +223,7 @@ impl DeviceState {
                 .raw("seen", &times(&self.seen))
                 .raw("seen_inner", &times(&self.seen_inner))
                 .raw("outbox", &format!("[{}]", outbox.join(",")))
+                .raw("asked", &times(&self.asked))
                 .bool("refused", self.refused)
                 .finish(),
         )
@@ -311,10 +323,15 @@ impl DeviceState {
                     .into_iter()
                     .map(|raw| {
                         let e = strict_json::parse_object(raw.as_bytes()).map_err(c)?;
-                        Ok(OutboxEntry { kind: e.string("kind").map_err(c)?, payload: e.base64("payload", None).map_err(c)?, created: ts(&e, "created")? })
+                        let exp = match e.opt_string("exp").map_err(c)? {
+                            Some(x) => Some(parse_ts(&x).ok_or(StoreError::Corrupt)?),
+                            None => None,
+                        };
+                        Ok(OutboxEntry { kind: e.string("kind").map_err(c)?, payload: e.base64("payload", None).map_err(c)?, created: ts(&e, "created")?, exp })
                     })
                     .collect::<Result<Vec<_>, StoreError>>()?,
             },
+            asked: times(&o, "asked")?,
             refused: if o.has("refused") { o.bool("refused").map_err(c)? } else { false },
         })
     }

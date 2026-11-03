@@ -55,6 +55,8 @@ pub(crate) struct Faults {
     pub(crate) temporary: usize,
     /// Answer every deposit token_revoked.
     pub(crate) revoked: bool,
+    /// Answer this many deposits 429 quota_exceeded.
+    pub(crate) quota: usize,
     pub(crate) deposits_seen: usize,
 }
 
@@ -88,6 +90,11 @@ impl Transport for Mem {
             }
             if f.revoked {
                 let error = RelayError::Relay { status: 403, code: "token_revoked".into(), retry_after: None, quota: None };
+                return Err(DepositError { error, possibly_delivered: false });
+            }
+            if f.quota > 0 {
+                f.quota -= 1;
+                let error = RelayError::Relay { status: 429, code: "quota_exceeded".into(), retry_after: None, quota: Some("mailbox".into()) };
                 return Err(DepositError { error, possibly_delivered: false });
             }
             if f.temporary > 0 {

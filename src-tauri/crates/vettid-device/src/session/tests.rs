@@ -77,7 +77,7 @@ async fn sends_and_receives() {
     let (relay, mut vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store, Ticking::new());
     assert_eq!(s.device_id(), Some("dev-1"));
-    let id = s.send(&mut store, "test.ping", r#"{"n":1}"#, None, false).await.unwrap();
+    let id = s.send(&mut store, "test.ping", r#"{"n":1}"#, false).await.unwrap();
     let got = vault_receive(&mut vault).await;
     assert_eq!((got.id.as_str(), got.kind.as_str(), got.body.as_str()), (id.as_str(), "test.ping", r#"{"n":1}"#));
     assert_eq!(got.seq, Some(2), "after hs.fin's seq 1");
@@ -88,7 +88,7 @@ async fn sends_and_receives() {
     assert_eq!(events[0].kind, "test.event");
     // The stored state carries on: a reopened session continues the seq.
     let mut again = session(&relay, &faults, &mut store, Ticking::new());
-    again.send(&mut store, "test.ping", "{}", None, false).await.unwrap();
+    again.send(&mut store, "test.ping", "{}", false).await.unwrap();
     assert_eq!(vault_receive(&mut vault).await.seq, Some(3));
 }
 
@@ -186,7 +186,7 @@ async fn the_outbox_survives_failures_and_restarts() {
     let (relay, mut vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store, Ticking::new());
     faults.lock().unwrap().temporary = 3;
-    let id = s.send(&mut store, "test.ping", "{}", None, false).await.unwrap();
+    let id = s.send(&mut store, "test.ping", "{}", false).await.unwrap();
     assert_eq!(s.outbox_len(), 1);
     drop(s); // the app stops
     let mut s = session(&relay, &faults, &mut store, Ticking::new());
@@ -203,12 +203,154 @@ async fn a_revoked_device_stops_sending() {
     let (relay, _vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store, Ticking::new());
     faults.lock().unwrap().revoked = true;
-    assert_eq!(s.send(&mut store, "test.ping", "{}", None, false).await.unwrap_err(), SessionError::Refused);
+    assert_eq!(s.send(&mut store, "test.ping", "{}", false).await.unwrap_err(), SessionError::Refused);
     assert!(s.is_refused());
-    assert_eq!(s.send(&mut store, "test.ping", "{}", None, false).await.unwrap_err(), SessionError::Refused);
+    assert_eq!(s.send(&mut store, "test.ping", "{}", false).await.unwrap_err(), SessionError::Refused);
     let reopened = session(&relay, &faults, &mut store, Ticking::new());
     assert!(reopened.is_refused(), "stored");
     assert_eq!(reopened.outbox_len(), 0);
+}
+
+/// §8.6: a refused device still collects, where device.unlinked waits.
+#[tokio::test]
+async fn a_refused_device_still_collects() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    faults.lock().unwrap().revoked = true;
+    assert_eq!(s.send(&mut store, "test.ping", "{}", false).await.unwrap_err(), SessionError::Refused);
+    vault_deposit(&mut vault, event("device.unlinked", "{}"), None).await;
+    let events = s.poll(&mut store).await.unwrap();
+    assert_eq!(events.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), ["device.unlinked"]);
+    assert!(s.is_refused());
+    assert_eq!(s.take_dropped(), ["test.ping"], "the queued message is reported as not sent");
+}
+
+/// Messages held from inside request() survive a poll that fails.
+#[tokio::test]
+async fn held_messages_survive_a_failing_poll() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    let answer = async {
+        let req = vault_receive(&mut vault).await;
+        vault_deposit(&mut vault, event("test.event", "{}"), None).await;
+        let mut resp = event("test.ask", "{}");
+        resp.response = Some(Response { re: req.id.clone(), status: Status::Ok });
+        vault_deposit(&mut vault, resp, None).await;
+    };
+    let (got, ()) = tokio::join!(s.request(&mut store, "test.ask", "{}", TimeDelta::seconds(30)), answer);
+    got.unwrap();
+    faults.lock().unwrap().collects = 5;
+    let held = s.poll(&mut store).await.unwrap();
+    assert_eq!(held.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), ["test.event"], "returned without collecting");
+    assert!(s.poll(&mut store).await.is_err(), "now the collect fails");
+}
+
+/// Any 429 (a full mailbox too) keeps the entry in the outbox (§8.6).
+#[tokio::test]
+async fn a_quota_429_keeps_the_entry() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    faults.lock().unwrap().quota = 1;
+    s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+    assert_eq!((s.outbox_len(), s.take_dropped().len()), (1, 0));
+    s.outbox_next = Utc::now() - TimeDelta::seconds(1);
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.outbox_len(), 0);
+    assert_eq!(vault_receive(&mut vault).await.kind, "test.ping");
+}
+
+/// Ephemeral types and vault.lock never enter the stored outbox; they go
+/// once. An expired outbox entry is dropped and reported.
+#[tokio::test]
+async fn ephemeral_and_lock_messages_are_sent_once() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    for kind in ["presence.ping", "vault.lock"] {
+        assert_eq!(s.send(&mut store, kind, "{}", false).await.unwrap_err(), SessionError::NotQueueable, "{kind}");
+    }
+    s.send_once(&mut store, "presence.ping", "{}", Some(Utc::now() + TimeDelta::minutes(1))).await.unwrap();
+    assert_eq!(vault_receive(&mut vault).await.kind, "presence.ping");
+    faults.lock().unwrap().temporary = 1;
+    assert!(s.send_once(&mut store, "vault.lock", "{}", None).await.is_err(), "not delivered, and not queued");
+    assert_eq!(s.outbox_len(), 0);
+    // An entry past its exp is dropped unsent.
+    let mut late = s.inner(None, "test.ping", "{}".into(), None, Some(Utc::now() - TimeDelta::seconds(1))).unwrap();
+    late.exp = Some(Utc::now() - TimeDelta::seconds(1));
+    s.queue("test.ping", late).unwrap();
+    s.save(&mut store).unwrap();
+    s.poll(&mut store).await.unwrap();
+    assert_eq!((s.outbox_len(), s.take_dropped()), (0, vec!["test.ping".to_string()]));
+}
+
+/// send() is Ok once stored, even if an older entry is then dropped; a
+/// resend keeps the id; a response after a restart still finds its
+/// request.
+#[tokio::test]
+async fn sends_resends_and_answers_after_restart() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    let next = faults.lock().unwrap().deposits_seen;
+    faults.lock().unwrap().deposit = Some(next);
+    let first = s.send(&mut store, "test.one", "{}", false).await.unwrap();
+    assert_eq!(s.take_dropped(), ["test.one"]);
+    let _ = first;
+    let id = s.send(&mut store, "test.ask", "{}", true).await.unwrap();
+    let req = vault_receive(&mut vault).await;
+    assert_eq!(req.id, id);
+    let again = s.resend(&mut store, &id, "test.ask", "{}", true).await.unwrap();
+    assert_eq!(again, id, "the same inner id");
+    assert_eq!(vault_receive(&mut vault).await.id, id);
+    drop(s); // the app stops before the answer
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    let mut resp = event("test.ask", r#"{"ok":1}"#);
+    resp.response = Some(Response { re: id.clone(), status: Status::Ok });
+    let env = vault_deposit(&mut vault, resp, None).await;
+    let got = s.poll(&mut store).await.unwrap();
+    assert_eq!(got.len(), 1, "the waiting request was stored");
+    // A duplicate of an answer to a request armed again is delivered.
+    s.resend(&mut store, &id, "test.ask", "{}", true).await.unwrap();
+    vault_receive(&mut vault).await;
+    let to = vault.device_mailbox();
+    vault.mem.deposit(URL, &to, &Token::from_received("x".into()), &env).await.unwrap();
+    assert_eq!(s.poll(&mut store).await.unwrap().len(), 1, "the cached answer reaches the resent request");
+}
+
+/// Past the cap the oldest entry is evicted and reported; token entries
+/// replace a waiting one; the refresh path stores the vault's answer.
+#[tokio::test]
+async fn the_outbox_cap_and_token_entries() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    faults.lock().unwrap().temporary = 1000;
+    for _ in 0..(OUTBOX_CAP + 2) {
+        s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+    }
+    assert_eq!(s.outbox_len(), OUTBOX_CAP);
+    assert_eq!(s.take_dropped().len(), 2);
+    faults.lock().unwrap().temporary = 0;
+    s.state.outbox.clear();
+    // The vault's token to us runs low: a refresh request goes out (once
+    // per hour), and the answer's token is kept.
+    s.state.vault_token_exp = Utc::now() + TimeDelta::days(2);
+    s.outbox_next = Utc::now() - TimeDelta::seconds(1);
+    s.poll(&mut store).await.unwrap();
+    let ask = vault_receive(&mut vault).await;
+    assert_eq!(ask.kind, "relay.token.refresh");
+    assert!(ask.response.is_none());
+    let (fresh, exp) = crate::token::mint_for_vault(&vault.mem.key, URL, &vault.device_relay_key(), Utc::now(), 0).unwrap();
+    let body = vettid_vms::strict_json::Builder::new().string("kind", "standing").string("token", fresh.as_str()).finish();
+    let mut answer = event("relay.token.refresh", &body);
+    answer.response = Some(Response { re: ask.id.clone(), status: Status::Ok });
+    vault_deposit(&mut vault, answer, None).await;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.state.vault_token_exp, exp);
+    // Two re-issues waiting: only the newest stays.
+    faults.lock().unwrap().temporary = 1000;
+    s.state.issued_exp = Utc::now() + TimeDelta::days(1);
+    s.poll(&mut store).await.unwrap();
+    s.state.issued_exp = Utc::now() + TimeDelta::days(1);
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.state.outbox.iter().filter(|o| o.kind == "relay.token.issued").count(), 1);
 }
 
 /// §7.2: the vault's refresh request gets a fresh standing token; the
