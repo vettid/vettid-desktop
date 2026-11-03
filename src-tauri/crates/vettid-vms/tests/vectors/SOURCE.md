@@ -13,9 +13,11 @@ those files are authoritative: this crate must reproduce them byte for byte.
 | `handshake.json` | `19c03153e2ecda009f449cb26d13929f34085783` (2026-10-04) | `9b69503b507fd117ab3d6a66368cb60bb24e09286867921a6f473fb476fb0577` |
 | `invite.json` | `df79ca9fbc4b5cb8f3d08c17285c819e71b5fc07` (2026-10-02) | `6d7be9ba65f8426070ee54f0ea6ed84fed1e49c54eb31e09a1e177d3d5286d2f` |
 | `envelope_sealed.json` | `df79ca9fbc4b5cb8f3d08c17285c819e71b5fc07` (2026-10-02) | `3ab4f20eebb3ec621e97d3b03705c8b3851312e99e227d423e8f0e6066887360` |
+| `rekey.json` | `dc2e90739dbcb135b47d8c5fe7e61d25977d7f8d` (2026-11-02) | `f7dfc99cde15921d1d6ddb9b0b4e54a836f9f84a247890fbecbe9cd4604df99b` |
 
 Copied on 2026-11-02 with `git show origin/main:testdata/vectors/<file>`
-(not from a working tree, whose line endings may differ). To update: copy
+(not from a working tree, whose line endings may differ). `rekey.json` was
+added on 2026-11-03 the same way, at `origin/main` `f6bfca1`. To update: copy
 them the same way, update this table, and run `cargo test -p vettid-vms`;
 the `vendored_vectors_match_source_md` test checks the hashes above and
 that the files have no CR.
