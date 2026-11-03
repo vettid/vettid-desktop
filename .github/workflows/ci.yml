@@ -108,7 +108,8 @@ jobs:
           done
           tree=$(cargo tree --manifest-path src-tauri/Cargo.toml -p vettid-desktop -e features --all-features --locked)
           # (The app doesn't depend on these crates yet; this guards the day
-          # it does.)
+          # it does. `devstack`, the removed plain-HTTP feature, stays in the
+          # pattern on purpose, so it can't come back unnoticed.)
           if grep -Eq "dev-relay|devstack" <<< "$tree"; then
             echo "the app can enable the dev-relay feature"; exit 1
           fi

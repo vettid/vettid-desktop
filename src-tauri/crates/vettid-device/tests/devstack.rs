@@ -92,9 +92,16 @@ async fn pairs_and_collects_on_the_dev_stack() {
     let Ok(url) = std::env::var("VETTID_DEVSTACK") else {
         panic!("set VETTID_DEVSTACK to the dev stack's control port, e.g. http://127.0.0.1:18082");
     };
+    // The same checks as the relay root's: a loopback IP literal, its origin.
+    let origin = vettid_relay::dev::check_control_url(&url).expect("a loopback http:// control URL with a port");
     let ctl = Control {
-        url: url.trim_end_matches('/').to_string(),
-        http: reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(150)).build().unwrap(),
+        url: origin,
+        http: reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(150))
+            .build()
+            .unwrap(),
     };
     let dev = DevRelay::from_stack(&ctl.url).await.expect("the stack's relay front and TEST-ONLY root");
     println!("relay front: {}", dev.front());

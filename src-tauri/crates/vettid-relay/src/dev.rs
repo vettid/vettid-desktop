@@ -57,7 +57,7 @@ impl std::fmt::Debug for DevRelay {
 /// or `[::1]`; not `localhost`, which a hosts file could point elsewhere),
 /// with an explicit port other than 80 (the URL parser drops a default
 /// port), and no user, path, query or fragment. Returns its origin.
-fn check_control_url(ctl: &str) -> Result<String, RelayError> {
+pub fn check_control_url(ctl: &str) -> Result<String, RelayError> {
     let u = reqwest::Url::parse(ctl).map_err(|_| RelayError::Invalid)?;
     let loopback = match u.host_str() {
         Some(h) => h.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().is_ok_and(|a| a.is_loopback()),
