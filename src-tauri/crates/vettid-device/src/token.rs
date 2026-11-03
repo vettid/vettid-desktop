@@ -16,7 +16,8 @@ use chrono::{DateTime, TimeDelta, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngCore;
 use vettid_relay::auth::{encode_key, mailbox_id};
-use vettid_relay::token::{check_time, mint_token, parse_token, Claims, Token, SCOPE_DEPOSIT};
+use vettid_relay::token::{mint_token, parse_token, Claims, Token, SCOPE_DEPOSIT};
+use vettid_vms::envelope::MAX_CLOCK_SKEW_FUTURE;
 
 /// A standing token's lifetime (§7.1).
 pub const STANDING_LIFETIME: TimeDelta = TimeDelta::days(30);
@@ -76,6 +77,11 @@ pub fn mint_for_vault(
 /// `hs.resp`, a standing token in `device.paired`): signed by the vault's
 /// relay key, `iss` the vault's mailbox, `sub` this device's relay key, a
 /// deposit token, unexpired. Returns its `exp`.
+///
+/// `iat` may be up to 5 minutes ahead of this device's clock (the inner
+/// `ts` rule, §8.4): the vault backdates `iat` by only 60 s, and a desktop
+/// clock a little slow must not throw away a valid approval. The relay
+/// itself checks `iat` against its own clock when the token is used.
 pub fn check_from_vault(
     token: &str,
     vault_relay_key: &VerifyingKey,
@@ -86,7 +92,9 @@ pub fn check_from_vault(
     if c.iss != mailbox_id(vault_relay_key) || c.sub != encode_key(own_relay_key) || c.scope != SCOPE_DEPOSIT {
         return Err(TokenRefused::Invalid);
     }
-    check_time(&c, now).map_err(|_| TokenRefused::Invalid)?;
+    if c.iat > now + MAX_CLOCK_SKEW_FUTURE || now >= c.exp {
+        return Err(TokenRefused::Invalid);
+    }
     Ok(c.exp)
 }
 
@@ -136,5 +144,11 @@ mod tests {
             Err(TokenRefused::Invalid)
         );
         assert_eq!(check_from_vault("v4.public.x", &vault.verifying_key(), &own.verifying_key(), now), Err(TokenRefused::Invalid));
+        // A clock up to 5 minutes slow still accepts it (iat is backdated
+        // only 60 s); more than that doesn't.
+        let slow = now - TimeDelta::minutes(4);
+        assert!(check_from_vault(good.as_str(), &vault.verifying_key(), &own.verifying_key(), slow).is_ok());
+        let too_slow = now - TimeDelta::minutes(7);
+        assert_eq!(check_from_vault(good.as_str(), &vault.verifying_key(), &own.verifying_key(), too_slow), Err(TokenRefused::Invalid));
     }
 }

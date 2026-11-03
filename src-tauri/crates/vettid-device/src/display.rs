@@ -25,14 +25,51 @@ pub const REJECTED_ON_PHONE: &str = "Rejected on your phone";
 /// not paired.
 pub const NOT_CONFIRMED: &str = "Not paired: the pairing was not confirmed in time. Start again from your phone.";
 
-/// Whether `c` is removed from shown text: control characters, the
+/// Whether `c` is removed from shown text: control characters; every
+/// format character (Unicode general category Cf: the soft hyphen, the
 /// bidirectional marks, embeddings, overrides and isolates, zero-width
-/// characters, and the byte order mark. Whitespace (tabs and line breaks
+/// characters, the byte order mark, interlinear annotation and tag
+/// characters, and the rest of the category as of Unicode 16); the
+/// combining grapheme joiner; the Hangul fillers and the variation
+/// selectors, which show as nothing. Whitespace (tabs and line breaks
 /// included) is kept, then collapsed to single spaces.
 fn hidden(c: char) -> bool {
     let u = c as u32;
     (c.is_control() && !c.is_whitespace())
-        || matches!(u, 0x061C | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x2069 | 0xFEFF)
+        || matches!(
+            u,
+            // Cf, Unicode 16.
+            0x00AD
+                | 0x0600..=0x0605
+                | 0x061C
+                | 0x06DD
+                | 0x070F
+                | 0x0890..=0x0891
+                | 0x08E2
+                | 0x180E
+                | 0x200B..=0x200F
+                | 0x202A..=0x202E
+                | 0x2060..=0x2064
+                | 0x2066..=0x206F
+                | 0xFEFF
+                | 0xFFF9..=0xFFFB
+                | 0x110BD
+                | 0x110CD
+                | 0x13430..=0x1343F
+                | 0x1BCA0..=0x1BCA3
+                | 0x1D173..=0x1D17A
+                | 0xE0001
+                | 0xE0020..=0xE007F
+                // Shown as nothing: the combining grapheme joiner, the
+                // Hangul fillers, the variation selectors.
+                | 0x034F
+                | 0x115F
+                | 0x1160
+                | 0x3164
+                | 0xFFA0
+                | 0xFE00..=0xFE0F
+                | 0xE0100..=0xE01EF
+        )
 }
 
 /// `name` as plain text to show: hidden characters removed, whitespace
@@ -63,17 +100,25 @@ mod tests {
         assert_eq!(shown_name(&tricky).as_deref(), Some("Test Vault"));
         assert_eq!(shown_name(&format!("  a{}{}b  ", ch(0xA), ch(0x9))).as_deref(), Some("a b"));
         assert_eq!(shown_name(&format!("{}{}", ch(0x200E), ch(0xFEFF))), None);
+        // Other invisible characters, which could make a name look empty
+        // or different: soft hyphen, tags, Hangul fillers.
+        for u in [0x00AD, 0xE0041, 0x3164, 0x115F, 0xFFA0, 0x034F, 0x180E, 0xFFF9] {
+            assert_eq!(shown_name(&format!("a{}b", ch(u))).as_deref(), Some("ab"), "U+{u:04X}");
+        }
+        assert_eq!(shown_name(&ch(0x3164).to_string()), None, "a filler alone is no name");
         assert_eq!(shown_name(&"n".repeat(200)).unwrap().chars().count(), MAX_SHOWN_NAME);
         // Other scripts are kept.
         let greek = format!("{}{}", ch(0x3A9), ch(0x3B1));
         assert_eq!(shown_name(&greek).as_deref(), Some(greek.as_str()));
     }
 
+    /// "paired" appears only as "not paired".
     #[test]
     fn the_wording_never_claims_a_pairing() {
         for text in [CONFIRM_ON_PHONE, REJECTED_ON_PHONE, NOT_CONFIRMED] {
-            assert!(!text.to_lowercase().starts_with("paired"), "{text}");
+            let t = text.to_lowercase();
+            assert_eq!(t.matches("paired").count(), t.matches("not paired").count(), "{text}");
         }
-        assert!(CONFIRM_ON_PHONE.contains("phone"));
+        assert!(CONFIRM_ON_PHONE.contains("confirm on your phone"));
     }
 }

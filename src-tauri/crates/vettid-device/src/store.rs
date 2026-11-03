@@ -110,12 +110,14 @@ fn role_name(r: Role) -> &'static str {
     }
 }
 
-fn direction(key: &[u8; 32], recipient: Kid, sender: Kid) -> String {
-    Builder::new()
-        .base64("key", key)
-        .string("recipient_kid", &hex::encode(recipient.0))
-        .string("sender_kid", &hex::encode(sender.0))
-        .finish()
+fn direction(key: &[u8; 32], recipient: Kid, sender: Kid) -> Zeroizing<String> {
+    Zeroizing::new(
+        Builder::new()
+            .base64("key", key)
+            .string("recipient_kid", &hex::encode(recipient.0))
+            .string("sender_kid", &hex::encode(sender.0))
+            .finish(),
+    )
 }
 
 impl DeviceState {
@@ -247,7 +249,23 @@ impl DeviceState {
         store.save(self.to_json().as_bytes())
     }
 
-    /// Load from `store`, if anything is stored.
+    /// The paired device, if there is one. A stored state that is still
+    /// pending (an app that stopped mid-pairing) is **not** a pairing: it
+    /// is removed, keys included, and `None` returned. Use this, not
+    /// [`DeviceState::load`], to decide whether the desktop is paired.
+    pub fn load_paired(store: &mut impl Persist) -> Result<Option<Self>, StoreError> {
+        match Self::load(store)? {
+            Some(s) if s.phase == Phase::Paired => Ok(Some(s)),
+            Some(_) => {
+                store.clear()?;
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Load from `store`, if anything is stored, **pending or paired**: see
+    /// [`DeviceState::load_paired`].
     pub fn load(store: &mut impl Persist) -> Result<Option<Self>, StoreError> {
         match store.load()? {
             Some(data) => Ok(Some(Self::from_json(&data)?)),

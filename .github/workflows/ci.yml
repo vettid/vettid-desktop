@@ -63,17 +63,27 @@ jobs:
           cargo clippy --manifest-path src-tauri/Cargo.toml -p vettid-vms --all-targets --locked -- -D warnings
       - name: clippy (vettid-device)
         run: cargo clippy --manifest-path src-tauri/Cargo.toml -p vettid-device --all-targets --locked -- -D warnings
-      # The dev-only plain-file key store: tested in debug builds, refused by
-      # the compiler in release builds, and never enabled by the app.
+      # The dev-only plain-file key store: tested in debug builds; refused in
+      # any release or optimized build, by lib.rs (no debug_assertions) and
+      # build.rs (profile release or opt-level above 0), also when the
+      # release profile is given debug assertions; and never enabled by the
+      # app, whatever its features.
       - name: dev key store gate (vettid-device)
+        shell: bash
         run: |
           cargo test --manifest-path src-tauri/Cargo.toml -p vettid-device --features dev-file-store --locked
-          if cargo check --manifest-path src-tauri/Cargo.toml -p vettid-device --features dev-file-store --release --locked 2> release.log; then
-            echo "a release build accepted the dev-file-store feature"; exit 1
+          for env in "" "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true"; do
+            if env $env cargo check --manifest-path src-tauri/Cargo.toml -p vettid-device --features dev-file-store --release --locked 2> release.log; then
+              echo "a release build accepted the dev-file-store feature ($env)"; exit 1
+            fi
+            grep -q "for development builds only" release.log
+          done
+          tree=$(cargo tree --manifest-path src-tauri/Cargo.toml -p vettid-desktop -e features --all-features --locked)
+          if grep -q "dev-file-store" <<< "$tree"; then
+            echo "the app can enable the dev-file-store feature"; exit 1
           fi
-          grep -q "for development builds only" release.log
-          if cargo tree --manifest-path src-tauri/Cargo.toml -p vettid-desktop -e features --locked | grep -q "dev-file-store"; then
-            echo "the app enables the dev-file-store feature"; exit 1
+          if grep -Eq '^[[:space:]]*debug-assertions[[:space:]]*=[[:space:]]*true' src-tauri/Cargo.toml; then
+            echo "a profile in src-tauri/Cargo.toml enables debug-assertions"; exit 1
           fi
 
   gitleaks:

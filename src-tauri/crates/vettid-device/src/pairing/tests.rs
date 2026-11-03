@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use base64::Engine;
 use chrono::{DateTime, TimeDelta, Utc};
 use ed25519_dalek::SigningKey;
 use vettid_relay::auth::{encode_key, mailbox_id};
@@ -30,18 +29,34 @@ use crate::token::mint_for_vault;
 
 const URL: &str = "https://relay.vettid.org";
 
-/// A relay in memory: mailboxes and claims, no token checks.
+/// A relay in memory: mailboxes and claims, no token checks, and a log of
+/// what happened, in order.
 #[derive(Default)]
 struct Relay {
     mailboxes: HashMap<String, Vec<Message>>,
     claims: HashMap<String, Vec<u8>>,
     fetches: usize,
+    log: Vec<String>,
+}
+
+/// Failures to inject into one party's relay calls.
+#[derive(Default)]
+struct Faults {
+    /// Fail this many collects (retryable).
+    collects: usize,
+    /// Fail this many acks (retryable).
+    acks: usize,
+    /// Fail the deposit with this index (0-based), certainly undelivered.
+    deposit: Option<usize>,
+    deposits_seen: usize,
 }
 
 #[derive(Clone)]
 struct Mem {
     relay: Arc<Mutex<Relay>>,
     key: SigningKey,
+    name: &'static str,
+    faults: Arc<Mutex<Faults>>,
 }
 
 impl Mem {
@@ -56,8 +71,18 @@ impl Transport for Mem {
         Ok(Registration { mailbox_id: self.mailbox(), limits: Limits::default(), created: true })
     }
     async fn deposit(&self, _base: &str, mailbox: &str, _token: &Token, payload: &[u8]) -> Result<String, DepositError> {
+        {
+            let mut f = self.faults.lock().unwrap();
+            let n = f.deposits_seen;
+            f.deposits_seen += 1;
+            if f.deposit == Some(n) {
+                let error = RelayError::Relay { status: 400, code: "bad_request".into(), retry_after: None, quota: None };
+                return Err(DepositError { error, possibly_delivered: false });
+            }
+        }
         let id = new_ulid(Utc::now()).unwrap();
         let mut r = self.relay.lock().unwrap();
+        r.log.push(format!("{} deposit", self.name));
         let Some(mb) = r.mailboxes.get_mut(mailbox) else {
             let error = RelayError::Relay { status: 404, code: "mailbox_unknown".into(), retry_after: None, quota: None };
             return Err(DepositError { error, possibly_delivered: false });
@@ -66,6 +91,13 @@ impl Transport for Mem {
         Ok(id)
     }
     async fn collect(&self, _base: &str, _wait: u64, max: u32) -> Result<Vec<Message>, RelayError> {
+        {
+            let mut f = self.faults.lock().unwrap();
+            if f.collects > 0 {
+                f.collects -= 1;
+                return Err(RelayError::Transport);
+            }
+        }
         let msgs: Vec<Message> = self.relay.lock().unwrap().mailboxes.get(&self.mailbox()).map(|m| m.iter().take(max as usize).cloned().collect()).unwrap_or_default();
         if msgs.is_empty() {
             tokio::task::yield_now().await;
@@ -73,6 +105,13 @@ impl Transport for Mem {
         Ok(msgs)
     }
     async fn ack(&self, _base: &str, msg_id: &str) -> Result<(), RelayError> {
+        {
+            let mut f = self.faults.lock().unwrap();
+            if f.acks > 0 {
+                f.acks -= 1;
+                return Err(RelayError::Transport);
+            }
+        }
         if let Some(mb) = self.relay.lock().unwrap().mailboxes.get_mut(&self.mailbox()) {
             mb.retain(|m| m.msg_id != msg_id);
         }
@@ -85,7 +124,28 @@ impl Transport for Mem {
     }
 }
 
-/// A clock that moves one second per reading, so every wait ends.
+/// A store that logs its saves into the relay's log, to check the order.
+struct LoggingStore {
+    inner: MemStore,
+    relay: Arc<Mutex<Relay>>,
+}
+
+impl Persist for LoggingStore {
+    fn save(&mut self, data: &[u8]) -> Result<(), StoreError> {
+        self.relay.lock().unwrap().log.push("save".into());
+        self.inner.save(data)
+    }
+    fn load(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+        self.inner.load()
+    }
+    fn clear(&mut self) -> Result<(), StoreError> {
+        self.relay.lock().unwrap().log.push("clear".into());
+        self.inner.clear()
+    }
+}
+
+/// A clock that moves one second per reading (so every wait ends), offset
+/// from real time by `offset` seconds.
 #[derive(Clone)]
 struct Ticking {
     start: DateTime<Utc>,
@@ -94,7 +154,10 @@ struct Ticking {
 
 impl Ticking {
     fn new() -> Self {
-        Ticking { start: Utc::now(), ticks: Arc::new(AtomicI64::new(0)) }
+        Self::offset(0)
+    }
+    fn offset(secs: i64) -> Self {
+        Ticking { start: Utc::now() + TimeDelta::seconds(secs), ticks: Arc::new(AtomicI64::new(0)) }
     }
 }
 
@@ -124,7 +187,7 @@ impl Vault {
     fn new(relay: &Arc<Mutex<Relay>>) -> Self {
         let k = keys();
         let v = &k["vault"];
-        let mem = Mem { relay: relay.clone(), key: SigningKey::from_bytes(&seed(&v["relay_seed_hex"])) };
+        let mem = Mem { relay: relay.clone(), key: SigningKey::from_bytes(&seed(&v["relay_seed_hex"])), name: "vault", faults: Default::default() };
         relay.lock().unwrap().mailboxes.entry(mem.mailbox()).or_default();
         Vault { mem, kem: PrivateKey::from_seed(&seed(&v["kem_seed_hex"])).unwrap(), ik: SigningKey::from_bytes(&seed(&v["ik_seed_hex"])), handshake: None }
     }
@@ -137,7 +200,7 @@ impl Vault {
         }
     }
 
-    /// A desktop pairing code: the bundle sealed as a claim, and its link.
+    /// A pairing code: the bundle sealed as a claim, and its link.
     fn invite(&self, kind: Kind, exp: DateTime<Utc>, hint: Option<&str>) -> String {
         let bundle = Bundle {
             kind: kind.purpose(),
@@ -216,13 +279,22 @@ impl Vault {
         sas(sched, &n_i, &n_r[..]).unwrap()
     }
 
-    /// Send `kind` with `body` to the desktop under the handshake's epoch.
-    async fn send(&mut self, kind: &str, body: String) {
-        let (_, epoch, init, _) = self.handshake.as_mut().unwrap();
+    /// `kind` with `body`, sealed under the handshake's epoch.
+    fn seal(&mut self, kind: &str, body: String) -> Vec<u8> {
+        let (_, epoch, _, _) = self.handshake.as_mut().unwrap();
         epoch.activate(Utc::now());
         let mut inner = Inner { id: new_ulid(Utc::now()).unwrap(), kind: kind.into(), ts: Utc::now(), seq: None, response: None, exp: None, body: Zeroizing::new(body) };
-        let env = epoch.seal(&mut inner).unwrap();
-        let to = init.from.relay.mailbox.clone();
+        epoch.seal(&mut inner).unwrap()
+    }
+
+    fn device_mailbox(&self) -> String {
+        self.handshake.as_ref().unwrap().2.from.relay.mailbox.clone()
+    }
+
+    /// Send `kind` with `body` to the desktop from the vault's relay key.
+    async fn send(&mut self, kind: &str, body: String) {
+        let env = self.seal(kind, body);
+        let to = self.device_mailbox();
         self.mem.deposit(URL, &to, &Token::from_received("x".into()), &env).await.unwrap();
     }
 
@@ -241,33 +313,43 @@ impl Vault {
     }
 }
 
-fn setup() -> (Arc<Mutex<Relay>>, Vault) {
+fn setup() -> (Arc<Mutex<Relay>>, Vault, Arc<Mutex<Faults>>) {
     let relay = Arc::new(Mutex::new(Relay::default()));
     let vault = Vault::new(&relay);
-    (relay, vault)
+    (relay, vault, Default::default())
 }
 
-fn mem(relay: &Arc<Mutex<Relay>>) -> impl FnOnce(SigningKey) -> Mem {
-    let relay = relay.clone();
-    move |key| Mem { relay, key }
+fn mem(relay: &Arc<Mutex<Relay>>, faults: &Arc<Mutex<Faults>>) -> impl FnOnce(SigningKey) -> Mem {
+    let (relay, faults) = (relay.clone(), faults.clone());
+    move |key| Mem { relay, key, name: "desktop", faults }
+}
+
+/// Up to the SAS: the code, the handshake, and both sides' SAS.
+async fn handshake_done(
+    relay: &Arc<Mutex<Relay>>,
+    vault: &mut Vault,
+    faults: &Arc<Mutex<Faults>>,
+    store: &mut impl Persist,
+    clock: Ticking,
+) -> Pairing<Mem, Ticking> {
+    let code = vault.invite(Kind::Desktop, Utc::now() + TimeDelta::minutes(10), Some("Al's vault"));
+    let (pairing, ()) = tokio::join!(start(&code, "Work laptop", mem(relay, faults), store, clock), vault.answer_init());
+    let pairing = pairing.unwrap();
+    assert_eq!(pairing.sas(), vault.check_fin().await, "both sides show the same code");
+    pairing
 }
 
 /// The whole flow: the code, the handshake, the SAS both sides agree on,
-/// the owner's approval, and a stored, active, paired state.
+/// the owner's approval, and a stored, active, paired state, in that
+/// order.
 #[tokio::test]
 async fn pairs_end_to_end() {
-    let (relay, mut vault) = setup();
-    let code = vault.invite(Kind::Desktop, Utc::now() + TimeDelta::minutes(10), Some("Al's vault"));
-    let mut store = MemStore::default();
-    let clock = Ticking::new();
-    let (pairing, ()) = tokio::join!(start(&code, "Work laptop", mem(&relay), &mut store, clock.clone()), vault.answer_init());
-    let pairing = pairing.unwrap();
-    let vault_sas = vault.check_fin().await;
-    assert_eq!(pairing.sas(), vault_sas, "both sides show the same code");
+    let (relay, mut vault, faults) = setup();
+    let mut store = LoggingStore { inner: MemStore::default(), relay: relay.clone() };
+    let pairing = handshake_done(&relay, &mut vault, &faults, &mut store, Ticking::new()).await;
     assert_eq!(pairing.instruction(), CONFIRM_ON_PHONE);
     assert_eq!(pairing.inviter_name(), Some("Al's vault"));
     assert_eq!(relay.lock().unwrap().fetches, 1, "the claim is fetched once");
-    // Stored while pending, before hs.fin went out.
     let pending = DeviceState::load(&mut store).unwrap().unwrap();
     assert_eq!((pending.phase, pending.epoch.active), (Phase::Pending, false));
 
@@ -275,7 +357,11 @@ async fn pairs_end_to_end() {
     vault.send(DEVICE_PAIRED, body).await;
     let (paired, state) = pairing.wait_for_approval(&mut store).await.unwrap();
     assert_eq!(paired, Paired { device_id: "dev-1".into(), vault_id: Some("vault-1".into()) });
-    let stored = DeviceState::load(&mut store).unwrap().unwrap();
+    // The order: hs.init out, stored, hs.fin out; the vault's device.paired
+    // in, stored.
+    let log: Vec<String> = relay.lock().unwrap().log.iter().filter(|l| *l != "vault deposit").cloned().collect();
+    assert_eq!(log, ["desktop deposit", "save", "desktop deposit", "save"]);
+    let stored = DeviceState::load_paired(&mut store).unwrap().unwrap();
     assert_eq!((stored.phase, stored.epoch.active, stored.device_id.as_deref()), (Phase::Paired, true, Some("dev-1")));
     assert_eq!(stored.vault_token.as_str(), state.vault_token.as_str());
     assert!(!format!("{stored:?}").contains("seed"));
@@ -285,57 +371,124 @@ async fn pairs_end_to_end() {
     let env = Envelope::parse(&epoch.seal(&mut ping).unwrap()).unwrap();
     assert_eq!(vault.handshake.as_mut().unwrap().1.open(&env).unwrap().kind, "test.ping");
     // Everything collected was acked.
-    let device_mb = mailbox_id(&vault.device_relay_key());
-    assert!(relay.lock().unwrap().mailboxes[&device_mb].is_empty());
+    assert!(relay.lock().unwrap().mailboxes[&vault.device_mailbox()].is_empty());
 }
 
 #[tokio::test]
 async fn a_rejection_ends_it_and_forgets_it() {
-    let (relay, mut vault) = setup();
-    let code = vault.invite(Kind::Desktop, Utc::now() + TimeDelta::minutes(10), None);
+    let (relay, mut vault, faults) = setup();
     let mut store = MemStore::default();
-    let (pairing, ()) = tokio::join!(start(&code, "Laptop", mem(&relay), &mut store, Ticking::new()), vault.answer_init());
-    let pairing = pairing.unwrap();
-    vault.check_fin().await;
+    let pairing = handshake_done(&relay, &mut vault, &faults, &mut store, Ticking::new()).await;
     vault.send(DEVICE_PAIR_REJECTED, "{}".into()).await;
     assert_eq!(pairing.wait_for_approval(&mut store).await.unwrap_err(), PairError::Rejected);
     assert!(store.data.is_none(), "nothing kept");
 }
 
-/// Fail secure: no answer, or answers that don't check out, end in "not
-/// paired" with nothing kept.
+/// Fail secure: messages that aren't the vault's answer are dropped, and
+/// with no answer the window ends "not paired" with nothing kept.
 #[tokio::test]
-async fn nothing_but_a_valid_device_paired_pairs() {
-    let (relay, mut vault) = setup();
-    let code = vault.invite(Kind::Desktop, Utc::now() + TimeDelta::minutes(10), None);
+async fn only_the_vault_can_answer() {
+    let (relay, mut vault, faults) = setup();
     let mut store = MemStore::default();
-    let (pairing, ()) = tokio::join!(start(&code, "Laptop", mem(&relay), &mut store, Ticking::new()), vault.answer_init());
-    let pairing = pairing.unwrap();
-    vault.check_fin().await;
-    // A device.paired whose token is for another device, one with another
-    // role, and one from another relay key: all dropped.
-    let other = SigningKey::from_bytes(&[9; 32]).verifying_key();
-    let body = vault.paired_body(&other);
-    vault.send(DEVICE_PAIRED, body).await;
-    let mut wrong_role = vault.paired_body(&vault.device_relay_key());
-    wrong_role = wrong_role.replace(r#""desktop""#, r#""agent""#);
-    vault.send(DEVICE_PAIRED, wrong_role).await;
-    let stranger = Mem { relay: relay.clone(), key: SigningKey::from_bytes(&[8; 32]) };
-    let to = mailbox_id(&vault.device_relay_key());
+    let pairing = handshake_done(&relay, &mut vault, &faults, &mut store, Ticking::new()).await;
+    // A properly sealed device.paired, deposited by another relay key, and
+    // plain junk: both dropped.
+    let body = vault.paired_body(&vault.device_relay_key());
+    let sealed = vault.seal(DEVICE_PAIRED, body);
+    let stranger = Mem { relay: relay.clone(), key: SigningKey::from_bytes(&[8; 32]), name: "stranger", faults: Default::default() };
+    let to = vault.device_mailbox();
+    stranger.deposit(URL, &to, &Token::from_received("x".into()), &sealed).await.unwrap();
     stranger.deposit(URL, &to, &Token::from_received("x".into()), b"junk").await.unwrap();
     assert_eq!(pairing.wait_for_approval(&mut store).await.unwrap_err(), PairError::TimedOut);
     assert!(store.data.is_none(), "the pending pairing is forgotten");
 }
 
+/// A device.paired from the vault that doesn't check out ends the pairing
+/// at once, not paired.
+#[tokio::test]
+async fn a_bad_device_paired_ends_it() {
+    for case in ["token for another device", "role agent", "no token"] {
+        let (relay, mut vault, faults) = setup();
+        let mut store = MemStore::default();
+        let pairing = handshake_done(&relay, &mut vault, &faults, &mut store, Ticking::new()).await;
+        let body = match case {
+            "token for another device" => vault.paired_body(&SigningKey::from_bytes(&[9; 32]).verifying_key()),
+            "role agent" => vault.paired_body(&vault.device_relay_key()).replace(r#""desktop""#, r#""agent""#),
+            _ => Builder::new().string("device_id", "dev-1").string("role", "desktop").finish(),
+        };
+        vault.send(DEVICE_PAIRED, body).await;
+        assert_eq!(pairing.wait_for_approval(&mut store).await.unwrap_err(), PairError::BadAnswer, "{case}");
+        assert!(store.data.is_none(), "{case}: nothing kept");
+    }
+}
+
+/// Temporary relay failures while waiting are retried; a failed ack after
+/// the answer is stored doesn't undo the pairing.
+#[tokio::test]
+async fn relay_blips_do_not_end_a_pairing() {
+    let (relay, mut vault, faults) = setup();
+    let mut store = MemStore::default();
+    let pairing = handshake_done(&relay, &mut vault, &faults, &mut store, Ticking::new()).await;
+    let body = vault.paired_body(&vault.device_relay_key());
+    vault.send(DEVICE_PAIRED, body).await;
+    {
+        let mut f = faults.lock().unwrap();
+        f.collects = 2;
+        f.acks = 100;
+    }
+    let (paired, _) = pairing.wait_for_approval(&mut store).await.unwrap();
+    assert_eq!(paired.device_id, "dev-1");
+    assert_eq!(DeviceState::load_paired(&mut store).unwrap().unwrap().phase, Phase::Paired);
+}
+
+/// An hs.fin that certainly wasn't delivered ends the pairing and removes
+/// the pending state, keys included.
+#[tokio::test]
+async fn an_undelivered_hs_fin_leaves_nothing() {
+    let (relay, mut vault, faults) = setup();
+    faults.lock().unwrap().deposit = Some(1); // the desktop's second deposit: hs.fin
+    let code = vault.invite(Kind::Desktop, Utc::now() + TimeDelta::minutes(10), None);
+    let mut store = LoggingStore { inner: MemStore::default(), relay: relay.clone() };
+    let (result, ()) = tokio::join!(start(&code, "x", mem(&relay, &faults), &mut store, Ticking::new()), vault.answer_init());
+    assert!(matches!(result.unwrap_err(), PairError::NotSent(_)));
+    assert!(store.inner.data.is_none());
+    assert!(relay.lock().unwrap().log.ends_with(&["save".to_string(), "clear".to_string()]));
+}
+
+/// A desktop clock 4 minutes slow still pairs (the vault backdates its
+/// tokens' iat by only 60 s).
+#[tokio::test]
+async fn a_slow_clock_still_pairs() {
+    let (relay, mut vault, faults) = setup();
+    let mut store = MemStore::default();
+    let pairing = handshake_done(&relay, &mut vault, &faults, &mut store, Ticking::offset(-240)).await;
+    let body = vault.paired_body(&vault.device_relay_key());
+    vault.send(DEVICE_PAIRED, body).await;
+    assert!(pairing.wait_for_approval(&mut store).await.is_ok());
+}
+
+/// After a restart mid-pairing, a pending state is no pairing: it is
+/// removed.
+#[tokio::test]
+async fn a_pending_state_after_restart_is_not_a_pairing() {
+    let (relay, mut vault, faults) = setup();
+    let mut store = MemStore::default();
+    let pairing = handshake_done(&relay, &mut vault, &faults, &mut store, Ticking::new()).await;
+    drop(pairing); // the app stops
+    assert_eq!(DeviceState::load(&mut store).unwrap().unwrap().phase, Phase::Pending);
+    assert!(DeviceState::load_paired(&mut store).unwrap().is_none());
+    assert!(store.data.is_none(), "removed, keys included");
+}
+
 #[tokio::test]
 async fn codes_are_checked_before_anything_is_spent() {
-    let (relay, vault) = setup();
+    let (relay, vault, faults) = setup();
     let mut store = MemStore::default();
     let agent = vault.invite(Kind::Agent, Utc::now() + TimeDelta::minutes(10), None);
-    assert_eq!(start(&agent, "x", mem(&relay), &mut store, Ticking::new()).await.unwrap_err(), PairError::NotForDesktop);
+    assert_eq!(start(&agent, "x", mem(&relay, &faults), &mut store, Ticking::new()).await.unwrap_err(), PairError::NotForDesktop);
     let expired = vault.invite(Kind::Desktop, Utc::now() - TimeDelta::seconds(5), None);
-    assert_eq!(start(&expired, "x", mem(&relay), &mut store, Ticking::new()).await.unwrap_err(), PairError::Expired);
-    assert_eq!(start("not a code", "x", mem(&relay), &mut store, Ticking::new()).await.unwrap_err(), PairError::Code(InviteError::Qr));
+    assert_eq!(start(&expired, "x", mem(&relay, &faults), &mut store, Ticking::new()).await.unwrap_err(), PairError::Expired);
+    assert_eq!(start("not a code", "x", mem(&relay, &faults), &mut store, Ticking::new()).await.unwrap_err(), PairError::Code(InviteError::Qr));
     assert_eq!(relay.lock().unwrap().fetches, 0, "no claim spent");
     assert!(store.data.is_none());
 }
@@ -343,10 +496,10 @@ async fn codes_are_checked_before_anything_is_spent() {
 /// No hs.resp: the window ends, nothing is stored.
 #[tokio::test]
 async fn no_answer_times_out() {
-    let (relay, vault) = setup();
+    let (relay, vault, faults) = setup();
     let code = vault.invite(Kind::Desktop, Utc::now() + TimeDelta::minutes(10), None);
     let mut store = MemStore::default();
-    assert_eq!(start(&code, "x", mem(&relay), &mut store, Ticking::new()).await.unwrap_err(), PairError::TimedOut);
+    assert_eq!(start(&code, "x", mem(&relay, &faults), &mut store, Ticking::new()).await.unwrap_err(), PairError::TimedOut);
     assert!(store.data.is_none());
 }
 
@@ -376,5 +529,4 @@ fn stored_state_round_trips() {
     assert_eq!(back.to_json().as_str(), json.as_str());
     assert_eq!(Epoch::restore(back.epoch).id(), epoch.id());
     assert_eq!(DeviceState::from_json(b"{}").unwrap_err(), StoreError::Corrupt);
-    let _ = base64::engine::general_purpose::STANDARD.encode([0u8]);
 }

@@ -20,8 +20,13 @@
 //! **Fail secure.** The desktop is paired only once a `device.paired`
 //! from the vault's relay key, under the handshake's keys, with a valid
 //! standing token for this device, has been stored. Anything else (no
-//! answer, a malformed answer, a deposit that may not have arrived) is
-//! "not paired", and the pairing state is removed when the window ends.
+//! answer, a malformed answer, a deposit that certainly didn't arrive) is
+//! "not paired", and every failure after the pending pairing was stored
+//! removes it again, keys included. A temporary relay failure is retried
+//! until the window ends; once the answer is stored, a failed ack is
+//! harmless (the relay redelivers, and the message is a duplicate).
+
+use std::future::Future;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -43,11 +48,14 @@ use crate::transport::Transport;
 
 /// How long a pairing waits after `hs.init` (§6.7).
 pub const PAIRING_WINDOW: TimeDelta = TimeDelta::minutes(10);
-/// The long-poll wait per collect, and the batch size.
-const COLLECT_WAIT_SECS: u64 = 25;
+/// The longest long-poll wait per collect, and the batch size.
+const COLLECT_WAIT_SECS: i64 = 25;
 const COLLECT_MAX: u32 = 32;
 /// The longest device name sent in `hs.init`'s profile.
 pub const MAX_DEVICE_NAME: usize = 64;
+/// Retry backoff for temporary relay failures.
+const BACKOFF_START_MS: u64 = 250;
+const BACKOFF_MAX_MS: u64 = 10_000;
 
 const DEVICE_PAIRED: &str = "device.paired";
 const DEVICE_PAIR_REJECTED: &str = "device.pair.rejected";
@@ -76,7 +84,7 @@ pub enum PairError {
     NotForDesktop,
     /// The code has expired.
     Expired,
-    /// A relay call failed.
+    /// A relay call failed for good (or until the window ended).
     Relay(RelayError),
     /// A deposit failed and certainly wasn't delivered.
     NotSent(RelayError),
@@ -84,6 +92,9 @@ pub enum PairError {
     Handshake(HandshakeError),
     /// A token from the vault isn't valid for this device.
     Token,
+    /// The vault's answer (under the handshake's keys) doesn't check out:
+    /// its body, role or token is wrong.
+    BadAnswer,
     /// The device state couldn't be stored.
     Store(StoreError),
     /// Fresh keys couldn't be made.
@@ -92,6 +103,10 @@ pub enum PairError {
     Rejected,
     /// The pairing window ended without an answer.
     TimedOut,
+    /// The pairing failed as the inner error says, **and** its stored
+    /// state (keys included) could not be removed: the caller must try
+    /// again or tell the person.
+    NotCleared(Box<PairError>),
 }
 
 impl std::fmt::Display for PairError {
@@ -103,10 +118,12 @@ impl std::fmt::Display for PairError {
             Self::Relay(e) | Self::NotSent(e) => write!(f, "pairing: {e}"),
             Self::Handshake(e) => write!(f, "pairing: {e}"),
             Self::Token => f.write_str("pairing: the vault's token is not valid for this device"),
+            Self::BadAnswer => f.write_str("pairing: the vault's answer did not check out"),
             Self::Store(e) => write!(f, "pairing: {e}"),
             Self::Keys => f.write_str("pairing: keys could not be made"),
             Self::Rejected => f.write_str(crate::display::REJECTED_ON_PHONE),
             Self::TimedOut => f.write_str(crate::display::NOT_CONFIRMED),
+            Self::NotCleared(e) => write!(f, "{e}; and the pairing's stored keys could not be removed"),
         }
     }
 }
@@ -155,6 +172,38 @@ fn seed() -> Result<Zeroizing<[u8; 32]>, PairError> {
     Ok(s)
 }
 
+/// Remove the stored state after `e`; if that fails too, say so.
+fn cleared(store: &mut impl Persist, e: PairError) -> PairError {
+    match store.clear() {
+        Ok(()) => e,
+        Err(_) => PairError::NotCleared(Box::new(e)),
+    }
+}
+
+/// Run `op` until it succeeds, fails for good, or the window ends:
+/// temporary relay failures (`retryable`) are retried with backoff.
+async fn retrying<R, Fut>(clock: &impl Clock, deadline: DateTime<Utc>, mut op: impl FnMut() -> Fut) -> Result<R, PairError>
+where
+    Fut: Future<Output = Result<R, RelayError>>,
+{
+    let mut delay = BACKOFF_START_MS;
+    loop {
+        match op().await {
+            Ok(r) => return Ok(r),
+            Err(e) if e.retryable() && clock.now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                delay = (delay * 2).min(BACKOFF_MAX_MS);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// The long-poll wait: at most 25 s, and no longer than the window.
+fn wait_secs(clock: &impl Clock, deadline: DateTime<Utc>) -> u64 {
+    (deadline - clock.now()).num_seconds().clamp(0, COLLECT_WAIT_SECS) as u64
+}
+
 /// Deposit, treating "maybe delivered" as sent (the receiver dedupes) and
 /// "certainly not delivered" as a failure.
 async fn deposit(t: &impl Transport, to: &RelayAddr, token: &Token, payload: &[u8]) -> Result<(), PairError> {
@@ -167,7 +216,8 @@ async fn deposit(t: &impl Transport, to: &RelayAddr, token: &Token, payload: &[u
 
 /// Start pairing from `code`: steps 1–5 above. `device_name` is this
 /// desktop's name, sent to the vault (the member sees it on their phone).
-/// `make_transport` gets this device's new relay key.
+/// `make_transport` gets this device's new relay key. On any error nothing
+/// is left in `store` (or [`PairError::NotCleared`] says otherwise).
 pub async fn start<T: Transport, C: Clock>(
     code: &str,
     device_name: &str,
@@ -190,11 +240,15 @@ pub async fn start<T: Transport, C: Clock>(
     let own_pk = relay_key.verifying_key();
     let transport = make_transport(relay_key.clone());
     let own_url = qr.relay.clone();
-    let registration = transport.register(&own_url).await?;
+    // The code's own expiry bounds these steps.
+    let code_deadline = DateTime::from_timestamp(qr.exp as i64, 0).unwrap_or(now);
+    let registration = retrying(&clock, code_deadline, || transport.register(&own_url)).await?;
+    // Not retried: a claim is single-fetch, and a lost answer means it is gone.
     let blob = transport.get_claim(&qr.relay, &qr.claim_id).await?;
-    let bundle = open_bundle(&blob, &qr, Kind::Desktop, now).map_err(PairError::Code)?;
+    let bundle = open_bundle(&blob, &qr, Kind::Desktop, clock.now()).map_err(PairError::Code)?;
     let vault = VaultRecord { ik: bundle.vault.ik, kem: bundle.vault.kem.clone(), relay: bundle.vault.relay.clone() };
 
+    let now = clock.now();
     let (standing, issued_exp) =
         mint_for_vault(&relay_key, &own_url, &vault.relay.pk, now, registration.limits.max_token_lifetime_seconds).map_err(|_| PairError::Token)?;
     let name = shown_name(device_name).unwrap_or_else(|| "Desktop".into());
@@ -223,60 +277,58 @@ pub async fn start<T: Transport, C: Clock>(
     deposit(&transport, &vault.relay, &Token::from_received(bundle.token.clone()), initiator.envelope()).await?;
 
     // Step 5: hs.resp. Anything that isn't it is acked and dropped.
-    loop {
+    let (out, resp_msg) = 'resp: loop {
         if clock.now() >= deadline {
             return Err(PairError::TimedOut);
         }
-        for m in transport.collect(&own_url, COLLECT_WAIT_SECS, COLLECT_MAX).await? {
-            let out = match resp_candidate(&m, &initiator) {
-                Some(sender) => match initiator.handle_resp(&m.payload, &sender, clock.now()) {
-                    Ok(out) => out,
-                    Err(e) => {
-                        transport.ack(&own_url, &m.msg_id).await?;
-                        if initiator.is_done() {
-                            // It decrypted and failed: the handshake is over.
-                            return Err(PairError::Handshake(e));
-                        }
-                        continue;
+        let batch = retrying(&clock, deadline, || transport.collect(&own_url, wait_secs(&clock, deadline), COLLECT_MAX)).await?;
+        for m in batch {
+            if clock.now() >= deadline {
+                return Err(PairError::TimedOut);
+            }
+            if let Some(sender) = resp_candidate(&m, &initiator) {
+                match initiator.handle_resp(&m.payload, &sender, clock.now()) {
+                    Ok(out) => break 'resp (out, m.msg_id),
+                    Err(e) if initiator.is_done() => {
+                        // It decrypted and failed: the handshake is over.
+                        let _ = transport.ack(&own_url, &m.msg_id).await;
+                        return Err(PairError::Handshake(e));
                     }
-                },
-                None => {
-                    transport.ack(&own_url, &m.msg_id).await?;
-                    continue;
+                    Err(_) => {}
                 }
-            };
-            let now = clock.now();
-            let request = out.resp.token.clone().ok_or(PairError::Token)?;
-            let request_exp = check_from_vault(&request, &vault.relay.pk, &own_pk, now).map_err(|_| PairError::Token)?;
-            let state = DeviceState {
-                ik_seed,
-                kem_seed,
-                relay_seed,
-                relay_url: own_url.clone(),
-                vault: vault.clone(),
-                vault_token: Zeroizing::new(request.clone()),
-                vault_token_exp: request_exp,
-                issued_exp,
-                phase: Phase::Pending,
-                pairing_deadline: deadline,
-                device_id: None,
-                vault_id: None,
-                epoch: out.epoch.snapshot(),
-            };
-            // Stored before hs.fin goes out and before hs.resp is acked.
-            state.save(store)?;
-            deposit(&transport, &vault.relay, &Token::from_received(request), &out.fin).await?;
-            transport.ack(&own_url, &m.msg_id).await?;
-            return Ok(Pairing {
-                transport,
-                clock,
-                state,
-                epoch: out.epoch,
-                sas: out.sas.ok_or(PairError::Handshake(HandshakeError::Body))?,
-                inviter: bundle.hint_name.as_deref().and_then(shown_name),
-            });
+            }
+            retrying(&clock, deadline, || transport.ack(&own_url, &m.msg_id)).await?;
         }
+    };
+    let now = clock.now();
+    let request = out.resp.token.clone().ok_or(PairError::Token)?;
+    let request_exp = check_from_vault(&request, &vault.relay.pk, &own_pk, now).map_err(|_| PairError::Token)?;
+    let sas = out.sas.clone().ok_or(PairError::Handshake(HandshakeError::Body))?;
+    let state = DeviceState {
+        ik_seed,
+        kem_seed,
+        relay_seed,
+        relay_url: own_url.clone(),
+        vault: vault.clone(),
+        vault_token: Zeroizing::new(request.clone()),
+        vault_token_exp: request_exp,
+        issued_exp,
+        phase: Phase::Pending,
+        pairing_deadline: deadline,
+        device_id: None,
+        vault_id: None,
+        epoch: out.epoch.snapshot(),
+    };
+    // Stored before hs.fin goes out and before hs.resp is acked; from here
+    // on, any failure removes it again.
+    state.save(store)?;
+    if let Err(e) = deposit(&transport, &vault.relay, &Token::from_received(request), &out.fin).await {
+        return Err(cleared(store, e));
     }
+    // Best effort: the state is stored, so a redelivered hs.resp is only a
+    // duplicate (it no longer decrypts under the finished handshake).
+    let _ = transport.ack(&own_url, &resp_msg).await;
+    Ok(Pairing { transport, clock, state, epoch: out.epoch, sas, inviter: bundle.hint_name.as_deref().and_then(shown_name) })
 }
 
 /// The relay sender, if `m` may be this handshake's `hs.resp`: a sealed
@@ -311,24 +363,29 @@ impl<T: Transport, C: Clock> Pairing<T, C> {
 
     /// Wait for the owner's answer (step 6). On `Ok` the device is paired
     /// and stored; on any `Err` it is not, and the pairing state is gone
-    /// from `store`.
+    /// from `store` (or [`PairError::NotCleared`] says otherwise).
     pub async fn wait_for_approval(mut self, store: &mut impl Persist) -> Result<(Paired, DeviceState), PairError> {
-        let result = self.wait(store).await;
-        if result.is_err() {
-            store.clear()?;
+        match self.wait(store).await {
+            Ok(p) => Ok((p, self.state)),
+            Err(e) => Err(cleared(store, e)),
         }
-        result.map(|p| (p, self.state))
     }
 
     async fn wait(&mut self, store: &mut impl Persist) -> Result<Paired, PairError> {
         let own_url = self.state.relay_url.clone();
         let own_pk = SigningKey::from_bytes(&self.state.relay_seed).verifying_key();
+        let deadline = self.state.pairing_deadline;
         loop {
-            if self.clock.now() >= self.state.pairing_deadline {
+            if self.clock.now() >= deadline {
                 return Err(PairError::TimedOut);
             }
-            for m in self.transport.collect(&own_url, COLLECT_WAIT_SECS, COLLECT_MAX).await? {
+            let (transport, clock) = (&self.transport, &self.clock);
+            let batch = retrying(clock, deadline, || transport.collect(&own_url, wait_secs(clock, deadline), COLLECT_MAX)).await?;
+            for m in batch {
                 let now = self.clock.now();
+                if now >= deadline {
+                    return Err(PairError::TimedOut);
+                }
                 match self.answer(&m, &own_pk, now) {
                     Answer::Paired(token, exp, paired) => {
                         self.epoch.activate(now);
@@ -338,23 +395,33 @@ impl<T: Transport, C: Clock> Pairing<T, C> {
                         self.state.device_id = Some(paired.device_id.clone());
                         self.state.vault_id = paired.vault_id.clone();
                         self.state.epoch = self.epoch.snapshot();
-                        // Stored before device.paired is acked (§8.3).
+                        // Stored before device.paired is acked (§8.3). Once
+                        // stored, a failed ack is harmless.
                         self.state.save(store)?;
-                        self.transport.ack(&own_url, &m.msg_id).await?;
+                        let _ = self.transport.ack(&own_url, &m.msg_id).await;
                         return Ok(paired);
                     }
                     Answer::Rejected => {
-                        self.transport.ack(&own_url, &m.msg_id).await?;
+                        let _ = self.transport.ack(&own_url, &m.msg_id).await;
                         return Err(PairError::Rejected);
                     }
-                    Answer::Drop => self.transport.ack(&own_url, &m.msg_id).await?,
+                    Answer::Bad => {
+                        let _ = self.transport.ack(&own_url, &m.msg_id).await;
+                        return Err(PairError::BadAnswer);
+                    }
+                    Answer::Drop => {
+                        let (transport, clock) = (&self.transport, &self.clock);
+                        retrying(clock, deadline, || transport.ack(&own_url, &m.msg_id)).await?;
+                    }
                 }
             }
         }
     }
 
-    /// What one collected message is: only the vault's relay key, under
-    /// the handshake's epoch, fresh, and a well-formed answer counts.
+    /// What one collected message is. Only the vault's relay key, under
+    /// the handshake's epoch, fresh, and not a response, can answer; such a
+    /// message (only the vault can write one) that doesn't check out ends
+    /// the pairing. Anything else is dropped.
     fn answer(&mut self, m: &Message, own_pk: &VerifyingKey, now: DateTime<Utc>) -> Answer {
         let vault = &self.state.vault.relay;
         let from_vault = decode_key(&m.sender).is_some_and(|s| s.as_bytes() == vault.pk.as_bytes());
@@ -368,9 +435,9 @@ impl<T: Transport, C: Clock> Pairing<T, C> {
             DEVICE_PAIRED => match paired_body(&inner.body) {
                 Some((paired, token)) => match check_from_vault(&token, &vault.pk, own_pk, now) {
                     Ok(exp) => Answer::Paired(token, exp, paired),
-                    Err(_) => Answer::Drop,
+                    Err(_) => Answer::Bad,
                 },
-                None => Answer::Drop,
+                None => Answer::Bad,
             },
             _ => Answer::Drop,
         }
@@ -380,11 +447,15 @@ impl<T: Transport, C: Clock> Pairing<T, C> {
 enum Answer {
     Paired(Zeroizing<String>, DateTime<Utc>, Paired),
     Rejected,
+    /// A `device.paired` from the vault that doesn't check out.
+    Bad,
     Drop,
 }
 
 /// `device.paired`'s body (§10.3) for a desktop: `device_id`, `role`
-/// `desktop`, the standing `token`, and `vault_id` if given.
+/// `desktop`, the standing `token` (required here: a device without its
+/// standing token can't reach its vault for long), and `vault_id` if
+/// given.
 fn paired_body(body: &str) -> Option<(Paired, Zeroizing<String>)> {
     let o = strict_json::parse_object(body.as_bytes()).ok()?;
     let device_id = o.string("device_id").ok().filter(|d| !d.is_empty() && d.len() <= 128)?;
