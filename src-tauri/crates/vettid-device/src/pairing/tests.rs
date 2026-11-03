@@ -248,6 +248,8 @@ fn stored_state_round_trips() {
             vettid_vms::envelope::Mode::Session,
         )
         .unwrap()],
+        access_end: Some(crate::store::PendingEnd { id: "01JB2Z6V9K3M4N5P6Q7R8S9T0Z".into(), session_id: Some("s-1".into()), attempts: 2 }),
+        access_end_unreadable: false,
     };
     let json = state.to_json();
     let back = DeviceState::from_json(json.as_bytes()).unwrap();
