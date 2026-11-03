@@ -169,7 +169,19 @@ impl DevRelay {
 
 /// A TEST-ONLY self-signed CA certificate (no key was kept), for the tests.
 #[cfg(test)]
-pub(crate) const FIXTURE_ROOT: &str = include_str!("testdata_fixture_root.pem");
+pub(crate) const FIXTURE_ROOT: &str = r"-----BEGIN CERTIFICATE-----
+MIIBtzCCAV2gAwIBAgIUEmxylFDByeZ6Ub2E+X6GHvAL+7MwCgYIKoZIzj0EAwIw
+MDEuMCwGA1UEAwwldmV0dGlkLWRlc2t0b3AgVEVTVC1PTkxZIGZpeHR1cmUgcm9v
+dDAgFw0yNjExMDMxMTUyNTBaGA8yMTI2MTAxMDExNTI1MFowMDEuMCwGA1UEAwwl
+dmV0dGlkLWRlc2t0b3AgVEVTVC1PTkxZIGZpeHR1cmUgcm9vdDBZMBMGByqGSM49
+AgEGCCqGSM49AwEHA0IABCzDlgktn3fSWlW5jzuwnzPMAoolWyeN+6ep916ONNmq
+GV1rMTrzk6GbyFk7nm3P7HPefVC5hr6l1b1clx+s/o6jUzBRMB0GA1UdDgQWBBSc
+DZoaS09MM/EySawXtKkeweMQyDAfBgNVHSMEGDAWgBScDZoaS09MM/EySawXtKke
+weMQyDAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIQCQ6t2+DXEI
+p8wMGQs/p3w0fKiR96OL1ZvJxGXpbWH8AQIgGG/oPr7mBQL6OGaHxsOH8jToVAi5
+W0NZR9I2QhCz5lU=
+-----END CERTIFICATE-----
+";
 
 #[cfg(test)]
 mod tests {
