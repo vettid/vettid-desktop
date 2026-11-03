@@ -32,3 +32,6 @@ pub mod transport;
 
 #[cfg(feature = "dev-file-store")]
 pub mod dev_store;
+
+#[cfg(test)]
+mod testutil;
