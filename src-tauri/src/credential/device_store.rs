@@ -259,6 +259,12 @@ pub(crate) mod tests {
         DeviceStore::with_keys(dir, None, keys())
     }
 
+    /// For the store tests: like [`store_for_tests`], but for a command
+    /// that started at `since` (`None`: no log-out check).
+    pub(crate) fn store_since_for_tests(dir: &Path, since: Option<WipeEpoch>) -> DeviceStore {
+        DeviceStore::with_keys(dir, since, keys())
+    }
+
     impl DeviceStore {
         /// Save some bytes (tests elsewhere only need a device file).
         pub(crate) fn save_raw_for_tests(&mut self) {
@@ -340,6 +346,46 @@ pub(crate) mod tests {
         assert_eq!(stored_key_protection(&dir), "none");
     }
 
+    /// #14: without a machine id there is no storage binding: a save fails
+    /// with the plain notice before any key is fetched, writing nothing and
+    /// creating no folder. (Was tested on the NATS-era store.)
+    #[test]
+    fn no_machine_id_saves_nothing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        struct NoMachineId(Arc<AtomicBool>);
+        impl DeviceKeys for NoMachineId {
+            fn master_for_save(&self) -> Result<MasterKey, KeystoreError> {
+                self.0.store(true, Ordering::SeqCst);
+                Ok(MasterKey { key: Zeroizing::new(MASTER), binding: BindingMode::Keyring })
+            }
+            fn master_for_load(&self) -> Result<MasterKey, KeystoreError> {
+                self.0.store(true, Ordering::SeqCst);
+                Ok(MasterKey { key: Zeroizing::new(MASTER), binding: BindingMode::Keyring })
+            }
+            fn storage_binding(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
+                Err(FingerprintError::MissingMachineId)
+            }
+        }
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        let fetched = Arc::new(AtomicBool::new(false));
+        let mut s = DeviceStore::with_keys(&dir, None, Box::new(NoMachineId(fetched.clone())));
+        assert_eq!(s.save(STATE), Err(StoreError::Io));
+        let err = s.take_failure().expect("why");
+        assert!(matches!(err, CredentialError::NoMachineId), "got {err}");
+        assert_eq!(err.to_string(), store::NO_MACHINE_ID_NOTICE);
+        assert!(!fetched.load(Ordering::SeqCst), "no key fetched or created");
+        assert!(!dir.exists(), "nothing written");
+
+        // A load with a saved file fails the same way and keeps the file.
+        store_in(&dir).save(STATE).unwrap();
+        let mut s = DeviceStore::with_keys(&dir, None, Box::new(NoMachineId(fetched)));
+        assert_eq!(s.load(), Err(StoreError::Io));
+        assert!(matches!(s.take_failure(), Some(CredentialError::NoMachineId)));
+        assert!(exists(&dir), "kept");
+    }
+
     /// A keyring that can't be read at load is Io (it may work later), and
     /// the file is kept.
     #[test]
@@ -413,8 +459,14 @@ pub(crate) mod tests {
         assert!(!exists(&dir), "nothing was written back");
         let mut after = store_in(&dir);
         after.save(STATE).unwrap();
+        let later = fs::read(dir.join(DEVICE_FILE)).unwrap();
+        // The old store still can't write over the later pairing.
+        assert_eq!(before.save(b"{\"v\":1,\"ik_seed\":\"b2xkLXN0b3Jl\"}"), Err(StoreError::Io));
+        assert!(matches!(before.take_failure(), Some(CredentialError::LoggedOutMeanwhile)));
+        assert_eq!(fs::read(dir.join(DEVICE_FILE)).unwrap(), later, "the later pairing is byte for byte as it was");
         before.clear().unwrap();
         assert!(exists(&dir), "the later pairing stays");
+        assert_eq!(fs::read(dir.join(DEVICE_FILE)).unwrap(), later, "and untouched by the clear");
     }
 
     #[test]

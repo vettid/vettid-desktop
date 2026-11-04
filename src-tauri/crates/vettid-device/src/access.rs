@@ -503,6 +503,21 @@ impl Access {
         store: &mut impl Persist,
         seconds: Option<u32>,
     ) -> Result<RequestOutcome, AccessError> {
+        self.request_answered(s, store, seconds).await.map(|(outcome, _)| outcome)
+    }
+
+    /// [`Access::request`], also returning the `ts` the vault put on its
+    /// answer: a caller that waits for the grant needs it to tell a denial
+    /// sent before this request (about an earlier one) from a denial of
+    /// this one. The one path for a request: the checks, the ordering rule
+    /// and the send are the same here and in [`Access::request`], which
+    /// calls this.
+    pub async fn request_answered<T: Transport, C: Clock>(
+        &mut self,
+        s: &mut Session<T, C>,
+        store: &mut impl Persist,
+        seconds: Option<u32>,
+    ) -> Result<(RequestOutcome, DateTime<Utc>), AccessError> {
         if seconds.is_some_and(|n| !(MIN_SECONDS..=MAX_SECONDS).contains(&n)) {
             return Err(AccessError::BadSeconds);
         }
@@ -512,7 +527,7 @@ impl Access {
             None => "{}".into(),
         };
         let answer = s.request(store, TYPE_REQUEST, &body, self.timeout).await?;
-        parse_request_answer(&answer)
+        Ok((parse_request_answer(&answer)?, answer.ts))
     }
 
     /// End this desktop's access session: the one named by `session_id`,

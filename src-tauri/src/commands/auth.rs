@@ -610,6 +610,14 @@ pub async fn extend_session(app: AppHandle, state: State<'_, AppState>) -> Resul
     // #33: never overlaps End session; see AppState::session_op.
     let _session_op = state.session_op.lock().await;
     let mark = reset_mark(&state);
+    // As in end_access: a refused device's mailbox rechecks aren't waited for.
+    // This reads the snapshot before taking the link, so a collect that has
+    // just begun (or a refusal found since) can still be waited out once.
+    // That doesn't fail open: the link is checked again under its lock, and
+    // a refused one sends nothing.
+    if state.snapshot().refused {
+        state.stop_refresh();
+    }
     let mut slot = state.link.lock().await;
     let Some(link) = slot.as_mut() else {
         return Ok(RegisterResponse::failed(UNLOCK_FAILED_NOTICE));
@@ -863,6 +871,15 @@ pub async fn end_session(state: State<'_, AppState>) -> Result<EndSessionRespons
 
 async fn end_access(state: &AppState) -> EndSessionResponse {
     begin_reset(state);
+    // A refused device's refresh is only collecting its mailbox, which can
+    // hold the link for a poll (25 s): stop it first, so this doesn't wait.
+    // It is restarted below if still needed. The snapshot is read before the
+    // link is taken, so this can still wait out one collect if the refusal
+    // was found after it; that doesn't fail open (the link is checked again
+    // under its lock, and a refused one sends nothing).
+    if state.snapshot().refused {
+        state.stop_refresh();
+    }
     // Not live from here on, whatever the vault answers.
     state.publish(state.snapshot().without_session());
     let notice = {
@@ -1296,10 +1313,10 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let dir = base.path().join("vettid-desktop");
         assert_eq!(retire_legacy_pairing(&dir), None);
-        store::tests::save_pairing_with_live_session(&dir, "legacy");
+        store::tests::legacy_pairing_for_tests(&dir);
         assert_eq!(retire_legacy_pairing(&dir), Some(store::UNREADABLE_NOTICE));
         assert!(!store::exists(&dir));
-        store::tests::save_pairing_with_live_session(&dir, "legacy-2");
+        store::tests::legacy_pairing_for_tests(&dir);
         crate::credential::device_store::tests::store_for_tests(&dir).save_raw_for_tests();
         assert_eq!(retire_legacy_pairing(&dir), None, "silent next to a device file");
         assert!(!store::exists(&dir));

@@ -1100,14 +1100,6 @@ pub(crate) fn test_let_everyone_delete_children(path: &Path) {
     tests::set_dacl(path, &format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)(A;;0x40;;;WD)"));
 }
 
-/// For tests elsewhere in the crate (#45): let Everyone read `path`, so it
-/// is no longer private.
-#[cfg(test)]
-pub(crate) fn test_let_everyone_read(path: &Path) {
-    let me = sid_string(&current_user_sid().unwrap()).unwrap();
-    tests::set_dacl(path, &format!("D:P(A;;FA;;;{me})(A;;FR;;;WD)"));
-}
-
 /// For tests elsewhere in the crate: whether `path` is protected and
 /// grants only the current user and SYSTEM.
 #[cfg(test)]

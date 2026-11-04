@@ -29,7 +29,7 @@
 //!    There is no fallback on Windows ([`MACHINE_BOUND_FALLBACK`]): a
 //!    Credential Manager failure fails the save. On every platform, a
 //!    store that is already keyring-bound is never re-saved machine-bound
-//!    (see `credential::store::save`).
+//!    (the device store never uses the machine-bound key at all).
 //!
 //! ## Why no passphrase
 //!

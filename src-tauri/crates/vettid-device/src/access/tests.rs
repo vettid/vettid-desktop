@@ -160,6 +160,36 @@ async fn seconds_are_checked_before_sending() {
     }
 }
 
+/// `request_answered` is `request` with the answer's `ts`: the same checks
+/// before anything is sent, and the vault's own timestamp afterwards
+/// (not the time the desktop read it).
+#[tokio::test]
+async fn request_answered_returns_the_answers_ts() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    assert_eq!(a.request_answered(&mut s, &mut store, Some(59)).await, Err(AccessError::BadSeconds));
+    assert_eq!(vault.waiting(), 0, "nothing sent");
+
+    let at = parse_ts("2026-11-03T12:00:00.000Z").unwrap();
+    let vault_side = async {
+        let req = receive(&mut vault).await;
+        assert_eq!(req.kind, TYPE_REQUEST);
+        assert_eq!(req.body.as_str(), "{}");
+        let mut r = response(&req, Status::Ok, &requested_body());
+        r.ts = at;
+        deposit(&mut vault, r).await;
+    };
+    let (got, ()) = tokio::join!(a.request_answered(&mut s, &mut store, None), vault_side);
+    let (outcome, ts) = got.expect("answered");
+    assert!(matches!(outcome, RequestOutcome::Requested { ref request_id, .. } if request_id == "r-1"));
+    assert_eq!(ts, at);
+
+    // An answer that is a vault error is an error, as for `request`.
+    let (got, _) = tokio::join!(a.request_answered(&mut s, &mut store, None), answer(&mut vault, TYPE_REQUEST, error("owner_check_required"), "{}"));
+    assert_eq!(got, Err(AccessError::Vault("owner_check_required".into())));
+}
+
 #[tokio::test]
 async fn too_soon_and_errors() {
     let (relay, mut vault, faults, mut store) = paired().await;

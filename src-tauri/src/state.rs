@@ -66,6 +66,19 @@ pub struct AppState {
     pub active_call: Arc<Mutex<Option<Arc<CallSession>>>>,
 }
 
+/// How long the restarted refresh waits before its first round: nothing to
+/// wait for if `now`; for a refused device the rounds are the slow
+/// mailbox rechecks, so the first waits as long as they do; else a minute.
+fn first_wait(now: bool, refused: bool) -> std::time::Duration {
+    if refused {
+        crate::link::REFUSED_RECHECK_EVERY
+    } else if now {
+        std::time::Duration::ZERO
+    } else {
+        crate::link::REFRESH_EVERY
+    }
+}
+
 impl AppState {
     pub fn new() -> Self {
         Self {
@@ -115,10 +128,25 @@ impl AppState {
     /// [`crate::link::REFRESH_EVERY`]. Call it with `link` locked, so the
     /// task it replaces isn't in the middle of an operation.
     pub fn start_refresh(&self, now: bool) {
-        let first = if now { std::time::Duration::ZERO } else { crate::link::REFRESH_EVERY };
+        // The snapshot is published before this is called.
+        let first = first_wait(now, self.snapshot().refused);
         let h = crate::link::spawn_refresh(self.shared(), first);
         if let Some(old) = self.refresh_task.lock().unwrap_or_else(|p| p.into_inner()).replace(h) {
             old.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_refused_device_restarts_with_the_slow_wait() {
+        assert_eq!(first_wait(false, true), crate::link::REFUSED_RECHECK_EVERY);
+        assert_eq!(first_wait(true, true), crate::link::REFUSED_RECHECK_EVERY, "an end can't be sent to it");
+        assert_eq!(first_wait(true, false), Duration::ZERO);
+        assert_eq!(first_wait(false, false), crate::link::REFRESH_EVERY);
     }
 }
