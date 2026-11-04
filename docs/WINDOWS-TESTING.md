@@ -124,8 +124,9 @@ outside the file; the earlier format's Credential Manager entry is only ever del
 hook below hasn't been compiled by `makensis` or tried. The wipe mode's unit tests pass. What follows is the
 design and what was read in the bundler's template (tauri-bundler 2.10.2, `installer.nsi`).
 
-**What the uninstaller removes now:** the saved pairing, always, silent `/S` included, but not on an update
-(`/UPDATE`). Its hook (`src-tauri/windows/installer-hooks.nsh`, `NSIS_HOOK_PREUNINSTALL`) runs
+**What the uninstaller removes now:** the saved pairing, on every real uninstall, silent `/S` included. Not
+on an update (`/UPDATE`), and not when an installer runs the old uninstaller (an upgrade, downgrade or
+reinstall by hand): those keep the pairing. Its hook (`src-tauri/windows/installer-hooks.nsh`, `NSIS_HOOK_PREUNINSTALL`) runs
 `vettid-desktop.exe --uninstall-wipe` (`src-tauri/src/uninstall.rs`), which is log-out's local wipe
 (`store::wipe_for_logout`), each part confirmed on disk:
 - `%LOCALAPPDATA%\vettid-desktop\`, with `device.enc` and any temporary copy of it, and an earlier build's
@@ -138,7 +139,12 @@ itself (VAULT-MESSAGING §7.4), and an uninstall shouldn't wait on the network. 
 until it is removed on the phone.
 
 **The order in the hook:**
-1. On `/UPDATE`, nothing: an update keeps the pairing.
+1. Nothing on `/UPDATE`, and nothing when the uninstaller runs in place, from the install folder
+   (`$EXEDIR` = `$INSTDIR`, compared in short form, ignoring case and a trailing backslash; owner decision
+   "a", 2026-11-04). An installer runs the old uninstaller in place (`uninstall.exe _?=$INSTDIR`), without
+   `/UPDATE`. An uninstall from Windows' Apps list, or `uninstall.exe /S`, first copies the uninstaller to a
+   temporary folder and runs it from there (the NSIS manual, 3.2: `_?=` "stops the uninstaller from copying
+   itself to the temporary directory and running from there"), so it wipes.
 2. The running app is closed first (`CheckIfAppIsRunning`; the template checks only after the hook). Otherwise
    it could save the pairing again after the wipe. If it can't be closed, or the person cancels, the uninstall
    stops before anything is removed.
@@ -155,8 +161,10 @@ until it is removed on the phone.
    phone step. Both texts wait for the owner's approval. The uninstall goes on in every case.
 5. On 20 or a failure the uninstaller's exit code is 2, silent included, so a script can tell.
 
-A scripted uninstall that needs the exit code has to run the uninstaller in place:
-`uninstall.exe /S _?=<install folder>` (NSIS otherwise copies the uninstaller to `%TEMP%` and returns at once; NSIS's documented behaviour, not checked here).
+**Scripts:** `uninstall.exe /S` deletes the pairing, but returns before the temporary copy has finished, so the
+exit code 2 can't be seen that way: check that `%LOCALAPPDATA%\vettid-desktop` is gone instead. Running it in
+place, `uninstall.exe /S _?=<install folder>`, waits and gives the exit code, but **keeps the pairing**, as for
+an installer.
 
 **Who can run `--uninstall-wipe`:** anyone who can run a program as this Windows user, who can already delete
 these files and entries. It opens no window, prints nothing and isn't passed to a running app.
@@ -165,14 +173,16 @@ these files and entries. It opens no window, prints nothing and isn't passed to 
 - A silent install (`/S`) over an existing install shows no pages, so it never runs the old uninstaller: the
   pairing is kept.
 - With `/UPDATE` (with or without `/P`), the installer never runs the old uninstaller.
-- Interactive, same version: the default is "Add/Reinstall components", which keeps the pairing. Choosing
-  "Uninstall VettID Desktop" runs the old uninstaller without `/UPDATE`, so the pairing is deleted.
-- Interactive, upgrade or downgrade: **the default is "Uninstall before installing"**, which runs the old
-  uninstaller without `/UPDATE`, so the pairing is deleted, and the person sees the message. "Do not
-  uninstall" keeps it. (Downgrades are allowed by default.)
+- Interactive, same version: the default is "Add/Reinstall components", which doesn't uninstall. Choosing
+  "Uninstall VettID Desktop" runs the old uninstaller in place, without `/UPDATE`: the pairing is kept.
+- Interactive, upgrade or downgrade: the default is "Uninstall before installing", which runs the old
+  uninstaller in place, without `/UPDATE`: the pairing is kept, and no message is shown. "Do not uninstall"
+  keeps it too. (Downgrades are allowed by default.)
 - Passive (`/P`) without `/UPDATE`: the reinstall page's choice is read from a control that isn't there. From
-  the code, a same-version reinstall then uninstalls first (pairing deleted), and an upgrade or downgrade
-  doesn't. To be checked on this machine.
+  the code, a same-version reinstall then runs the old uninstaller in place (pairing kept), and an upgrade or
+  downgrade doesn't run it. To be checked on this machine.
+- So the pairing is deleted only by an uninstall itself: from the Apps list, or `uninstall.exe` run without
+  `_?=`.
 
 **Still left behind after uninstall:** `%LOCALAPPDATA%\com.vettid.desktop\EBWebView\` and
 `HKCU\Software\vettid\VettID Desktop`, unless "Delete the application data" is ticked (see above). Neither
@@ -185,8 +195,9 @@ and an administrator's elevation as another account would wipe that account's fo
 
 - Interactive install and uninstall, and what SmartScreen and Defender show a person (left for the owner).
 - An upgrade from an older version.
-- The uninstall hook end to end: a fixture `device.enc` removed by `/S`; a held file reported (exit code 2) and
-  kept; a clean uninstall; a reinstall (`/S`, `/S /UPDATE`, `/P`) keeping the fixture.
+- The uninstall hook end to end: a fixture `device.enc` removed by `uninstall.exe /S`; a held file kept (the
+  exit code isn't observable without `_?=`); a clean uninstall; `/S _?=` in place keeping the fixture; a
+  reinstall (`/S`, `/S /UPDATE`, `/P`) keeping it.
 - A standard (non-administrator) account, and a second Windows user.
 - Anything that needs pairing: the state file and its ACL on disk, sessions, sleep and resume, fast user
   switching, a wrong clock.
