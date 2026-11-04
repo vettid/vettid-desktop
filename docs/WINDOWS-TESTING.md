@@ -177,8 +177,8 @@ also open its window) exits 0.
      Desktop wasn't uninstalled. This Windows account isn't the one that installed it, and uninstalling it
      from here would leave that account's saved pairing on this computer. Sign in as the account that
      installed VettID Desktop, and uninstall it there." (for the owner's approval). The app, its uninstaller
-     and the user's Apps-list entry stay, so the user can still log out or uninstall. A per-machine install
-     (not used) is always refused, for the same reason.
+     and the user's Apps-list entry stay, so the user can still log out or uninstall. Any other install mode
+     (per-machine or "both", not used) fails the build with an `!error`: every uninstall would be refused.
    - A running app is closed (`CheckIfAppIsRunning`). If the person cancels, or the app can't be closed, the
      uninstall stops there. **This check can also silently do nothing** (when its Restart Manager session or
      registration fails), and the app could be started again before the wipe; step 3 covers both.
@@ -192,11 +192,18 @@ also open its window) exits 0.
    `FileExists` reads a folder it can't list as empty. The confirmation is the wipe's own 10 or 11.
    - Code 10 and nothing there: "This desktop was paired. Remove it on your phone too."
    - Code 11 and nothing there: nothing is shown.
-   - Anything else (code 20, 0, any other code, the program not starting, or a file there): the
-     uninstaller's exit code is 2, a Warning (event ID 1001) goes to the Windows Application event log
-     (below), and the message says the saved pairing couldn't be removed, with the folder, the Credential
-     Manager entry and the phone step.
-   - Both texts wait for the owner's approval. The uninstall has finished in every case that reaches step 3.
+   - The program still there: the uninstaller's exit code is 2, a Warning (event ID 1003) goes to the
+     Windows Application event log (below), and the message (owner approval needed): "VettID Desktop couldn't
+     be fully removed from this computer: its program is still in `<install folder>`, and may still be
+     running. Close VettID Desktop, then delete that folder. Also delete `<local app data>`\vettid-desktop if
+     it's there, and any vettid-desktop entry in Windows Credential Manager. Remove this desktop on your phone
+     too."
+   - Anything else (code 20, 0, any other code, the program not starting, or a pairing file there): exit
+     code 2, event 1001, and the message (owner approval needed): "VettID Desktop was uninstalled, but this
+     desktop's saved pairing couldn't be removed from this computer, or its removal couldn't be confirmed. If
+     the folder `<local app data>`\vettid-desktop is still there, delete it, and delete any vettid-desktop
+     entry in Windows Credential Manager. Remove this desktop on your phone too."
+   - The texts wait for the owner's approval. The uninstall has finished in every case that reaches step 3.
    - Messages are shown only when a person is watching: not under `/S`, and not under `/P` (passive), where a
      box would wait for a click. The exit code is set either way.
 
@@ -222,17 +229,22 @@ also open its window) exits 0.
   No installer passes `/WIPEPAIRING`.
 - **The event log:** every failure, silent or not, writes a Warning, source "VettID Desktop", to the Application
   log: event ID 1001 when the pairing couldn't be removed or confirmed, 1002 when the uninstall was refused
-  because another account ran it. The source isn't registered (that needs an administrator), so Event Viewer says the
+  because another account ran it, 1003 when the program itself couldn't be deleted. The source isn't registered (that needs an administrator), so Event Viewer says the
   description isn't found and shows the text as the event's data. Find it with
   `Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='VettID Desktop']]]"`. Its text (for
-  the owner's approval) names no person, folder or account; 1001's gives the wipe's result code. The 1001 text:
+  the owner's approval) names no person, folder or account; 1001's and 1003's give the wipe's result code.
+  The 1001 text:
   "VettID Desktop was uninstalled, but this desktop's saved pairing couldn't be removed from this computer, or
   its removal couldn't be confirmed (result `<code>`). If %LOCALAPPDATA%\vettid-desktop is still there for the
   account that installed it, delete it, and delete any vettid-desktop entry in that account's Windows
   Credential Manager. Remove this desktop on the phone too." The 1002 text: "VettID Desktop wasn't
   uninstalled: the uninstaller ran as a Windows account that didn't install it, and uninstalling it would
   leave the installing account's saved pairing on this computer. Sign in as the account that installed VettID
-  Desktop, and uninstall it there."
+  Desktop, and uninstall it there." The 1003 text: "VettID Desktop couldn't be fully removed from this
+  computer: its program was still in its folder after the uninstall, and may still be running (result
+  `<code>`). Close VettID Desktop, then delete its program folder; for the account that installed it, also
+  delete %LOCALAPPDATA%\vettid-desktop if it's there, and any vettid-desktop entry in that account's Windows
+  Credential Manager. Remove this desktop on the phone too."
 
 **Who can run `--uninstall-wipe`:** anyone who can run a program as this Windows user, who can already delete
 these files and entries. It opens no window, prints nothing and isn't passed to a running app.
@@ -258,13 +270,15 @@ temporary copy runs, so its exit code is seen):**
 | 10c. only the product key records it, code 11 | 0 | yes |
 | 10d. neither key there, code 11 (refused: program kept, one event 1002) | 2 | no |
 | 10e. another account under `/P` and under `/S` (refused at once: no progress page left open) | 2 | no |
+| 13. the program held open, so it can't be started or deleted (event 1003) | 2 | no (result -1) |
+| `installMode` per-machine | the build fails (`!error`) | |
 | 11. in place with `/WIPEPAIRING`, code 11 | 0 | yes |
 | 11b. in place with `/WIPEPAIRING`, code 10 | 0 | yes |
 | 11c. in place with `/WIPEPAIRING`, code 20 (one event logged) | 2 | yes |
 | 12. in place with `/WIPEPAIRING /UPDATE`, code 20 | 0 | no |
 
 Every failing case wrote one Warning (level 3) with its text: ID 1001 for 3 to 6b, 8b and 11c, with the
-result code, and ID 1002 for 10 and 10d.
+result code, ID 1002 for 10 and 10d, and ID 1003 for 13.
 
 **End to end, with a real installer** (`cargo tauri build --debug --bundles nsis`, tauri-cli 2.12.2, a
 per-user install; Windows 11 Pro 10.0.26300). The pairing is a fixture: 64 bytes as `device.enc`. No

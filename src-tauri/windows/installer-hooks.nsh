@@ -170,10 +170,12 @@ Var VettidWipe
       ; Only a per-user install, uninstalled by the account that installed
       ; it. A per-machine install would be uninstalled elevated, by any
       ; account: whose pairing to delete can't be told.
+      ; Any other install mode fails the build, rather than making the app
+      ; impossible to uninstall (every uninstall would be refused below).
       !if "${INSTALLMODE}" == "currentUser"
         !insertmacro VETTID_INSTALLED_FOR_THIS_USER
       !else
-        StrCpy $0 0
+        !error "installer-hooks.nsh: the uninstall wipe supports only a per-user install (installMode currentUser), not ${INSTALLMODE}"
       !endif
       ${If} $0 <> 1
         ; Refused, before anything is removed: going on would delete the
@@ -224,7 +226,8 @@ Var VettidWipe
 
 ; A Warning with the text in $7, source "VettID Desktop", in the Application
 ; log: event ID 1001 for an uninstall whose pairing couldn't be removed or
-; confirmed, 1002 for an uninstall refused because another account ran it.
+; confirmed, 1002 for an uninstall refused because another account ran it,
+; 1003 for an uninstall that couldn't delete the program itself.
 ; The source isn't registered (that needs an administrator), so Event Viewer
 ; says the event's description isn't found and shows the text as the
 ; event's data. `Get-WinEvent -LogName Application -FilterXPath
@@ -266,9 +269,12 @@ Var VettidWipe
     ${OrIf} ${FileExists} "$1\vettid-desktop\*.tmp-*"
       StrCpy $2 1
     ${EndIf}
-    ; The program still there: it may still be running, and save again.
+    ; $8 = 1 if the program is still there: it may still be running, and
+    ; save again. That is a failure too, with its own text.
+    StrCpy $8 0
     ${If} ${FileExists} "$INSTDIR\${MAINBINARYNAME}.exe"
       StrCpy $2 1
+      StrCpy $8 1
     ${EndIf}
 
     ; $3 = 1 if a person is watching: not silent, not passive (/P, where a
@@ -295,12 +301,23 @@ Var VettidWipe
       ; Silent or not, the failure is also written to the Windows Application
       ; event log, where it outlives the uninstall and where IT tools look: a
       ; plain `uninstall.exe /S` returns 0 before this runs, and shows no box.
-      ; NEW TEXT (owner approval needed).
-      StrCpy $7 "VettID Desktop was uninstalled, but this desktop's saved pairing couldn't be removed from this computer, or its removal couldn't be confirmed (result $VettidWipe). If %LOCALAPPDATA%\vettid-desktop is still there for the account that installed it, delete it, and delete any vettid-desktop entry in that account's Windows Credential Manager. Remove this desktop on the phone too."
-      !insertmacro VETTID_REPORT_EVENT 1001
-      ${If} $3 = 1
+      ${If} $8 = 1
+        ; The program couldn't be deleted: "uninstalled" would be false.
         ; NEW TEXT (owner approval needed).
-        MessageBox MB_OK|MB_ICONEXCLAMATION "This desktop's saved pairing couldn't be removed from this computer, or its removal couldn't be confirmed. If the folder $1\vettid-desktop is still there, delete it, and delete any vettid-desktop entry in Windows Credential Manager. Remove this desktop on your phone too." /SD IDOK
+        StrCpy $7 "VettID Desktop couldn't be fully removed from this computer: its program was still in its folder after the uninstall, and may still be running (result $VettidWipe). Close VettID Desktop, then delete its program folder; for the account that installed it, also delete %LOCALAPPDATA%\vettid-desktop if it's there, and any vettid-desktop entry in that account's Windows Credential Manager. Remove this desktop on the phone too."
+        !insertmacro VETTID_REPORT_EVENT 1003
+        ${If} $3 = 1
+          ; NEW TEXT (owner approval needed).
+          MessageBox MB_OK|MB_ICONEXCLAMATION "VettID Desktop couldn't be fully removed from this computer: its program is still in $INSTDIR, and may still be running. Close VettID Desktop, then delete that folder. Also delete $1\vettid-desktop if it's there, and any vettid-desktop entry in Windows Credential Manager. Remove this desktop on your phone too." /SD IDOK
+        ${EndIf}
+      ${Else}
+        ; NEW TEXT (owner approval needed).
+        StrCpy $7 "VettID Desktop was uninstalled, but this desktop's saved pairing couldn't be removed from this computer, or its removal couldn't be confirmed (result $VettidWipe). If %LOCALAPPDATA%\vettid-desktop is still there for the account that installed it, delete it, and delete any vettid-desktop entry in that account's Windows Credential Manager. Remove this desktop on the phone too."
+        !insertmacro VETTID_REPORT_EVENT 1001
+        ${If} $3 = 1
+          ; NEW TEXT (owner approval needed).
+          MessageBox MB_OK|MB_ICONEXCLAMATION "VettID Desktop was uninstalled, but this desktop's saved pairing couldn't be removed from this computer, or its removal couldn't be confirmed. If the folder $1\vettid-desktop is still there, delete it, and delete any vettid-desktop entry in Windows Credential Manager. Remove this desktop on your phone too." /SD IDOK
+        ${EndIf}
       ${EndIf}
     ${EndIf}
   ${EndIf}
