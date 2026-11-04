@@ -133,6 +133,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Paused time, for the link loop's tests.
+tokio = { version = "1", features = ["full", "test-util"] }
 # A fake vault for the link's tests (src/link/fake.rs).
 vettid-vms = { path = "crates/vettid-vms" }
 vettid-relay = { path = "crates/vettid-relay" }

@@ -1,20 +1,19 @@
-//! Encrypted credential storage for the VettID desktop app.
+//! The parts the device store (`device_store`) is built from, and the
+//! local half of log-out.
 //!
-//! Credentials are encrypted at rest with a 32-byte master key fetched
-//! from the OS keyring (Linux Secret Service / macOS Keychain), with a
-//! machine-bound fallback when the keyring isn't reachable. The user
-//! never enters a passphrase: every privileged vault operation already
-//! requires phone authorization, and the on-disk blob — even decrypted
-//! — only lets the attacker publish `device.request-session`, which
-//! the phone has to authorize before it becomes a working session.
+//! - the private, atomic write of a file in the config folder
+//!   ([`write_private`]; `winacl` on Windows), the folder check
+//!   ([`ensure_config_dir`]), the one-writer lock and the wipe count
+//!   ([`WipeEpoch`]) that stop a save from outliving a log-out (#30), and
+//!   the sealing helpers;
+//! - the wipe ([`wipe_for_logout`]) and the check that it is confirmed;
+//! - the warning when another account can open the folder or file
+//!   ([`privacy_warning`]);
+//! - the earlier builds' pairing, `connection.enc`, which this build can't
+//!   open: [`exists`] finds it and [`remove_legacy_pairing`] deletes it
+//!   without decrypting it. Nothing here reads or writes its contents.
 //!
-//! See [`keystore`](super::keystore) for the key-source details and
-//! [`DESKTOP-REWORK-PLAN.md`](../../../../DESKTOP-REWORK-PLAN.md) §4 for
-//! the threat-model rationale.
-//!
-//! On-disk format: JSON-serialized `EncryptedStore` at
-//! `~/.config/vettid-desktop/connection.enc` (Linux) or
-//! `~/Library/Application Support/vettid-desktop/connection.enc` (macOS).
+//! See [`keystore`](super::keystore) for the key-source details.
 
 use std::fmt;
 use std::fs;
@@ -29,32 +28,14 @@ use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, Zeroizing};
 
-use crate::credential::keystore::{self, BindingMode, KeystoreError, MasterKey};
+use crate::credential::keystore::{BindingMode, KeystoreError};
 use crate::fingerprint::platform_key;
 use crate::fingerprint::platform_linux::FingerprintError;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// Current version of the encrypted store format.
-///
-/// - v1: legacy passphrase + Argon2id. Rejected outright (see
-///   DESKTOP-REWORK-PLAN.md §7).
-/// - v2: 32-byte master key from [`crate::credential::keystore`], no
-///   AEAD associated data. Decryptable for backwards-compat but a
-///   v2 read triggers an automatic re-seal to v3 on next save.
-/// - v3: same master key, but the AEAD now binds the ciphertext to
-///   the local machine via [`compute_blob_aad`]. A blob copied to a
-///   different machine — even with the original keyring entry — no
-///   longer decrypts. See SECURITY-REVIEW-2026-05-25.md D-HIGH-3.
-const STORE_VERSION: i32 = 3;
-const LEGACY_STORE_VERSION_V2: i32 = 2;
-
-/// Domain-separation label baked into the AEAD AAD.
-const AAD_LABEL: &[u8] = b"vettid-desktop-credential-v3";
 
 /// Credential file name within the config directory: the pairing of the
 /// builds that reached the vault over NATS. This build doesn't use it: it
@@ -65,13 +46,9 @@ const CREDENTIAL_FILE: &str = "connection.enc";
 /// [`super::device_store`]. Log-out removes it with the folder.
 pub(super) const DEVICE_FILE: &str = "device.enc";
 
-/// Marks the saved pairing's session as live (#26). A session is treated
-/// as live only while this file holds the tag of the saved session id: it
-/// is written, privately, with a pairing or session that has an expiry,
-/// and removed when the session ends. Removing a file works where a save
-/// is refused (a folder that isn't private, an unreachable keyring), so a
-/// session ended in that state isn't reloaded as live from the expiry the
-/// refused save couldn't clear. No key is needed to read or remove it.
+/// An earlier build's marker that its pairing's session was live (#26).
+/// This build neither writes nor reads it; it is removed with the legacy
+/// pairing so none is left behind.
 const SESSION_LIVE_FILE: &str = "session.live";
 
 /// Subdirectory name appended to the OS config dir.
@@ -97,19 +74,6 @@ pub const KEYRING_UNAVAILABLE_NOTICE: &str =
 /// keyring or not. Checked before pairing starts and at unlock.
 pub const NO_MACHINE_ID_NOTICE: &str =
     "This computer has no machine id, so this desktop can't keep or open a saved pairing on it. If your phone lists this desktop, remove it there.";
-
-/// Shown after End session when this desktop couldn't record on disk that
-/// the session ended (#26): the live marker couldn't be removed, so the
-/// next launch may show the old session as open.
-pub const SESSION_END_NOT_RECORDED_NOTICE: &str =
-    "The session ended, but this desktop couldn't record that on this computer, so next time it may show the old session as still open. If it does, end the session again.";
-
-/// Shown when a pairing or Start New Session got a session from the vault
-/// but couldn't record it on this computer (#33, owner decision (a),
-/// 2026-11-01). The pairing itself is saved, so pairing again would only
-/// leave a stale device on the phone.
-pub const SESSION_NOT_RECORDED_NOTICE: &str =
-    "This desktop is paired, but it couldn't record the new session on this computer. Choose Start New Session to try again. You don't need to pair again.";
 
 /// Windows: shown when the folder that holds the pairing folder
 /// (`%LOCALAPPDATA%`) lets another account remove, rename or replace what
@@ -185,14 +149,9 @@ pub enum CredentialError {
     /// The keystore couldn't fetch a master key (keyring unavailable
     /// AND machine-bound fallback failed).
     KeystoreError(String),
-    /// The credential file does not exist.
-    NotFound(String),
-    /// The store version is not supported.
-    UnsupportedVersion(i32),
-    /// A machine-bound store did not decrypt with this machine's key.
-    /// `load` deleted the file if an earlier build sealed it under the
-    /// public fingerprint, and kept it otherwise. Displays
-    /// [`UNREADABLE_NOTICE`].
+    /// A saved pairing can't be opened: a device file that does not open
+    /// with this machine's key, or the earlier builds' `connection.enc`.
+    /// Displays [`UNREADABLE_NOTICE`].
     Unreadable,
     /// The keyring failed and the save may not fall back to the
     /// machine-bound key: on Windows, or because the store on disk is
@@ -234,10 +193,6 @@ impl fmt::Display for CredentialError {
             CredentialError::CryptoError(msg) => write!(f, "crypto error: {}", msg),
             CredentialError::FingerprintError(e) => write!(f, "fingerprint error: {}", e),
             CredentialError::KeystoreError(msg) => write!(f, "keystore error: {}", msg),
-            CredentialError::NotFound(path) => write!(f, "credential file not found: {}", path),
-            CredentialError::UnsupportedVersion(v) => {
-                write!(f, "unsupported store version: {}", v)
-            }
             CredentialError::Unreadable => f.write_str(UNREADABLE_NOTICE),
             CredentialError::KeyringUnavailable => f.write_str(KEYRING_UNAVAILABLE_NOTICE),
             CredentialError::NoConfigDir => f.write_str(NO_CONFIG_DIR_NOTICE),
@@ -273,39 +228,6 @@ impl From<FingerprintError> for CredentialError {
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
-
-/// All sensitive material for an active desktop-to-vault connection.
-///
-/// This struct is JSON-serialized before encryption. The `Zeroize` derive
-/// ensures that sensitive byte fields are overwritten when the struct is dropped.
-#[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
-#[zeroize(drop)]
-pub struct ConnectionCredentials {
-    pub connection_id: String,
-    /// Session key derived from X25519 + HKDF. Zeroized on expiry.
-    #[serde(with = "serde_bytes")]
-    pub connection_key: Vec<u8>,
-    pub key_id: String,
-    #[serde(with = "serde_bytes")]
-    pub device_private_key: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    pub device_public_key: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    pub vault_public_key: Vec<u8>,
-    /// JWT+seed block for the device's scoped NATS account (earlier builds;
-    /// this one never uses it).
-    pub message_space_token: String,
-    pub message_space_url: String,
-    pub owner_guid: String,
-    pub owner_name: String,
-    pub session_id: String,
-    /// Unix seconds at which the current session expires. 0 = unknown/expired.
-    #[serde(default)]
-    pub session_expires_at: i64,
-    /// User-approved session duration in seconds, for re-request on extension.
-    #[serde(default)]
-    pub session_duration_seconds: i64,
-}
 
 /// The on-disk JSON format for encrypted credentials. v2.
 ///
@@ -490,46 +412,6 @@ fn acl_error(path: &Path, e: super::winacl::AclError) -> CredentialError {
     }
 }
 
-/// Encrypt credentials and write them to `connection.enc` in `config_dir`.
-///
-/// The encryption key comes from the OS keyring (or the machine-bound
-/// fallback when the keyring is unavailable). No user input. The file
-/// is written atomically through a temporary file: mode 0600 on unix, and
-/// on Windows a protected DACL for the user and SYSTEM (see `winacl`).
-///
-/// SECURITY: Intermediate key material is zeroized after use; the
-/// `MasterKey` returned by the keystore zeroizes on drop.
-///
-/// `since` is [`wipe_epoch`] as recorded when the command that saves
-/// started (a pairing, a Start New Session). If a log-out has wiped the
-/// pairing since, the save fails with [`CredentialError::LoggedOutMeanwhile`]
-/// and writes nothing: it must not recreate a pairing the log-out reported
-/// removed (#30).
-pub fn save(
-    config_dir: &Path,
-    creds: &ConnectionCredentials,
-    since: WipeEpoch,
-) -> Result<BindingMode, CredentialError> {
-    save_since(&SystemKeys, config_dir, creds, Mode::CreateOrReplace, Some(since))
-}
-
-/// Like [`save`], for updating a pairing that is already saved (clearing
-/// the session at end_session). Fails with [`CredentialError::NotFound`],
-/// writing nothing and creating no folder, if `connection.enc` isn't there
-/// when the write lock is taken: a log-out that wiped the pairing must not
-/// be undone by an update that loaded it just before (#28). It fails with
-/// [`CredentialError::LoggedOutMeanwhile`] if a log-out wiped the pairing
-/// after `since`, even if a new pairing has been saved since: the update
-/// carries the old pairing's credentials and must not overwrite the new one
-/// (#30).
-pub fn save_existing(
-    config_dir: &Path,
-    creds: &ConnectionCredentials,
-    since: WipeEpoch,
-) -> Result<BindingMode, CredentialError> {
-    save_since(&SystemKeys, config_dir, creds, Mode::UpdateExisting, Some(since))
-}
-
 /// [`ensure_config_dir`] for the start of a pairing (#30): under the writer
 /// lock, and refused with [`CredentialError::LoggedOutMeanwhile`] if a
 /// log-out has wiped the pairing since `since`, so it can't recreate the
@@ -549,8 +431,8 @@ pub fn ensure_config_dir_since(config_dir: &Path, since: WipeEpoch) -> Result<()
 static WIPES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A point in this process's wipes, from [`wipe_epoch`]. A command that
-/// saves records it when it starts and hands it to [`save`] or
-/// [`save_existing`].
+/// saves records it when it starts and hands it to its store
+/// ([`super::device_store::DeviceStore::new`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WipeEpoch(u64);
 
@@ -558,45 +440,6 @@ pub struct WipeEpoch(u64);
 /// will save, before anything that could wait.
 pub fn wipe_epoch() -> WipeEpoch {
     WipeEpoch(WIPES.load(std::sync::atomic::Ordering::SeqCst))
-}
-
-/// Whether a save may create the pairing or only update it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    CreateOrReplace,
-    UpdateExisting,
-}
-
-/// Read and decrypt credentials from `connection.enc` in `config_dir`.
-///
-/// Uses the master key from the same keystore source the file was
-/// encrypted under (recorded in the file's `binding` header).
-/// Returns `(credentials, binding_mode)`.
-///
-/// A machine-bound file that does not decrypt is reported as
-/// [`CredentialError::Unreadable`]. It is deleted only if it was sealed by an
-/// earlier build under the public fingerprint (it opens with that as the
-/// key); otherwise it is kept. A keyring-bound file that does not decrypt
-/// is left in place. Files sealed before #14, when the key and the AAD
-/// covered all five machine attributes, don't open: the person pairs again.
-pub fn load(config_dir: &Path) -> Result<(ConnectionCredentials, BindingMode), CredentialError> {
-    load_with(&SystemKeys, config_dir)
-}
-
-/// Where [`save`] and [`load`] get their keys. Production uses
-/// [`SystemKeys`]; tests pass fixed keys, so a store round trip can be
-/// tested without a keyring or real machine attributes.
-pub(crate) trait KeySource {
-    /// The master key for a new save (keyring, else machine-bound).
-    fn master_for_save(&self) -> Result<MasterKey, KeystoreError>;
-    /// The master key for a store sealed under `binding`.
-    fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError>;
-    /// This machine's storage binding, mixed into the AAD (#14).
-    fn storage_binding(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError>;
-    /// The public machine fingerprint. Only used to recognize a file a
-    /// pre-#10 build sealed with the fingerprint as both its key and its
-    /// AAD value, so it can be deleted.
-    fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError>;
 }
 
 /// The storage binding's failure as the store reports it: no machine id
@@ -612,201 +455,21 @@ pub(super) fn binding_error(e: FingerprintError) -> CredentialError {
 /// for the storage binding (#14). Called before pairing starts, so the
 /// vault never lists a desktop that can't save its pairing.
 pub fn check_machine_binding() -> Result<(), CredentialError> {
-    SystemKeys.storage_binding().map(|_| ()).map_err(binding_error)
-}
-
-/// The keyring and this machine's attributes.
-struct SystemKeys;
-
-impl KeySource for SystemKeys {
-    fn master_for_save(&self) -> Result<MasterKey, KeystoreError> {
-        keystore::fetch_or_create_master_key()
-    }
-    fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError> {
-        keystore::fetch_for_binding(binding)
-    }
-    fn storage_binding(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
-        platform_key::derive_storage_binding()
-    }
-    fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
-        platform_key::derive_platform_key()
-    }
-}
-
-fn load_with(
-    keys: &dyn KeySource,
-    config_dir: &Path,
-) -> Result<(ConnectionCredentials, BindingMode), CredentialError> {
-    let store = read_store(config_dir)?;
-    let binding = BindingMode::from_str(&store.binding).ok_or_else(|| {
-        CredentialError::SerializationError(format!("unknown binding mode: {}", store.binding))
-    })?;
-    let platform_key = keys.storage_binding().map_err(binding_error)?;
-    let master = keys.master_for_load(binding)?;
-    match decrypt_store(&store, &master.key, &platform_key) {
-        Ok(mut creds) => {
-            // #26: the expiry counts only while the live marker names this
-            // session. Only the expiry is cleared; nothing reads the id of
-            // a session that isn't live.
-            if creds.session_expires_at != 0 && !session_marked_live(config_dir, &creds.session_id) {
-                log::info!("credential store: the saved session is not marked live; treating it as ended");
-                creds.session_expires_at = 0;
-                creds.session_duration_seconds = 0;
-            }
-            Ok((creds, binding))
-        }
-        Err(CredentialError::CryptoError(e)) if binding == BindingMode::MachineBound => {
-            // Delete the file only when it is positively one written by an
-            // earlier build, which used the public fingerprint as its key.
-            // Any other failure is kept: a file sealed before #14 (key and
-            // AAD over all five attributes), or a machine id that changed
-            // and may change back. Pairing again or "Remove this desktop"
-            // replaces it.
-            let sealed_by_old_build = keys
-                .legacy_fingerprint()
-                .map(|fp| decrypt_store(&store, &fp, &fp).is_ok())
-                .unwrap_or(false);
-            if sealed_by_old_build {
-                log::warn!(
-                    "credential store: machine-bound file was sealed under the public fingerprint by an earlier build; deleting it"
-                );
-                if let Err(de) = delete(config_dir) {
-                    log::error!("credential store: could not delete the old file: {}", de);
-                }
-            } else {
-                log::warn!(
-                    "credential store: machine-bound file does not decrypt on this machine ({}); keeping it",
-                    e
-                );
-            }
-            Err(CredentialError::Unreadable)
-        }
-        Err(e) => Err(e),
-    }
+    platform_key::derive_storage_binding().map(|_| ()).map_err(binding_error)
 }
 
 /// One writer at a time in this process: a save, a delete or a wipe
 /// removes temporary files a crashed earlier save left behind, and must not
-/// remove another save's while it is running (e.g. end_session racing a
+/// remove another save's while it is running (e.g. an update racing a
 /// pairing). A wipe holding it also can't be undone by a save that started
-/// first: [`save_existing`] fails once the file is gone (#28). The app runs
-/// as a single instance, so this covers every writer.
+/// first (#28). The app runs as a single instance, so this covers every
+/// writer.
 ///
 /// A save holds it while it fetches the master key, which may wait on a
 /// keyring prompt; a log-out started meanwhile waits for that save.
 pub(super) fn writer_lock() -> std::sync::MutexGuard<'static, ()> {
     static WRITER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     WRITER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// A save with no log-out check, for tests that don't concern log-out.
-#[cfg(test)]
-fn save_with(
-    keys: &dyn KeySource,
-    config_dir: &Path,
-    creds: &ConnectionCredentials,
-) -> Result<BindingMode, CredentialError> {
-    save_with_mode(keys, config_dir, creds, Mode::CreateOrReplace)
-}
-
-#[cfg(test)]
-fn save_with_mode(
-    keys: &dyn KeySource,
-    config_dir: &Path,
-    creds: &ConnectionCredentials,
-    mode: Mode,
-) -> Result<BindingMode, CredentialError> {
-    save_since(keys, config_dir, creds, mode, None)
-}
-
-/// A save, refused if a wipe has run since `since` (#30). `None` only in
-/// tests that don't concern log-out.
-fn save_since(
-    keys: &dyn KeySource,
-    config_dir: &Path,
-    creds: &ConnectionCredentials,
-    mode: Mode,
-    since: Option<WipeEpoch>,
-) -> Result<BindingMode, CredentialError> {
-    let _one_at_a_time = writer_lock();
-    if let Some(since) = since {
-        if wipe_epoch() != since {
-            log::warn!("Credential store: a log-out wiped the pairing after this save's command started; nothing written");
-            return Err(CredentialError::LoggedOutMeanwhile);
-        }
-    }
-    if mode == Mode::UpdateExisting {
-        match pairing_present(config_dir) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(CredentialError::NotFound(config_dir.join(CREDENTIAL_FILE).display().to_string()))
-            }
-            Err(e) => {
-                return Err(CredentialError::IoError(format!(
-                    "check {}: {}",
-                    config_dir.join(CREDENTIAL_FILE).display(),
-                    e
-                )))
-            }
-        }
-    }
-
-    // The storage binding first: without a machine id nothing can be
-    // saved, and no keyring key should be created for it (#14).
-    let platform_key = keys.storage_binding().map_err(binding_error)?;
-    let master = keys.master_for_save()?;
-    // SECURITY: never downgrade. If the store on disk is keyring-bound
-    // and the keyring fails now, the keystore falls back to the
-    // machine-bound key; re-sealing under it would silently move the
-    // pairing to a key any local user can recompute. Fail the save and
-    // leave the file as it is. A file that exists but can't be read or
-    // parsed may be keyring-bound too, so it is not overwritten either.
-    if master.binding != BindingMode::Keyring {
-        match on_disk_store(config_dir) {
-            OnDisk::Absent | OnDisk::Bound(BindingMode::MachineBound) => {}
-            OnDisk::Bound(BindingMode::Keyring) | OnDisk::Unreadable => {
-                log::warn!("Credential store: keyring unavailable; not overwriting a keyring-bound or unreadable store under a weaker key");
-                return Err(CredentialError::KeyringUnavailable);
-            }
-        }
-    }
-    let binding = master.binding;
-
-    let mut plaintext = serde_json::to_vec(creds)
-        .map_err(|e| CredentialError::SerializationError(format!("marshal credentials: {}", e)))?;
-
-    let aad = compute_blob_aad(binding.as_str(), &platform_key);
-    let (nonce, ciphertext) = encrypt_xchacha20(&master.key, &plaintext, &aad)?;
-    plaintext.zeroize();
-    // `master` zeroizes on drop.
-
-    let store = EncryptedStore {
-        version: STORE_VERSION,
-        binding: binding.as_str().to_string(),
-        nonce,
-        ciphertext,
-    };
-
-    let data = serde_json::to_vec(&store)
-        .map_err(|e| CredentialError::SerializationError(format!("marshal store: {}", e)))?;
-
-    ensure_config_dir(config_dir)?;
-
-    write_private(config_dir, CREDENTIAL_FILE, &data)?;
-
-    // #26: the session is live only with the marker. If it can't be
-    // written the pairing is still saved, and the session is treated as
-    // ended: the person starts a new one.
-    if creds.session_expires_at > 0 && !creds.session_id.is_empty() {
-        if let Err(e) = write_private(config_dir, SESSION_LIVE_FILE, session_tag(&creds.session_id).as_bytes()) {
-            log::warn!("credential store: could not mark the session live ({}); it will be treated as ended", e);
-            remove_session_marker(config_dir);
-        }
-    } else {
-        remove_session_marker(config_dir);
-    }
-
-    Ok(binding)
 }
 
 /// Write `data` as `config_dir/name`, privately and atomically.
@@ -823,161 +486,6 @@ pub(super) fn write_private(config_dir: &Path, name: &str, data: &[u8]) -> Resul
     #[cfg(not(windows))]
     {
         write_atomically(config_dir, name, data)
-    }
-}
-
-/// The live marker's content for `session_id`: a hash, so the id itself
-/// isn't written outside the encrypted pairing.
-fn session_tag(session_id: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"vettid-desktop-session-live-v1|");
-    h.update(session_id.as_bytes());
-    hex::encode(h.finalize())
-}
-
-/// Whether the live marker names `session_id`. Anything else is "not
-/// live": no marker, another session's, an unreadable one, a link or a
-/// folder in its place, one larger than a tag, and on Windows one that
-/// another account can open (a shared folder lets another account plant
-/// or restore it). A copy restored by an account that can write the
-/// folder can't be told apart without a key; the warning after unlock
-/// already covers that folder.
-///
-/// A session the vault ended in this run is never live again, even if its
-/// marker couldn't be removed (#45).
-fn session_marked_live(config_dir: &Path, session_id: &str) -> bool {
-    !session_id.is_empty()
-        && !ended_by_vault(session_id)
-        && read_marker(config_dir, session_id) == Marker::Names
-}
-
-/// What the live marker says about a session (#45).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Marker {
-    /// A private, readable marker naming the session.
-    Names,
-    /// A private, readable marker naming another session.
-    Other,
-    /// No marker.
-    Absent,
-    /// Something that can't be confirmed either way: a read error, a link
-    /// or a folder in its place, one too large, or (Windows) one another
-    /// account can open.
-    Unknown,
-}
-
-fn read_marker(config_dir: &Path, session_id: &str) -> Marker {
-    use std::io::Read;
-    const MAX_MARKER: u64 = 128;
-    let path = config_dir.join(SESSION_LIVE_FILE);
-    match fs::symlink_metadata(&path) {
-        Ok(m) if m.file_type().is_file() && m.len() <= MAX_MARKER => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Marker::Absent,
-        _ => return Marker::Unknown,
-    }
-    #[cfg(windows)]
-    if super::winacl::check_private(&path).is_err() {
-        return Marker::Unknown;
-    }
-    let mut tag = String::new();
-    match fs::File::open(&path).and_then(|f| f.take(MAX_MARKER).read_to_string(&mut tag)) {
-        Ok(_) if tag.trim() == session_tag(session_id) => Marker::Names,
-        Ok(_) => Marker::Other,
-        Err(_) => Marker::Unknown,
-    }
-}
-
-/// Tags of the sessions the vault ended in this run (#45).
-static ENDED_BY_VAULT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
-fn ended_by_vault(session_id: &str) -> bool {
-    let tag = session_tag(session_id);
-    ENDED_BY_VAULT.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|t| *t == tag)
-}
-
-/// Whether the saved session `session_id` is recorded as live (#26). A
-/// pairing or extension checks this after its save, so it never reports
-/// a session as started that the next load would treat as ended.
-pub fn session_is_recorded(config_dir: &Path, session_id: &str) -> bool {
-    session_marked_live(config_dir, session_id)
-}
-
-/// Best-effort removal of the live marker, for paths that report nothing.
-fn remove_session_marker(config_dir: &Path) {
-    let _ = fs::remove_file(config_dir.join(SESSION_LIVE_FILE));
-}
-
-/// End the saved session on disk (#26): remove the live marker, so the
-/// next launch treats the session as ended even if the cleared session
-/// can't be saved. Ok only if the marker is confirmed gone; the caller
-/// tells the person otherwise ([`SESSION_END_NOT_RECORDED_NOTICE`]).
-pub fn end_saved_session(config_dir: &Path) -> Result<(), CredentialError> {
-    end_saved_session_locked(config_dir, &writer_lock())
-}
-
-/// End a session the vault ended (#45). Under the writer lock:
-/// - the session is recorded as ended for the rest of this run, so it is
-///   never live again even if the marker can't be removed;
-/// - the live marker is removed if it names `session_id`, or if what is
-///   there can't be confirmed either way (removing it can only end a
-///   session, the safe direction; nothing of this process is writing a
-///   newer one meanwhile);
-/// - a readable marker naming another session (a Start New Session, a new
-///   pairing) is left alone.
-///
-/// The pairing itself is never touched. `Ok(true)` if a marker was removed
-/// and is confirmed gone, `Ok(false)` if there was none or it named another
-/// session, `Err` if one named this session or couldn't be confirmed but
-/// wasn't removed (a folder in its place, say).
-///
-/// This relies on the vault giving each session a new id, as the legacy
-/// vault does (a new UUID per pairing and per rotation): a reused id would
-/// stay ended for the rest of the run.
-pub fn end_saved_session_if(config_dir: &Path, session_id: &str) -> Result<bool, CredentialError> {
-    let guard = writer_lock();
-    if session_id.is_empty() {
-        return Ok(false);
-    }
-    {
-        let mut ended = ENDED_BY_VAULT.lock().unwrap_or_else(|p| p.into_inner());
-        let tag = session_tag(session_id);
-        if !ended.contains(&tag) {
-            ended.push(tag);
-        }
-    }
-    match read_marker(config_dir, session_id) {
-        Marker::Absent | Marker::Other => Ok(false),
-        Marker::Names | Marker::Unknown => end_saved_session_locked(config_dir, &guard).map(|()| true),
-    }
-}
-
-/// Like [`end_saved_session`], for End session (#30): if a log-out has
-/// wiped the pairing since `since`, it fails with
-/// [`CredentialError::LoggedOutMeanwhile`] and removes nothing, since the
-/// marker there now may belong to a pairing made after that log-out.
-pub fn end_saved_session_since(config_dir: &Path, since: WipeEpoch) -> Result<(), CredentialError> {
-    let guard = writer_lock();
-    if wipe_epoch() != since {
-        return Err(CredentialError::LoggedOutMeanwhile);
-    }
-    end_saved_session_locked(config_dir, &guard)
-}
-
-fn end_saved_session_locked(
-    config_dir: &Path,
-    _one_at_a_time: &std::sync::MutexGuard<'static, ()>,
-) -> Result<(), CredentialError> {
-    let path = config_dir.join(SESSION_LIVE_FILE);
-    match fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(CredentialError::IoError(format!("remove {}: {}", path.display(), e))),
-    }
-    match fs::symlink_metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Ok(_) => Err(CredentialError::IoError(format!("{} is still there", path.display()))),
-        Err(e) => Err(CredentialError::IoError(format!("check {}: {}", path.display(), e))),
     }
 }
 
@@ -1051,14 +559,6 @@ fn pairing_present(config_dir: &Path) -> std::io::Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e),
     }
-}
-
-/// Delete the credential file from `config_dir`. Used only by [`load`] for
-/// an earlier build's file; it isn't a log-out, so it doesn't move the
-/// wipe count (#30). The app logs out through [`wipe_for_logout`].
-fn delete(config_dir: &Path) -> Result<(), CredentialError> {
-    let _one_at_a_time = writer_lock();
-    delete_locked(config_dir)
 }
 
 /// Remove `config_dir` and everything in it, for log-out, holding the
@@ -1177,7 +677,8 @@ pub(super) fn confirm_gone(config_dir: &Path, name: &str) -> Result<(), Credenti
 }
 
 fn delete_locked(config_dir: &Path) -> Result<(), CredentialError> {
-    remove_session_marker(config_dir);
+    // An earlier build's live marker; best effort, it holds no secret.
+    let _ = fs::remove_file(config_dir.join(SESSION_LIVE_FILE));
     remove_file_locked(config_dir, CREDENTIAL_FILE)
 }
 
@@ -1209,17 +710,6 @@ pub(super) fn remove_file_locked(config_dir: &Path, name: &str) -> Result<(), Cr
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// What is on disk where the store goes.
-#[derive(Debug, PartialEq, Eq)]
-enum OnDisk {
-    /// No credential file.
-    Absent,
-    /// A store with this binding.
-    Bound(BindingMode),
-    /// A file that exists but can't be read, parsed or understood.
-    Unreadable,
-}
-
 /// A warning for the person when another account can open the saved
 /// pairing's folder or file (#24), worded for how the pairing is sealed.
 /// Called after a successful load; it warns and never refuses, since
@@ -1250,26 +740,6 @@ pub fn privacy_warning(config_dir: &Path, binding: BindingMode) -> Option<&'stat
         }
     }
     None
-}
-
-/// The notice for a session extension refused because the folder or file
-/// isn't private (#26). Pairing again into the same folder wouldn't help,
-/// so it points at Log out, as the warnings after unlock do (#24, #28):
-/// on Windows worded for how the pairing is sealed, on unix the folder
-/// notice (the only refusal there is the folder's owner).
-pub fn not_private_extension_notice(config_dir: &Path) -> &'static str {
-    #[cfg(unix)]
-    {
-        let _ = config_dir;
-        NOT_PRIVATE_FOLDER_NOTICE
-    }
-    #[cfg(not(unix))]
-    {
-        match on_disk_store(config_dir) {
-            OnDisk::Bound(BindingMode::MachineBound) => NOT_PRIVATE_MACHINE_NOTICE,
-            _ => NOT_PRIVATE_KEYRING_NOTICE,
-        }
-    }
 }
 
 /// Whether the folder and file are private to the current user, as far
@@ -1327,65 +797,6 @@ fn is_private(_config_dir: &Path) -> bool {
     true
 }
 
-/// Which key protects the saved pairing, for the person to see (#11):
-/// "keyring", "machine", "none" (no file) or "unknown".
-///
-/// The file is parsed but nothing is decrypted and no key is fetched, so
-/// this says how the file is sealed, not that it opens. Editing the
-/// `binding` field doesn't let anyone in: the binding is part of the AEAD
-/// associated data, so an edited file fails to open.
-pub fn stored_key_protection(config_dir: &Path) -> &'static str {
-    match on_disk_store(config_dir) {
-        OnDisk::Absent => "none",
-        // On a platform without the machine-bound key (Windows), such a
-        // file (from an earlier development build) is refused at load, so
-        // it is shown as unreadable rather than as a binding in use.
-        OnDisk::Bound(BindingMode::MachineBound) if !keystore::MACHINE_BOUND_FALLBACK => "unknown",
-        OnDisk::Bound(binding) => binding.as_str(),
-        OnDisk::Unreadable => "unknown",
-    }
-}
-
-fn on_disk_store(config_dir: &Path) -> OnDisk {
-    match read_store(config_dir) {
-        Ok(store) => BindingMode::from_str(&store.binding).map_or(OnDisk::Unreadable, OnDisk::Bound),
-        Err(CredentialError::NotFound(_)) => OnDisk::Absent,
-        Err(_) => OnDisk::Unreadable,
-    }
-}
-
-/// Read and parse the encrypted store from disk.
-fn read_store(config_dir: &Path) -> Result<EncryptedStore, CredentialError> {
-    let path = config_dir.join(CREDENTIAL_FILE);
-    let data = fs::read(&path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            CredentialError::NotFound(path.display().to_string())
-        } else {
-            CredentialError::IoError(format!("read {}: {}", path.display(), e))
-        }
-    })?;
-
-    let store: EncryptedStore = serde_json::from_slice(&data)
-        .map_err(|e| CredentialError::SerializationError(format!("parse store: {}", e)))?;
-
-    if store.version != STORE_VERSION && store.version != LEGACY_STORE_VERSION_V2 {
-        return Err(CredentialError::UnsupportedVersion(store.version));
-    }
-
-    Ok(store)
-}
-
-/// Compute the AEAD associated-data used to bind a v3 credential blob
-/// to its origin machine. The 32-byte storage binding (an HMAC of the
-/// machine id, #14) is mixed in along with the binding mode and a version
-/// label. A blob whose AAD doesn't match the current machine will
-/// fail to decrypt even when the master key is correct — closing the
-/// "copied the file + the keyring entry to my own laptop" path.
-/// See SECURITY-REVIEW-2026-05-25.md D-HIGH-3.
-fn compute_blob_aad(binding: &str, platform_key: &[u8; 32]) -> Vec<u8> {
-    aad_with_label(AAD_LABEL, binding, platform_key)
-}
-
 /// [`compute_blob_aad`] under another domain-separation label, for another
 /// file sealed with the same master key ([`super::device_store`]): a blob
 /// of one can't be opened as the other.
@@ -1397,48 +808,6 @@ pub(super) fn aad_with_label(label: &[u8], binding: &str, platform_key: &[u8; 32
     aad.push(b'|');
     aad.extend_from_slice(platform_key);
     aad
-}
-
-/// Decrypt the store with the given 32-byte master key. `platform_key`
-/// goes into the v3 AAD.
-fn decrypt_store(
-    store: &EncryptedStore,
-    key: &[u8; 32],
-    platform_key: &[u8; 32],
-) -> Result<ConnectionCredentials, CredentialError> {
-    if store.nonce.len() != NONCE_SIZE {
-        return Err(CredentialError::CryptoError(format!(
-            "bad nonce length: expected {}, got {}",
-            NONCE_SIZE,
-            store.nonce.len(),
-        )));
-    }
-    let nonce = XNonce::from_slice(&store.nonce);
-    let cipher = XChaCha20Poly1305::new_from_slice(key)
-        .map_err(|e| CredentialError::CryptoError(format!("cipher: {}", e)))?;
-    // Zeroized on drop, so also when parsing below fails.
-    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(if store.version >= STORE_VERSION {
-        let aad = compute_blob_aad(&store.binding, platform_key);
-        cipher
-            .decrypt(
-                nonce,
-                Payload {
-                    msg: store.ciphertext.as_slice(),
-                    aad: &aad,
-                },
-            )
-            .map_err(|e| CredentialError::CryptoError(format!("decrypt v3: {}", e)))?
-    } else {
-        // v2 legacy path — no AAD. Subsequent save() rewrites this
-        // blob as v3 with current-machine AAD.
-        cipher
-            .decrypt(nonce, store.ciphertext.as_slice())
-            .map_err(|e| CredentialError::CryptoError(format!("decrypt v2: {}", e)))?
-    });
-
-    let creds: ConnectionCredentials = serde_json::from_slice(&plaintext)
-        .map_err(|e| CredentialError::SerializationError(format!("parse credentials: {}", e)))?;
-    Ok(creds)
 }
 
 /// Encrypt plaintext with XChaCha20-Poly1305, binding the ciphertext
@@ -1465,58 +834,44 @@ pub(super) fn encrypt_xchacha20(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::credential::device_store::tests::{store_for_tests, store_since_for_tests};
+    use vettid_device::store::Persist;
 
-    /// For tests elsewhere in the crate (#45): a pairing in `dir` whose
-    /// session `session_id` is marked live.
-    pub(crate) fn save_pairing_with_live_session(dir: &Path, session_id: &str) {
-        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
-        save_with(&keys, dir, &creds_with_session(session_id, 1_900_000_000)).expect("save");
-        assert!(session_is_recorded(dir, session_id));
+    /// For tests elsewhere in the crate: an earlier build's pairing in
+    /// `dir` (a `connection.enc` this build can't open, and its live
+    /// marker). The bytes are not a valid store: nothing may need to read
+    /// them to find and delete the file.
+    pub(crate) fn legacy_pairing_for_tests(dir: &Path) {
+        ensure_config_dir(dir).expect("folder");
+        write_private(dir, CREDENTIAL_FILE, b"sealed by an earlier build").expect("legacy pairing");
+        write_private(dir, SESSION_LIVE_FILE, b"marker").expect("legacy marker");
+        assert!(exists(dir));
     }
 
-    /// #45: a vault-ended session's marker goes only if it still names
-    /// that session; the pairing stays either way.
-    #[test]
-    fn a_vault_ended_sessions_marker_goes_only_if_it_names_it() {
-        let base = tempfile::tempdir().unwrap();
-        let config_dir = base.path().join("vettid-desktop");
-        save_pairing_with_live_session(&config_dir, "vs-b");
-        assert_eq!(end_saved_session_if(&config_dir, "vs-a").unwrap(), false, "another session's marker");
-        assert!(session_is_recorded(&config_dir, "vs-b"));
-        assert_eq!(end_saved_session_if(&config_dir, "vs-b").unwrap(), true);
-        assert!(!session_is_recorded(&config_dir, "vs-b"));
-        assert!(exists(&config_dir), "the pairing stays");
-        assert_eq!(end_saved_session_if(&config_dir, "vs-b").unwrap(), false, "already gone");
-        let none = base.path().join("absent");
-        assert_eq!(end_saved_session_if(&none, "vs-b").unwrap(), false, "no folder");
+    /// This build's pairing in `dir`: a `device.enc` sealed by the device
+    /// store under fixed test keys, with no log-out check.
+    fn device_pairing(dir: &Path) {
+        store_for_tests(dir).save_raw_for_tests();
+        assert!(dir.join(DEVICE_FILE).exists());
     }
 
-    /// #45: a session the vault ended isn't live again in this run, even
-    /// if its marker couldn't be removed (here it is restored afterwards).
+    /// An earlier build's pairing is removed with its live marker and
+    /// temporary copies, without being opened; this build's device file
+    /// stays. (Was: the same, with a pairing made by the deleted
+    /// `ConnectionCredentials` save; now the legacy file is plain bytes.)
     #[test]
-    fn a_vault_ended_session_stays_ended_if_its_marker_comes_back() {
+    fn removing_the_legacy_pairing_leaves_the_device_file() {
         let base = tempfile::tempdir().unwrap();
-        let config_dir = base.path().join("vettid-desktop");
-        save_pairing_with_live_session(&config_dir, "s-back");
-        let marker = fs::read(config_dir.join(SESSION_LIVE_FILE)).unwrap();
-        assert!(end_saved_session_if(&config_dir, "s-back").unwrap());
-        write_private(&config_dir, SESSION_LIVE_FILE, &marker).unwrap();
-        assert!(!session_is_recorded(&config_dir, "s-back"), "still ended");
-    }
-
-    /// #45, Windows: a marker another account can open can't be confirmed,
-    /// so a vault end removes it.
-    #[cfg(windows)]
-    #[test]
-    fn a_vault_end_removes_a_marker_it_cant_confirm() {
-        let base = tempfile::tempdir().unwrap();
-        let config_dir = base.path().join("vettid-desktop");
-        save_pairing_with_live_session(&config_dir, "s-shared");
-        super::super::winacl::test_let_everyone_read(&config_dir.join(SESSION_LIVE_FILE));
-        assert_eq!(read_marker(&config_dir, "s-shared"), Marker::Unknown);
-        assert!(end_saved_session_if(&config_dir, "s-shared").unwrap());
-        assert!(!config_dir.join(SESSION_LIVE_FILE).exists());
-        assert!(exists(&config_dir), "the pairing stays");
+        let dir = base.path().join("vettid-desktop");
+        legacy_pairing_for_tests(&dir);
+        fs::write(dir.join(format!("{CREDENTIAL_FILE}.tmp-1-00")), b"ciphertext").unwrap();
+        device_pairing(&dir);
+        remove_legacy_pairing(&dir).unwrap();
+        assert!(!exists(&dir));
+        assert!(!dir.join(SESSION_LIVE_FILE).exists());
+        assert!(!dir.join(format!("{CREDENTIAL_FILE}.tmp-1-00")).exists());
+        assert!(dir.join(DEVICE_FILE).exists());
+        remove_legacy_pairing(&dir).unwrap();
     }
 
     #[test]
@@ -1527,9 +882,6 @@ pub(crate) mod tests {
         let (nonce, ct) = encrypt_xchacha20(&key, plaintext, aad).expect("encrypt");
         assert_eq!(nonce.len(), NONCE_SIZE);
 
-        // Re-decrypt by hand (the public `decrypt_store` requires a
-        // round-trip through the keystore, which the CI tests can't
-        // exercise without a real Secret Service).
         let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
         let pt = cipher
             .decrypt(
@@ -1545,7 +897,7 @@ pub(crate) mod tests {
         let key = [0x42u8; 32];
         let (nonce, ct) = encrypt_xchacha20(&key, b"secret", b"aad-A").expect("encrypt");
         let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
-        // Same key, same nonce, different AAD → AEAD must reject.
+        // Same key, same nonce, different AAD: AEAD must reject.
         let result = cipher.decrypt(
             XNonce::from_slice(&nonce),
             Payload { msg: ct.as_slice(), aad: b"aad-B" },
@@ -1553,400 +905,14 @@ pub(crate) mod tests {
         assert!(result.is_err(), "AEAD must reject mismatched AAD");
     }
 
-    /// Fixed keys in place of the keyring and the machine attributes.
-    struct FixedKeys {
-        binding: BindingMode,
-        master: [u8; 32],
-        platform: [u8; 32],
-    }
-
-    impl KeySource for FixedKeys {
-        fn master_for_save(&self) -> Result<MasterKey, KeystoreError> {
-            Ok(MasterKey { key: Zeroizing::new(self.master), binding: self.binding })
-        }
-        fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError> {
-            Ok(MasterKey { key: Zeroizing::new(self.master), binding })
-        }
-        fn storage_binding(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
-            Ok(Zeroizing::new(self.platform))
-        }
-        fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
-            Ok(Zeroizing::new(FINGERPRINT))
-        }
-    }
-
-    fn sample_creds() -> ConnectionCredentials {
-        ConnectionCredentials {
-            connection_id: "conn-1".into(),
-            connection_key: vec![7u8; 32],
-            key_id: "key-1".into(),
-            device_private_key: vec![1u8; 32],
-            device_public_key: vec![2u8; 32],
-            vault_public_key: vec![3u8; 32],
-            message_space_token: "token".into(),
-            message_space_url: "nats://example.invalid:4222".into(),
-            owner_guid: "owner".into(),
-            owner_name: "Owner".into(),
-            session_id: "session-1".into(),
-            session_expires_at: 1_900_000_000,
-            session_duration_seconds: 3600,
-        }
-    }
-
-    /// This build's storage binding (the AAD value).
-    const PLATFORM: [u8; 32] = [0x11; 32];
-    /// This build's machine-bound key.
-    const BOUND_KEY: [u8; 32] = [0x22; 32];
-    /// The public five-attribute fingerprint: never the binding or a key
-    /// in this build, as in production.
-    const FINGERPRINT: [u8; 32] = [0x99; 32];
-
+    /// Production values: where this computer has a machine id the check
+    /// passes; where it has none the error is the plain notice the person
+    /// sees.
     #[test]
-    fn machine_bound_store_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let keys = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: PLATFORM };
-        let creds = sample_creds();
-
-        let binding = save_with(&keys, dir.path(), &creds).expect("save");
-        assert_eq!(binding, BindingMode::MachineBound);
-        assert_eq!(read_store(dir.path()).unwrap().binding, "machine");
-
-        let (loaded, binding) = load_with(&keys, dir.path()).expect("load");
-        assert_eq!(binding, BindingMode::MachineBound);
-        assert_eq!(loaded.connection_id, creds.connection_id);
-        assert_eq!(loaded.connection_key, creds.connection_key);
-        assert_eq!(loaded.device_private_key, creds.device_private_key);
-        assert_eq!(loaded.session_expires_at, creds.session_expires_at);
-    }
-
-    /// An earlier build's pairing (`connection.enc`) is removed with its
-    /// live marker; this build's device file stays.
-    #[test]
-    fn removing_the_legacy_pairing_leaves_the_device_file() {
-        let base = tempfile::tempdir().unwrap();
-        let dir = base.path().join("vettid-desktop");
-        save_pairing_with_live_session(&dir, "legacy");
-        write_private(&dir, DEVICE_FILE, b"sealed").unwrap();
-        remove_legacy_pairing(&dir).unwrap();
-        assert!(!exists(&dir));
-        assert!(!dir.join(SESSION_LIVE_FILE).exists());
-        assert!(dir.join(DEVICE_FILE).exists());
-        remove_legacy_pairing(&dir).unwrap();
-    }
-
-    /// A file sealed by an earlier build, whose machine-bound key was the
-    /// public machine fingerprint, gives the plain notice and is deleted.
-    #[test]
-    fn blob_sealed_under_the_fingerprint_is_unreadable_and_deleted() {
-        let dir = tempfile::tempdir().unwrap();
-        // Pre-#10: the public fingerprint as the key and in the AAD. Not
-        // this build's storage binding (PLATFORM), as in production.
-        let old_build = FixedKeys { binding: BindingMode::MachineBound, master: FINGERPRINT, platform: FINGERPRINT };
-        save_with(&old_build, dir.path(), &sample_creds()).expect("save");
-
-        let this_build = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: PLATFORM };
-        let err = load_with(&this_build, dir.path()).err().expect("must not load");
-        assert!(matches!(err, CredentialError::Unreadable), "got {err}");
-        assert_eq!(err.to_string(), UNREADABLE_NOTICE);
-        assert!(!err.to_string().contains("decrypt"));
-        assert!(!exists(dir.path()), "the unreadable file must be deleted");
-    }
-
-    /// The machine id changed (since #14 the only input): the machine-bound
-    /// key and the storage binding both differ. The pairing is unreadable
-    /// for now but must not be deleted, since the id may change back, and
-    /// then it opens again.
-    #[test]
-    fn attribute_drift_keeps_the_file_and_it_opens_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let before = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: PLATFORM };
-        save_with(&before, dir.path(), &sample_creds()).expect("save");
-
-        let drifted = FixedKeys { binding: BindingMode::MachineBound, master: [0x66; 32], platform: [0x33; 32] };
-        let err = load_with(&drifted, dir.path()).err().expect("must not load");
-        assert!(matches!(err, CredentialError::Unreadable), "got {err}");
-        assert_eq!(err.to_string(), UNREADABLE_NOTICE);
-        assert!(exists(dir.path()), "a drifted pairing must be kept");
-
-        let (loaded, _) = load_with(&before, dir.path()).expect("opens once the attribute is back");
-        assert_eq!(loaded.connection_id, "conn-1");
-    }
-
-    /// Only the AAD differs (same master key, different storage binding):
-    /// also kept.
-    #[test]
-    fn machine_bound_aad_mismatch_keeps_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let there = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: [0x33; 32] };
-        save_with(&there, dir.path(), &sample_creds()).expect("save");
-
-        let here = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: PLATFORM };
-        assert!(matches!(load_with(&here, dir.path()), Err(CredentialError::Unreadable)));
-        assert!(exists(dir.path()));
-    }
-
-    /// A keyring-bound file that does not decrypt is not deleted: the
-    /// keyring entry may come back, and this change is about
-    /// machine-bound files only.
-    #[test]
-    fn keyring_bound_decrypt_failure_keeps_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let saved = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
-        save_with(&saved, dir.path(), &sample_creds()).expect("save");
-
-        let other = FixedKeys { binding: BindingMode::Keyring, master: [0x55; 32], platform: PLATFORM };
-        assert!(matches!(load_with(&other, dir.path()), Err(CredentialError::CryptoError(_))));
-        assert!(exists(dir.path()));
-    }
-
-    fn creds_with_session(session_id: &str, expires_at: i64) -> ConnectionCredentials {
-        let mut c = sample_creds();
-        c.session_id = session_id.to_string();
-        c.session_expires_at = expires_at;
-        c.session_duration_seconds = 3600;
-        c
-    }
-
-    /// #26: a saved session with an expiry is live only with the marker.
-    /// Ending it removes the marker, and the next load treats it as ended
-    /// even though the expiry is still in the file, as after a refused
-    /// save. The session id is kept for telling the vault.
-    #[test]
-    fn an_ended_session_is_not_reloaded_as_live() {
-        let base = tempfile::tempdir().unwrap();
-        let config_dir = base.path().join("vettid-desktop");
-        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
-        save_with(&keys, &config_dir, &creds_with_session("sess-1", 1_900_000_000)).unwrap();
-        let (live, _) = load_with(&keys, &config_dir).unwrap();
-        assert_eq!(live.session_expires_at, 1_900_000_000, "marked live");
-
-        end_saved_session(&config_dir).expect("ended");
-        assert!(!config_dir.join(SESSION_LIVE_FILE).exists());
-        let (ended, _) = load_with(&keys, &config_dir).unwrap();
-        assert_eq!(ended.session_expires_at, 0, "not live without the marker");
-        assert_eq!(ended.session_duration_seconds, 0);
-        assert_eq!(ended.session_id, "sess-1", "kept for the vault");
-        assert!(end_saved_session(&config_dir).is_ok(), "ending twice is fine");
-    }
-
-    /// #26: the marker names one session. A marker for another session,
-    /// or one that can't be parsed, is not live; a new session's save
-    /// replaces it; a save with the session cleared removes it.
-    #[test]
-    fn the_live_marker_names_one_session() {
-        let base = tempfile::tempdir().unwrap();
-        let config_dir = base.path().join("vettid-desktop");
-        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
-        save_with(&keys, &config_dir, &creds_with_session("sess-1", 1_900_000_000)).unwrap();
-        let marker = fs::read_to_string(config_dir.join(SESSION_LIVE_FILE)).unwrap();
-        assert!(!marker.contains("sess-1"), "the id itself is not written");
-
-        fs::write(config_dir.join(SESSION_LIVE_FILE), session_tag("sess-other")).unwrap();
-        assert_eq!(load_with(&keys, &config_dir).unwrap().0.session_expires_at, 0);
-        fs::write(config_dir.join(SESSION_LIVE_FILE), b"garbage").unwrap();
-        assert_eq!(load_with(&keys, &config_dir).unwrap().0.session_expires_at, 0);
-
-        save_with(&keys, &config_dir, &creds_with_session("sess-2", 1_900_000_001)).unwrap();
-        assert_eq!(load_with(&keys, &config_dir).unwrap().0.session_expires_at, 1_900_000_001);
-
-        save_with(&keys, &config_dir, &creds_with_session("sess-2", 0)).unwrap();
-        assert!(!config_dir.join(SESSION_LIVE_FILE).exists(), "cleared session removes it");
-        delete(&config_dir).unwrap();
-        assert!(!config_dir.join(SESSION_LIVE_FILE).exists());
-    }
-
-    /// #26: a save that fails leaves the old marker as it was; a delete
-    /// and a wipe remove it.
-    #[test]
-    fn a_failed_save_keeps_the_marker_and_wipe_removes_it() {
-        let base = tempfile::tempdir().unwrap();
-        let config_dir = base.path().join("vettid-desktop");
-        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
-        save_with(&keys, &config_dir, &creds_with_session("sess-1", 1_900_000_000)).unwrap();
-        let before = fs::read(config_dir.join(SESSION_LIVE_FILE)).unwrap();
-        struct NoBinding;
-        impl KeySource for NoBinding {
-            fn master_for_save(&self) -> Result<MasterKey, KeystoreError> {
-                unreachable!()
-            }
-            fn master_for_load(&self, _: BindingMode) -> Result<MasterKey, KeystoreError> {
-                unreachable!()
-            }
-            fn storage_binding(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
-                Err(FingerprintError::MissingMachineId)
-            }
-            fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
-                Ok(Zeroizing::new(FINGERPRINT))
-            }
-        }
-        assert!(save_with(&NoBinding, &config_dir, &creds_with_session("sess-2", 1)).is_err());
-        assert_eq!(fs::read(config_dir.join(SESSION_LIVE_FILE)).unwrap(), before, "unchanged");
-        assert!(session_is_recorded(&config_dir, "sess-1"));
-
-        wipe(&config_dir).unwrap();
-        assert!(!config_dir.join(SESSION_LIVE_FILE).exists());
-    }
-
-    /// #26: only a small regular file counts as the marker.
-    #[test]
-    fn a_marker_that_is_a_folder_or_too_large_is_not_live() {
-        let base = tempfile::tempdir().unwrap();
-        let config_dir = base.path().join("vettid-desktop");
-        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
-        save_with(&keys, &config_dir, &creds_with_session("sess-1", 1_900_000_000)).unwrap();
-        let marker = config_dir.join(SESSION_LIVE_FILE);
-        let mut big = session_tag("sess-1");
-        big.push_str(&" ".repeat(200));
-        fs::write(&marker, big).unwrap();
-        assert!(!session_is_recorded(&config_dir, "sess-1"), "too large");
-        fs::remove_file(&marker).unwrap();
-        fs::create_dir(&marker).unwrap();
-        assert!(!session_is_recorded(&config_dir, "sess-1"), "a folder");
-        assert_eq!(load_with(&keys, &config_dir).unwrap().0.session_expires_at, 0);
-    }
-
-    /// Windows (#21): a save under a parent another account controls is
-    /// refused with the parent notice, writes neither file, and leaves an
-    /// existing pairing and its marker as they were.
-    #[cfg(windows)]
-    #[test]
-    fn windows_a_save_under_an_unsafe_parent_changes_nothing() {
-        let base = tempfile::tempdir().unwrap();
-        let parent = base.path().join("local");
-        let config_dir = parent.join("vettid-desktop");
-        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
-        save_with(&keys, &config_dir, &creds_with_session("sess-1", 1_900_000_000)).unwrap();
-        let file = fs::read(config_dir.join(CREDENTIAL_FILE)).unwrap();
-        let marker = fs::read(config_dir.join(SESSION_LIVE_FILE)).unwrap();
-        super::super::winacl::test_let_everyone_delete_children(&parent);
-        let err = save_with(&keys, &config_dir, &creds_with_session("sess-2", 1_900_000_001)).err().expect("refused");
-        assert!(matches!(err, CredentialError::ParentNotPrivate), "got {err}");
-        assert_eq!(err.to_string(), PARENT_NOT_PRIVATE_NOTICE);
-        assert!(matches!(
-            save_with_mode(&keys, &config_dir, &creds_with_session("sess-1", 0), Mode::UpdateExisting),
-            Err(CredentialError::ParentNotPrivate)
-        ));
-        assert_eq!(fs::read(config_dir.join(CREDENTIAL_FILE)).unwrap(), file);
-        assert_eq!(fs::read(config_dir.join(SESSION_LIVE_FILE)).unwrap(), marker);
-    }
-
-    /// Windows (#21): a parent that is a junction gives the link notice,
-    /// not the "another account" one, and nothing is created through it.
-    #[cfg(windows)]
-    #[test]
-    fn windows_a_linked_parent_gives_the_link_notice() {
-        let base = tempfile::tempdir().unwrap();
-        let real = base.path().join("real");
-        fs::create_dir(&real).unwrap();
-        let link = base.path().join("local");
-        let out = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(&link)
-            .arg(&real)
-            .output()
-            .expect("mklink");
-        assert!(out.status.success(), "mklink /J failed");
-        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
-        let err = save_with(&keys, &link.join("vettid-desktop"), &sample_creds()).err().expect("refused");
-        assert!(matches!(err, CredentialError::ParentIsLink), "got {err}");
-        assert_eq!(err.to_string(), PARENT_IS_LINK_NOTICE);
-        assert!(!real.join("vettid-desktop").exists());
-    }
-
-    /// Windows (#26): the case from the issue. The folder becomes shared,
-    /// so the save that clears the session is refused, but ending the
-    /// session still removes the marker, and the session isn't reloaded
-    /// as live.
-    #[cfg(windows)]
-    #[test]
-    fn windows_a_refused_save_still_ends_the_session() {
-        let base = tempfile::tempdir().unwrap();
-        let config_dir = base.path().join("vettid-desktop");
-        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
-        save_with(&keys, &config_dir, &creds_with_session("sess-1", 1_900_000_000)).unwrap();
-        super::super::winacl::test_share_with_everyone(&config_dir);
-        assert!(matches!(
-            save_with_mode(&keys, &config_dir, &creds_with_session("sess-1", 0), Mode::UpdateExisting),
-            Err(CredentialError::NotPrivate)
-        ));
-        assert!(session_is_recorded(&config_dir, "sess-1"), "the refused save left it");
-        end_saved_session(&config_dir).expect("the marker can still be removed");
-        assert_eq!(load_with(&keys, &config_dir).unwrap().0.session_expires_at, 0);
-        assert_eq!(not_private_extension_notice(&config_dir), NOT_PRIVATE_KEYRING_NOTICE);
-    }
-
-    /// #14: a machine-bound file saved before #14 (the v1 key over all five
-    /// attributes, the fingerprint in the AAD) doesn't open, gets the plain
-    /// notice and is kept. It is not taken for a pre-#10 file.
-    #[test]
-    fn machine_bound_file_from_before_14_is_unreadable_and_kept() {
-        let dir = tempfile::tempdir().unwrap();
-        let v1 = FixedKeys { binding: BindingMode::MachineBound, master: [0x61; 32], platform: FINGERPRINT };
-        save_with(&v1, dir.path(), &sample_creds()).expect("save");
-        let now = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: PLATFORM };
-        let err = load_with(&now, dir.path()).err().expect("must not load");
-        assert!(matches!(err, CredentialError::Unreadable), "got {err}");
-        assert!(exists(dir.path()), "kept");
-    }
-
-    /// #14: a keyring-bound file saved before #14 (the fingerprint in the
-    /// AAD) doesn't open with the same keyring key, and is kept.
-    #[test]
-    fn keyring_file_from_before_14_does_not_open_and_is_kept() {
-        let dir = tempfile::tempdir().unwrap();
-        let before = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: FINGERPRINT };
-        save_with(&before, dir.path(), &sample_creds()).expect("save");
-        let now = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
-        assert!(matches!(load_with(&now, dir.path()), Err(CredentialError::CryptoError(_))));
-        assert!(exists(dir.path()), "kept");
-    }
-
-    /// #14: without a machine id there is no storage binding: a save fails
-    /// with the plain notice before any key is fetched, writing nothing and
-    /// creating no folder; a load fails the same way and keeps the file.
-    #[test]
-    fn no_machine_id_saves_nothing_and_opens_nothing() {
-        struct NoMachineId(std::cell::Cell<bool>);
-        impl KeySource for NoMachineId {
-            fn master_for_save(&self) -> Result<MasterKey, KeystoreError> {
-                self.0.set(true);
-                Ok(MasterKey { key: Zeroizing::new([0x44; 32]), binding: BindingMode::Keyring })
-            }
-            fn master_for_load(&self, _: BindingMode) -> Result<MasterKey, KeystoreError> {
-                self.0.set(true);
-                Ok(MasterKey { key: Zeroizing::new([0x44; 32]), binding: BindingMode::Keyring })
-            }
-            fn storage_binding(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
-                Err(FingerprintError::MissingMachineId)
-            }
-            fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
-                Ok(Zeroizing::new(FINGERPRINT))
-            }
-        }
-        let base = tempfile::tempdir().unwrap();
-        let config_dir = base.path().join("vettid-desktop");
-        let keys = NoMachineId(std::cell::Cell::new(false));
-        let err = save_with(&keys, &config_dir, &sample_creds()).err().expect("must fail");
-        assert!(matches!(err, CredentialError::NoMachineId), "got {err}");
-        assert_eq!(err.to_string(), NO_MACHINE_ID_NOTICE);
-        assert!(!keys.0.get(), "no key fetched or created");
-        assert!(!config_dir.exists(), "nothing written");
-
-        let saved = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
-        save_with(&saved, &config_dir, &sample_creds()).unwrap();
-        let err = load_with(&keys, &config_dir).err().expect("must fail");
-        assert!(matches!(err, CredentialError::NoMachineId), "got {err}");
-        assert!(exists(&config_dir), "kept");
-    }
-
-    /// Production values: the storage binding is neither the fingerprint
-    /// nor, where there is one, the machine-bound key. Skipped on a machine
-    /// without a machine id (the error is then the one the person sees).
-    #[test]
-    fn system_storage_binding_is_not_the_fingerprint() {
-        match SystemKeys.storage_binding() {
+    fn machine_binding_check_follows_the_machine_id() {
+        match platform_key::derive_storage_binding() {
             Ok(binding) => {
-                if let Ok(fp) = SystemKeys.legacy_fingerprint() {
+                if let Ok(fp) = platform_key::derive_platform_key() {
                     assert_ne!(*binding, *fp);
                 }
                 assert!(check_machine_binding().is_ok());
@@ -1955,131 +921,26 @@ pub(crate) mod tests {
         }
     }
 
-    /// The real keystore logic (`fetch_or_create_master_key_with`) over
-    /// test sources: the store asks the keystore exactly as in production.
-    /// The fallback is allowed here, as on Linux and macOS, so these tests
-    /// cover the machine-bound path on every platform; the Windows policy
-    /// has its own test below.
-    struct ThroughKeystore(keystore::tests::TestSources);
-
-    impl KeySource for ThroughKeystore {
-        fn master_for_save(&self) -> Result<MasterKey, KeystoreError> {
-            keystore::fetch_or_create_master_key_with_policy(&self.0, true)
-        }
-        fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError> {
-            keystore::fetch_for_binding_with_policy(&self.0, binding, true)
-        }
-        // From the test attributes, as production derives it from the
-        // real ones: a missing machine id fails here first.
-        fn storage_binding(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
-            use keystore::Sources;
-            platform_key::storage_binding_from(&self.0.machine_attributes()?)
-        }
-        fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
-            Ok(Zeroizing::new(FINGERPRINT))
-        }
-    }
-
-    /// No keyring, and a machine without a usable machine id: the storage
-    /// binding is refused before any key is fetched (#14), so the save
-    /// fails with the plain notice and nothing is written, not even the
-    /// directory.
-    #[test]
-    fn missing_machine_id_fails_the_save_and_writes_no_file() {
-        for machine_id in ["", "uninitialized", "00000000-0000-0000-0000-000000000000"] {
-            let dir = tempfile::tempdir().unwrap();
-            let config_dir = dir.path().join("vettid-desktop");
-            let keys = ThroughKeystore(keystore::tests::TestSources::no_keyring(
-                keystore::tests::attrs_with_machine_id(machine_id),
-            ));
-            let err = save_with(&keys, &config_dir, &sample_creds())
-                .err()
-                .expect("save must fail");
-            assert!(matches!(err, CredentialError::NoMachineId), "got {err}");
-            assert_eq!(err.to_string(), NO_MACHINE_ID_NOTICE);
-            assert!(!config_dir.exists(), "{machine_id:?}: nothing may be written");
-        }
-    }
-
-    /// The same path with a real machine id works end to end.
-    #[test]
-    fn no_keyring_with_a_machine_id_round_trips_through_the_keystore() {
-        let dir = tempfile::tempdir().unwrap();
-        let keys = ThroughKeystore(keystore::tests::TestSources::no_keyring(
-            keystore::tests::attrs_with_machine_id("4c4c4544003a3610804db7c04f4d3732"),
-        ));
-        assert_eq!(save_with(&keys, dir.path(), &sample_creds()).unwrap(), BindingMode::MachineBound);
-        let (loaded, binding) = load_with(&keys, dir.path()).expect("load");
-        assert_eq!(binding, BindingMode::MachineBound);
-        assert_eq!(loaded.connection_id, "conn-1");
-    }
-
-    fn with_keyring() -> keystore::tests::TestSources {
-        keystore::tests::TestSources {
-            keyring: Some(std::cell::RefCell::new(None)),
-            attrs: keystore::tests::attrs_with_machine_id("4c4c4544003a3610804db7c04f4d3732"),
-        }
-    }
-
-    fn without_keyring() -> keystore::tests::TestSources {
-        keystore::tests::TestSources::no_keyring(keystore::tests::attrs_with_machine_id(
-            "4c4c4544003a3610804db7c04f4d3732",
-        ))
-    }
-
-    /// A keyring-bound store, then the keyring fails: the keystore would
-    /// fall back, but the save refuses to re-seal under the machine-bound
-    /// key, and the file on disk is left byte for byte as it was.
-    #[test]
-    fn keyring_store_is_never_resaved_machine_bound() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = ThroughKeystore(with_keyring());
-        assert_eq!(save_with(&first, dir.path(), &sample_creds()).unwrap(), BindingMode::Keyring);
-        let before = fs::read(dir.path().join(CREDENTIAL_FILE)).unwrap();
-
-        let broken = ThroughKeystore(without_keyring());
-        let err = save_with(&broken, dir.path(), &sample_creds()).err().expect("save must fail");
-        assert!(matches!(err, CredentialError::KeyringUnavailable), "got {err}");
-        assert_eq!(err.to_string(), KEYRING_UNAVAILABLE_NOTICE);
-
-        let after = fs::read(dir.path().join(CREDENTIAL_FILE)).unwrap();
-        assert_eq!(before, after, "the keyring-bound file must be left as it was");
-        assert_eq!(read_store(dir.path()).unwrap().binding, "keyring");
-    }
-
-    /// Deleting the pairing also removes temporary files an interrupted
-    /// save left behind.
-    #[test]
-    fn delete_removes_leftover_temporary_files() {
-        let base = tempfile::tempdir().unwrap();
-        let config_dir = base.path().join("vettid-desktop");
-        save_with(&ThroughKeystore(with_keyring()), &config_dir, &sample_creds()).unwrap();
-        let stale = config_dir.join(format!("{CREDENTIAL_FILE}.tmp-1-00"));
-        fs::write(&stale, b"ciphertext").unwrap();
-        delete(&config_dir).unwrap();
-        assert!(!exists(&config_dir));
-        assert!(!stale.exists());
-    }
-
-    /// A pairing saved normally is private: no warning.
+    /// A device pairing saved normally is private: no warning.
     #[test]
     fn privately_saved_pairing_gives_no_warning() {
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
-        save_with(&ThroughKeystore(with_keyring()), &config_dir, &sample_creds()).unwrap();
+        device_pairing(&config_dir);
         assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), None);
         assert_eq!(privacy_warning(&config_dir, BindingMode::MachineBound), None);
     }
 
     /// Windows: a folder or file another account can open gives the
-    /// warning for the binding, and nothing is changed.
+    /// warning for the binding, and nothing is changed. (Now on
+    /// `device.enc`.)
     #[cfg(windows)]
     #[test]
     fn windows_shared_pairing_gives_the_warning() {
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
-        save_with(&ThroughKeystore(with_keyring()), &config_dir, &sample_creds()).unwrap();
-        let file = config_dir.join(CREDENTIAL_FILE);
+        device_pairing(&config_dir);
+        let file = config_dir.join(DEVICE_FILE);
         let before = fs::read(&file).unwrap();
         super::super::winacl::test_share_with_everyone(&file);
         assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), Some(NOT_PRIVATE_KEYRING_NOTICE));
@@ -2088,30 +949,29 @@ pub(crate) mod tests {
 
         // A shared folder with a private file warns too.
         let other = base.path().join("other");
-        save_with(&ThroughKeystore(with_keyring()), &other, &sample_creds()).unwrap();
+        device_pairing(&other);
         super::super::winacl::test_share_with_everyone(&other);
         assert_eq!(privacy_warning(&other, BindingMode::Keyring), Some(NOT_PRIVATE_KEYRING_NOTICE));
     }
 
     /// Unix (#12): a new folder is 0700 and the file 0600; a rewrite goes
     /// through a temporary file and replaces a widened file with a 0600 one;
-    /// no temporary file is left.
+    /// no temporary file is left. (Now on `device.enc`.)
     #[cfg(unix)]
     #[test]
     fn unix_folder_0700_file_0600_and_atomic_rewrite() {
         use std::os::unix::fs::PermissionsExt;
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
-        let keys = ThroughKeystore(with_keyring());
-        save_with(&keys, &config_dir, &sample_creds()).unwrap();
+        device_pairing(&config_dir);
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&config_dir), 0o700);
-        let file = config_dir.join(CREDENTIAL_FILE);
+        let file = config_dir.join(DEVICE_FILE);
         assert_eq!(mode(&file), 0o600);
 
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
-        fs::write(config_dir.join(format!("{CREDENTIAL_FILE}{TEMP_INFIX}1-00")), b"stale").unwrap();
-        save_with(&keys, &config_dir, &sample_creds()).unwrap();
+        fs::write(config_dir.join(format!("{DEVICE_FILE}{TEMP_INFIX}1-00")), b"stale").unwrap();
+        device_pairing(&config_dir);
         assert_eq!(mode(&file), 0o600, "replaced by a 0600 file");
         let temps = fs::read_dir(&config_dir)
             .unwrap()
@@ -2119,66 +979,67 @@ pub(crate) mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(TEMP_INFIX))
             .count();
         assert_eq!(temps, 0);
-        assert!(load_with(&keys, &config_dir).is_ok());
+        assert!(store_for_tests(&config_dir).load().unwrap().is_some());
     }
 
-    /// Unix: a file group or others can read gives the warning.
+    /// Unix: a file group or others can read gives the warning. (Now on
+    /// `device.enc`.)
     #[cfg(unix)]
     #[test]
     fn unix_readable_file_gives_the_warning() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        save_with(&ThroughKeystore(with_keyring()), dir.path(), &sample_creds()).unwrap();
-        let file = dir.path().join(CREDENTIAL_FILE);
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        device_pairing(&dir);
+        let file = dir.join(DEVICE_FILE);
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(privacy_warning(dir.path(), BindingMode::Keyring), Some(NOT_PRIVATE_KEYRING_NOTICE));
-        assert_eq!(privacy_warning(dir.path(), BindingMode::MachineBound), Some(NOT_PRIVATE_MACHINE_NOTICE));
+        assert_eq!(privacy_warning(&dir, BindingMode::Keyring), Some(NOT_PRIVATE_KEYRING_NOTICE));
+        assert_eq!(privacy_warning(&dir, BindingMode::MachineBound), Some(NOT_PRIVATE_MACHINE_NOTICE));
         fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(privacy_warning(dir.path(), BindingMode::Keyring), None);
+        assert_eq!(privacy_warning(&dir, BindingMode::Keyring), None);
     }
 
     /// Unix (#28): the user's own folder that others can write to (as
     /// earlier builds made it under umask 002) is tightened to 0700 and the
     /// save goes through. The refusal is for another owner, which needs a
-    /// second account to test.
+    /// second account to test. (Now saving `device.enc`.)
     #[cfg(unix)]
     #[test]
     fn unix_save_tightens_the_users_own_folder_others_can_write() {
         use std::os::unix::fs::PermissionsExt;
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
-        let keys = ThroughKeystore(with_keyring());
-        save_with(&keys, &config_dir, &sample_creds()).unwrap();
+        device_pairing(&config_dir);
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
         for wide in [0o775, 0o720, 0o702, 0o777, 0o1777] {
             fs::set_permissions(&config_dir, fs::Permissions::from_mode(wide)).unwrap();
-            save_with(&keys, &config_dir, &sample_creds()).expect("tightened, then saved");
+            device_pairing(&config_dir);
             assert_eq!(mode(&config_dir), 0o700, "{wide:o}");
-            assert!(load_with(&keys, &config_dir).is_ok());
+            assert!(store_for_tests(&config_dir).load().unwrap().is_some());
         }
         // Read and search access for others is not a refusal (the file is
         // 0600), and the folder is left as it is.
         fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o755)).unwrap();
-        save_with(&keys, &config_dir, &sample_creds()).expect("0755 is accepted");
+        device_pairing(&config_dir);
         assert_eq!(fs::metadata(&config_dir).unwrap().permissions().mode() & 0o7777, 0o755);
     }
 
     /// Unix (#28): at unlock, the user's own folder that others can write
     /// to is tightened and gives no warning; a file others can read still
     /// gives the stronger one. (The folder warning itself is for another
-    /// owner, which needs a second account to test.)
+    /// owner, which needs a second account to test.) Now on `device.enc`.
     #[cfg(unix)]
     #[test]
     fn unix_own_folder_others_can_write_is_tightened_at_unlock() {
         use std::os::unix::fs::PermissionsExt;
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
-        save_with(&ThroughKeystore(with_keyring()), &config_dir, &sample_creds()).unwrap();
+        device_pairing(&config_dir);
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
         fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o770)).unwrap();
         assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), None);
         assert_eq!(mode(&config_dir), 0o700);
-        let file = config_dir.join(CREDENTIAL_FILE);
+        let file = config_dir.join(DEVICE_FILE);
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
         fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o770)).unwrap();
         assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), Some(NOT_PRIVATE_KEYRING_NOTICE));
@@ -2226,48 +1087,55 @@ pub(crate) mod tests {
     }
 
     /// Unix (#28): when the folder can't be read, the pairing is not
-    /// reported gone: exists() says it may be there, an update refuses,
-    /// and a wipe is not confirmed. (Root ignores the mode, and then the
-    /// test has nothing to check.)
+    /// reported gone: exists() says it may be there, a save refuses, and
+    /// a wipe is not confirmed. (Root ignores the mode, and then the test
+    /// has nothing to check.) The pairing is an earlier build's file for
+    /// `exists`, and this build's device file for the save.
     #[cfg(unix)]
     #[test]
     fn unix_an_unreadable_folder_is_not_reported_gone() {
         use std::os::unix::fs::PermissionsExt;
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
-        let keys = ThroughKeystore(with_keyring());
-        save_with(&keys, &config_dir, &sample_creds()).unwrap();
+        legacy_pairing_for_tests(&config_dir);
+        device_pairing(&config_dir);
         fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o000)).unwrap();
         let root_ignores_modes = fs::read_dir(&config_dir).is_ok();
         let present = exists(&config_dir);
-        let update = save_with_mode(&keys, &config_dir, &sample_creds(), Mode::UpdateExisting);
+        let mut s = store_for_tests(&config_dir);
+        let update = s.save(b"update");
+        let why = s.take_failure();
         let confirmed = confirm_wiped(&config_dir);
         fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
         if root_ignores_modes {
             return;
         }
         assert!(present, "can't be ruled out, so it may be there");
-        assert!(matches!(update, Err(CredentialError::IoError(_))), "no update on a guess");
+        assert!(update.is_err(), "no save on a guess");
+        assert!(matches!(why, Some(CredentialError::IoError(_))), "said as an I/O error: {why:?}");
         assert!(confirmed.is_err(), "not confirmed gone");
     }
 
     /// Unix (#28): a symlinked pairing folder is wiped through the link:
-    /// the pairing and its temporary copies are removed from the folder it
-    /// points to, then the link goes.
+    /// the pairing (this build's and an earlier build's) and their
+    /// temporary copies are removed from the folder it points to, then the
+    /// link goes.
     #[cfg(unix)]
     #[test]
     fn wipe_through_a_symlinked_folder_removes_the_pairing() {
         let base = tempfile::tempdir().unwrap();
         let real = base.path().join("dotfiles-vettid-desktop");
         let link = base.path().join("vettid-desktop");
-        let keys = ThroughKeystore(with_keyring());
-        save_with(&keys, &real, &sample_creds()).unwrap();
+        device_pairing(&real);
+        legacy_pairing_for_tests(&real);
+        fs::write(real.join(format!("{DEVICE_FILE}{TEMP_INFIX}1-00")), b"stale").unwrap();
         fs::write(real.join(format!("{CREDENTIAL_FILE}{TEMP_INFIX}1-00")), b"stale").unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert!(exists(&link));
+        assert!(super::super::device_store::exists(&link));
         wipe(&link).expect("wipe");
         assert!(fs::symlink_metadata(&link).is_err(), "link removed");
-        assert!(!real.join(CREDENTIAL_FILE).exists(), "pairing removed from the target");
+        assert!(!real.join(DEVICE_FILE).exists(), "pairing removed from the target");
+        assert!(!real.join(CREDENTIAL_FILE).exists(), "legacy pairing removed from the target");
         assert_eq!(fs::read_dir(&real).unwrap().count(), 0, "no temporary copy left");
     }
 
@@ -2278,7 +1146,9 @@ pub(crate) mod tests {
         let base = tempfile::tempdir().unwrap();
         let real = base.path().join("elsewhere");
         let link = base.path().join("vettid-desktop");
-        save_with(&ThroughKeystore(with_keyring()), &real, &sample_creds()).unwrap();
+        device_pairing(&real);
+        legacy_pairing_for_tests(&real);
+        fs::write(real.join(format!("{DEVICE_FILE}.tmp-1-00")), b"stale").unwrap();
         fs::write(real.join(format!("{CREDENTIAL_FILE}.tmp-1-00")), b"stale").unwrap();
         let out = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
@@ -2287,126 +1157,93 @@ pub(crate) mod tests {
             .output()
             .expect("mklink");
         assert!(out.status.success(), "mklink /J failed");
-        assert!(exists(&link));
+        assert!(super::super::device_store::exists(&link));
         wipe(&link).expect("wipe");
         assert!(fs::symlink_metadata(&link).is_err(), "junction removed");
         assert!(real.exists(), "the target folder itself is not removed");
-        assert_eq!(fs::read_dir(&real).unwrap().count(), 0, "pairing and temporary copy removed");
+        assert_eq!(fs::read_dir(&real).unwrap().count(), 0, "pairing and temporary copies removed");
     }
 
-    /// An update after a wipe writes nothing and doesn't recreate the
-    /// folder (#28): log-out must not be undone by end_session.
+    /// A wipe removes the folder, a second wipe of nothing is fine, and a
+    /// store that clears afterwards doesn't recreate the folder (#28):
+    /// log-out must not be undone by a later End session. (Was: an
+    /// update of the NATS-era pairing refused with `NotFound`; there is no
+    /// update-only save for `device.enc`, so this checks the wipe and the
+    /// clear.)
     #[test]
-    fn update_after_a_wipe_writes_nothing() {
+    fn nothing_is_recreated_after_a_wipe() {
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
-        let keys = ThroughKeystore(with_keyring());
-        assert!(matches!(
-            save_with_mode(&keys, &config_dir, &sample_creds(), Mode::UpdateExisting),
-            Err(CredentialError::NotFound(_))
-        ));
-        assert!(!config_dir.exists(), "no folder created");
-        save_with(&keys, &config_dir, &sample_creds()).unwrap();
-        save_with_mode(&keys, &config_dir, &sample_creds(), Mode::UpdateExisting).expect("update");
+        let mut s = store_for_tests(&config_dir);
+        s.save(b"state").unwrap();
         wipe(&config_dir).expect("wipe");
         assert!(!config_dir.exists());
-        assert!(matches!(
-            save_with_mode(&keys, &config_dir, &sample_creds(), Mode::UpdateExisting),
-            Err(CredentialError::NotFound(_))
-        ));
+        s.clear().expect("clearing what is gone");
         assert!(!config_dir.exists(), "not recreated");
         assert!(wipe(&config_dir).is_ok(), "nothing there is wiped");
     }
 
     /// #30: a pairing or Start New Session whose command started before a
     /// log-out's wipe saves nothing afterwards, and creates no folder.
+    /// (Now through a `DeviceStore`.)
     #[test]
     fn a_save_that_started_before_a_wipe_writes_nothing() {
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
-        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
         let since = wipe_epoch();
         wipe(&config_dir).expect("wipe");
-        let err = save_since(&keys, &config_dir, &creds_with_session("sess-1", 1_900_000_000), Mode::CreateOrReplace, Some(since))
-            .err()
-            .expect("refused");
+        let mut s = store_since_for_tests(&config_dir, Some(since));
+        assert!(s.save(b"state").is_err());
+        let err = s.take_failure().expect("why");
         assert!(matches!(err, CredentialError::LoggedOutMeanwhile), "got {err}");
         assert_eq!(err.to_string(), LOGGED_OUT_MEANWHILE_NOTICE);
         assert!(!config_dir.exists(), "nothing recreated");
     }
 
-    /// #30, from #29's review: end_session loaded the old pairing, then a
-    /// log-out and a new pairing both completed. Its update is refused and
-    /// the new pairing and its marker are left as they were.
-    #[test]
-    fn an_end_session_update_is_not_written_over_a_pairing_made_after_a_logout() {
-        let base = tempfile::tempdir().unwrap();
-        let config_dir = base.path().join("vettid-desktop");
-        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
-        save_with(&keys, &config_dir, &creds_with_session("old", 1_900_000_000)).unwrap();
-        let since = wipe_epoch();
-        let (mut old, _) = load_with(&keys, &config_dir).unwrap();
-        wipe(&config_dir).expect("log-out");
-        save_with(&keys, &config_dir, &creds_with_session("new", 1_900_000_001)).unwrap();
-        let file = fs::read(config_dir.join(CREDENTIAL_FILE)).unwrap();
-        let marker = fs::read(config_dir.join(SESSION_LIVE_FILE)).unwrap();
-        old.session_id.clear();
-        old.session_expires_at = 0;
-        assert!(matches!(
-            save_since(&keys, &config_dir, &old, Mode::UpdateExisting, Some(since)),
-            Err(CredentialError::LoggedOutMeanwhile)
-        ));
-        assert_eq!(fs::read(config_dir.join(CREDENTIAL_FILE)).unwrap(), file);
-        assert_eq!(fs::read(config_dir.join(SESSION_LIVE_FILE)).unwrap(), marker);
-        assert!(session_is_recorded(&config_dir, "new"));
-    }
-
     /// #30: with no wipe since its command started, a save goes ahead as
-    /// before, both a create and an update. Other tests wipe at the same
-    /// time (the count is per process), so an attempt one of them overtook
-    /// is tried again.
+    /// before. Other tests wipe at the same time (the count is per
+    /// process), so an attempt one of them overtook is tried again.
     #[test]
     fn with_no_wipe_since_it_started_a_save_goes_ahead() {
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
-        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
-        for mode in [Mode::CreateOrReplace, Mode::UpdateExisting] {
-            let mut saved = false;
-            for _ in 0..100 {
-                let since = wipe_epoch();
-                match save_since(&keys, &config_dir, &creds_with_session("sess-1", 1_900_000_000), mode, Some(since)) {
-                    Ok(_) => {
-                        saved = true;
-                        break;
-                    }
-                    Err(CredentialError::LoggedOutMeanwhile) => assert_ne!(wipe_epoch(), since, "refused with no wipe"),
-                    Err(e) => panic!("{e}"),
+        let mut saved = false;
+        for _ in 0..100 {
+            let since = wipe_epoch();
+            let mut s = store_since_for_tests(&config_dir, Some(since));
+            match s.save(b"state") {
+                Ok(()) => {
+                    saved = true;
+                    break;
+                }
+                Err(_) => {
+                    let err = s.take_failure().expect("why");
+                    assert!(matches!(err, CredentialError::LoggedOutMeanwhile), "{err}");
+                    assert_ne!(wipe_epoch(), since, "refused with no wipe");
                 }
             }
-            assert!(saved);
         }
-        assert!(session_is_recorded(&config_dir, "sess-1"));
+        assert!(saved);
+        assert!(super::super::device_store::exists(&config_dir));
     }
 
     /// #30: log-out deletes the keyring key while it still holds the writer
     /// lock, so a save that starts meanwhile runs only after the key is
     /// gone (it then mints a new one) and is never sealed under the deleted
-    /// key.
+    /// key. (The waiting save is now a `DeviceStore` save.)
     #[test]
     fn logout_deletes_the_key_before_any_waiting_save_runs() {
         use std::sync::{Arc, Mutex};
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
         let other = base.path().join("other");
-        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
-        save_with(&keys, &config_dir, &sample_creds()).unwrap();
+        device_pairing(&config_dir);
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut saver = None;
         wipe_then(Some(&config_dir), || {
             let (order2, other2) = (order.clone(), other.clone());
             let handle = std::thread::spawn(move || {
-                let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
-                save_with(&keys, &other2, &sample_creds()).unwrap();
+                store_for_tests(&other2).save_raw_for_tests();
                 order2.lock().unwrap().push("saved");
             });
             std::thread::sleep(std::time::Duration::from_millis(150));
@@ -2418,23 +1255,6 @@ pub(crate) mod tests {
         saver.unwrap().join().unwrap();
         assert_eq!(*order.lock().unwrap(), ["key deleted", "saved"]);
         assert!(!config_dir.exists());
-    }
-
-    /// #30: End session's marker removal after a log-out leaves the marker
-    /// of a pairing made since alone.
-    #[test]
-    fn end_session_after_a_logout_leaves_a_new_pairings_marker() {
-        let base = tempfile::tempdir().unwrap();
-        let config_dir = base.path().join("vettid-desktop");
-        let keys = FixedKeys { binding: BindingMode::Keyring, master: [0x44; 32], platform: PLATFORM };
-        let since = wipe_epoch();
-        wipe(&config_dir).expect("log-out");
-        save_with(&keys, &config_dir, &creds_with_session("new", 1_900_000_000)).unwrap();
-        assert!(matches!(
-            end_saved_session_since(&config_dir, since),
-            Err(CredentialError::LoggedOutMeanwhile)
-        ));
-        assert!(session_is_recorded(&config_dir, "new"));
     }
 
     /// #30: the folder check at the start of a pairing doesn't recreate the
@@ -2463,127 +1283,66 @@ pub(crate) mod tests {
         assert_ne!(wipe_epoch(), since, "a save that started before is still refused");
     }
 
-    /// The key protection shown in Settings follows the file's header.
+    /// Windows (#21): a save under a parent another account controls is
+    /// refused with the parent notice and leaves an existing pairing as it
+    /// was. (Now `device.enc`.)
+    #[cfg(windows)]
     #[test]
-    fn stored_key_protection_reports_the_binding_on_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(stored_key_protection(dir.path()), "none");
-
-        save_with(&ThroughKeystore(with_keyring()), dir.path(), &sample_creds()).unwrap();
-        assert_eq!(stored_key_protection(dir.path()), "keyring");
-
-        // Machine-bound: shown as such where that key is used; on Windows,
-        // where such a file is refused at load, as unknown.
-        let bound = tempfile::tempdir().unwrap();
-        save_with(&ThroughKeystore(without_keyring()), bound.path(), &sample_creds()).unwrap();
-        let want = if keystore::MACHINE_BOUND_FALLBACK { "machine" } else { "unknown" };
-        assert_eq!(stored_key_protection(bound.path()), want);
-
-        let garbage = tempfile::tempdir().unwrap();
-        fs::write(garbage.path().join(CREDENTIAL_FILE), b"not json").unwrap();
-        assert_eq!(stored_key_protection(garbage.path()), "unknown");
-
-        let future = tempfile::tempdir().unwrap();
-        fs::write(
-            future.path().join(CREDENTIAL_FILE),
-            br#"{"version":99,"binding":"keyring","nonce":[],"ciphertext":[]}"#,
-        )
-        .unwrap();
-        assert_eq!(stored_key_protection(future.path()), "unknown", "unsupported version");
+    fn windows_a_save_under_an_unsafe_parent_changes_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("local");
+        let config_dir = parent.join("vettid-desktop");
+        device_pairing(&config_dir);
+        let file = fs::read(config_dir.join(DEVICE_FILE)).unwrap();
+        super::super::winacl::test_let_everyone_delete_children(&parent);
+        let mut s = store_for_tests(&config_dir);
+        assert!(s.save(b"newer state").is_err());
+        let err = s.take_failure().expect("why");
+        assert!(matches!(err, CredentialError::ParentNotPrivate), "got {err}");
+        assert_eq!(err.to_string(), PARENT_NOT_PRIVATE_NOTICE);
+        assert_eq!(fs::read(config_dir.join(DEVICE_FILE)).unwrap(), file);
     }
 
-    /// A file that exists but can't be parsed, or names an unknown
-    /// binding, may be keyring-bound: a machine-bound save leaves it as it
-    /// is. With the keyring working, the save replaces it.
+    /// Windows (#21): a parent that is a junction gives the link notice,
+    /// not the "another account" one, and nothing is created through it.
+    #[cfg(windows)]
     #[test]
-    fn unreadable_store_is_not_overwritten_machine_bound() {
-        let unknown_binding = br#"{"version":3,"binding":"future","nonce":[],"ciphertext":[]}"#;
-        for contents in [&b"not json"[..], &b""[..], &unknown_binding[..]] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join(CREDENTIAL_FILE);
-            fs::write(&path, contents).unwrap();
-            assert_eq!(on_disk_store(dir.path()), OnDisk::Unreadable);
-
-            let broken = ThroughKeystore(without_keyring());
-            let err = save_with(&broken, dir.path(), &sample_creds()).err().expect("save must fail");
-            assert!(matches!(err, CredentialError::KeyringUnavailable), "got {err}");
-            assert_eq!(fs::read(&path).unwrap(), contents, "the file must be left as it was");
-
-            let keyring = ThroughKeystore(with_keyring());
-            assert_eq!(save_with(&keyring, dir.path(), &sample_creds()).unwrap(), BindingMode::Keyring);
-        }
-        let empty = tempfile::tempdir().unwrap();
-        assert_eq!(on_disk_store(empty.path()), OnDisk::Absent);
-    }
-
-    /// The other direction is allowed: a machine-bound store is re-saved
-    /// under the keyring once the keyring works.
-    #[test]
-    fn machine_bound_store_moves_to_the_keyring_when_it_works() {
-        let dir = tempfile::tempdir().unwrap();
-        let bound = ThroughKeystore(without_keyring());
-        assert_eq!(save_with(&bound, dir.path(), &sample_creds()).unwrap(), BindingMode::MachineBound);
-        let keyring = ThroughKeystore(with_keyring());
-        assert_eq!(save_with(&keyring, dir.path(), &sample_creds()).unwrap(), BindingMode::Keyring);
-        assert_eq!(read_store(dir.path()).unwrap().binding, "keyring");
-        let (loaded, binding) = load_with(&keyring, dir.path()).expect("load");
-        assert_eq!(binding, BindingMode::Keyring);
-        assert_eq!(loaded.connection_id, "conn-1");
-    }
-
-    /// The Windows policy: no keyring means no save at all, with the plain
-    /// notice, even with a usable machine id; nothing is written.
-    #[test]
-    fn without_the_fallback_no_keyring_fails_the_save_and_writes_nothing() {
-        struct NoFallback(keystore::tests::TestSources);
-        impl KeySource for NoFallback {
-            fn master_for_save(&self) -> Result<MasterKey, KeystoreError> {
-                keystore::fetch_or_create_master_key_with_policy(&self.0, false)
-            }
-            fn master_for_load(&self, binding: BindingMode) -> Result<MasterKey, KeystoreError> {
-                keystore::fetch_for_binding_with_policy(&self.0, binding, false)
-            }
-            fn storage_binding(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
-                Ok(Zeroizing::new(PLATFORM))
-            }
-            fn legacy_fingerprint(&self) -> Result<Zeroizing<[u8; 32]>, FingerprintError> {
-                Ok(Zeroizing::new(FINGERPRINT))
-            }
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let config_dir = dir.path().join("vettid-desktop");
-        let err = save_with(&NoFallback(without_keyring()), &config_dir, &sample_creds())
-            .err()
-            .expect("save must fail");
-        assert!(matches!(err, CredentialError::KeyringUnavailable), "got {err}");
-        assert!(!config_dir.exists(), "nothing may be written");
-
-        // A machine-bound file (from an earlier build) is not opened under
-        // this policy either: it reads as unreadable, and is kept.
-        let other = tempfile::tempdir().unwrap();
-        save_with(&ThroughKeystore(without_keyring()), other.path(), &sample_creds()).unwrap();
-        let before = fs::read(other.path().join(CREDENTIAL_FILE)).unwrap();
-        let err = load_with(&NoFallback(without_keyring()), other.path()).err().expect("load must fail");
-        assert!(matches!(err, CredentialError::Unreadable), "got {err}");
-        assert_eq!(fs::read(other.path().join(CREDENTIAL_FILE)).unwrap(), before, "kept");
+    fn windows_a_linked_parent_gives_the_link_notice() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = base.path().join("local");
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .expect("mklink");
+        assert!(out.status.success(), "mklink /J failed");
+        let mut s = store_for_tests(&link.join("vettid-desktop"));
+        assert!(s.save(b"state").is_err());
+        let err = s.take_failure().expect("why");
+        assert!(matches!(err, CredentialError::ParentIsLink), "got {err}");
+        assert_eq!(err.to_string(), PARENT_IS_LINK_NOTICE);
+        assert!(!real.join("vettid-desktop").exists());
     }
 
     /// Windows: a save makes the folder and the file private to the user.
+    /// (Now `device.enc`.)
     #[cfg(windows)]
     #[test]
     fn windows_save_makes_folder_and_file_user_only() {
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
-        let keys = ThroughKeystore(with_keyring());
-        save_with(&keys, &config_dir, &sample_creds()).expect("save");
+        device_pairing(&config_dir);
         assert!(super::super::winacl::test_is_user_only(&config_dir), "folder");
-        assert!(super::super::winacl::test_is_user_only(&config_dir.join(CREDENTIAL_FILE)), "file");
+        assert!(super::super::winacl::test_is_user_only(&config_dir.join(DEVICE_FILE)), "file");
         // A second save over the private file works.
-        save_with(&keys, &config_dir, &sample_creds()).expect("second save");
+        device_pairing(&config_dir);
     }
 
     /// Windows: a folder another account can open is refused, and nothing
-    /// is written into it.
+    /// is written into it. (Now `device.enc`.)
     #[cfg(windows)]
     #[test]
     fn windows_save_refuses_a_shared_folder() {
@@ -2591,27 +1350,28 @@ pub(crate) mod tests {
         let config_dir = base.path().join("vettid-desktop");
         fs::create_dir(&config_dir).unwrap();
         super::super::winacl::test_share_with_everyone(&config_dir);
-        let err = save_with(&ThroughKeystore(with_keyring()), &config_dir, &sample_creds())
-            .err()
-            .expect("save must fail");
+        let mut s = store_for_tests(&config_dir);
+        assert!(s.save(b"state").is_err());
+        let err = s.take_failure().expect("why");
         assert!(matches!(err, CredentialError::NotPrivate), "got {err}");
         assert_eq!(err.to_string(), NOT_PRIVATE_NOTICE);
-        assert!(!config_dir.join(CREDENTIAL_FILE).exists(), "nothing may be written");
+        assert!(!config_dir.join(DEVICE_FILE).exists(), "nothing may be written");
     }
 
     /// Windows: an existing file another account can open is refused
-    /// before it is truncated.
+    /// before it is truncated. (Now `device.enc`.)
     #[cfg(windows)]
     #[test]
     fn windows_save_refuses_a_shared_file_and_keeps_it() {
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
-        let keys = ThroughKeystore(with_keyring());
-        save_with(&keys, &config_dir, &sample_creds()).expect("save");
-        let file = config_dir.join(CREDENTIAL_FILE);
+        device_pairing(&config_dir);
+        let file = config_dir.join(DEVICE_FILE);
         let before = fs::read(&file).unwrap();
         super::super::winacl::test_share_with_everyone(&file);
-        let err = save_with(&keys, &config_dir, &sample_creds()).err().expect("save must fail");
+        let mut s = store_for_tests(&config_dir);
+        assert!(s.save(b"newer state").is_err());
+        let err = s.take_failure().expect("why");
         assert!(matches!(err, CredentialError::NotPrivate), "got {err}");
         assert_eq!(fs::read(&file).unwrap(), before, "not truncated");
     }

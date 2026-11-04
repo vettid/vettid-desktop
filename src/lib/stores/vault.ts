@@ -45,18 +45,36 @@ export const totalUnreadStore: Readable<number> = derived(
  *  mount and on every data-request-received push, then writes the
  *  count here. The Sharing rail icon reads this for a notification
  *  dot so the user knows requests are queued even after dismissing
- *  the modal. */
-export const pendingGrantCountStore: Writable<number> = writable(0);
+ *  the modal. `null`: not known (nothing loaded yet, or the last load
+ *  failed): no count is claimed. */
+export const pendingGrantCountStore: Writable<number | null> = writable(null);
 
 // ---------------------------------------------------------------------------
 // Loaders — call from views to (re)fetch from the vault
 // ---------------------------------------------------------------------------
 
+/** Why the last `loadConnections` failed (the backend's own text), or ''. */
+export const connectionsErrorStore: Writable<string> = writable('');
+
+/**
+ * Re-fetch the connection list. On failure the list is cleared (a list
+ * we could not confirm is not shown as current) and the backend's error
+ * text goes to `connectionsErrorStore`; it never reads as an empty list.
+ */
 export async function loadConnections(): Promise<void> {
-    const resp: VaultOpResponse = await invoke('list_connections');
-    if (resp.success && resp.data) {
-        const data = resp.data as { connections?: Connection[] };
-        connectionsStore.set(data.connections ?? []);
+    try {
+        const resp: VaultOpResponse = await invoke('list_connections');
+        if (resp.success && resp.data) {
+            const data = resp.data as { connections?: Connection[] };
+            connectionsStore.set(data.connections ?? []);
+            connectionsErrorStore.set('');
+            return;
+        }
+        connectionsStore.set([]);
+        connectionsErrorStore.set(resp.error ?? 'Failed to load connections');
+    } catch (e) {
+        connectionsStore.set([]);
+        connectionsErrorStore.set(String(e));
     }
 }
 

@@ -254,9 +254,11 @@
       const resp: any = await invoke('get_secret', { id: s.id });
       if (resp?.success && resp?.data) {
         addValue = String(resp.data.value ?? '');
+      } else {
+        addError = resp?.error || 'Could not load the current value.';
       }
-    } catch {
-      // Leave value blank — the user can re-enter it.
+    } catch (e) {
+      addError = String(e);
     }
   }
 

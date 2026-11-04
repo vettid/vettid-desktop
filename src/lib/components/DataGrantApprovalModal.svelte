@@ -52,6 +52,12 @@
             // still need a response on the vault side).
             pendingGrantCountStore.set(pending.length);
         } catch (e) {
+            // Never keep (or offer to act on) a list we could not confirm,
+            // and claim no count. The error goes to the console only (no
+            // view shows grant-list errors yet); nothing here can be approved.
+            pending = [];
+            activeIndex = 0;
+            pendingGrantCountStore.set(null);
             console.warn('grant.list-pending failed', e);
         }
     }
