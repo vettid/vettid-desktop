@@ -552,16 +552,65 @@ const NOT_WIPED_NOTICE: &str = "This desktop's saved pairing could not be delete
 /// ... when neither happened.
 const NOT_WIPED_NOR_SENT_NOTICE: &str = "This desktop's saved pairing could not be deleted from this computer, and your vault was not told. Remove this desktop on your phone, then try logging out again.";
 
+/// NEW TEXT (owner approval needed): logout ended this desktop's access at
+/// the vault and the pairing is gone from this computer. The vault still
+/// lists the desktop: a desktop can't unlink itself (VAULT-MESSAGING §7.4,
+/// `device.unlink` is an app-only type).
+const ACCESS_ENDED_LOGOUT_NOTICE: &str = "This desktop has been logged out, and its access to your vault was ended. Your phone still lists this desktop: remove it there.";
+/// NEW TEXT (owner approval needed): access ended at the vault, but the
+/// saved pairing could not be deleted from this computer.
+const ACCESS_ENDED_NOT_WIPED_NOTICE: &str = "This desktop's access to your vault was ended, but its saved pairing could not be deleted from this computer. Remove this desktop on your phone, then try logging out again.";
+
+/// How long logout tries to end this desktop's access at the vault (and
+/// to get the link for it) before it wipes anyway: a dead relay can't
+/// block a log-out.
+const LOGOUT_END_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Result of [`logout`].
 #[derive(Debug, Serialize)]
 pub struct LogoutResponse {
-    /// Whether the vault was told. Always false in this build: the device
-    /// engine has no message yet for a device to remove itself.
+    /// Whether the vault was told to remove this desktop. Always false: a
+    /// desktop can't unlink itself (`device.unlink` is app-only, §7.4).
     pub revoke_sent: bool,
+    /// The vault confirmed that this desktop's access ended (an unnamed
+    /// `device.session.end`, answered). False on anything less.
+    pub access_ended: bool,
     /// The saved pairing is gone from this computer.
     pub local_wiped: bool,
     /// Plain text to show the person when either of the above is false.
     pub notice: Option<String>,
+}
+
+/// How logout's end of access came out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogoutEnd {
+    /// No open pairing: nothing to end.
+    NoLink,
+    /// The vault confirmed the end ([`EndOutcome::Ended`]).
+    Ended,
+    /// Anything else: unconfirmed, replaced, refused by the ordering rule,
+    /// not sent, or not done within [`LOGOUT_END_BOUND`]. Nothing is claimed.
+    NotConfirmed,
+}
+
+/// `r`: `None` with no link; `Some(None)` if the end didn't finish within
+/// the bound; else the end's result.
+fn logout_end(r: Option<Option<Result<EndOutcome, vettid_device::access::AccessError>>>) -> LogoutEnd {
+    match r {
+        None => LogoutEnd::NoLink,
+        Some(Some(Ok(EndOutcome::Ended))) => LogoutEnd::Ended,
+        Some(_) => LogoutEnd::NotConfirmed,
+    }
+}
+
+/// What logout tells the person: "access ended" only when the vault
+/// confirmed it; otherwise the "your vault was not told" texts.
+fn logout_end_notice(end: LogoutEnd, local_wiped: bool) -> Option<&'static str> {
+    match (end, local_wiped) {
+        (LogoutEnd::Ended, true) => Some(ACCESS_ENDED_LOGOUT_NOTICE),
+        (LogoutEnd::Ended, false) => Some(ACCESS_ENDED_NOT_WIPED_NOTICE),
+        (_, wiped) => logout_notice(false, wiped),
+    }
 }
 
 fn logout_notice(revoke_sent: bool, local_wiped: bool) -> Option<&'static str> {
@@ -612,9 +661,12 @@ fn wipe_local_pairing_with(
     }
 }
 
-/// Log out: wipe the saved pairing (folder and keyring key) and drop the
-/// link. The vault is not told (see [`LogoutResponse::revoke_sent`]), and
-/// the response says so, so the UI never implies it was.
+/// Log out: end this desktop's access at the vault (an unnamed
+/// `device.session.end`, within [`LOGOUT_END_BOUND`]), then wipe the saved
+/// pairing (folder and keyring key) whatever came of that, and drop the
+/// link. The vault can't be told to remove the desktop (see
+/// [`LogoutResponse::revoke_sent`]); the response says what happened, and
+/// says access ended only if the vault confirmed it.
 #[tauri::command]
 pub async fn logout(state: State<'_, AppState>) -> Result<LogoutResponse, String> {
     // With no known folder there is nothing to wipe, and that can't be
@@ -623,24 +675,57 @@ pub async fn logout(state: State<'_, AppState>) -> Result<LogoutResponse, String
     if let Err(e) = &config_dir {
         log::warn!("logout: {}", e);
     }
-    Ok(log_out(&state, config_dir.as_deref().ok(), wipe_local_pairing).await)
+    Ok(log_out(&state, config_dir.as_deref().ok(), wipe_local_pairing, LOGOUT_END_BOUND).await)
 }
 
-/// [`logout`]'s work, with the wipe passed in (tests keep the real key).
-async fn log_out(state: &AppState, config_dir: Option<&std::path::Path>, wipe: impl FnOnce(Option<&std::path::Path>) -> bool) -> LogoutResponse {
+/// [`logout`]'s work, with the wipe (tests keep the real key) and the
+/// bound passed in.
+async fn log_out(
+    state: &AppState,
+    config_dir: Option<&std::path::Path>,
+    wipe: impl FnOnce(Option<&std::path::Path>) -> bool,
+    bound: std::time::Duration,
+) -> LogoutResponse {
+    // A Start New Session waiting for the phone stops (it checks this).
     begin_reset(state);
     state.publish(Snapshot::default());
-    // The link is dropped below, so stopping its refresh mid-operation
-    // leaves nothing in memory half done.
+    let deadline = tokio::time::Instant::now() + bound;
+    // The link, if it can be had within the bound: a refresh or a Start New
+    // Session may hold it.
+    let mut guard = tokio::time::timeout_at(deadline, state.link.lock()).await.ok();
+    // Stopped with the link held, or (if it couldn't be had) mid-operation,
+    // which leaves nothing half done that matters: the link is dropped below.
     state.stop_refresh();
-    // The wipe first: from here, no save of a pairing or session started
-    // before can write (#30), even while the link is still held.
+    let end = match guard.as_mut() {
+        None => {
+            log::warn!("logout: the link was busy; access not ended at the vault");
+            LogoutEnd::NotConfirmed
+        }
+        Some(slot) => match slot.as_mut() {
+            None => LogoutEnd::NoLink,
+            // Unnamed: all of this desktop's access (§6.8). An end cut short
+            // by the bound is dropped with the link.
+            Some(l) => logout_end(Some(tokio::time::timeout_at(deadline, l.end()).await.ok())),
+        },
+    };
+    // Whatever the outcome. From here, no save of a pairing or session
+    // started before can write (#30).
     let local_wiped = wipe(config_dir);
-    drop(state.link.lock().await.take());
+    let mut slot = match guard {
+        Some(g) => g,
+        None => state.link.lock().await,
+    };
+    drop(slot.take());
+    drop(slot);
     *state.is_registered.write().await = false;
     state.publish(Snapshot::default());
     finish_reset(state);
-    LogoutResponse { revoke_sent: false, local_wiped, notice: logout_notice(false, local_wiped).map(str::to_string) }
+    LogoutResponse {
+        revoke_sent: false,
+        access_ended: end == LogoutEnd::Ended,
+        local_wiped,
+        notice: logout_end_notice(end, local_wiped).map(str::to_string),
+    }
 }
 
 /// End this desktop's access session (§6.8, "End access": all of it, no
@@ -904,7 +989,7 @@ mod tests {
             match which {
                 "lock" => lock_memory(&state).await,
                 "logout" => {
-                    let r = log_out(&state, None, |_| false).await;
+                    let r = log_out(&state, None, |_| false, LOGOUT_END_BOUND).await;
                     assert!(!r.revoke_sent && !r.local_wiped);
                     assert_eq!(r.notice.as_deref(), Some(NOT_WIPED_NOR_SENT_NOTICE));
                 }
@@ -928,12 +1013,74 @@ mod tests {
     async fn logout_reports_what_happened() {
         let state = AppState::new();
         *state.is_registered.write().await = true;
-        let r = log_out(&state, None, |_| true).await;
+        let r = log_out(&state, None, |_| true, LOGOUT_END_BOUND).await;
         assert!(!r.revoke_sent);
+        assert!(!r.access_ended, "no link: nothing ended");
         assert!(r.local_wiped);
         assert_eq!(r.notice.as_deref(), Some(REVOKE_NOT_SENT_NOTICE));
         assert!(!*state.is_registered.read().await);
         assert_eq!(state.snapshot(), Snapshot::default());
+    }
+
+    /// Logout's end of access: "ended" only for the vault's confirmed end;
+    /// every other outcome, and no link, gets the "not told" texts.
+    #[test]
+    fn logout_says_access_ended_only_when_the_vault_confirmed_it() {
+        use vettid_device::access::AccessError;
+        use vettid_device::session::SessionError;
+        assert_eq!(logout_end(None), LogoutEnd::NoLink);
+        assert_eq!(logout_end(Some(Some(Ok(EndOutcome::Ended)))), LogoutEnd::Ended);
+        for not in [
+            Some(Ok(EndOutcome::Unconfirmed)),
+            Some(Ok(EndOutcome::Replaced)),
+            Some(Err(AccessError::EndUnconfirmed)),
+            Some(Err(AccessError::Session(SessionError::TimedOut))),
+            Some(Err(AccessError::Session(SessionError::Refused))),
+            // Not done within the bound.
+            None,
+        ] {
+            assert_eq!(logout_end(Some(not.clone())), LogoutEnd::NotConfirmed, "{not:?}");
+        }
+        assert_eq!(logout_end_notice(LogoutEnd::Ended, true), Some(ACCESS_ENDED_LOGOUT_NOTICE));
+        assert_eq!(logout_end_notice(LogoutEnd::Ended, false), Some(ACCESS_ENDED_NOT_WIPED_NOTICE));
+        for end in [LogoutEnd::NotConfirmed, LogoutEnd::NoLink] {
+            assert_eq!(logout_end_notice(end, true), Some(REVOKE_NOT_SENT_NOTICE));
+            assert_eq!(logout_end_notice(end, false), Some(NOT_WIPED_NOR_SENT_NOTICE));
+        }
+        assert!(ACCESS_ENDED_LOGOUT_NOTICE.contains("remove it there"));
+    }
+
+    /// A busy link (a refresh or Start New Session stuck on a dead relay)
+    /// doesn't hold up the wipe beyond the bound, and nothing is claimed.
+    #[tokio::test]
+    async fn a_busy_link_doesnt_block_the_wipe() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let state = Arc::new(AppState::new());
+        let held = state.link.clone().lock_owned().await;
+        let wiped = Arc::new(AtomicBool::new(false));
+        let run = {
+            let (state, wiped) = (state.clone(), wiped.clone());
+            tokio::spawn(async move {
+                log_out(&state, None, move |_| {
+                    wiped.store(true, Ordering::SeqCst);
+                    true
+                }, std::time::Duration::from_millis(50))
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !wiped.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("wiped while the link was still busy");
+        drop(held);
+        let r = run.await.unwrap();
+        assert!(!r.access_ended && !r.revoke_sent && r.local_wiped);
+        assert_eq!(r.notice.as_deref(), Some(REVOKE_NOT_SENT_NOTICE));
+        assert!(state.link.lock().await.is_none());
     }
 
     /// #43: every memory reset is counted as started and finished, so an
@@ -943,7 +1090,7 @@ mod tests {
         use std::sync::atomic::Ordering::SeqCst;
         let state = AppState::new();
         lock_memory(&state).await;
-        log_out(&state, None, |_| false).await;
+        log_out(&state, None, |_| false, LOGOUT_END_BOUND).await;
         end_access(&state).await;
         assert_eq!(state.resets_started.load(SeqCst), 3);
         assert_eq!(state.resets_finished.load(SeqCst), 3);
