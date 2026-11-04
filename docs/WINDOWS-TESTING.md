@@ -91,7 +91,7 @@ shortcut) and the uninstall entry.
 
 I removed the leftovers by hand after each run.
 
-## Paired state after uninstall (read in the code, not run)
+## Paired state after uninstall, before AG3 and the uninstall hook (read in the code, not run)
 
 Nothing was paired on this machine: pairing needs a phone and a vault on staging. So no state file and no
 Credential Manager entry were created in either run (checked: neither exists).
@@ -115,14 +115,231 @@ From the code, a paired desktop keeps:
     it once the file is gone. AG3 (#13) removes the entry and confirms each part of a wipe.
   - doesn't unlink the desktop: a desktop can't unlink itself (VAULT-MESSAGING §7.4), only the phone can.
 
-AG3 (#13) replaces the Credential Manager entry with a DPAPI-wrapped key kept inside `device.enc`. That leaves
-one part to remove. Whether the uninstaller should remove it, or tell the person to log out or unlink first,
-is for the owner to decide.
+That was before AG3. With AG3 (#13) the data key is DPAPI-wrapped inside `device.enc`, so nothing else is kept
+outside the file; the earlier format's Credential Manager entry is only ever deleted.
+
+## Uninstall: the saved pairing (owner decision "a")
+
+What was run:
+- the wipe mode's unit tests;
+- the hook compiled by `makensis` 3.11 into a mock uninstaller (the template's order, a stand-in for
+  `CheckIfAppIsRunning` without the Tauri plugin, and a stand-in wipe program that exits with a chosen code);
+- a real debug installer, end to end (results below).
+
+The rest was read in the bundler's template (tauri-bundler 2.10.2, `installer.nsi`).
+
+**Build with tauri-cli 2.12.2 or later** (tested with 2.12.2). The hook passes `CheckIfAppIsRunning` the
+program's path, the 2.12 template's form. Earlier templates take a process name there, and the hook's app
+check would then silently do nothing, leaving the post-uninstall check (step 3 below) as the only safeguard.
+The CLI is installed with cargo (`cargo install tauri-cli`), so the repository can't pin it.
+
+**What the uninstaller removes now:** the saved pairing, on every real uninstall, silent `/S` included. Not
+on an update (`/UPDATE`), and not when an installer runs the old uninstaller (an upgrade, downgrade or
+reinstall by hand): those keep the pairing. Its hook (`src-tauri/windows/installer-hooks.nsh`) runs
+`vettid-desktop.exe --uninstall-wipe` (`src-tauri/src/uninstall.rs`), which is log-out's local wipe
+(`store::wipe_for_logout`), each part confirmed on disk:
+- `%LOCALAPPDATA%\vettid-desktop\`, with `device.enc` and any temporary copy of it, and an earlier build's
+  `connection.enc`;
+- the protectors' external keys (none on Windows: DPAPI keeps nothing outside the file);
+- the earlier format's Credential Manager entry `vettid-desktop/master-key-v1/local`.
+
+**What it doesn't do:** it doesn't contact the vault, and doesn't tell the phone. A desktop can't unlink
+itself (VAULT-MESSAGING §7.4), and an uninstall shouldn't wait on the network. The vault lists the desktop
+until it is removed on the phone.
+
+**The wipe's exit codes:**
+
+| Code | Meaning |
+|---|---|
+| 10 | A pairing was saved here, and every part is confirmed gone. |
+| 11 | Nothing was paired here (no pairing file before the wipe). |
+| 20 | Something couldn't be removed, or its removal couldn't be confirmed. Also: no user folder, or a panic. |
+
+Anything else is a failure, **0 included**: a program that ignores the switch (an older build, which would
+also open its window) exits 0.
+
+**The order:**
+1. `NSIS_HOOK_PREUNINSTALL`, before the template removes anything:
+   - Skipped on `/UPDATE`; when `$INSTDIR` is empty (a missing install-location entry); and when the
+     uninstaller runs in place, from the install folder (`$EXEDIR` = `$INSTDIR`, compared in short form,
+     ignoring case and a trailing backslash; owner decision "a", 2026-11-04). An installer runs the old
+     uninstaller in place (`uninstall.exe _?=$INSTDIR`), without `/UPDATE`. An uninstall from Windows' Apps
+     list, or `uninstall.exe /S`, first copies the uninstaller to a temporary folder and runs it from there
+     (the NSIS manual, 3.2: `_?=` "stops the uninstaller from copying itself to the temporary directory and
+     running from there"; seen in the mock, case 9 below), so it wipes. `/WIPEPAIRING` (see Scripts) makes
+     an in-place uninstall wipe; `/UPDATE` skips it even then.
+   - **Refused when this account didn't install the app:** the uninstall goes on only if the account the
+     uninstaller runs as has `$INSTDIR` recorded in its own `HKCU`, as the product key's default value or the
+     uninstall entry's `InstallLocation` (the template deletes both only later). Otherwise (an uninstall "Run
+     as administrator" with another account's password, a SYSTEM or management-tool uninstall, or the keys
+     gone), the wipe would delete that account's pairing and keep the user's. So nothing is removed: the
+     uninstall stops there with exit code 2, a Warning (event ID 1002) and, if someone is watching, "VettID
+     Desktop wasn't uninstalled. This Windows account isn't the one that installed it, and uninstalling it
+     from here would leave that account's saved pairing on this computer. Sign in as the account that
+     installed VettID Desktop, and uninstall it there." (for the owner's approval). The app, its uninstaller
+     and the user's Apps-list entry stay, so the user can still log out or uninstall. Any other install mode
+     (per-machine or "both", not used) fails the build with an `!error`: every uninstall would be refused.
+   - A running app is closed (`CheckIfAppIsRunning`). If the person cancels, or the app can't be closed, the
+     uninstall stops there. **This check can also silently do nothing** (when its Restart Manager session or
+     registration fails), and the app could be started again before the wipe; step 3 covers both.
+   - The wipe runs; its code is kept for step 3. Nothing is shown yet.
+2. The template: its own running-app check (which closes the app or stops the uninstall), then removes the
+   program, shortcuts and registry entries.
+3. `NSIS_HOOK_POSTUNINSTALL`, unless the wipe was skipped. It looks for `device.enc`, `connection.enc` and any
+   `*.tmp-*` in the current user's local app data folder (the known folder, as the app finds it, not the
+   `LOCALAPPDATA` variable), under `vettid-desktop`, and for `vettid-desktop.exe` still in the install folder
+   (the app may still be running, and save again). This is an extra check, not the confirmation: NSIS's
+   `FileExists` reads a folder it can't list as empty. The confirmation is the wipe's own 10 or 11.
+   - Code 10 and nothing there: "This desktop was paired. Remove it on your phone too."
+   - Code 11 and nothing there: nothing is shown.
+   - The program still there: the uninstaller's exit code is 2, a Warning (event ID 1003) goes to the
+     Windows Application event log (below), and the message (owner approval needed): "VettID Desktop couldn't
+     be fully removed from this computer: its program is still in `<install folder>`, and may still be
+     running. Close VettID Desktop, then delete that folder. Also delete `<local app data>`\vettid-desktop if
+     it's there, and any vettid-desktop entry in Windows Credential Manager. Remove this desktop on your phone
+     too."
+   - Anything else (code 20, 0, any other code, the program not starting, or a pairing file there): exit
+     code 2, event 1001, and the message (owner approval needed): "VettID Desktop was uninstalled, but this
+     desktop's saved pairing couldn't be removed from this computer, or its removal couldn't be confirmed. If
+     the folder `<local app data>`\vettid-desktop is still there, delete it, and delete any vettid-desktop
+     entry in Windows Credential Manager. Remove this desktop on your phone too."
+   - The texts wait for the owner's approval. The uninstall has finished in every case that reaches step 3.
+   - Messages are shown only when a person is watching: not under `/S`, and not under `/P` (passive), where a
+     box would wait for a click. The exit code is set either way.
+
+**Edge cases:**
+- The "paired" message can show when the folder couldn't be read before the wipe (counted as "may be
+  paired"), but the wipe then removed it cleanly. That errs on the safe side: the person is told to check the
+  phone.
+- If the template's own app check (step 2) is cancelled or fails (the app was started again after the
+  wipe), the uninstall stops there and step 3 doesn't run. The wipe has already run, but the person sees
+  neither message, only the template's "is running" one; the exit code is non-zero.
+- If NSIS ever ran a real uninstall in place (say, if it couldn't copy itself to `%TEMP%`), the hook would
+  keep the pairing and say nothing. Not found: the manual doesn't say what NSIS does then, and the NSIS
+  download here has no source for the uninstaller's start-up.
+
+**Scripts:**
+- `uninstall.exe /S` deletes the pairing, but returns 0 at once, before its temporary copy has run, so a
+  failure can't be seen in its exit code, and silent mode shows no box.
+- To wait and see the result, run it in place with the switch:
+  `uninstall.exe /S /WIPEPAIRING _?=<install folder>`. It wipes, and exits 0 or, if the pairing couldn't be
+  removed or confirmed, 2. Run in place, the uninstaller can't delete itself: remove `uninstall.exe` and the
+  folder afterwards.
+- `uninstall.exe /S _?=<install folder>` without the switch **keeps the pairing**, as for an installer.
+  No installer passes `/WIPEPAIRING`.
+- **The event log:** every failure, silent or not, writes a Warning, source "VettID Desktop", to the Application
+  log: event ID 1001 when the pairing couldn't be removed or confirmed, 1002 when the uninstall was refused
+  because another account ran it, 1003 when the program itself couldn't be deleted. The source isn't registered (that needs an administrator), so Event Viewer says the
+  description isn't found and shows the text as the event's data. Find it with
+  `Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='VettID Desktop']]]"`. Its text (for
+  the owner's approval) names no person, folder or account; 1001's and 1003's give the wipe's result code.
+  The 1001 text:
+  "VettID Desktop was uninstalled, but this desktop's saved pairing couldn't be removed from this computer, or
+  its removal couldn't be confirmed (result `<code>`). If %LOCALAPPDATA%\vettid-desktop is still there for the
+  account that installed it, delete it, and delete any vettid-desktop entry in that account's Windows
+  Credential Manager. Remove this desktop on the phone too." The 1002 text: "VettID Desktop wasn't
+  uninstalled: the uninstaller ran as a Windows account that didn't install it, and uninstalling it would
+  leave the installing account's saved pairing on this computer. Sign in as the account that installed VettID
+  Desktop, and uninstall it there." The 1003 text: "VettID Desktop couldn't be fully removed from this
+  computer: its program was still in its folder after the uninstall, and may still be running (result
+  `<code>`). Close VettID Desktop, then delete its program folder; for the account that installed it, also
+  delete %LOCALAPPDATA%\vettid-desktop if it's there, and any vettid-desktop entry in that account's Windows
+  Credential Manager. Remove this desktop on the phone too."
+
+**Who can run `--uninstall-wipe`:** anyone who can run a program as this Windows user, who can already delete
+these files and entries. It opens no window, prints nothing and isn't passed to a running app.
+
+**The mock (makensis 3.11; the uninstaller copied out of the install folder and run with `/S _?=`, as NSIS's
+temporary copy runs, so its exit code is seen):**
+
+| Case | Uninstaller exit code | Wipe ran |
+|---|---|---|
+| 1. wipe code 10, nothing left | 0 | yes |
+| 2. wipe code 11 | 0 | yes |
+| 3. wipe code 0 (a program that ignores the switch) | 2 | yes |
+| 4. wipe code 20 | 2 | yes |
+| 5. no program | 2 | no |
+| 6. code 10, but `device.enc` there afterwards (as if a running app saved it again) | 2 | yes |
+| 6b. code 10, but a `device.enc.tmp-*` there afterwards | 2 | yes |
+| 7. in place (`_?=` from the install folder), code 20 | 0 | no |
+| 8. `/UPDATE`, code 20 | 0 | no |
+| 8b. `/P`, code 20 (no box) | 2 | yes |
+| 9. plain `uninstall.exe /S` from the install folder | 0 (the launcher's) | yes (from the temporary copy) |
+| 10. another account: neither key records the folder, code 11 (refused: program kept, one event 1002) | 2 | no |
+| 10b. only `InstallLocation` records it, code 11 | 0 | yes |
+| 10c. only the product key records it, code 11 | 0 | yes |
+| 10d. neither key there, code 11 (refused: program kept, one event 1002) | 2 | no |
+| 10e. another account under `/P` and under `/S` (refused at once: no progress page left open) | 2 | no |
+| 13. the program held open, so it can't be started or deleted (event 1003) | 2 | no (result -1) |
+| `installMode` per-machine | the build fails (`!error`) | |
+| 11. in place with `/WIPEPAIRING`, code 11 | 0 | yes |
+| 11b. in place with `/WIPEPAIRING`, code 10 | 0 | yes |
+| 11c. in place with `/WIPEPAIRING`, code 20 (one event logged) | 2 | yes |
+| 12. in place with `/WIPEPAIRING /UPDATE`, code 20 | 0 | no |
+
+Every failing case wrote one Warning (level 3) with its text: ID 1001 for 3 to 6b, 8b and 11c, with the
+result code, ID 1002 for 10 and 10d, and ID 1003 for 13.
+
+**End to end, with a real installer** (`cargo tauri build --debug --bundles nsis`, tauri-cli 2.12.2, a
+per-user install; Windows 11 Pro 10.0.26300). The pairing is a fixture: 64 bytes as `device.enc`. No
+`vettid-desktop` Credential Manager entry existed, and the unrelated entries were untouched. Exit codes are
+the uninstaller's own: from a temporary copy run with `/S _?=<install folder>` and waited for, as NSIS's
+launcher does, or from `/S /WIPEPAIRING _?=`. Each uninstall started at least 10 s after the install (see the
+last row).
+
+| Case | Exit code | Afterwards |
+|---|---|---|
+| Fixture there (8 of 8 runs, and at the hook's final head) | 0 | fixture, folder and program gone |
+| Fixture held open with share mode 0 (3 of 3, and at the final head) | 2 | fixture kept, program gone |
+| Nothing paired | 0 | everything gone |
+| The app running (4 of 4 at the final head) | 0 | app closed, fixture and program gone |
+| A stand-in writing `device.enc` back as soon as it's gone, for 20 s | 2 | fixture there |
+| Another account, simulated: this account's two keys changed to another folder | 2, one event 1002 | refused: fixture, program, `uninstall.exe` and the Apps-list entry kept |
+| `/S /WIPEPAIRING _?=`, fixture there | 0 | fixture and program gone |
+| `/S /WIPEPAIRING _?=`, fixture held open | 2, one event | fixture kept |
+| In place, `/S _?=` | 0 | fixture kept |
+| Reinstall over an install: `/S`, `/S /UPDATE`, `/P`, `/P /UPDATE` | 0 | fixture kept |
+| Uninstall within about a second of the install | 2 in 2 of 7 runs | once the fixture gone but the program left; once both kept |
+
+The last row and two plain `uninstall.exe /S` runs that took over 60 s (the first uninstall after a build; one
+app-running run, not seen again in 4 more) fit Defender scanning the new, unsigned files, but that isn't
+confirmed. Each failed safe: nothing was reported removed that wasn't.
+
+Not covered by the mock: the real `CheckIfAppIsRunning` and its plugin, the message boxes, and the real app.
+
+**Reinstall, upgrade and downgrade (read in `installer.nsi`; the same-version silent and passive reinstalls
+were run, above):**
+- A silent install (`/S`) over an existing install shows no pages, so it never runs the old uninstaller: the
+  pairing is kept.
+- With `/UPDATE` (with or without `/P`), the installer never runs the old uninstaller.
+- Interactive, same version: the default is "Add/Reinstall components", which doesn't uninstall. Choosing
+  "Uninstall VettID Desktop" runs the old uninstaller in place, without `/UPDATE`: the pairing is kept.
+- Interactive, upgrade or downgrade: the default is "Uninstall before installing", which runs the old
+  uninstaller in place, without `/UPDATE`: the pairing is kept, and no message is shown. "Do not uninstall"
+  keeps it too. (Downgrades are allowed by default.)
+- Passive (`/P`) without `/UPDATE`: the reinstall page's choice is read from a control that isn't there. From
+  the code, a same-version reinstall then runs the old uninstaller in place (pairing kept), and an upgrade or
+  downgrade doesn't run it. Run here for the same version, `/P` and `/P /UPDATE`: the fixture was kept. An
+  upgrade or downgrade under `/P` wasn't run (it needs a second version).
+- So the pairing is deleted only by an uninstall itself: from the Apps list, `uninstall.exe` run without
+  `_?=`, or in place with `/WIPEPAIRING`.
+
+**Still left behind after uninstall:** `%LOCALAPPDATA%\com.vettid.desktop\EBWebView\` and
+`HKCU\Software\vettid\VettID Desktop`, unless "Delete the application data" is ticked (see above). Neither
+holds the pairing.
+
+**Another account's elevation** ("Run as administrator" with an administrator's password): the account check
+in step 1 refuses the uninstall before anything is removed, so the administrator's own pairing is untouched,
+and the app, its uninstaller and the user's Apps-list entry stay (exit 2, event 1002, and the box if someone
+is watching). The user can then log out of the desktop, or uninstall as themselves. Tested only by changing
+the registry entries in the mock and in a real install; not with a second account.
 
 ## Not tested yet
 
 - Interactive install and uninstall, and what SmartScreen and Defender show a person (left for the owner).
 - An upgrade from an older version.
+- The uninstall hook's message boxes, an uninstall from Windows' Apps list, and an elevated uninstall as a
+  second account.
 - A standard (non-administrator) account, and a second Windows user.
 - Anything that needs pairing: the state file and its ACL on disk, sessions, sleep and resume, fast user
   switching, a wrong clock.

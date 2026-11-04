@@ -2,6 +2,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    // The Windows uninstaller's wipe of the saved pairing (see
+    // `uninstall.rs`): before anything else, so it never starts Tauri,
+    // opens a window or reaches a running app through the single-instance
+    // plugin. Windows only: no other platform's uninstaller runs it.
+    #[cfg(windows)]
+    if vettid_desktop::uninstall::requested(std::env::args_os()) {
+        std::process::exit(vettid_desktop::uninstall::run());
+    }
     // Disable WebKitGTK's DMABUF renderer on Linux. The default code
     // path crashes hard (SIGBUS) on Fedora 44 + mesa 26.0.6 + Wayland
     // under memory pressure — the GPU buffer gets truncated mid-share
