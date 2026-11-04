@@ -33,6 +33,10 @@ export const sessionStore = writable<SessionState>(initialState);
  */
 export const sessionNotice = writable<string | null>(null);
 
+/** The stale-session notice last shown from `get_session_info`, so it is
+ *  cleared once the vault confirms the session again. */
+let staleNoticeShown: string | null = null;
+
 export function activateSession(
   sessionId: string,
   expiresAt: number,
@@ -92,6 +96,12 @@ export async function refreshSessionFromBackend(): Promise<void> {
     }>('get_session_info');
 
     if (info.is_active) {
+      // Confirmed again: the stale-session notice no longer applies.
+      if (staleNoticeShown) {
+        const shown = staleNoticeShown;
+        sessionNotice.update(n => (n === shown ? null : n));
+        staleNoticeShown = null;
+      }
       sessionStore.set({
         state: 'active',
         sessionId: info.session_id,
@@ -106,7 +116,10 @@ export async function refreshSessionFromBackend(): Promise<void> {
     } else {
       // The vault hasn't confirmed the session lately: say so (shown on
       // the Start-a-new-session screen).
-      if (info.notice) sessionNotice.set(info.notice);
+      if (info.notice) {
+        sessionNotice.set(info.notice);
+        staleNoticeShown = info.notice;
+      }
       sessionStore.update(s => ({ ...s, state: 'expired', secondsRemaining: 0 }));
     }
   } catch {
