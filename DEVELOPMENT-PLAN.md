@@ -1,5 +1,9 @@
 # VettID Desktop — Development Plan
 
+> **Note (2026-11-03):** NATS is retired in this desktop. It reaches its vault through the
+> relay with `src-tauri/crates/vettid-device` (vettid-desktop#64). The NATS details below are
+> history; this plan has not been rewritten.
+
 ## Current State Assessment (2026-04-13)
 
 The desktop client is a **functional prototype** built with Tauri v2 (Rust backend + Svelte 5 frontend). The core architecture is sound and aligned with the Android app's NATS-based vault communication model.

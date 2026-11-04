@@ -1,5 +1,9 @@
 # VettID Desktop — Rework Plan
 
+> **Note (2026-11-03):** NATS is retired in this desktop. It reaches its vault through the
+> relay with `src-tauri/crates/vettid-device` (vettid-desktop#64). The NATS details below are
+> history; this plan has not been rewritten.
+
 Supersedes the relevant sections of `DEVELOPMENT-PLAN.md` (which is
 oriented around the old 8-character pairing flow and a feature-parity
 checklist). The post-Stage-2 pairing flow is solid; this plan focuses
