@@ -596,19 +596,10 @@ fn wipe_then(
 ) -> Result<(), CredentialError> {
     let _one_at_a_time = writer_lock();
     WIPES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let on_disk = config_dir.map_or_else(super::protector::Wiping::unknown, super::device_store::what_is_sealed);
-    // A retry of a wipe that didn't finish knows what the first attempt
-    // removed from its marker; the marker is written before anything is
-    // removed.
-    let wiping = match config_dir.and_then(wipe_marker::read) {
-        Some(pending) => pending.and(on_disk),
-        None => on_disk,
+    let wiping = match config_dir {
+        Some(dir) => begin_wipe(dir, super::device_store::what_is_sealed(dir)),
+        None => super::protector::Wiping::unknown(),
     };
-    if let Some(dir) = config_dir {
-        if let Err(e) = wipe_marker::write(dir, &wiping) {
-            log::warn!("Credential store: the wipe's marker wasn't written: {}", e);
-        }
-    }
     let wiped = match config_dir {
         Some(dir) => wipe_locked(dir),
         None => Err(CredentialError::NoConfigDir),
@@ -618,13 +609,46 @@ fn wipe_then(
         log::error!("Credential store: a key was not removed: {}", e);
     }
     let done = wiped.and(keys);
-    // Last, only once every other part is confirmed gone.
     if let (Ok(()), Some(dir)) = (&done, config_dir) {
-        if let Err(e) = wipe_marker::remove(dir) {
-            log::warn!("Credential store: the wipe's marker wasn't removed: {}", e);
-        }
+        finish_wipe(dir);
     }
     done
+}
+
+/// Wipes of `config_dir`s that haven't finished, in this process: kept
+/// as well as the marker, for when the marker couldn't be written.
+static PENDING_WIPES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, super::protector::Wiping>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Before a wipe of `config_dir` (log-out, a store's clear on
+/// device.unlinked, an earlier format's retirement) removes anything: what
+/// it removes, `on_disk` together with any wipe of it that hasn't finished
+/// (its marker, or this process's memory), recorded in the marker and in
+/// memory. The caller holds the writer lock, and calls [`finish_wipe`]
+/// only once every part is confirmed gone.
+pub(super) fn begin_wipe(config_dir: &Path, on_disk: super::protector::Wiping) -> super::protector::Wiping {
+    let mut pending = PENDING_WIPES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut wiping = on_disk;
+    if let Some(marked) = wipe_marker::read(config_dir) {
+        wiping = marked.and(wiping);
+    }
+    if let Some(remembered) = pending.get(config_dir) {
+        wiping = remembered.clone().and(wiping);
+    }
+    if let Err(e) = wipe_marker::write(config_dir, &wiping) {
+        log::warn!("Credential store: the wipe's marker wasn't written ({}); this process remembers it, a restart loses it", e);
+    }
+    pending.insert(config_dir.to_path_buf(), wiping.clone());
+    wiping
+}
+
+/// After a wipe of `config_dir` whose every part is confirmed gone: the
+/// marker goes (last), and the memory of it.
+pub(super) fn finish_wipe(config_dir: &Path) {
+    if let Err(e) = wipe_marker::remove(config_dir) {
+        log::warn!("Credential store: the wipe's marker wasn't removed: {}", e);
+    }
+    PENDING_WIPES.lock().unwrap_or_else(|e| e.into_inner()).remove(config_dir);
 }
 
 /// The marker of a log-out's wipe that hasn't finished
@@ -632,8 +656,10 @@ fn wipe_then(
 /// wipe removes): what the device file's header said before it, so a retry
 /// after the file is gone still knows which protector kept a key. Holds no
 /// secret (a protector id and a flag), written `0600` and synced. It is not
-/// a pairing: nothing else reads it. Unix only: Windows' and macOS's
-/// protectors don't depend on it.
+/// a pairing: nothing else reads it. Written on Linux and macOS
+/// (`cfg(unix)`); only Linux's Secret Service protector reads what it
+/// says, so on macOS it is harmless and unused. Not written on Windows,
+/// where DPAPI keeps nothing outside the file.
 mod wipe_marker {
     use super::super::protector::Wiping;
     use std::path::{Path, PathBuf};
@@ -1535,9 +1561,10 @@ pub(crate) mod tests {
         assert!(!super::super::device_store::exists(&dir));
     }
 
-    /// An earlier format's file on a computer with no Secret Service: its
+    /// An earlier format's file with the Secret Service unreachable: its
     /// retirement can't confirm the legacy key (LEGACY_NOT_REMOVED), and
-    /// the log-out that notice asks for, with nothing legacy left, is Ok.
+    /// the log-out after it remembers (the marker): "not removed", never a
+    /// guess. (A v1 file exists only where an earlier build had a keyring.)
     #[cfg(target_os = "linux")]
     #[test]
     fn legacy_retirement_without_a_secret_service_then_log_out() {
@@ -1550,7 +1577,54 @@ pub(crate) mod tests {
         let retired = super::super::device_store::retire_legacy_with(&dir, &p);
         assert!(matches!(retired, Err(CredentialError::LegacyNotRemoved)));
         assert!(!dir.join(DEVICE_FILE).exists(), "the file itself went");
-        wipe_then(Some(&dir), remove_unreachable).unwrap();
+        assert!(marker(&dir).exists());
+        assert!(matches!(wipe_then(Some(&dir), remove_unreachable), Err(CredentialError::IoError(_))));
+        assert!(marker(&dir).exists());
+    }
+
+    /// device.unlinked's clear of a Secret Service file that left the key:
+    /// the log-out after it remembers it (the marker).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_clear_that_left_a_key_then_log_out_is_not_removed() {
+        use vettid_device::store::Persist;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        sealed_by(&dir, "secret-service");
+        let (ss, legacy) = super::super::secret_service::unreachable_for_tests();
+        let p = super::super::protector::Protectors::new(vec![Box::new(ss)], Box::new(legacy));
+        let mut store = super::super::device_store::DeviceStore::with_protectors(&dir, None, p);
+        assert!(store.clear().is_err());
+        assert!(!dir.join(DEVICE_FILE).exists(), "the file went");
+        assert!(marker(&dir).exists());
+        assert!(wipe_then(Some(&dir), remove_unreachable).is_err());
+        assert!(marker(&dir).exists());
+    }
+
+    /// The marker couldn't be written and the wipe failed partway: a retry
+    /// in the same process still knows (memory).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_wipe_whose_marker_wasnt_written_is_remembered() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("parent");
+        let dir = parent.join("vettid-desktop");
+        sealed_by(&dir, "secret-service");
+        // A parent this user can't write to: no marker, and the folder
+        // can't be removed either (the wipe fails partway).
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
+        let first = wipe_then(Some(&dir), remove_unreachable);
+        let second = wipe_then(Some(&dir), |w| {
+            assert_eq!(w.sealed_by.as_deref(), Some("secret-service"), "remembered");
+            remove_unreachable(w)
+        });
+        let marker_written = marker(&dir).exists();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(first.is_err() && second.is_err());
+        assert!(root || !marker_written, "root can write it anyway");
     }
 
     /// No known folder, or a relative one, is refused: never the current

@@ -250,8 +250,8 @@ impl Protectors {
     }
 
     /// Remove the legacy entry alone, confirmed gone.
-    pub(crate) fn remove_legacy_key(&self) -> Result<(), ProtectorError> {
-        self.legacy.remove_for(&Wiping::legacy_file())
+    pub(crate) fn remove_legacy_key(&self, wiping: &Wiping) -> Result<(), ProtectorError> {
+        self.legacy.remove_for(wiping)
     }
 }
 

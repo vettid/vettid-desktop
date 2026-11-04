@@ -312,10 +312,16 @@ impl DeviceStore {
             return Ok(());
         }
         self.sealing = None;
-        let wiping = what_is_sealed(&self.dir);
+        // The marker first (`store::begin_wipe`), so a log-out after a
+        // clear that left a key knows what the file was.
+        let wiping = store::begin_wipe(&self.dir, what_is_sealed(&self.dir));
         let file = store::remove_file_locked(&self.dir, DEVICE_FILE).and_then(|()| store::confirm_gone(&self.dir, DEVICE_FILE));
         let keys = self.protectors.remove_external_keys(&wiping).map_err(CredentialError::from);
-        file.and(keys)
+        let done = file.and(keys);
+        if done.is_ok() {
+            store::finish_wipe(&self.dir);
+        }
+        done
     }
 }
 
@@ -382,10 +388,16 @@ pub(super) fn retire_legacy_with(dir: &Path, protectors: &Protectors) -> Result<
         Ok(Some(raw)) if is_legacy(&raw) => {}
         _ => return Ok(false),
     }
+    // The marker first, so a log-out after a retirement that left the key
+    // knows an earlier format was here.
+    let wiping = store::begin_wipe(dir, Wiping::legacy_file());
     let file = store::remove_file_locked(dir, DEVICE_FILE).and_then(|()| store::confirm_gone(dir, DEVICE_FILE));
-    let key = protectors.remove_legacy_key();
+    let key = protectors.remove_legacy_key(&wiping);
     match (file, key) {
-        (Ok(()), Ok(())) => Ok(true),
+        (Ok(()), Ok(())) => {
+            store::finish_wipe(dir);
+            Ok(true)
+        }
         (file, key) => {
             if let Err(e) = file {
                 log::error!("device store: the earlier version's file: {}", e);

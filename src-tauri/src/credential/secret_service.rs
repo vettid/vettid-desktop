@@ -40,10 +40,13 @@
 //! is "not removed". Only GNOME Keyring has been tried; KWallet is
 //! untested.
 //!
-//! What that leaves, disclosed: with the Secret Service unreachable, an
-//! item orphaned by a crash between `wrap` and the file's save, or a
-//! `master-key-v1` an earlier build failed to remove after deleting its
-//! file, stays in the keyring, and log-out reports nothing to remove. The
+//! Every wipe of this build (log-out, the clear on device.unlinked, the
+//! earlier format's retirement) records what it removes in a marker before
+//! removing anything, so a later log-out still knows. What that leaves,
+//! disclosed: with the Secret Service unreachable, an item orphaned by a
+//! crash between `wrap` and the file's save, or a `master-key-v1` that an
+//! earlier build failed to remove after deleting its own file, stays in
+//! the keyring, and log-out reports nothing to remove. The
 //! header is read unauthenticated, so a forged one (`"protector":"tpm"`
 //! over a file the Secret Service sealed) makes log-out skip that item
 //! while the Secret Service is unreachable: a false "removed". Forging it
