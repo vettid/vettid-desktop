@@ -168,12 +168,17 @@ also open its window) exits 0.
      (the NSIS manual, 3.2: `_?=` "stops the uninstaller from copying itself to the temporary directory and
      running from there"; seen in the mock, case 9 below), so it wipes. `/WIPEPAIRING` (see Scripts) makes
      an in-place uninstall wipe; `/UPDATE` skips it even then.
-   - **Not wiped when this account didn't install the app:** the wipe runs only if the account the
+   - **Refused when this account didn't install the app:** the uninstall goes on only if the account the
      uninstaller runs as has `$INSTDIR` recorded in its own `HKCU`, as the product key's default value or the
      uninstall entry's `InstallLocation` (the template deletes both only later). Otherwise (an uninstall "Run
-     as administrator" with another account's password, or the keys gone), the wipe is skipped and step 3
-     reports a failure: the wipe would delete the other account's pairing and keep the user's. A per-machine
-     install (not used) is never wiped, for the same reason.
+     as administrator" with another account's password, a SYSTEM or management-tool uninstall, or the keys
+     gone), the wipe would delete that account's pairing and keep the user's. So nothing is removed: the
+     uninstall stops there with exit code 2, a Warning (event ID 1002) and, if someone is watching, "VettID
+     Desktop wasn't uninstalled. This Windows account isn't the one that installed it, and uninstalling it
+     from here would leave that account's saved pairing on this computer. Sign in as the account that
+     installed VettID Desktop, and uninstall it there." (for the owner's approval). The app, its uninstaller
+     and the user's Apps-list entry stay, so the user can still log out or uninstall. A per-machine install
+     (not used) is always refused, for the same reason.
    - A running app is closed (`CheckIfAppIsRunning`). If the person cancels, or the app can't be closed, the
      uninstall stops there. **This check can also silently do nothing** (when its Restart Manager session or
      registration fails), and the app could be started again before the wipe; step 3 covers both.
@@ -187,12 +192,11 @@ also open its window) exits 0.
    `FileExists` reads a folder it can't list as empty. The confirmation is the wipe's own 10 or 11.
    - Code 10 and nothing there: "This desktop was paired. Remove it on your phone too."
    - Code 11 and nothing there: nothing is shown.
-   - Anything else (code 20, 0, any other code, the program not starting, the wipe skipped for another
-     account, or a file there): the uninstaller's exit code is 2, a Warning goes to the Windows Application
-     event log (below), and the message says the saved pairing couldn't be removed, with the folder, the
-     Credential Manager entry and the phone step. For another account the folder is named as
-     `%LOCALAPPDATA%`, not that account's.
-   - Both texts wait for the owner's approval. The uninstall has finished in every case.
+   - Anything else (code 20, 0, any other code, the program not starting, or a file there): the
+     uninstaller's exit code is 2, a Warning (event ID 1001) goes to the Windows Application event log
+     (below), and the message says the saved pairing couldn't be removed, with the folder, the Credential
+     Manager entry and the phone step.
+   - Both texts wait for the owner's approval. The uninstall has finished in every case that reaches step 3.
    - Messages are shown only when a person is watching: not under `/S`, and not under `/P` (passive), where a
      box would wait for a click. The exit code is set either way.
 
@@ -216,11 +220,19 @@ also open its window) exits 0.
   folder afterwards.
 - `uninstall.exe /S _?=<install folder>` without the switch **keeps the pairing**, as for an installer.
   No installer passes `/WIPEPAIRING`.
-- **The event log:** every failure, silent or not, writes a Warning, event ID 1001, source "VettID Desktop", to
-  the Application log. The source isn't registered (that needs an administrator), so Event Viewer says the
+- **The event log:** every failure, silent or not, writes a Warning, source "VettID Desktop", to the Application
+  log: event ID 1001 when the pairing couldn't be removed or confirmed, 1002 when the uninstall was refused
+  because another account ran it. The source isn't registered (that needs an administrator), so Event Viewer says the
   description isn't found and shows the text as the event's data. Find it with
   `Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='VettID Desktop']]]"`. Its text (for
-  the owner's approval) names no person, folder or account, and gives the wipe's result code.
+  the owner's approval) names no person, folder or account; 1001's gives the wipe's result code. The 1001 text:
+  "VettID Desktop was uninstalled, but this desktop's saved pairing couldn't be removed from this computer, or
+  its removal couldn't be confirmed (result `<code>`). If %LOCALAPPDATA%\vettid-desktop is still there for the
+  account that installed it, delete it, and delete any vettid-desktop entry in that account's Windows
+  Credential Manager. Remove this desktop on the phone too." The 1002 text: "VettID Desktop wasn't
+  uninstalled: the uninstaller ran as a Windows account that didn't install it, and uninstalling it would
+  leave the installing account's saved pairing on this computer. Sign in as the account that installed VettID
+  Desktop, and uninstall it there."
 
 **Who can run `--uninstall-wipe`:** anyone who can run a program as this Windows user, who can already delete
 these files and entries. It opens no window, prints nothing and isn't passed to a running app.
@@ -241,17 +253,17 @@ temporary copy runs, so its exit code is seen):**
 | 8. `/UPDATE`, code 20 | 0 | no |
 | 8b. `/P`, code 20 (no box) | 2 | yes |
 | 9. plain `uninstall.exe /S` from the install folder | 0 (the launcher's) | yes (from the temporary copy) |
-| 10. another account: neither key records the folder, code 11 (one event logged) | 2 | no |
+| 10. another account: neither key records the folder, code 11 (refused: program kept, one event 1002) | 2 | no |
 | 10b. only `InstallLocation` records it, code 11 | 0 | yes |
 | 10c. only the product key records it, code 11 | 0 | yes |
-| 10d. neither key there, code 11 | 2 | no |
+| 10d. neither key there, code 11 (refused: program kept, one event 1002) | 2 | no |
 | 11. in place with `/WIPEPAIRING`, code 11 | 0 | yes |
 | 11b. in place with `/WIPEPAIRING`, code 10 | 0 | yes |
 | 11c. in place with `/WIPEPAIRING`, code 20 (one event logged) | 2 | yes |
 | 12. in place with `/WIPEPAIRING /UPDATE`, code 20 | 0 | no |
 
-Every failing case (3 to 6b, 8b, 10, 10d, 11c) wrote one Warning (level 3, ID 1001) with the text and the
-result code.
+Every failing case wrote one Warning (level 3) with its text: ID 1001 for 3 to 6b, 8b and 11c, with the
+result code, and ID 1002 for 10 and 10d.
 
 **End to end, with a real installer** (`cargo tauri build --debug --bundles nsis`, tauri-cli 2.12.2, a
 per-user install; Windows 11 Pro 10.0.26300). The pairing is a fixture: 64 bytes as `device.enc`. No
@@ -267,7 +279,7 @@ last row).
 | Nothing paired | 0 | everything gone |
 | The app running (4 of 4 at the final head) | 0 | app closed, fixture and program gone |
 | A stand-in writing `device.enc` back as soon as it's gone, for 20 s | 2 | fixture there |
-| Another account, simulated: this account's two keys changed to another folder | 2, one event | fixture kept |
+| Another account, simulated: this account's two keys changed to another folder | 2, one event 1002 | refused: fixture, program, `uninstall.exe` and the Apps-list entry kept |
 | `/S /WIPEPAIRING _?=`, fixture there | 0 | fixture and program gone |
 | `/S /WIPEPAIRING _?=`, fixture held open | 2, one event | fixture kept |
 | In place, `/S _?=` | 0 | fixture kept |
@@ -294,18 +306,18 @@ were run, above):**
   the code, a same-version reinstall then runs the old uninstaller in place (pairing kept), and an upgrade or
   downgrade doesn't run it. Run here for the same version, `/P` and `/P /UPDATE`: the fixture was kept. An
   upgrade or downgrade under `/P` wasn't run (it needs a second version).
-- So the pairing is deleted only by an uninstall itself: from the Apps list, or `uninstall.exe` run without
-  `_?=`.
+- So the pairing is deleted only by an uninstall itself: from the Apps list, `uninstall.exe` run without
+  `_?=`, or in place with `/WIPEPAIRING`.
 
 **Still left behind after uninstall:** `%LOCALAPPDATA%\com.vettid.desktop\EBWebView\` and
 `HKCU\Software\vettid\VettID Desktop`, unless "Delete the application data" is ticked (see above). Neither
 holds the pairing.
 
 **Another account's elevation** ("Run as administrator" with an administrator's password): the account check
-in step 1 skips the wipe, so the administrator's own pairing is untouched, and the uninstall reports a failure
-(exit 2, the event, and the box if someone is watching). The user's pairing stays until they log out of the
-desktop, or uninstall as themselves. Tested only by changing the registry entries in the mock and in a real
-install; not with a second account.
+in step 1 refuses the uninstall before anything is removed, so the administrator's own pairing is untouched,
+and the app, its uninstaller and the user's Apps-list entry stay (exit 2, event 1002, and the box if someone
+is watching). The user can then log out of the desktop, or uninstall as themselves. Tested only by changing
+the registry entries in the mock and in a real install; not with a second account.
 
 ## Not tested yet
 

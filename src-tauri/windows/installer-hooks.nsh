@@ -126,9 +126,10 @@
 
 ; The wipe's result, from NSIS_HOOK_PREUNINSTALL to NSIS_HOOK_POSTUNINSTALL:
 ; "" if the wipe was skipped (update, in place, no $INSTDIR), else its exit
-; code, -1 if the program couldn't be started, or -2 if it wasn't run because
-; this account didn't install at $INSTDIR (or the install isn't per-user):
-; the installing user's pairing may be kept, so that is a failure too.
+; code, or -1 if the program couldn't be started. (-2, this account didn't
+; install at $INSTDIR, or the install isn't per-user, never reaches
+; NSIS_HOOK_POSTUNINSTALL: the uninstall is refused before anything is
+; removed.)
 Var VettidWipe
 
 ; Why these are macros, not functions: this file is included near the top
@@ -175,7 +176,22 @@ Var VettidWipe
         StrCpy $0 0
       !endif
       ${If} $0 <> 1
+        ; Refused, before anything is removed: going on would delete the
+        ; program, the uninstaller and this account's registry entries,
+        ; and leave the installing account's pairing with no app to log
+        ; out from and no uninstaller to run. Exit code 2 (Abort in a
+        ; section), an event, and the box if someone is watching.
         StrCpy $VettidWipe -2
+        SetErrorLevel 2
+        ; NEW TEXT (owner approval needed).
+        StrCpy $7 "VettID Desktop wasn't uninstalled: the uninstaller ran as a Windows account that didn't install it, and uninstalling it would leave the installing account's saved pairing on this computer. Sign in as the account that installed VettID Desktop, and uninstall it there."
+        !insertmacro VETTID_REPORT_EVENT 1002
+        ${IfNot} ${Silent}
+        ${AndIf} $PassiveMode <> 1
+          ; NEW TEXT (owner approval needed).
+          MessageBox MB_OK|MB_ICONEXCLAMATION "VettID Desktop wasn't uninstalled. This Windows account isn't the one that installed it, and uninstalling it from here would leave that account's saved pairing on this computer. Sign in as the account that installed VettID Desktop, and uninstall it there." /SD IDOK
+        ${EndIf}
+        Abort
       ${Else}
         ; Close a running app first, so it can't save the pairing again
         ; after the wipe. This check can silently do nothing (when the
@@ -204,24 +220,23 @@ Var VettidWipe
   ${EndIf}
 !macroend
 
-; A Warning, event ID 1001, source "VettID Desktop", in the Application log,
-; for an uninstall whose pairing couldn't be removed or confirmed. The
-; source isn't registered (that needs an administrator), so Event Viewer
-; says the event's description isn't found and shows the text below as the
+; A Warning with the text in $7, source "VettID Desktop", in the Application
+; log: event ID 1001 for an uninstall whose pairing couldn't be removed or
+; confirmed, 1002 for an uninstall refused because another account ran it.
+; The source isn't registered (that needs an administrator), so Event Viewer
+; says the event's description isn't found and shows the text as the
 ; event's data. `Get-WinEvent -LogName Application -FilterXPath
 ; "*[System[Provider[@Name='VettID Desktop']]]"` finds it (a ProviderName
 ; filter doesn't, for an unregistered source). An account may write to the
 ; Application log without elevation. If the write fails, nothing else
-; changes: the exit code is 2 regardless. The text names no person, folder
+; changes: the exit code is 2 regardless. The texts name no person, folder
 ; or account. Uses $4 to $7.
-!macro VETTID_REPORT_FAILURE
-  ; NEW TEXT (owner approval needed).
-  StrCpy $7 "VettID Desktop was uninstalled, but this desktop's saved pairing couldn't be removed from this computer, or its removal couldn't be confirmed (result $VettidWipe). If %LOCALAPPDATA%\vettid-desktop is still there for the account that installed it, delete it, and delete any vettid-desktop entry in that account's Windows Credential Manager. Remove this desktop on the phone too."
+!macro VETTID_REPORT_EVENT id
   System::Call 'advapi32::RegisterEventSourceW(p 0, w "VettID Desktop") p .r4'
   ${If} $4 != 0
     System::Call '*(w r7) p .r5'
     ${If} $5 != 0
-      System::Call 'advapi32::ReportEventW(p r4, i 2, i 0, i 1001, p 0, i 1, i 0, p r5, p 0) i .r6'
+      System::Call 'advapi32::ReportEventW(p r4, i 2, i 0, i ${id}, p 0, i 1, i 0, p r5, p 0) i .r6'
       System::Free $5
     ${EndIf}
     System::Call 'advapi32::DeregisterEventSource(p r4)'
@@ -241,12 +256,7 @@ Var VettidWipe
     StrCpy $2 0
     SetShellVarContext current
     StrCpy $1 $LOCALAPPDATA
-    ${If} $VettidWipe = -2
-      ; Not wiped: this account isn't the one that installed. Its folder
-      ; isn't the installing user's, so the box names the folder generically.
-      StrCpy $2 1
-      StrCpy $1 "%LOCALAPPDATA%"
-    ${ElseIf} $1 == ""
+    ${If} $1 == ""
       StrCpy $2 1
       StrCpy $1 "%LOCALAPPDATA%"
     ${ElseIf} ${FileExists} "$1\vettid-desktop\device.enc"
@@ -283,7 +293,9 @@ Var VettidWipe
       ; Silent or not, the failure is also written to the Windows Application
       ; event log, where it outlives the uninstall and where IT tools look: a
       ; plain `uninstall.exe /S` returns 0 before this runs, and shows no box.
-      !insertmacro VETTID_REPORT_FAILURE
+      ; NEW TEXT (owner approval needed).
+      StrCpy $7 "VettID Desktop was uninstalled, but this desktop's saved pairing couldn't be removed from this computer, or its removal couldn't be confirmed (result $VettidWipe). If %LOCALAPPDATA%\vettid-desktop is still there for the account that installed it, delete it, and delete any vettid-desktop entry in that account's Windows Credential Manager. Remove this desktop on the phone too."
+      !insertmacro VETTID_REPORT_EVENT 1001
       ${If} $3 = 1
         ; NEW TEXT (owner approval needed).
         MessageBox MB_OK|MB_ICONEXCLAMATION "This desktop's saved pairing couldn't be removed from this computer, or its removal couldn't be confirmed. If the folder $1\vettid-desktop is still there, delete it, and delete any vettid-desktop entry in Windows Credential Manager. Remove this desktop on your phone too." /SD IDOK
