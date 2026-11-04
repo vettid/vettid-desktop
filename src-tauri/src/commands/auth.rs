@@ -135,6 +135,8 @@ pub async fn register(
     // this pairing is not saved.
     let since = store::wipe_epoch();
     let mark = reset_mark(&state);
+    // Review MEDIUM 3: an unlock meanwhile leaves the device store alone.
+    let _pairing = PairingUnderWay::new(&state.pairing);
     let config_dir = store::default_config_dir().map_err(|e| e.to_string())?;
     // Checked before pairing starts, so a folder another account can open,
     // a computer without the machine id the pairing is bound to (#14), or a
@@ -420,20 +422,23 @@ pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String
     // #43: likewise a lock or End session, including one under way now.
     let mark = reset_mark(&state);
 
+    // Review MEDIUM 3: open already, or a pairing under way: the store is
+    // left alone.
+    if let Some(r) = already_open(&state.pairing, &state.link).await {
+        return Ok(r);
+    }
+
     let config_dir = match store::default_config_dir() {
         Ok(dir) => dir,
         Err(e) => return Ok(UnlockResponse { unlocked: false, notice: Some(e.to_string()) }),
     };
 
+    if let Some(notice) = retire_legacy_pairing(&config_dir) {
+        return Ok(UnlockResponse { unlocked: false, notice: Some(notice.to_string()) });
+    }
     if !device_store::exists(&config_dir) {
-        if !store::exists(&config_dir) {
-            // Not paired: nothing to open and nothing to say.
-            return Ok(UnlockResponse { unlocked: false, notice: None });
-        }
-        if let Err(e) = store::remove_legacy_pairing(&config_dir) {
-            log::error!("unlock: an earlier build's pairing couldn't be removed: {}", e);
-        }
-        return Ok(UnlockResponse { unlocked: false, notice: Some(store::UNREADABLE_NOTICE.to_string()) });
+        // Not paired: nothing to open and nothing to say.
+        return Ok(UnlockResponse { unlocked: false, notice: None });
     }
 
     let mut link = match Link::open(DeviceStore::new(&config_dir, since)) {
@@ -468,6 +473,52 @@ pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String
     // Warn (never refuse) when another account can open the saved
     // pairing's folder or file (#24).
     Ok(UnlockResponse { unlocked: true, notice: store::privacy_warning(&config_dir, BindingMode::Keyring).map(str::to_string) })
+}
+
+/// Counts a pairing under way while it lives (see `AppState::pairing`).
+struct PairingUnderWay<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> PairingUnderWay<'a> {
+    fn new(n: &'a std::sync::atomic::AtomicUsize) -> Self {
+        n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        PairingUnderWay(n)
+    }
+}
+
+impl Drop for PairingUnderWay<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// What unlock answers without touching the device store: the link that
+/// is open (a second unlock reopens nothing), or nothing while a pairing
+/// is under way (opening the store would remove its pending state).
+async fn already_open<T: vettid_device::transport::Transport, C: vettid_device::pairing::Clock>(
+    pairing: &std::sync::atomic::AtomicUsize,
+    link: &tokio::sync::Mutex<Option<Link<T, C>>>,
+) -> Option<UnlockResponse> {
+    if pairing.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        return Some(UnlockResponse { unlocked: false, notice: None });
+    }
+    let slot = link.lock().await;
+    let l = slot.as_ref()?;
+    let notice = l.refused().then(|| link::REFUSED_NOTICE.to_string());
+    Some(UnlockResponse { unlocked: true, notice })
+}
+
+/// Review LOW 11: remove an earlier build's pairing (`connection.enc`)
+/// whenever it is there. The person is told only if it was the only
+/// pairing (this build's `device.enc` absent): the plain "can't be opened"
+/// notice. Next to a device file it goes silently.
+fn retire_legacy_pairing(config_dir: &std::path::Path) -> Option<&'static str> {
+    if !store::exists(config_dir) {
+        return None;
+    }
+    if let Err(e) = store::remove_legacy_pairing(config_dir) {
+        log::error!("unlock: an earlier build's pairing couldn't be removed: {}", e);
+    }
+    (!device_store::exists(config_dir)).then_some(store::UNREADABLE_NOTICE)
 }
 
 /// Session info the frontend uses to decide which view to render
@@ -538,20 +589,35 @@ pub async fn extend_session(app: AppHandle, state: State<'_, AppState>) -> Resul
     let snap = link.snapshot(now);
     // A reset that started meanwhile has cleared what the UI shows, and
     // shows its own result.
-    if !overtaken_by_reset(&state, mark) {
+    let overtaken = overtaken_by_reset(&state, mark);
+    if !overtaken {
         state.publish(snap.clone());
         if link.keep_refreshing(now) {
             state.start_refresh(false);
         }
     }
+    if let Err(f) = &result {
+        log::info!("extend_session: no session: {:?}", f);
+    }
+    let failure = link.store.take_failure();
+    Ok(extend_response(result, overtaken, &snap, now, failure.as_ref()))
+}
+
+/// What Start New Session answers. Review LOW 5: a lock, log-out or End
+/// session that overtook it (even after the grant) means it is not shown
+/// live: the person is told it stopped.
+fn extend_response(
+    result: Result<(), link::RequestFailed>,
+    overtaken: bool,
+    snap: &Snapshot,
+    now: chrono::DateTime<chrono::Utc>,
+    failure: Option<&CredentialError>,
+) -> RegisterResponse {
     match result {
-        Ok(()) if snap.active_at(now) => Ok(RegisterResponse::live(&snap)),
-        Ok(()) => Ok(RegisterResponse::failed(link::ACCESS_NOT_CONFIRMED_NOTICE)),
-        Err(f) => {
-            log::info!("extend_session: no session: {:?}", f);
-            let failure = link.store.take_failure();
-            Ok(RegisterResponse::failed(link::request_notice(&f, failure.as_ref())))
-        }
+        _ if overtaken => RegisterResponse::failed(link::REQUEST_STOPPED_NOTICE),
+        Ok(()) if snap.active_at(now) => RegisterResponse::live(snap),
+        Ok(()) => RegisterResponse::failed(link::ACCESS_NOT_CONFIRMED_NOTICE),
+        Err(f) => RegisterResponse::failed(link::request_notice(&f, failure)),
     }
 }
 
@@ -699,13 +765,15 @@ async fn log_out(
     // A Start New Session waiting for the phone stops (it checks this).
     begin_reset(state);
     state.publish(Snapshot::default());
-    let deadline = tokio::time::Instant::now() + bound;
-    // The link, if it can be had within the bound: a refresh or a Start New
-    // Session may hold it.
-    let mut guard = tokio::time::timeout_at(deadline, state.link.lock()).await.ok();
-    // Stopped with the link held, or (if it couldn't be had) mid-operation,
-    // which leaves nothing half done that matters: the link is dropped below.
+    // Review LOW 6: the refresh first, as lock does, so the bound goes to
+    // the end itself. Stopped mid-operation, it may leave the link's memory
+    // part way through a status read (on disk it is as after a crash): the
+    // link is used once more, for the end, then dropped.
     state.stop_refresh();
+    let deadline = tokio::time::Instant::now() + bound;
+    // The link, if it can be had within the bound: a Start New Session may
+    // hold it (it stops at its next check).
+    let mut guard = tokio::time::timeout_at(deadline, state.link.lock()).await.ok();
     let end = match guard.as_mut() {
         None => {
             log::warn!("logout: the link was busy; access not ended at the vault");
@@ -1091,6 +1159,83 @@ mod tests {
         assert!(!r.access_ended && !r.revoke_sent && r.local_wiped);
         assert_eq!(r.notice.as_deref(), Some(REVOKE_NOT_SENT_NOTICE));
         assert!(state.link.lock().await.is_none());
+    }
+
+    /// MEDIUM 3: while a pairing is under way unlock opens nothing; an open
+    /// link answers for itself (refused: with its notice).
+    #[tokio::test]
+    async fn unlock_leaves_a_pairing_under_way_and_an_open_link_alone() {
+        use crate::link::fake::FakeVault;
+        use std::sync::atomic::AtomicUsize;
+        let pairing = AtomicUsize::new(0);
+        let none: tokio::sync::Mutex<Option<Link>> = tokio::sync::Mutex::new(None);
+        assert!(already_open(&pairing, &none).await.is_none(), "nothing open: unlock goes on");
+        {
+            let _p = PairingUnderWay::new(&pairing);
+            let r = already_open(&pairing, &none).await.expect("left alone");
+            assert!(!r.unlocked && r.notice.is_none());
+        }
+        assert!(already_open(&pairing, &none).await.is_none(), "the count drops with the pairing");
+
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, l) = FakeVault::paired(dir.path());
+        let open = tokio::sync::Mutex::new(Some(l));
+        let r = already_open(&pairing, &open).await.expect("open already");
+        assert!(r.unlocked && r.notice.is_none());
+        vault.revoke(false);
+        let _ = open.lock().await.as_mut().unwrap().read_status().await;
+        let r = already_open(&pairing, &open).await.unwrap();
+        assert_eq!(r.notice.as_deref(), Some(link::REFUSED_NOTICE));
+    }
+
+    /// LOW 11: an earlier build's pairing goes whenever it is there; the
+    /// notice only when it was the only one.
+    #[test]
+    fn the_legacy_pairing_goes_and_says_so_only_when_alone() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        assert_eq!(retire_legacy_pairing(&dir), None);
+        store::tests::save_pairing_with_live_session(&dir, "legacy");
+        assert_eq!(retire_legacy_pairing(&dir), Some(store::UNREADABLE_NOTICE));
+        assert!(!store::exists(&dir));
+        store::tests::save_pairing_with_live_session(&dir, "legacy-2");
+        crate::credential::device_store::tests::store_for_tests(&dir).save_raw_for_tests();
+        assert_eq!(retire_legacy_pairing(&dir), None, "silent next to a device file");
+        assert!(!store::exists(&dir));
+        assert!(device_store::exists(&dir));
+    }
+
+    /// LOW 5: Start New Session overtaken by a reset says it stopped, even
+    /// with a live grant.
+    #[test]
+    fn an_overtaken_start_new_session_isnt_shown_live() {
+        let now = chrono::Utc::now();
+        let live = Snapshot { unlocked: true, session_id: Some("s".into()), live_until: Some(now + chrono::TimeDelta::minutes(5)), ..Default::default() };
+        let r = extend_response(Ok(()), true, &live, now, None);
+        assert!(!r.success);
+        assert_eq!(r.error.as_deref(), Some(link::REQUEST_STOPPED_NOTICE));
+        assert!(extend_response(Ok(()), false, &live, now, None).success);
+        let r = extend_response(Ok(()), false, &Snapshot::default(), now, None);
+        assert_eq!(r.error.as_deref(), Some(link::ACCESS_NOT_CONFIRMED_NOTICE));
+    }
+
+    /// LOW 6: logout stops the refresh before it waits for the link, so a
+    /// refresh holding the link doesn't eat the bound.
+    #[tokio::test]
+    async fn logout_stops_the_refresh_before_waiting_for_the_link() {
+        let state = AppState::new();
+        let link = state.link.clone();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        *state.refresh_task.lock().unwrap() = Some(tokio::spawn(async move {
+            let _slot = link.lock().await;
+            let _ = held_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        held_rx.await.unwrap();
+        let started = std::time::Instant::now();
+        let r = log_out(&state, None, |_| true, std::time::Duration::from_secs(5)).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "the bound wasn't spent waiting");
+        assert!(r.local_wiped);
     }
 
     /// #43: every memory reset is counted as started and finished, so an

@@ -36,6 +36,10 @@ pub struct AppState {
     /// Whether the user is registered (a pairing is saved).
     pub is_registered: Arc<RwLock<bool>>,
 
+    /// Pairings under way (`register`): while one is, `unlock` leaves the
+    /// device store alone (opening it would remove the pending pairing).
+    pub pairing: Arc<std::sync::atomic::AtomicUsize>,
+
     /// Held for the whole of End session and of Start New Session, so the
     /// two never overlap (#33).
     pub session_op: Arc<Mutex<()>>,
@@ -65,6 +69,7 @@ impl AppState {
             notify: Arc::new(std::sync::RwLock::new(None)),
             delegation: Arc::new(Mutex::new(DelegationManager::new())),
             is_registered: Arc::new(RwLock::new(false)),
+            pairing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_op: Arc::new(Mutex::new(())),
             resets_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             resets_finished: Arc::new(std::sync::atomic::AtomicU64::new(0)),

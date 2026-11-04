@@ -259,6 +259,13 @@ pub(crate) mod tests {
         DeviceStore::with_keys(dir, None, keys())
     }
 
+    impl DeviceStore {
+        /// Save some bytes (tests elsewhere only need a device file).
+        pub(crate) fn save_raw_for_tests(&mut self) {
+            self.save(STATE).unwrap();
+        }
+    }
+
     const MASTER: [u8; 32] = [0x5a; 32];
     const PLATFORM: [u8; 32] = [0x17; 32];
 
