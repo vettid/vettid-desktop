@@ -15,11 +15,9 @@ export interface PendingApproval {
 }
 
 /**
- * Raw payload envelope from the Rust listener for any `vault:*` push event
- * coming off the per-device `MessageSpace.{owner}.forApp.device.{conn}.>`
- * channel (see nats/listener.rs::event_suffix for the subject routing).
- * The listener forwards the NATS subject and a base64-encoded payload —
- * per-feature consumers decode/decrypt as appropriate.
+ * Raw payload envelope for a `vault:*` push event: a subject and a
+ * base64-encoded payload, which per-feature consumers decode. Nothing
+ * emits these in this build (the NATS listener that did is gone).
  */
 export interface AppEventEnvelope {
     subject: string;

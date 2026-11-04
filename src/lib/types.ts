@@ -2,7 +2,7 @@
 // Shared TypeScript types for the desktop app
 //
 // SCOPE: every interface in this file is a wire-format contract — it
-// must match exactly what the vault emits over NATS. If the vault
+// must match exactly what the vault sends. If the vault
 // renames a field or removes one, fix it here in the same change.
 //
 // We deliberately do NOT keep "view convenience" or "future scaffold"

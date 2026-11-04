@@ -292,7 +292,8 @@ pub struct ConnectionCredentials {
     pub device_public_key: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub vault_public_key: Vec<u8>,
-    /// JWT+seed block for the device's scoped NATS account.
+    /// JWT+seed block for the device's scoped NATS account (earlier builds;
+    /// this one never uses it).
     pub message_space_token: String,
     pub message_space_url: String,
     pub owner_guid: String,

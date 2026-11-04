@@ -70,9 +70,10 @@
       const result = await invoke<{ unlocked: boolean; notice?: string | null }>('unlock');
       if (result?.notice) {
         pairingNotice = result.notice;
-        // The file may have been deleted (an earlier build's) or kept.
-        await refreshRegistration();
       }
+      // Always: unlock may have removed a pairing (an earlier build's, or
+      // one the vault removed) with or without a notice.
+      await refreshRegistration();
     } catch (e) {
       console.warn('Auto-unlock failed:', e);
       pairingNotice = "This desktop couldn't open its saved pairing. If this keeps happening, remove this desktop on your phone and pair again.";

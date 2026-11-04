@@ -62,8 +62,8 @@
     statusMessage = '';
     sessionNotice.set(null);
     try {
-      // The session always ends in this run; `notice` says when that
-      // couldn't be recorded on this computer (#26).
+      // The session stops being shown as live at once; `notice` says when
+      // the vault didn't confirm the end (or a newer session runs on).
       const result = await invoke<{ notice: string | null }>('end_session');
       statusMessage = result.notice ?? 'Session ended.';
       // This view is replaced at once; the notice is shown on the next.

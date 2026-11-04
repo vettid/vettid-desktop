@@ -6,7 +6,7 @@
   let theme = $derived($themeStore);
 
   // Sub-pages cover persistent preferences only — live session ops
-  // (Lock, End session, NATS diagnostics) moved to the Session
+  // (Lock, End session) moved to the Session
   // screen since they're transient operations the user reaches via
   // the top-bar pill. Settings keeps Device / Appearance / Danger
   // Zone (Log out) / About.
