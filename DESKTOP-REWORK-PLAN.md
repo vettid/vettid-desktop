@@ -239,6 +239,78 @@ pairing that says "we couldn't reach your keyring; we'll bind to
 this machine instead." That's the same posture macOS Keychain
 takes when it can't unlock.
 
+> **Superseded (2026-11-04, #13).** The machine-bound fallback is
+> retired (owner decision, desktop V6 plan): see "At-rest protectors"
+> below. Kept above as history.
+
+### At-rest protectors (AG3, #13; proposed 2026-11-04, needs the owner's approval)
+
+The desktop follows the agent's AG3 design (AGENT-PLAN §4.2): one
+state file (`device.enc`: the device engine's `DeviceState`, which holds
+its seeds, the vault record, tokens and the session keyring), sealed
+with XChaCha20-Poly1305 under a **random 256-bit data key**. The data
+key is **wrapped by a platform protector** and stored, wrapped, in the
+file's header. That header is the associated data. A new data key is
+made at each pairing. The machine-attribute key (`platform_key`, the
+"machine-bound" mode) is **dropped**: it is an HMAC of values any local
+process can read, so it adds obscurity, not a secret.
+
+**Why move off the keyring.** Today the data key is the OS keyring's
+master key. That works, but it fails two of AG3's aims. On macOS the
+`keyring` crate uses the file-based login keychain, which drops
+`ThisDeviceOnly` and travels with Time Machine and Migration Assistant.
+On Linux, a Secret Service collection opens on any machine with the
+home directory and the login password. And the keyring entry lives
+apart from the file, so a wipe has two parts to get right.
+
+**Protectors, in the order the desktop tries them:**
+
+| Platform | Protector | Copied to another machine | Notes |
+|---|---|---|---|
+| Windows | **DPAPI, user scope** (`CryptProtectData`, `CRYPTPROTECT_UI_FORBIDDEN`, an app-specific entropy label) | Doesn't open: it needs this user's DPAPI master key on this computer | It replaces today's Credential Manager entry (`wincred.rs`), which is DPAPI underneath but a second object to wipe. The owner-only DACL check stays. A **domain account** or a **roaming profile** gets a notice, not a refusal (as AGENT-PLAN §4.2, 2026-10-18): the organization can recover the key, or it opens wherever the profile loads |
+| macOS | **Data protection keychain** item, `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, not synchronizable | Doesn't open | It needs a `keychain-access-groups` entitlement, so only the **signed app bundle** (the owner's App ID and provisioning profile) can use it. An unsigned or ad-hoc build falls back to the passphrase protector and says why |
+| Linux | **TPM 2.0** (`/dev/tpmrm0`): the data key sealed to this TPM | Doesn't open | Used when a TPM resource manager is present and usable by the user |
+| Linux, no TPM | **Secret Service** (GNOME Keyring or KWallet), as today | **Opens** with the home directory and the login password | The desktop says "not bound to this computer" in Settings. *Owner's choice (b): skip this step and go straight to the passphrase* |
+| Any, none of the above | **Passphrase** (Argon2id at least at VAULT-MESSAGING §4.1's password parameters; the strength rules of §1), asked at each launch | Opens anywhere with the passphrase | Says "not bound to this computer". *Owner's choice (c): refuse to pair instead* |
+
+**Rules:**
+- **Fail secure.** A protector that fails at load (DPAPI error, TPM
+  busy, keychain locked) keeps the file and says why; it is never
+  re-sealed to a weaker protector on its own. Choosing a weaker
+  protector happens only at pairing, and the person is told which.
+- **Wipe** (log out, `device.unlinked`): delete the file (and its
+  temporary copies), and delete the protector's key where it keeps
+  one: the keychain item. DPAPI and the TPM keep none outside the file.
+  As in AGENT-PLAN §4.2, an old copy of the file recovered from a
+  backup or the raw disk can still be opened on the same computer by
+  the same user (DPAPI, TPM). That is accepted for v1 and said in the
+  README.
+- **Status:** Settings shows the protector in use and whether the state
+  is bound to this computer.
+- **Migration:** a `device.enc` sealed under today's keyring key is
+  re-sealed under the new protector at its next load (it is opened
+  first, so nothing is lost), and the old keyring entry is then deleted.
+  A machine-bound store from an earlier build is deleted unread, as
+  `connection.enc` is today.
+
+**Done** (task 01M6EFHHANEEVAMCKH3WT7JM71):
+- a round trip per protector;
+- a copied state doesn't open, where the protector claims that;
+- the machine-bound code is removed.
+
+**Where each is tested:**
+- **Windows (DPAPI):** on the Windows test machine, including "another
+  Windows user can't open it".
+- **Linux:** in CI. The TPM protector runs against a software TPM
+  (`swtpm`) where CI has one, and Secret Service against a headless
+  `gnome-keyring` if practical.
+- **macOS keychain:** needs the owner's signed build, so it is checked
+  on a Mac when that build exists. Until then, macOS uses the passphrase
+  protector.
+
+Built in that order: Windows first (it can be tested here), then
+Linux, then macOS.
+
 ---
 
 ## 5. On-device storage policy
@@ -390,6 +462,8 @@ read receipts and delivery state matching Android.
    pairing: "Couldn't reach your keyring — binding to this machine
    instead. Disk-only theft is still safe; user-account compromise
    would be enough to decrypt."
+   *Superseded (2026-11-04, #13): the machine-bound key is retired;
+   see §4 "At-rest protectors".*
 2. **Migration** → skip. No real users yet. On first launch with
    the new build the existing `connection.enc` is wiped and the
    user re-pairs. Transitional code stays out of the codebase.
@@ -405,6 +479,7 @@ read receipts and delivery state matching Android.
 5. **Distros without a keyring daemon** → same as #1. Resolved by
    the machine-bound fallback. Minimal Linux setups (kiosks,
    GrapheneOS-style) work without extra packaging.
+   *Superseded (2026-11-04, #13): see §4 "At-rest protectors".*
 6. **Outbound invitations** (added 2026-05-22) → cut from the
    desktop. Creating a connection (generate invite code → QR →
    share) stays phone-only; the desktop manages and converses with
