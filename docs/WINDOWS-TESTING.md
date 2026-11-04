@@ -334,13 +334,53 @@ and the app, its uninstaller and the user's Apps-list entry stay (exit 2, event 
 is watching). The user can then log out of the desktop, or uninstall as themselves. Tested only by changing
 the registry entries in the mock and in a real install; not with a second account.
 
+**IT-managed installs (Intune, SCCM/ConfigMgr, an admin's script):** the installer stays per-user (owner
+decision "a" on #72, 2026-11-04). Deploy it in **user context**, so it runs as the person who will use the app:
+in Intune, a Win32 app with "Install behavior: User"; in ConfigMgr, a deployment type with "Installation
+behavior: Install for user" and "Logon requirement: Only when a user is logged on". The install and the
+uninstall then run as that person, without administrator rights, and the uninstall's confirmed wipe of the
+saved pairing works as above.
+- **Install:** `<setup>.exe /S`. It installs to `%LOCALAPPDATA%\VettID Desktop` for that user and exits 0.
+- **Uninstall:** `"%LOCALAPPDATA%\VettID Desktop\uninstall.exe" /S /WIPEPAIRING _?=%LOCALAPPDATA%\VettID Desktop`.
+  `_?=` must come last and is not quoted, even with spaces (the NSIS manual, 3.2). This form waits and gives the
+  real exit code: 0, or 2 on any failure, with a Warning in that user's Application event log (see Scripts).
+  A plain `uninstall.exe /S` returns 0 at once, before the wipe has run. A management tool should count 2 as
+  a failure, which Intune's default return codes already do.
+- **Detection:** the file `%LOCALAPPDATA%\VettID Desktop\vettid-desktop.exe`.
+- **Not system context.** Run as SYSTEM, the installer installs into SYSTEM's own profile, not the user's, and
+  an uninstall as SYSTEM, or as any account but the installing one, is refused (exit 2, event 1002), as above.
+- **The person must be signed in** for either to run. An IT department that needs system-context deployment
+  isn't supported yet (#72 lists what that would take).
+- **The phone:** as with every uninstall, the vault still lists the desktop until it is removed on the phone.
+
+Whether a given tool expands `%LOCALAPPDATA%` in its uninstall command and detection rule wasn't tested here:
+no Intune or ConfigMgr. If it doesn't, use the full path.
+
+**Run from a standard account** (2026-11-04, Windows 11 Pro 10.0.26300, the #71 debug installer). This was a
+temporary local account in Users only, not Administrators, with its own profile. The commands above were run as
+that account through secondary logon (`Start-Process -Credential -LoadUserProfile`), and a fixture `device.enc`
+stood in for a pairing:
+
+| Case | Exit code | Afterwards |
+|---|---|---|
+| `setup.exe /S` | 0 | installed in that account's `%LOCALAPPDATA%\VettID Desktop`; its `HKCU` product key written |
+| `uninstall.exe /S /WIPEPAIRING _?=…` | 0, no event | fixture, program and folders gone |
+| The same, with the fixture held open | 2, event 1001 | fixture kept; the program removed |
+| Run again after that | 2, event 1001 | fixture kept: the program is gone, so nothing can run the wipe. The person deletes `%LOCALAPPDATA%\vettid-desktop` by hand, as 1001 says |
+| `windo`'s own profile | – | no install folder before or after |
+
+The events go to the machine's Application log, so a management tool or an administrator can read them. A
+non-elevated process can start one as another account but can't wait on it, so the test waited for a result file.
+
 ## Not tested yet
 
 - Interactive install and uninstall, and what SmartScreen and Defender show a person (left for the owner).
 - An upgrade from an older version.
 - The uninstall hook's message boxes, an uninstall from Windows' Apps list, and an elevated uninstall as a
   second account.
-- A standard (non-administrator) account, and a second Windows user.
+- A standard (non-administrator) account signed in interactively, and two Windows users using the app on one
+  machine. Silent install and uninstall from a standard account were run (see IT-managed installs).
+- A deployment from Intune or ConfigMgr itself.
 - Anything that needs pairing: the state file and its ACL on disk, sessions, sleep and resume, fast user
   switching, a wrong clock.
 - `cargo tauri dev`, and the `webrtc` feature.
