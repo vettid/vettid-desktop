@@ -23,6 +23,10 @@
     let activeIndex = $state(0);
     let busy = $state(false);
     let error = $state('');
+    // Why the list of pending requests could not be loaded (the
+    // backend's text). While set, `pending` is empty and no count is
+    // claimed; it is shown even when no request is open.
+    let loadError = $state('');
     // Inline state for the approval form — user can tighten down
     // duration / max-uses below what the peer asked for.
     let expiresAtChoice = $state<'1h' | '24h' | '7d' | '30d' | 'never'>('24h');
@@ -44,6 +48,7 @@
     async function refresh() {
         try {
             pending = await listPending();
+            loadError = '';
             // Reset to the first non-dismissed when the list changes.
             activeIndex = 0;
             // Update the global pending count so the rail nav can
@@ -52,7 +57,10 @@
             // still need a response on the vault side).
             pendingGrantCountStore.set(pending.length);
         } catch (e) {
-            console.warn('grant.list-pending failed', e);
+            // Never keep (or offer to act on) a list we could not confirm.
+            pending = [];
+            activeIndex = 0;
+            loadError = e instanceof Error ? e.message : String(e);
         }
     }
 
@@ -162,6 +170,10 @@
         return k;
     }
 </script>
+
+{#if loadError && !open}
+    <div class="load-error" role="alert">{loadError}</div>
+{/if}
 
 {#if open && active}
     <div class="modal-backdrop" role="presentation"></div>
@@ -362,6 +374,21 @@
         box-sizing: border-box;
     }
     .field input:focus, .field select:focus { border-color: var(--accent); }
+
+    .load-error {
+        position: fixed;
+        right: 16px;
+        bottom: 16px;
+        max-width: 360px;
+        z-index: 50;
+        pointer-events: none;
+        background: rgba(244, 67, 54, 0.12);
+        border: 1px solid rgba(244, 67, 54, 0.3);
+        color: #ef5350;
+        padding: 8px 12px;
+        border-radius: 6px;
+        font-size: 0.85rem;
+    }
 
     .error {
         background: rgba(244, 67, 54, 0.12);

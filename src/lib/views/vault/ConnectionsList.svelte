@@ -1,9 +1,8 @@
 <script lang="ts">
     import { onMount } from 'svelte';
-    import { invoke } from '@tauri-apps/api/core';
-    import type { Connection, VaultOpResponse } from '../../types';
+    import type { Connection } from '../../types';
     import { selectedConnectionStore } from '../../stores/navigation';
-    import { connectionsStore } from '../../stores/vault';
+    import { connectionsStore, connectionsErrorStore, loadConnections as refreshStore } from '../../stores/vault';
     import { peerName } from '../../connectionName';
     import { formatRelativeOrAbsolute } from '../../time';
     import Avatar from '../../components/Avatar.svelte';
@@ -12,12 +11,11 @@
     // The vault store owns the canonical list — it's refreshed by
     // initVaultListeners() on connection/message push events, so reading
     // from the store gives us live updates without an extra subscription
-    // here. The local invoke below is just for explicit error-handling
-    // on the initial load (the store's loadConnections() is silent on
-    // failure by design — the listeners are best-effort).
+    // here. A failed refresh (here or from a push event) is shown through
+    // connectionsErrorStore.
     let connections = $derived($connectionsStore);
     let loading = $state(true);
-    let error = $state('');
+    let error = $derived($connectionsErrorStore);
     let search = $state('');
 
     type SortOrder = 'recent' | 'alpha' | 'created';
@@ -45,20 +43,9 @@
 
     async function loadConnections() {
         loading = connections.length === 0;
-        error = '';
-        try {
-            const resp: VaultOpResponse = await invoke('list_connections');
-            if (resp.success && resp.data) {
-                const data = resp.data as { connections?: Connection[] };
-                // Write into the shared store so anything else subscribed
-                // (notifications, etc.) sees the fresh list too.
-                connectionsStore.set(data.connections ?? []);
-            } else {
-                error = resp.error ?? 'Failed to load connections';
-            }
-        } catch (e) {
-            error = String(e);
-        }
+        // Writes the shared store (and its error) so anything else
+        // subscribed sees the fresh list too.
+        await refreshStore();
         loading = false;
     }
 

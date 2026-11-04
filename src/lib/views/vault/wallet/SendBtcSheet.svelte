@@ -128,11 +128,13 @@
           return;
         }
       }
-      feeError = resp?.error || 'Could not load fee estimates — using defaults.';
-      feeRates = { priority: 10, normal: 5, economy: 2 };
+      // No made-up rates: without real estimates there is no fee to
+      // show, and the send stays blocked (see feeRate below).
+      feeRates = null;
+      feeError = resp?.error || 'Could not load fee estimates.';
     } catch (e) {
-      feeError = 'Could not load fee estimates — using defaults.';
-      feeRates = { priority: 10, normal: 5, economy: 2 };
+      feeRates = null;
+      feeError = String(e);
     }
   }
 
@@ -158,7 +160,7 @@
   // Total (amount + estimated fee) must fit inside the cached balance.
   let fundsValid = $derived(amountSats > 0 && totalSats <= balanceSats);
   let canReview = $derived(
-    !!walletId && addressValid && amountValid && fundsValid && !sending
+    !!walletId && feeRates !== null && addressValid && amountValid && fundsValid && !sending
   );
 
   let addressFeedback = $derived.by(() => {
@@ -444,7 +446,7 @@
             >
               <span class="ft-name">{feeTierLabel(tier)}</span>
               <span class="ft-eta">{feeTierEta(tier)}</span>
-              <span class="ft-rate">{feeRates ? `${feeRates[tier]} sat/vB` : '…'}</span>
+              <span class="ft-rate">{feeRates ? `${feeRates[tier]} sat/vB` : feeError ? '—' : '…'}</span>
             </button>
           {/each}
         </div>

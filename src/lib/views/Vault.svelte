@@ -100,9 +100,14 @@
       // Tab counts in the background — failures here don't block the
       // header or the tab panel from rendering.
       Promise.all([
-        invoke<any>('list_secrets_catalog').catch(() => null),
-        invoke<any>('list_wallets').catch(() => null),
+        invoke<any>('list_secrets_catalog').catch((e) => ({ success: false, error: String(e) })),
+        invoke<any>('list_wallets').catch((e) => ({ success: false, error: String(e) })),
       ]).then(([secretsResp, walletsResp]) => {
+        // A count that could not be loaded stays hidden (never 0); the
+        // backend's text is shown with the other load errors.
+        for (const r of [secretsResp, walletsResp]) {
+          if (!r?.success && !errorMessage) errorMessage = r?.error ?? 'Failed to load vault';
+        }
         // Vault returns the list as `data.secrets`, not `data.items` —
         // the older key was a stale guess.
         if (secretsResp?.success && secretsResp?.data?.secrets) {
