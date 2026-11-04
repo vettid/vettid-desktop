@@ -120,13 +120,15 @@ outside the file; the earlier format's Credential Manager entry is only ever del
 
 ## Uninstall: the saved pairing (owner decision "a")
 
-**Not run on this machine yet.** The debug installer build was stopped for low memory before NSIS ran, so the
-hook below hasn't been compiled by `makensis` or tried. The wipe mode's unit tests pass. What follows is the
-design and what was read in the bundler's template (tauri-bundler 2.10.2, `installer.nsi`).
+**Not run in a real installer yet.** The debug installer build was stopped for low memory before NSIS ran.
+What was run: the wipe mode's unit tests, and the hook compiled by `makensis` 3.11 into a mock uninstaller
+(the template's order, a stand-in for `CheckIfAppIsRunning` without the Tauri plugin, and a stand-in wipe
+program that exits with a chosen code); results below. The rest was read in the bundler's template
+(tauri-bundler 2.10.2, `installer.nsi`).
 
 **What the uninstaller removes now:** the saved pairing, on every real uninstall, silent `/S` included. Not
 on an update (`/UPDATE`), and not when an installer runs the old uninstaller (an upgrade, downgrade or
-reinstall by hand): those keep the pairing. Its hook (`src-tauri/windows/installer-hooks.nsh`, `NSIS_HOOK_PREUNINSTALL`) runs
+reinstall by hand): those keep the pairing. Its hook (`src-tauri/windows/installer-hooks.nsh`) runs
 `vettid-desktop.exe --uninstall-wipe` (`src-tauri/src/uninstall.rs`), which is log-out's local wipe
 (`store::wipe_for_logout`), each part confirmed on disk:
 - `%LOCALAPPDATA%\vettid-desktop\`, with `device.enc` and any temporary copy of it, and an earlier build's
@@ -138,28 +140,53 @@ reinstall by hand): those keep the pairing. Its hook (`src-tauri/windows/install
 itself (VAULT-MESSAGING §7.4), and an uninstall shouldn't wait on the network. The vault lists the desktop
 until it is removed on the phone.
 
-**The order in the hook:**
-1. Nothing on `/UPDATE`, and nothing when the uninstaller runs in place, from the install folder
-   (`$EXEDIR` = `$INSTDIR`, compared in short form, ignoring case and a trailing backslash; owner decision
-   "a", 2026-11-04). An installer runs the old uninstaller in place (`uninstall.exe _?=$INSTDIR`), without
-   `/UPDATE`. An uninstall from Windows' Apps list, or `uninstall.exe /S`, first copies the uninstaller to a
-   temporary folder and runs it from there (the NSIS manual, 3.2: `_?=` "stops the uninstaller from copying
-   itself to the temporary directory and running from there"), so it wipes.
-2. The running app is closed first (`CheckIfAppIsRunning`; the template checks only after the hook). Otherwise
-   it could save the pairing again after the wipe. If it can't be closed, or the person cancels, the uninstall
-   stops before anything is removed.
-3. The wipe. Its exit code:
+**The wipe's exit codes:**
 
 | Code | Meaning |
 |---|---|
-| 0 | Nothing was paired here (no pairing file before the wipe). |
 | 10 | A pairing was saved here, and every part is confirmed gone. |
+| 11 | Nothing was paired here (no pairing file before the wipe). |
 | 20 | Something couldn't be removed, or its removal couldn't be confirmed. Also: no user folder, or a panic. |
 
-4. Interactive: on 10, "This desktop was paired. Remove it on your phone too." On 20, any other code, or if the
-   program couldn't be started, a message that the saved pairing couldn't be removed, with the folder, and the
-   phone step. Both texts wait for the owner's approval. The uninstall goes on in every case.
-5. On 20 or a failure the uninstaller's exit code is 2, silent included, so a script can tell.
+Anything else is a failure, **0 included**: a program that ignores the switch (an older build, which would
+also open its window) exits 0.
+
+**The order:**
+1. `NSIS_HOOK_PREUNINSTALL`, before the template removes anything:
+   - Skipped on `/UPDATE`; when `$INSTDIR` is empty (a missing install-location entry); and when the
+     uninstaller runs in place, from the install folder (`$EXEDIR` = `$INSTDIR`, compared in short form,
+     ignoring case and a trailing backslash; owner decision "a", 2026-11-04). An installer runs the old
+     uninstaller in place (`uninstall.exe _?=$INSTDIR`), without `/UPDATE`. An uninstall from Windows' Apps
+     list, or `uninstall.exe /S`, first copies the uninstaller to a temporary folder and runs it from there
+     (the NSIS manual, 3.2: `_?=` "stops the uninstaller from copying itself to the temporary directory and
+     running from there"; seen in the mock, case 9 below), so it wipes.
+   - A running app is closed (`CheckIfAppIsRunning`). If the person cancels, or the app can't be closed, the
+     uninstall stops there. **This check can also silently do nothing** (when its Restart Manager session or
+     registration fails), and the app could be started again before the wipe; step 3 covers both.
+   - The wipe runs; its code is kept for step 3. Nothing is shown yet.
+2. The template: its own running-app check (which closes the app or stops the uninstall), then removes the
+   program, shortcuts and registry entries.
+3. `NSIS_HOOK_POSTUNINSTALL`, unless the wipe was skipped. It looks for `device.enc`, `connection.enc` and any
+   `*.tmp-*` in `%LOCALAPPDATA%\vettid-desktop`, and for `vettid-desktop.exe` still in the install folder (the
+   app may still be running, and save again).
+   - Code 10 and nothing there: "This desktop was paired. Remove it on your phone too."
+   - Code 11 and nothing there: nothing is shown.
+   - Anything else (code 20, 0, any other code, the program not starting, or a file there): the uninstaller's
+     exit code is 2, and the message that the saved pairing couldn't be removed, with the folder, the
+     Credential Manager entry and the phone step.
+   - Both texts wait for the owner's approval. The uninstall has finished in every case.
+   - Messages are shown only when a person is watching: not under `/S`, and not under `/P` (passive), where a
+     box would wait for a click. The exit code is set either way.
+
+**Edge cases:**
+- The "paired" message can show when the folder couldn't be read before the wipe (counted as "may be
+  paired"), but the wipe then removed it cleanly. That errs on the safe side: the person is told to check the
+  phone.
+- If the uninstall stops at the template's own app check (step 2), the wipe has already run, but nothing is
+  shown about it.
+- If NSIS ever ran a real uninstall in place (say, if it couldn't copy itself to `%TEMP%`), the hook would
+  keep the pairing and say nothing. Not found: the manual doesn't say what NSIS does then, and the NSIS
+  download here has no source for the uninstaller's start-up.
 
 **Scripts:** `uninstall.exe /S` deletes the pairing, but returns before the temporary copy has finished, so the
 exit code 2 can't be seen that way: check that `%LOCALAPPDATA%\vettid-desktop` is gone instead. Running it in
@@ -168,6 +195,25 @@ an installer.
 
 **Who can run `--uninstall-wipe`:** anyone who can run a program as this Windows user, who can already delete
 these files and entries. It opens no window, prints nothing and isn't passed to a running app.
+
+**The mock (makensis 3.11; the uninstaller copied out of the install folder and run with `/S _?=`, as NSIS's
+temporary copy runs, so its exit code is seen):**
+
+| Case | Uninstaller exit code | Wipe ran |
+|---|---|---|
+| 1. wipe code 10, nothing left | 0 | yes |
+| 2. wipe code 11 | 0 | yes |
+| 3. wipe code 0 (a program that ignores the switch) | 2 | yes |
+| 4. wipe code 20 | 2 | yes |
+| 5. no program | 2 | no |
+| 6. code 10, but `device.enc` there afterwards (as if a running app saved it again) | 2 | yes |
+| 6b. code 10, but a `device.enc.tmp-*` there afterwards | 2 | yes |
+| 7. in place (`_?=` from the install folder), code 20 | 0 | no |
+| 8. `/UPDATE`, code 20 | 0 | no |
+| 8b. `/P`, code 20 (no box) | 2 | yes |
+| 9. plain `uninstall.exe /S` from the install folder | 0 (the launcher's) | yes (from the temporary copy) |
+
+Not covered by the mock: the real `CheckIfAppIsRunning` and its plugin, the message boxes, and the real app.
 
 **Reinstall, upgrade and downgrade (read in `installer.nsi`, not run):**
 - A silent install (`/S`) over an existing install shows no pages, so it never runs the old uninstaller: the
@@ -188,16 +234,21 @@ these files and entries. It opens no window, prints nothing and isn't passed to 
 `HKCU\Software\vettid\VettID Desktop`, unless "Delete the application data" is ticked (see above). Neither
 holds the pairing.
 
-**Not covered:** a per-machine install (`installMode: perMachine`, not used): the uninstaller runs elevated,
-and an administrator's elevation as another account would wipe that account's folder, not the user's.
+**Not covered: another account's elevation.**
+- A per-machine install (`installMode: perMachine`, not used) runs its uninstaller elevated. An
+  administrator's elevation as another account would wipe that account's folder, not the user's.
+- The same applies to this per-user install if its uninstaller is run elevated as another account (say,
+  "Run as administrator" with an administrator's password). The wipe then removes that account's pairing, if
+  it has one. It reports "nothing paired" (code 11, no message), and the user's own pairing stays.
 
 ## Not tested yet
 
 - Interactive install and uninstall, and what SmartScreen and Defender show a person (left for the owner).
 - An upgrade from an older version.
-- The uninstall hook end to end: a fixture `device.enc` removed by `uninstall.exe /S`; a held file kept (the
-  exit code isn't observable without `_?=`); a clean uninstall; `/S _?=` in place keeping the fixture; a
-  reinstall (`/S`, `/S /UPDATE`, `/P`) keeping it.
+- The uninstall hook in a real installer: a fixture `device.enc` removed by `uninstall.exe /S`; a held file
+  kept (the exit code isn't observable without `_?=`); a clean uninstall; `/S _?=` in place keeping the
+  fixture; a reinstall (`/S`, `/S /UPDATE`, `/P`) keeping it; the app running during the uninstall; the
+  message boxes.
 - A standard (non-administrator) account, and a second Windows user.
 - Anything that needs pairing: the state file and its ACL on disk, sessions, sleep and resume, fast user
   switching, a wrong clock.
