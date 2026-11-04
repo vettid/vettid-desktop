@@ -42,9 +42,9 @@ lists only `app`, `dmg`, `appimage` and `deb`.
 | The installed copy, `%LOCALAPPDATA%\VettID Desktop\vettid-desktop.exe` | **started** |
 | The debug test binary from `cargo test` | ran on three builds, then was blocked on the next, 3 attempts out of 3 |
 
-**Why the two copies were treated differently (found in run 2):** they aren't the same file. After it builds the
-bundle, Tauri writes a 3-byte bundle-type marker into the executable. The installed copy says `NSS` (NSIS) and
-the build-folder copy says `UNK`. Otherwise the two are byte for byte the same (`cmp`: 3 bytes differ, at one
+**Why the two copies were treated differently (found in run 2):** they aren't the same file. Before packing the
+installer, the bundler writes a 3-byte bundle-type marker (`NSS`, for NSIS) into the exe it packs. Then it puts
+the build-folder exe back as it was (`UNK`) (tauri-bundler 2.10.2, `bundle.rs`). Otherwise the two are byte for byte the same (`cmp`: 3 bytes differ, at one
 offset). So they have different hashes, and SAC judges each hash on its own.
 
 **What this means for members:** an unsigned build may or may not run, and when SAC blocks it there is no "run
@@ -106,9 +106,14 @@ From the code, a paired desktop keeps:
 **The consequences:**
 - The desktop stays linked at the vault until the person unlinks it from the phone.
 - A reinstall finds the old pairing.
-- Logging out first wipes both parts (`device_store` wipe, each part confirmed) and ends the session at the
-  vault (`device.session.end`). It doesn't unlink the desktop: a desktop can't unlink itself
-  (VAULT-MESSAGING §7.4), only the phone can.
+- Logging out first:
+  - asks the vault to end its access (`device.session.end`, waiting up to 10 s), and says so only if the vault
+    confirms;
+  - wipes either way. `store::wipe_for_logout` deletes the state folder and checks on disk that it's gone, then
+    tries to delete the Credential Manager entry. **That second step isn't confirmed:** a failure is only logged
+    (`keystore::delete_keyring_key`), so the entry can outlive a logout reported as done. Nothing is sealed under
+    it once the file is gone. AG3 (#13) removes the entry and confirms each part of a wipe.
+  - doesn't unlink the desktop: a desktop can't unlink itself (VAULT-MESSAGING §7.4), only the phone can.
 
 AG3 (#13) replaces the Credential Manager entry with a DPAPI-wrapped key kept inside `device.enc`. That leaves
 one part to remove. Whether the uninstaller should remove it, or tell the person to log out or unlink first,
