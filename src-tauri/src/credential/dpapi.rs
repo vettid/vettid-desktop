@@ -12,7 +12,10 @@
 
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
+use windows_sys::Win32::Foundation::{GetLastError, LocalFree, ERROR_INVALID_DATA, NTE_BAD_DATA};
+use windows_sys::Win32::NetworkManagement::NetManagement::{NetApiBufferFree, NetGetJoinInformation, NetSetupDomainName};
+use windows_sys::Win32::System::GroupPolicy::{PT_ROAMING, PT_ROAMING_PREEXISTING};
+use windows_sys::Win32::UI::Shell::GetProfileType;
 use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
 };
@@ -43,6 +46,17 @@ impl Dpapi {
 
     fn failing(what: &str, code: u32) -> ProtectorError {
         ProtectorError::Failing { by: NAME, detail: format!("{what} failed (error {code})") }
+    }
+}
+
+/// How a `CryptUnprotectData` error is taken: a blob that is bad (garbled,
+/// cut short, or not made with this entropy) won't open later either;
+/// anything else (a profile or password problem, a busy system) may.
+fn unprotect_error(code: u32) -> ProtectorError {
+    if code == ERROR_INVALID_DATA || code == NTE_BAD_DATA as u32 {
+        ProtectorError::WontOpen(format!("CryptUnprotectData: a bad blob (error {code})"))
+    } else {
+        Dpapi::failing("CryptUnprotectData", code)
     }
 }
 
@@ -123,10 +137,11 @@ impl Protector for Dpapi {
     fn wrap(&self, key: &[u8; 32]) -> Result<Vec<u8>, ProtectorError> {
         protect(key, self.entropy).map_err(|c| Self::failing("CryptProtectData", c))
     }
-    /// Any DPAPI error is failing, not "won't open": a reset password or a
-    /// profile problem may be put right, and the file is kept either way.
+    /// A bad blob won't open ([`unprotect_error`]); any other DPAPI error is
+    /// failing: a reset password or a profile problem may be put right. The
+    /// file is kept either way.
     fn unwrap(&self, wrapped: &[u8]) -> Result<DataKey, ProtectorError> {
-        let plain = unprotect(wrapped, self.entropy).map_err(|c| Self::failing("CryptUnprotectData", c))?;
+        let plain = unprotect(wrapped, self.entropy).map_err(unprotect_error)?;
         if plain.len() != 32 {
             return Err(ProtectorError::WontOpen(format!("a wrapped key of {} bytes", plain.len())));
         }
@@ -138,6 +153,85 @@ impl Protector for Dpapi {
     fn remove_external(&self) -> Result<(), ProtectorError> {
         Ok(())
     }
+}
+
+/// Who else may open a DPAPI-wrapped key of this account (the plan's DPAPI
+/// row): a notice for the person, never a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Reach {
+    /// This computer is joined to a domain: its administrators can recover
+    /// the account's DPAPI keys.
+    pub domain: bool,
+    /// The profile roams: the DPAPI master keys travel with it.
+    pub roaming: bool,
+}
+
+/// NEW TEXT (owner approval needed): Settings, when this computer is
+/// joined to a domain.
+pub(crate) const DOMAIN_NOTICE: &str =
+    "This computer is joined to your organisation's domain. An administrator of that domain may be able to open this desktop's saved pairing.";
+
+/// NEW TEXT (owner approval needed): Settings, when the profile roams.
+pub(crate) const ROAMING_NOTICE: &str =
+    "Your Windows profile roams. With a copy of the saved pairing file, a copy of your profile and your password can open it on another computer.";
+
+impl Reach {
+    /// This account's reach. SECURITY: a check that fails counts as false
+    /// and gives no notice, so no notice is not a guarantee (the plan says
+    /// so); the failure is logged by its code.
+    pub fn here() -> Self {
+        Self::from_checks(domain_joined(), roaming_profile())
+    }
+
+    fn from_checks(domain: Result<bool, u32>, roaming: Result<bool, u32>) -> Self {
+        let checked = |what: &str, r: Result<bool, u32>| {
+            r.unwrap_or_else(|code| {
+                log::warn!("dpapi: the {what} check failed (error {code}); no notice");
+                false
+            })
+        };
+        Reach { domain: checked("domain", domain), roaming: checked("roaming profile", roaming) }
+    }
+
+    /// The notices for Settings, in order.
+    pub fn notices(self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.domain {
+            out.push(DOMAIN_NOTICE);
+        }
+        if self.roaming {
+            out.push(ROAMING_NOTICE);
+        }
+        out
+    }
+}
+
+/// `NetGetJoinInformation`: joined to a domain (not a workgroup).
+fn domain_joined() -> Result<bool, u32> {
+    let mut name: windows_sys::core::PWSTR = ptr::null_mut();
+    let mut status = 0;
+    // SAFETY: both out-pointers are live locals; the name buffer is freed
+    // with NetApiBufferFree below.
+    let code = unsafe { NetGetJoinInformation(ptr::null(), &mut name, &mut status) };
+    if !name.is_null() {
+        // SAFETY: allocated by NetGetJoinInformation; freed once.
+        unsafe { NetApiBufferFree(name as *const _) };
+    }
+    if code != 0 {
+        return Err(code);
+    }
+    Ok(status == NetSetupDomainName)
+}
+
+/// `GetProfileType`: the current user's profile roams.
+fn roaming_profile() -> Result<bool, u32> {
+    let mut flags = 0u32;
+    // SAFETY: `flags` is a live local.
+    if unsafe { GetProfileType(&mut flags) } == 0 {
+        // SAFETY: reads the calling thread's last-error value.
+        return Err(unsafe { GetLastError() });
+    }
+    Ok(flags & (PT_ROAMING | PT_ROAMING_PREEXISTING) != 0)
 }
 
 /// The earlier format's Credential Manager entry
@@ -182,15 +276,51 @@ mod tests {
 
         // Another entropy label doesn't open it.
         let other = Dpapi::with_entropy(b"vettid-desktop-something-else");
-        assert!(matches!(other.unwrap(&wrapped), Err(ProtectorError::Failing { .. })));
+        assert!(other.unwrap(&wrapped).is_err());
         // Nor does a changed blob.
         let mut tampered = wrapped.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 1;
         assert!(p.unwrap(&tampered).is_err());
         assert!(p.unwrap(&[]).is_err());
+        // A garbled blob won't open (Unreadable), not "try again".
+        let garbled = vec![0x17u8; wrapped.len()];
+        match p.unwrap(&garbled) {
+            Err(ProtectorError::WontOpen(_)) => {}
+            Err(e) => panic!("a garbled blob: {e}"),
+            Ok(_) => panic!("a garbled blob opened"),
+        }
         // Not absent, nothing outside the file.
         assert_eq!(p.availability(), Availability::Present);
         p.remove_external().unwrap();
+    }
+
+    #[test]
+    fn bad_blob_errors_wont_open_and_others_fail() {
+        assert!(matches!(unprotect_error(ERROR_INVALID_DATA), ProtectorError::WontOpen(_)));
+        assert!(matches!(unprotect_error(NTE_BAD_DATA as u32), ProtectorError::WontOpen(_)));
+        // NTE_BAD_KEY_STATE (a reset password), access denied: may work later.
+        for other in [0x8009000Bu32, 5] {
+            assert!(matches!(unprotect_error(other), ProtectorError::Failing { .. }));
+        }
+    }
+
+    /// A failed check gives no notice; either check alone gives its own.
+    #[test]
+    fn reach_notices_follow_the_checks() {
+        assert_eq!(Reach::from_checks(Ok(false), Ok(false)).notices(), Vec::<&str>::new());
+        assert_eq!(Reach::from_checks(Ok(true), Ok(false)).notices(), vec![DOMAIN_NOTICE]);
+        assert_eq!(Reach::from_checks(Ok(false), Ok(true)).notices(), vec![ROAMING_NOTICE]);
+        assert_eq!(Reach::from_checks(Ok(true), Ok(true)).notices(), vec![DOMAIN_NOTICE, ROAMING_NOTICE]);
+        assert_eq!(Reach::from_checks(Err(5), Err(5)), Reach::default());
+        assert_eq!(Reach::from_checks(Err(5), Ok(true)).notices(), vec![ROAMING_NOTICE]);
+    }
+
+    /// The real checks run on this machine (their answer isn't asserted).
+    #[test]
+    fn the_real_reach_checks_return() {
+        let _ = domain_joined();
+        let _ = roaming_profile();
+        let _ = Reach::here();
     }
 }

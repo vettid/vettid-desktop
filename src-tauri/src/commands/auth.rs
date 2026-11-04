@@ -31,6 +31,9 @@ pub struct AuthStatus {
     pub key_protection: String,
     /// Whether that protection binds the saved pairing to this computer.
     pub key_bound: bool,
+    /// Plain notices on who else may open it (Windows: a domain-joined
+    /// computer, a roaming profile). None is not a guarantee.
+    pub key_notices: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -407,7 +410,7 @@ pub struct UnlockResponse {
 /// What the person is told when the saved pairing could not be opened for
 /// a reason without a plain notice of its own. The detail goes to the log
 /// only.
-const UNLOCK_FAILED_NOTICE: &str = "This desktop couldn't open its saved pairing. If this keeps happening, remove this desktop on your phone and pair again.";
+const UNLOCK_FAILED_NOTICE: &str = "This desktop couldn't open its saved pairing. If this keeps happening, remove this desktop on your phone; then, in Settings, open Danger zone and choose Log out this desktop, and pair again.";
 
 /// Open the saved pairing: the device state, sealed under a data key that
 /// a protector wraps (DPAPI on Windows, the keyring elsewhere; no user
@@ -1039,6 +1042,7 @@ pub async fn get_status(state: State<'_, AppState>) -> Result<AuthStatus, String
     Ok(AuthStatus {
         key_protection: protection.protector.to_string(),
         key_bound: protection.bound,
+        key_notices: device_store::protection_notices(protection).into_iter().map(str::to_string).collect(),
         is_registered,
         is_unlocked: snap.unlocked,
         has_active_session: snap.active_at(chrono::Utc::now()),

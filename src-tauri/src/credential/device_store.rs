@@ -266,9 +266,9 @@ impl DeviceStore {
             Ok(f) => f,
             // The earlier format goes, unread; then there is nothing here.
             Err(_) if is_legacy(&raw) => {
-                retire_legacy_with(&self.dir, &self.protectors).map_err(|e| (e, StoreError::Io))?;
+                let retired = retire_legacy_with(&self.dir, &self.protectors);
                 self.sealing = None;
-                return Ok(None);
+                return after_retiring(&self.dir, retired).map(|()| None).map_err(|e| (e, StoreError::Io));
             }
             Err(_) => return Err(corrupt("unreadable")),
         };
@@ -391,6 +391,19 @@ fn retire_legacy_with(dir: &Path, protectors: &Protectors) -> Result<bool, Crede
     }
 }
 
+/// A load that found the earlier format: nothing is there only once the
+/// retirement confirmed it. `Ok(false)` (the file couldn't be read again
+/// under the lock, or changed) while a file may still be there is an I/O
+/// error: the file is kept, and "not paired" isn't said on a guess (a
+/// pairing would otherwise write over it).
+fn after_retiring(dir: &Path, retired: Result<bool, CredentialError>) -> Result<(), CredentialError> {
+    match retired? {
+        true => Ok(()),
+        false if exists(dir) => Err(CredentialError::IoError("the earlier version's device file couldn't be checked again".into())),
+        false => Ok(()),
+    }
+}
+
 /// [`retire_legacy_with`] with this platform's protectors, for unlock.
 pub fn retire_legacy(config_dir: &Path) -> Result<bool, CredentialError> {
     retire_legacy_with(config_dir, &Protectors::system())
@@ -411,6 +424,19 @@ pub struct KeyProtection {
     pub protector: &'static str,
     /// Whether that protector binds the file to this computer.
     pub bound: bool,
+}
+
+/// Notices for Settings about who else may open the saved pairing under
+/// its protector: on Windows with DPAPI, a domain-joined computer or a
+/// roaming profile (`dpapi::Reach`). A check that fails gives none, so none
+/// is not a guarantee.
+pub fn protection_notices(protection: KeyProtection) -> Vec<&'static str> {
+    #[cfg(windows)]
+    if protection.protector == "dpapi" {
+        return super::dpapi::Reach::here().notices();
+    }
+    let _ = protection;
+    Vec::new()
 }
 
 pub fn stored_key_protection(config_dir: &Path) -> KeyProtection {
@@ -682,6 +708,21 @@ pub(crate) mod tests {
         assert!(matches!(s.take_failure(), Some(CredentialError::LegacyNotRemoved)));
     }
 
+    /// A retirement that couldn't confirm anything while the file may still
+    /// be there is an error, not "nothing here".
+    #[test]
+    fn a_retirement_that_couldnt_check_is_not_nothing_here() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        store::ensure_config_dir(&dir).unwrap();
+        assert!(after_retiring(&dir, Ok(false)).is_ok(), "no file: nothing here");
+        fs::write(dir.join(DEVICE_FILE), legacy_bytes()).unwrap();
+        assert!(matches!(after_retiring(&dir, Ok(false)), Err(CredentialError::IoError(_))));
+        assert!(matches!(after_retiring(&dir, Err(CredentialError::LegacyNotRemoved)), Err(CredentialError::LegacyNotRemoved)));
+        assert!(after_retiring(&dir, Ok(true)).is_ok());
+        assert!(exists(&dir), "nothing here removes the file");
+    }
+
     /// Only the earlier format exactly is deleted: anything else this build
     /// can't read is kept.
     #[test]
@@ -795,7 +836,8 @@ pub(crate) mod tests {
         assert!(!good.header.wrapped_key.is_empty());
         let mut fresh = DeviceStore::with_protectors(&dir, None, dpapi());
         assert_eq!(fresh.load().unwrap().as_deref().map(|v| &v[..]), Some(STATE));
-        // A changed wrapped key: DPAPI refuses it, the file is kept.
+        // A changed wrapped key: DPAPI refuses it as a bad blob, the file is
+        // kept.
         let mut f = SealedFile { header: good.header.clone(), ciphertext: good.ciphertext.clone() };
         let mut w = B64.decode(&f.header.wrapped_key).unwrap();
         let last = w.len() - 1;
@@ -803,8 +845,9 @@ pub(crate) mod tests {
         f.header.wrapped_key = B64.encode(w);
         write_sealed(&dir, &f);
         let mut s = DeviceStore::with_protectors(&dir, None, dpapi());
-        assert_eq!(s.load(), Err(StoreError::Io));
-        assert!(matches!(s.take_failure(), Some(CredentialError::NotOpened { by: "Windows data protection" })));
+        assert_eq!(s.load(), Err(StoreError::Corrupt));
+        assert!(matches!(s.take_failure(), Some(CredentialError::Unreadable)));
+        assert!(exists(&dir));
         // A changed header field: the AEAD refuses it.
         let mut f = SealedFile { header: good.header.clone(), ciphertext: good.ciphertext.clone() };
         f.header.created_at -= 1;

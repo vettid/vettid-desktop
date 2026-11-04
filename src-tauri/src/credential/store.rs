@@ -53,7 +53,7 @@ const CONFIG_SUBDIR: &str = "vettid-desktop";
 /// What the person is told when a saved pairing can't be opened. Shown
 /// as is, so it must stay plain: no error codes, no crypto terms.
 pub const UNREADABLE_NOTICE: &str =
-    "This desktop's saved pairing can't be opened. Remove this desktop on your phone, then pair again.";
+    "This desktop's saved pairing can't be opened. Remove this desktop on your phone. Then, in Settings, open Danger zone and choose Log out this desktop, and pair again.";
 
 /// NEW TEXT (owner approval needed): shown when the protector this
 /// computer offers is there but failed, so nothing was saved (#13). `by`
@@ -68,7 +68,7 @@ fn not_protected_notice(by: &str) -> String {
 /// pairing's protector is there but couldn't open it (#13). The file is
 /// kept: it may open later (after signing in again), or the person re-pairs.
 fn not_opened_notice(by: &str) -> String {
-    format!("This desktop couldn't open its saved pairing with {by} just now. The pairing is kept. Sign out of your computer and back in to try again; if it keeps happening, remove this desktop on your phone and pair again.")
+    format!("This desktop couldn't open its saved pairing with {by} just now. The pairing is kept. Sign out of your computer and back in to try again. If it keeps happening, remove this desktop on your phone; then, in Settings, open Danger zone and choose Log out this desktop, and pair again.")
 }
 
 /// NEW TEXT (owner approval needed): shown when this computer offers no

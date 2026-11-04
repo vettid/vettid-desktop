@@ -106,7 +106,8 @@ keyring = { version = "3", default-features = false, features = ["apple-native",
 
 # Win32 calls for the Windows machine fingerprint (registry, disk serial,
 # network adapters), DPAPI (Win32_Security_Cryptography: the device file's
-# protector) and deleting the earlier format's Credential Manager entry. See
+# protector; NetManagement, GroupPolicy and UI_Shell for its domain and
+# roaming-profile notices) and deleting the earlier format's Credential Manager entry. See
 # fingerprint/platform_windows.rs, credential/dpapi.rs and credential/wincred.rs. Wdk_Storage_FileSystem
 # is for NtSetInformationFile: renaming the pairing by handle, relative to its
 # folder's handle (credential/winacl.rs, #28).
@@ -115,6 +116,7 @@ windows-sys = { version = "0.59", features = [
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_NetManagement",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     "Win32_Security",
@@ -122,10 +124,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Cryptography",
     "Win32_Security_Credentials",
     "Win32_Storage_FileSystem",
+    "Win32_System_GroupPolicy",
     "Win32_System_IO",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
 ] }
 
 # geteuid, for checking who owns the pairing folder (credential/store.rs, #28).
