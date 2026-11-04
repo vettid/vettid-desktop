@@ -482,6 +482,9 @@ pub struct SessionInfoResponse {
     pub expires_at: i64,
     pub seconds_remaining: i64,
     pub is_active: bool,
+    /// Why a session this desktop knows of isn't shown as active: the vault
+    /// hasn't confirmed it lately (`link::STALE_NOTICE`).
+    pub notice: Option<String>,
 }
 
 /// What the frontend polls (cheap, no network) to drive the expiry UI:
@@ -503,6 +506,7 @@ fn session_info(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> Result<S
         expires_at: until.map_or(0, |t| t.timestamp()),
         seconds_remaining: until.map_or(0, |t| (t - now).num_seconds().max(0)),
         is_active: active,
+        notice: (snap.stale && !active).then(|| link::STALE_NOTICE.to_string()),
     })
 }
 
@@ -1117,6 +1121,7 @@ mod tests {
             live_until: Some(until),
             reachable: true,
             refused: false,
+            stale: false,
         };
         let info = session_info(&snap, now).unwrap();
         assert!(info.is_active);
@@ -1126,6 +1131,11 @@ mod tests {
         let later = session_info(&snap, until + chrono::TimeDelta::seconds(1)).unwrap();
         assert!(!later.is_active);
         assert_eq!((later.expires_at, later.seconds_remaining, later.session_id.as_str()), (0, 0, ""));
+        assert_eq!(later.notice, None);
+        let stale = Snapshot { live_until: None, stale: true, ..snap };
+        let info = session_info(&stale, now).unwrap();
+        assert!(!info.is_active);
+        assert_eq!(info.notice.as_deref(), Some(link::STALE_NOTICE));
     }
 
     /// A failed pairing claims nothing: the engine's own texts for a

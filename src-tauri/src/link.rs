@@ -87,6 +87,15 @@ pub const UNLINKED_NOT_ERASED_NOTICE: &str = "Your vault removed this desktop, b
 /// How often the background task reads `vault.status` while a session is
 /// live (or an end waits for its answer).
 pub const REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long after the vault last confirmed the session (a `vault.status`
+/// read, a grant confirmed by one, an answered end) it is still shown as
+/// active: two refreshes. Past it, the UI shows it as not confirmed.
+pub const STALE_AFTER: TimeDelta = TimeDelta::seconds(2 * REFRESH_EVERY.as_secs() as i64);
+
+/// NEW TEXT (owner approval needed): the session may still run at the
+/// vault, but the vault hasn't confirmed it for [`STALE_AFTER`].
+pub const STALE_NOTICE: &str = "This desktop hasn't heard from your vault for a few minutes, so it doesn't show the session as active. It shows it again once your vault confirms it.";
+
 /// The pause after a failed poll while waiting for a grant.
 const POLL_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -119,6 +128,9 @@ pub struct Snapshot {
     pub reachable: bool,
     /// The vault's mailbox refused this device (§8.6): no session is live.
     pub refused: bool,
+    /// The access session is current as far as this desktop knows, but the
+    /// vault hasn't confirmed it for [`STALE_AFTER`]: not shown as live.
+    pub stale: bool,
 }
 
 impl Snapshot {
@@ -212,6 +224,10 @@ pub struct Link<T: Transport = Http, C: Clock = SystemClock> {
     /// The mailbox was collected once after the refusal (§8.6: a
     /// `device.unlinked` may still wait there).
     refusal_polled: bool,
+    /// When the vault last confirmed what this link knows of the session:
+    /// a `vault.status` read, or an answered end. `None`: never in this
+    /// run (no baseline).
+    confirmed: Option<DateTime<Utc>>,
 }
 
 impl<T: Transport, C: Clock> std::fmt::Debug for Link<T, C> {
@@ -239,7 +255,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
         if session.access_end_unreadable() {
             log::warn!("link: the stored unanswered end didn't read; it is settled through vault.status");
         }
-        Link { session, store, access: Access::new(), reachable: false, refusal_polled: false }
+        Link { session, store, access: Access::new(), reachable: false, refusal_polled: false, confirmed: None }
     }
 
     /// The vault's mailbox refused this device (`token_revoked`, §8.6), or
@@ -275,6 +291,9 @@ impl<T: Transport, C: Clock> Link<T, C> {
     pub async fn read_status(&mut self) -> Result<(), AccessError> {
         let r = self.access.read_status(&mut self.session, &mut self.store).await.map(drop);
         self.reachable = r.as_ref().err().is_none_or(answered);
+        if r.is_ok() {
+            self.confirmed = Some(Utc::now());
+        }
         self.note_refused().await;
         r
     }
@@ -283,8 +302,15 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// there is one.
     pub async fn refresh(&mut self) -> Result<(), AccessError> {
         let r = match self.access.read_status(&mut self.session, &mut self.store).await {
-            Ok(read) if read.end_pending => self.access.settle(&mut self.session, &mut self.store).await.map(drop),
-            Ok(_) => Ok(()),
+            Ok(read) => {
+                // The status read itself confirms what it named.
+                self.confirmed = Some(Utc::now());
+                if read.end_pending {
+                    self.access.settle(&mut self.session, &mut self.store).await.map(drop)
+                } else {
+                    Ok(())
+                }
+            }
             Err(e) => Err(e),
         };
         self.reachable = r.as_ref().err().is_none_or(answered);
@@ -298,16 +324,22 @@ impl<T: Transport, C: Clock> Link<T, C> {
     }
 
     /// Whether the background refresh still has something to do: a live
-    /// session to keep in view, or an end to settle. Never for a refused
-    /// device.
+    /// session to keep in view (and confirmed), an end to settle, or no
+    /// baseline yet (`vault.status` failed: the session is learned once the
+    /// network is back). Never for a refused device.
     pub fn keep_refreshing(&self, now: DateTime<Utc>) -> bool {
-        !self.refused() && (self.access.active_at(now) || self.session.access_end().is_some())
+        !self.refused() && (self.access.active_at(now) || self.session.access_end().is_some() || self.confirmed.is_none())
     }
 
-    /// What the UI may see now. A refused device shows no session.
+    /// What the UI may see now. A refused device shows no session; a
+    /// session the vault hasn't confirmed for [`STALE_AFTER`] isn't shown
+    /// as live (`stale`).
     pub fn snapshot(&self, now: DateTime<Utc>) -> Snapshot {
         let refused = self.refused();
-        let live_until = if refused { None } else { live_until(&self.access, now) };
+        let known = if refused { None } else { live_until(&self.access, now) };
+        let cap = self.confirmed.map(|c| c + STALE_AFTER);
+        let live_until = known.zip(cap).map(|(u, c)| u.min(c)).filter(|u| *u >= now);
+        let stale = known.is_some() && live_until.is_none();
         let current = live_until.and(self.access.current());
         Snapshot {
             unlocked: true,
@@ -317,6 +349,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
             live_until,
             reachable: self.reachable,
             refused,
+            stale,
         }
     }
 
@@ -401,6 +434,9 @@ impl<T: Transport, C: Clock> Link<T, C> {
     pub async fn end(&mut self) -> Result<EndOutcome, AccessError> {
         let r = self.access.end(&mut self.session, &mut self.store, None).await;
         self.reachable = r.as_ref().err().is_none_or(answered);
+        if r.is_ok() {
+            self.confirmed = Some(Utc::now());
+        }
         self.note_refused().await;
         r
     }
@@ -621,6 +657,39 @@ mod tests {
         assert_eq!(refresh_round(&mut slot).await, Round::Unlinked { erased: true });
         assert!(slot.is_none());
         assert!(!crate::credential::device_store::exists(dir.path()), "its state is erased");
+    }
+
+    /// MEDIUM 2: a session the vault hasn't confirmed for STALE_AFTER isn't
+    /// shown as live (it is "stale"), and is again once a status read
+    /// confirms it.
+    #[tokio::test]
+    async fn an_unconfirmed_session_goes_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.set_session(Some(("s-1", Utc::now() + TimeDelta::hours(1))));
+        link.read_status().await.unwrap();
+        let now = Utc::now();
+        let snap = link.snapshot(now);
+        assert!(snap.active_at(now) && !snap.stale);
+        assert!(snap.live_until.unwrap() <= now + STALE_AFTER, "capped at the confirmation");
+        link.confirmed = Some(now - STALE_AFTER - TimeDelta::seconds(1));
+        let snap = link.snapshot(now);
+        assert!(!snap.active_at(now), "not shown as live");
+        assert!(snap.stale);
+        assert!(link.keep_refreshing(now), "the refresh keeps trying to confirm it");
+        link.refresh().await.unwrap();
+        assert!(link.snapshot(Utc::now()).active_at(Utc::now()));
+    }
+
+    /// LOW 7: with no baseline (no successful vault.status yet) the refresh
+    /// keeps going; once the vault says there is no session, it stops.
+    #[tokio::test]
+    async fn the_refresh_runs_until_there_is_a_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_vault, mut link) = FakeVault::paired(dir.path());
+        assert!(link.keep_refreshing(Utc::now()), "no baseline yet");
+        link.read_status().await.unwrap();
+        assert!(!link.keep_refreshing(Utc::now()), "no session, nothing to keep up");
     }
 
     /// A request from a refused device isn't sent, and says why.

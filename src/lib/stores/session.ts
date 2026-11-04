@@ -88,6 +88,7 @@ export async function refreshSessionFromBackend(): Promise<void> {
       expires_at: number;
       seconds_remaining: number;
       is_active: boolean;
+      notice?: string | null;
     }>('get_session_info');
 
     if (info.is_active) {
@@ -103,6 +104,9 @@ export async function refreshSessionFromBackend(): Promise<void> {
         phoneReachable: true,
       });
     } else {
+      // The vault hasn't confirmed the session lately: say so (shown on
+      // the Start-a-new-session screen).
+      if (info.notice) sessionNotice.set(info.notice);
       sessionStore.update(s => ({ ...s, state: 'expired', secondsRemaining: 0 }));
     }
   } catch {
