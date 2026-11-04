@@ -1,21 +1,21 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import QRCode from 'qrcode';
   import { onDestroy } from 'svelte';
   import { sessionNotice } from '../stores/session';
 
   let inviteCode = $state('');
   let step = $state<'code' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error' | 'paired-no-session'>('code');
   let errorMessage = $state('');
-  let qrDataUrl = $state('');
-  let connectionId = $state('');
-  // The key the new pairing was saved under (#11): "keyring" or "machine".
+  // The six-digit code the member compares with their phone (§6.7).
+  let sas = $state('');
+  let sasInstruction = $state('');
+  // The key the new pairing was saved under (#11): "keyring".
   let keyProtection = $state('');
-  let unlistenQr: UnlistenFn | null = null;
+  let unlistenSas: UnlistenFn | null = null;
 
   onDestroy(() => {
-    unlistenQr?.();
+    unlistenSas?.();
   });
 
   // Svelte action: focus the input when it mounts so the user can
@@ -26,25 +26,17 @@
   }
 
   async function submit() {
-    // The phone app generates 12-char codes displayed as three
-    // 4-character blocks (ABCD-EFGH-JKLM). Accept either form on
-    // input — strip dashes/whitespace before validating.
-    inviteCode = inviteCode.replace(/[\s-]/g, '').toUpperCase();
-    if (inviteCode.length !== 12) {
-      errorMessage = 'Invite code must be 12 characters.';
-      return;
-    }
+    // The pairing code is pasted as the phone shows it; the backend reads
+    // it (only surrounding whitespace is dropped).
+    inviteCode = inviteCode.trim();
+    if (!inviteCode) return;
     errorMessage = '';
     step = 'awaiting-qr';
 
-    // Listen for the QR event emitted by the backend after stage-1 resolves.
-    unlistenQr = await listen<{ connection_id: string; qr_payload: string }>('pairing:qr-ready', async (event) => {
-      connectionId = event.payload.connection_id;
-      try {
-        qrDataUrl = await QRCode.toDataURL(event.payload.qr_payload, { margin: 1, width: 280 });
-      } catch (e) {
-        errorMessage = `Failed to render QR: ${e}`;
-      }
+    // The backend emits the SAS once the handshake with the vault is done.
+    unlistenSas = await listen<{ sas: string; instruction: string }>('pairing:sas', (event) => {
+      sas = event.payload.sas;
+      sasInstruction = event.payload.instruction;
       step = 'awaiting-approval';
     });
 
@@ -78,10 +70,10 @@
     step = 'code';
     inviteCode = '';
     errorMessage = '';
-    qrDataUrl = '';
-    connectionId = '';
-    unlistenQr?.();
-    unlistenQr = null;
+    sas = '';
+    sasInstruction = '';
+    unlistenSas?.();
+    unlistenSas = null;
   }
 </script>
 
@@ -94,26 +86,27 @@
       <ol class="instructions">
         <li>Open VettID on your phone.</li>
         <li>Tap <strong>Connect Desktop</strong> from the feed FAB.</li>
-        <li>Type the 12-character code shown below — dashes are optional.</li>
+        <li>Copy the pairing code your phone shows, and paste it below.</li>
       </ol>
 
       <input
         type="text"
         bind:value={inviteCode}
-        maxlength="14"
-        placeholder="ABCD-EFGH-JKLM"
+        placeholder="Pairing code"
         class="code-field"
+        spellcheck="false"
+        autocomplete="off"
         use:autofocus
-        oninput={() => { inviteCode = inviteCode.toUpperCase(); errorMessage = ''; }}
+        oninput={() => { errorMessage = ''; }}
         onkeydown={(e) => {
-          if (e.key === 'Enter' && inviteCode.replace(/[\s-]/g, '').length === 12) {
+          if (e.key === 'Enter' && inviteCode.trim()) {
             e.preventDefault();
             submit();
           }
         }}
       />
 
-      <button class="btn primary" onclick={submit} disabled={inviteCode.replace(/[\s-]/g, '').length !== 12}>
+      <button class="btn primary" onclick={submit} disabled={!inviteCode.trim()}>
         Connect
       </button>
 
@@ -124,10 +117,10 @@
       </div>
 
     {:else if step === 'awaiting-approval'}
-      <p class="subtitle">Scan this QR with your phone to authorize the session.</p>
-      {#if qrDataUrl}
-        <img src={qrDataUrl} alt="Authorization QR" class="qr" />
+      {#if sas}
+        <p class="sas" aria-label="Pairing check code">{sas}</p>
       {/if}
+      <p class="subtitle">{sasInstruction}</p>
       <div class="waiting">
         <div class="spinner"></div>
         <p>Awaiting approval on your phone…</p>
@@ -224,7 +217,7 @@
   .btn.primary { background: var(--accent); color: #1a1a1a; font-weight: 500; }
   .btn.primary:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn.secondary { background: rgba(255,255,255,0.05); color: var(--text-muted); }
-  .qr { display: block; margin: 0 auto 16px; background: white; padding: 10px; border-radius: 8px; }
+  .sas { font-family: 'Courier New', monospace; font-size: 2rem; letter-spacing: 0.3em; text-align: center; margin: 8px 0 12px; }
   .waiting { display: flex; align-items: center; gap: 12px; padding: 16px;
              background: rgba(15, 52, 96, 0.3); border-radius: 8px; margin-top: 16px; }
   .waiting p { color: var(--text-muted); }

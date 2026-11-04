@@ -75,7 +75,7 @@ export function resetSession() {
 
 /**
  * Ask the backend for the current session state from the loaded credentials
- * and update the store. Cheap and offline — no NATS calls. Callers should
+ * and update the store. Cheap and offline — no vault calls. Callers should
  * invoke on app launch and periodically (e.g., every 30s) to drive the
  * expiry UI.
  */

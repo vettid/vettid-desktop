@@ -73,7 +73,7 @@ async function notify(title: string, body: string): Promise<void> {
 
 /**
  * Initialise desktop notifications. Idempotent — call once at app start
- * (App.svelte onMount), alongside initCallListener / initNatsListener.
+ * (App.svelte onMount), alongside initCallListener.
  */
 export function initNotifications(): void {
   if (initialized) return;

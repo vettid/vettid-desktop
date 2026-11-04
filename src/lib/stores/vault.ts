@@ -8,16 +8,6 @@ import { decodeEventPayload } from '../events';
 // Store-local types
 // ---------------------------------------------------------------------------
 
-/**
- * NATS connection state surfaced by the Rust listener via `vault:nats-state`.
- * Mirrors the kebab-case serialization of `NatsConnectionEvent`.
- */
-export type NatsState =
-    | 'connected'
-    | 'disconnected'
-    | 'lame-duck-mode'
-    | 'unknown';
-
 export interface PendingApproval {
     requestId: string;
     operation: string;
@@ -42,7 +32,6 @@ export interface AppEventEnvelope {
 
 export const connectionsStore: Writable<Connection[]> = writable([]);
 export const pendingApprovalsStore: Writable<PendingApproval[]> = writable([]);
-export const natsStateStore: Writable<NatsState> = writable('unknown');
 
 /** Per-connection unread count, keyed by connection_id. */
 export const unreadByConnectionStore: Writable<Record<string, number>> = writable({});
@@ -82,23 +71,6 @@ let listenersInitialized = false;
 export function initVaultListeners(): void {
     if (listenersInitialized) return;
     listenersInitialized = true;
-
-    // Connection-state events from the NATS listener — drives the StatusBar
-    // indicator and triggers re-sync on reconnect.
-    listen<{ [key: string]: unknown } | string>('vault:nats-state', (event) => {
-        const value = event.payload;
-        const stateName =
-            typeof value === 'string'
-                ? value
-                : (Object.keys(value)[0] as string | undefined) ?? 'unknown';
-        natsStateStore.set(stateName as NatsState);
-
-        if (stateName === 'connected') {
-            // Refresh the data the user can see when the link comes back up;
-            // missed push events are replaced with the authoritative list.
-            void loadConnections();
-        }
-    });
 
     // Connection lifecycle (peer-accepted, activated, key-exchanged, rejected).
     // We re-list to pick up state transitions — cheaper than maintaining a
@@ -172,7 +144,7 @@ export function initVaultListeners(): void {
 
     // Vault locked — UI must prompt for re-unlock.
     listen<unknown>('vault:vault-locked', () => {
-        // Surface via natsState so the StatusBar can show a "vault locked" pill.
+        // The StatusBar could show a "vault locked" pill.
         // A dedicated locked-state store would belong in session.ts — wired
         // there in a follow-up when we have the re-unlock UX.
     });

@@ -100,7 +100,7 @@
 
 {#if busy}
   <!-- Full-view takeover while end-session / lock is in flight. The
-       end-session round-trip (publish + NATS flush + on-disk reset)
+       end-session round-trip with the vault (through the relay)
        can take a beat; without this the user sees a frozen, still-
        clickable screen and assumes nothing happened. -->
   <div class="busy-overlay">

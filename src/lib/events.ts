@@ -1,5 +1,6 @@
-// events.ts — helpers for the vault:* Tauri event envelopes emitted by
-// the Rust listener in src-tauri/src/nats/listener.rs.
+// events.ts — helpers for the vault:* Tauri event envelopes. Nothing emits
+// them in this build: the NATS listener that did is gone, and the relay
+// session doesn't forward vault events yet.
 //
 // Every event payload is uniformly shaped as
 //   { subject: string, payload_b64: string }
