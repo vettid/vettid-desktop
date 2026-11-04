@@ -631,6 +631,62 @@ pub(crate) mod tests {
         assert!(store_in(&dir).load().unwrap().is_some());
     }
 
+    /// A header that names another protector that is present here doesn't
+    /// open: a file sealed by one isn't handed to the other. Corrupt, and
+    /// the file is kept.
+    #[test]
+    fn a_header_naming_another_present_protector_doesnt_open() {
+        use protector::{Availability, DataKey, Protector, ProtectorError, Protectors};
+        /// Present, with its own wrapping (the test protector's, inverted).
+        struct Other(testing::TestProtector);
+        impl Protector for Other {
+            fn id(&self) -> &'static str {
+                "other"
+            }
+            fn availability(&self) -> Availability {
+                self.0.availability()
+            }
+            fn probe(&self) -> Result<(), ProtectorError> {
+                self.0.probe()
+            }
+            fn wrap(&self, key: &[u8; 32]) -> Result<Vec<u8>, ProtectorError> {
+                Ok(self.0.wrap(key)?.into_iter().map(|b| !b).collect())
+            }
+            fn unwrap(&self, wrapped: &[u8]) -> Result<DataKey, ProtectorError> {
+                let inverted: Vec<u8> = wrapped.iter().map(|b| !b).collect();
+                self.0.unwrap(&inverted)
+            }
+            fn remove_external(&self) -> Result<(), ProtectorError> {
+                self.0.remove_external()
+            }
+        }
+        let both = |first: &Arc<Behaviour>, second: &Arc<Behaviour>| {
+            Protectors::new(
+                vec![Box::new(testing::TestProtector(first.clone())), Box::new(Other(testing::TestProtector(second.clone())))],
+                Box::new(testing::TestLegacy(first.clone())),
+            )
+        };
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        let (first, second) = (Arc::new(Behaviour::default()), Arc::new(Behaviour::default()));
+        // Sealed by "test", renamed to "other"; then sealed by "other"
+        // ("test" absent), renamed to "test".
+        for (sealer_absent, renamed_to) in [(false, "other"), (true, "test")] {
+            fs::remove_dir_all(&dir).ok();
+            Behaviour::set(&first.absent, sealer_absent);
+            DeviceStore::with_protectors(&dir, None, both(&first, &second)).save(STATE).unwrap();
+            Behaviour::set(&first.absent, false);
+            let mut f = read_sealed(&dir);
+            assert_ne!(f.header.protector, renamed_to);
+            f.header.protector = renamed_to.into();
+            write_sealed(&dir, &f);
+            let mut s = DeviceStore::with_protectors(&dir, None, both(&first, &second));
+            assert_eq!(s.load(), Err(StoreError::Corrupt), "renamed to {renamed_to}");
+            assert!(matches!(s.take_failure(), Some(CredentialError::Unreadable)));
+            assert!(exists(&dir), "kept");
+        }
+    }
+
     /// Fail secure: a protector that fails at save writes nothing and says
     /// so; with none present, the no-protector notice. Never a fallback.
     #[test]

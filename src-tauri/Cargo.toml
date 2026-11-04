@@ -98,11 +98,12 @@ serde_bytes = "0.11"
 
 # OS keyring (Secret Service on Linux, Keychain on macOS). Off Windows it
 # holds the device file's data key (credential/protector.rs, the interim
-# protector until the TPM, keychain and passphrase ones, #13). `linux-native`
-# avoids the Secret Service D-Bus dependency mismatch some distros
-# have; on macOS the default platform store is the Keychain. Windows
+# protector until the TPM, keychain and passphrase ones, #13). On Linux
+# that is the Secret Service alone (`sync-secret-service`, the plan's
+# choice (b)), with its D-Bus session encrypted (`crypto-rust`), not the
+# kernel keyring; on macOS the platform store is the Keychain. Windows
 # does not use it: the device file is protected by DPAPI there.
-keyring = { version = "3", default-features = false, features = ["apple-native", "linux-native", "sync-secret-service"] }
+keyring = { version = "3", default-features = false, features = ["apple-native", "sync-secret-service", "crypto-rust"] }
 
 # Win32 calls for the Windows machine fingerprint (registry, disk serial,
 # network adapters), DPAPI (Win32_Security_Cryptography: the device file's
