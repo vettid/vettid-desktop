@@ -90,6 +90,12 @@ pub const UNLINKED_NOT_ERASED_NOTICE: &str = "Your vault removed this desktop, b
 /// How often the background task reads `vault.status` while a session is
 /// live (or an end waits for its answer).
 pub const REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+/// After a refusal (`token_revoked`): how long between collecting the
+/// mailbox again, for a `device.unlinked` that arrives later (§8.6), and
+/// how many times in all. Bounded: two hours at most, then nothing more
+/// until the next launch. Each collect waits at most one poll (25 s).
+pub const REFUSED_RECHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+pub const REFUSED_RECHECKS: u32 = 8;
 /// How long after the vault last confirmed the session (a `vault.status`
 /// read, a grant confirmed by one, an answered end) it is still shown as
 /// active: two refreshes. Past it, the UI shows it as not confirmed.
@@ -273,13 +279,28 @@ impl<T: Transport, C: Clock> Link<T, C> {
 
     /// After an operation: if the device has just been found refused,
     /// collect its mailbox once, where a `device.unlinked` may still wait
-    /// (§8.6); [`Link::unlinked`] then says so.
+    /// (§8.6); [`Link::unlinked`] then says so. Later collects are
+    /// [`Link::recheck_refused`]'s.
     async fn note_refused(&mut self) {
         if !self.refused() || self.refusal_polled {
             return;
         }
         self.refusal_polled = true;
         log::warn!("link: the vault's mailbox refused this device");
+        self.collect_refused().await;
+    }
+
+    /// Collect the mailbox of a refused device once more, where a
+    /// `device.unlinked` sent after the refusal may now wait (§8.6);
+    /// [`Link::unlinked`] then says so. Nothing is shown or claimed on a
+    /// failed collect: the device stays refused, with no session.
+    pub async fn recheck_refused(&mut self) {
+        if self.refused() && !self.unlinked() {
+            self.collect_refused().await;
+        }
+    }
+
+    async fn collect_refused(&mut self) {
         match self.session.poll(&mut self.store).await {
             Ok(msgs) => {
                 for m in &msgs {
@@ -550,6 +571,33 @@ pub async fn refresh_round<T: Transport, C: Clock>(slot: &mut Option<Link<T, C>>
     }
 }
 
+/// One recheck of a refused link in `slot` ([`Link::recheck_refused`]): a
+/// device the vault has removed since is erased and taken out; otherwise it
+/// is left as it was (refused, no session).
+pub async fn recheck_refused_round<T: Transport, C: Clock>(slot: &mut Option<Link<T, C>>) -> Round {
+    let Some(link) = slot.as_mut() else { return Round::Gone };
+    link.recheck_refused().await;
+    if link.unlinked() {
+        let link = slot.take().expect("checked above");
+        return Round::Unlinked { erased: link.erase() };
+    }
+    Round::Continue(link.snapshot(Utc::now()))
+}
+
+/// What the person is told, and the state kept, once the vault removed the
+/// device: the same wherever it was found.
+async fn finish_unlinked(shared: &Shared, erased: bool) {
+    shared.publish(Snapshot::default());
+    if erased {
+        *shared.is_registered.write().await = false;
+        log::warn!("link: the vault removed this device; its state is erased");
+        shared.tell(UNLINKED_ERASED_NOTICE);
+    } else {
+        log::error!("link: the vault removed this device; its state couldn't be erased");
+        shared.tell(UNLINKED_NOT_ERASED_NOTICE);
+    }
+}
+
 /// The background refresh: after `first`, then every [`REFRESH_EVERY`], a
 /// [`refresh_round`], until there is nothing left to keep up
 /// ([`Link::keep_refreshing`]), the link is gone, the device is refused, or
@@ -567,21 +615,32 @@ pub fn spawn_refresh(shared: Shared, first: std::time::Duration) -> JoinHandle<(
                 Round::Continue(snap) => shared.publish(snap),
                 Round::Stop(snap, notice) => {
                     shared.publish(snap);
+                    let refused = notice == Some(REFUSED_NOTICE);
                     if let Some(n) = notice {
                         shared.tell(n);
+                    }
+                    if !refused {
+                        return;
+                    }
+                    // A refused device: a `device.unlinked` may still come.
+                    // Look again on a slow, bounded schedule.
+                    drop(slot);
+                    for _ in 0..REFUSED_RECHECKS {
+                        tokio::time::sleep(REFUSED_RECHECK_EVERY).await;
+                        let mut slot = shared.link.lock().await;
+                        match recheck_refused_round(&mut slot).await {
+                            Round::Unlinked { erased } => {
+                                finish_unlinked(&shared, erased).await;
+                                return;
+                            }
+                            Round::Gone => return,
+                            _ => {}
+                        }
                     }
                     return;
                 }
                 Round::Unlinked { erased } => {
-                    shared.publish(Snapshot::default());
-                    if erased {
-                        *shared.is_registered.write().await = false;
-                        log::warn!("link: the vault removed this device; its state is erased");
-                        shared.tell(UNLINKED_ERASED_NOTICE);
-                    } else {
-                        log::error!("link: the vault removed this device; its state couldn't be erased");
-                        shared.tell(UNLINKED_NOT_ERASED_NOTICE);
-                    }
+                    finish_unlinked(&shared, erased).await;
                     return;
                 }
             }
@@ -672,6 +731,52 @@ mod tests {
         assert!(!link.keep_refreshing(Utc::now()));
         assert!(!link.unlinked());
         assert_eq!(vault.collects(), 1, "collected once after the refusal");
+    }
+
+    /// #65: a `device.unlinked` that arrives after the refusal (and after
+    /// the one collect that followed it) is found by a later recheck: the
+    /// device is erased. Before it arrives a recheck collects again and
+    /// changes nothing: still refused, no session shown.
+    #[tokio::test]
+    async fn a_device_unlinked_after_the_refusal_is_found_by_a_recheck() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.set_session(Some(("s-1", Utc::now() + TimeDelta::hours(1))));
+        link.read_status().await.unwrap();
+        vault.revoke(false);
+        let mut slot = Some(link);
+        assert!(matches!(refresh_round(&mut slot).await, Round::Stop(_, Some(REFUSED_NOTICE))));
+        assert_eq!(vault.collects(), 1, "collected once after the refusal");
+
+        match recheck_refused_round(&mut slot).await {
+            Round::Continue(snap) => {
+                assert!(snap.refused);
+                assert!(!snap.active_at(Utc::now()), "no session shown");
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert_eq!(vault.collects(), 2, "collected again");
+        assert!(slot.is_some());
+        assert!(crate::credential::device_store::exists(dir.path()), "nothing erased yet");
+
+        vault.event("device.unlinked", "{}", Utc::now());
+        assert_eq!(recheck_refused_round(&mut slot).await, Round::Unlinked { erased: true });
+        assert!(slot.is_none());
+        assert!(!crate::credential::device_store::exists(dir.path()), "its state is erased");
+        assert_eq!(recheck_refused_round(&mut slot).await, Round::Gone);
+    }
+
+    /// #65: a link that isn't refused is not collected by a recheck.
+    #[tokio::test]
+    async fn a_recheck_leaves_a_device_that_isnt_refused_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, link) = FakeVault::paired(dir.path());
+        vault.revoke(false);
+        vault.event("device.unlinked", "{}", Utc::now());
+        let mut slot = Some(link);
+        // Not yet found refused (nothing sent): nothing is collected.
+        assert!(matches!(recheck_refused_round(&mut slot).await, Round::Continue(_)));
+        assert_eq!(vault.collects(), 0);
     }
 
     /// HIGH 1: a refused device whose mailbox still holds `device.unlinked`
