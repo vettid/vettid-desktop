@@ -245,71 +245,73 @@ takes when it can't unlock.
 
 ### At-rest protectors (AG3, #13; proposed 2026-11-04, needs the owner's approval)
 
-The desktop follows the agent's AG3 design (AGENT-PLAN §4.2): one
-state file (`device.enc`: the device engine's `DeviceState`, which holds
-its seeds, the vault record, tokens and the session keyring), sealed
-with XChaCha20-Poly1305 under a **random 256-bit data key**. The data
-key is **wrapped by a platform protector** and stored, wrapped, in the
-file's header. That header is the associated data. A new data key is
-made at each pairing. The machine-attribute key (`platform_key`, the
-"machine-bound" mode) is **dropped**: it is an HMAC of values any local
-process can read, so it adds obscurity, not a secret.
+The desktop follows the agent's AG3 design (AGENT-PLAN §4.2), with the
+deviations marked below.
 
-**Why move off the keyring.** Today the data key is the OS keyring's
-master key. That works, but it fails two of AG3's aims. On macOS the
-`keyring` crate uses the file-based login keychain, which drops
-`ThisDeviceOnly` and travels with Time Machine and Migration Assistant.
-On Linux, a Secret Service collection opens on any machine with the
-home directory and the login password. And the keyring entry lives
-apart from the file, so a wipe has two parts to get right.
+**Format.**
+- **The file:** one state file, `device.enc`, holding the device engine's `DeviceState`: its seeds, the vault record, tokens and the session keyring.
+- **Encryption:** it is sealed with XChaCha20-Poly1305 under a **random 256-bit data key**. The data key is **wrapped by a platform protector** and kept, wrapped, in the file's header.
+- **The header:** `{v, protector, wrapped_key, nonce, created_at}`. The passphrase protector adds the Argon2id salt and parameters, so the parameters can be raised later.
+- **Associated data:** the header bytes plus the label `vettid-desktop-device-v1`.
+- **When a key is made:** a new data key at each pairing.
+- **The file itself:** written to a temporary file, synced and renamed. It keeps the owner-only permissions checked at load: the DACL on Windows, 0700 for the folder and 0600 for the file elsewhere.
 
-**Protectors, in the order the desktop tries them:**
+**Dropped:**
+- the machine-attribute key (`platform_key`, the "machine-bound" mode), because it is an HMAC of values any local process can read, so it adds obscurity, not a secret;
+- the #14 storage binding (a machine-id HMAC) from the associated data, so a machine without a readable machine id can pair.
 
-| Platform | Protector | Copied to another machine | Notes |
-|---|---|---|---|
-| Windows | **DPAPI, user scope** (`CryptProtectData`, `CRYPTPROTECT_UI_FORBIDDEN`, an app-specific entropy label) | Doesn't open: it needs this user's DPAPI master key on this computer | It replaces today's Credential Manager entry (`wincred.rs`), which is DPAPI underneath but a second object to wipe. The owner-only DACL check stays. A **domain account** or a **roaming profile** gets a notice, not a refusal (as AGENT-PLAN §4.2, 2026-10-18): the organization can recover the key, or it opens wherever the profile loads |
-| macOS | **Data protection keychain** item, `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, not synchronizable | Doesn't open | It needs a `keychain-access-groups` entitlement, so only the **signed app bundle** (the owner's App ID and provisioning profile) can use it. An unsigned or ad-hoc build falls back to the passphrase protector and says why |
-| Linux | **TPM 2.0** (`/dev/tpmrm0`): the data key sealed to this TPM | Doesn't open | Used when a TPM resource manager is present and usable by the user |
-| Linux, no TPM | **Secret Service** (GNOME Keyring or KWallet), as today | **Opens** with the home directory and the login password | The desktop says "not bound to this computer" in Settings. *Owner's choice (b): skip this step and go straight to the passphrase* |
-| Any, none of the above | **Passphrase** (Argon2id at least at VAULT-MESSAGING §4.1's password parameters; the strength rules of §1), asked at each launch | Opens anywhere with the passphrase | Says "not bound to this computer". *Owner's choice (c): refuse to pair instead* |
+**Why move off the keyring.**
+- **macOS:** today the data key is the OS keyring's master key. The `keyring` crate uses the file-based login keychain, which doesn't support `ThisDeviceOnly`, and its items travel with Time Machine and Migration Assistant.
+- **Linux:** a Secret Service collection opens on another machine given the keyring file and its login password.
+- **Wiping:** the keyring entry lives apart from the file, so a wipe has two parts to get right.
+
+**Protectors, best first:**
+
+| Platform | Protector | What it binds to, and who can still open it |
+|---|---|---|
+| Windows | **DPAPI, user scope**: `CryptProtectData` with `CRYPTPROTECT_UI_FORBIDDEN` and an app-specific entropy label. `CRYPTPROTECT_LOCAL_MACHINE` is **not** set. It replaces today's Credential Manager entry (`wincred.rs`), which is DPAPI underneath but a second object to wipe. | A copy of the state file alone doesn't open elsewhere. A copy of the whole profile (the DPAPI master keys are under `%APPDATA%\Microsoft\Protect`) **plus the user's password** does. Any process running as this user can unwrap; the entropy label is domain separation, not a secret. An administrator can unwrap by running code as the user, or from LSASS, while the user is logged on. That is out of scope, and the README says so. A **domain account** or **roaming profile** gets a notice, not a refusal (AGENT-PLAN §4.2, 2026-10-18). A check that fails gives no notice, so no notice is not a guarantee. (`device.enc` is in `%LOCALAPPDATA%`, which doesn't roam.) |
+| macOS | **Data protection keychain** item, `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, not synchronizable. It needs a `keychain-access-groups` entitlement, so only the **signed app bundle** (the owner's App ID and provisioning profile) can use it. | This device only. Without the entitlement (an unsigned or ad-hoc build), the keychain is *absent* and the next protector is used, with the reason shown. |
+| Linux | **TPM 2.0** through `/dev/tpmrm0`: the data key sealed under a primary key in the storage hierarchy, with **no PCR policy** (so firmware and kernel updates don't lock the person out) and no authValue. Built on `tss-esapi`, which needs `libtss2` as a package dependency. | This TPM only. Root, or any user who can read the file and use the TPM, can unseal. Clearing the TPM loses the state: a load failure, so re-pair. Many distributions give `/dev/tpmrm0` to `root:tss` only, so an ordinary user often has no TPM. |
+| Linux, no TPM | **Secret Service** (GNOME Keyring or KWallet). **A deviation from AG3**, which has no such step; owner's choice (b) below. | It opens on another machine given the keyring file and its login password. It doesn't meet LEASH §3.4's "copying … MUST render them undecryptable". Settings says "not bound to this computer". |
+| Any, none of the above | **Passphrase**: Argon2id at least at VAULT-MESSAGING §4.1's password parameters, with §1's strength rules applied at pairing. Asked at each launch. Owner's choice (c) below. | It opens anywhere with the passphrase. It doesn't meet LEASH §3.4, and Settings says "not bound to this computer". The passphrase is zeroized in Rust and never logged (it crosses IPC as a webview string that can't be zeroized). Wrong entries get a growing delay. A forgotten passphrase means re-pairing; there is no recovery. |
 
 **Rules:**
-- **Fail secure.** A protector that fails at load (DPAPI error, TPM
-  busy, keychain locked) keeps the file and says why; it is never
-  re-sealed to a weaker protector on its own. Choosing a weaker
-  protector happens only at pairing, and the person is told which.
-- **Wipe** (log out, `device.unlinked`): delete the file (and its
-  temporary copies), and delete the protector's key where it keeps
-  one: the keychain item. DPAPI and the TPM keep none outside the file.
-  As in AGENT-PLAN §4.2, an old copy of the file recovered from a
-  backup or the raw disk can still be opened on the same computer by
-  the same user (DPAPI, TPM). That is accepted for v1 and said in the
-  README.
-- **Status:** Settings shows the protector in use and whether the state
-  is bound to this computer.
-- **Migration:** a `device.enc` sealed under today's keyring key is
-  re-sealed under the new protector at its next load (it is opened
-  first, so nothing is lost), and the old keyring entry is then deleted.
-  A machine-bound store from an earlier build is deleted unread, as
-  `connection.enc` is today.
+- **Absent and failing are different.** At pairing the desktop moves to the next protector only when the better one is *absent*: no device, no entitlement, no service. That is detected, never inferred from an error. A protector that is present but fails (DPAPI error, TPM busy, keychain locked) **stops the pairing with the reason**.
+- **No silent downgrade.** At load, a file whose protector ranks below the best one available here opens only after a notice saying so, and Settings keeps showing it. A file is never re-sealed to a weaker protector. A protector that fails at load keeps the file, says why, and offers a re-pair; it never falls back on its own.
+- **Migration: none** (decision #2 stands).
+  - **What is deleted:** a `device.enc` in today's keyring-sealed format is deleted unread, and so is the old `master-key-v1` keyring or Credential Manager entry.
+  - **Re-pairing:** the person re-pairs, with a notice.
+  - **Reporting:** a deletion is reported only once it is confirmed.
+  - **The legacy file:** `connection.enc` stays removed unread, as today.
+- **Wipe** (log out, `device.unlinked`):
+  - **What goes:** the file and its temporary copies, plus the protector's key where it keeps one (the keychain item) and any legacy `master-key-v1` entry. DPAPI and the TPM keep nothing outside the file.
+  - **No overwrite:** AG3's "overwrite" step is dropped, since overwriting is not reliable on SSDs or journalled file systems.
+  - **Confirmed, or "not removed":** each part is confirmed gone (`confirm_gone`). A part that can't be confirmed is reported as "not removed" and retried, never reported as done on a guess.
+  - **Old copies:** as in AGENT-PLAN §4.2, an old copy of the file recovered from a backup or the raw disk can still be opened on the same computer by the same user (DPAPI, TPM). That is accepted for v1, and the README says so.
+- **Status:** Settings shows the protector in use and whether the state is bound to this computer.
+- **No weaker test modes in member builds.**
+  - **Test protectors** (fixed keys, the `swtpm` wiring) are `#[cfg(test)]` only. No build flag or environment variable selects a weaker protector in a build a member could run.
+  - **Logging:** a protector's error is logged by its code, never with key bytes or the passphrase.
+
+**Owner's choices:**
+- **(b) Secret Service on Linux without a TPM.**
+  - *Keep (recommended):* most Linux desktops have a keyring but no TPM the user can reach. Without this step, they would go straight to a passphrase at every launch.
+  - *Drop:* restores AG3 exactly.
+- **(c) When no protector binds to this computer.**
+  - *Passphrase (recommended):* as AG3.
+  - *Refuse to pair:* keeps the desktop passwordless (§4). But then no macOS desktop can pair until the signed build exists, and, with (b) dropped, no Linux desktop without TPM access can either.
 
 **Done** (task 01M6EFHHANEEVAMCKH3WT7JM71):
-- a round trip per protector;
-- a copied state doesn't open, where the protector claims that;
-- the machine-bound code is removed.
+- **Round trips:** DPAPI (on the Windows test machine), TPM (against `swtpm` in CI, if CI has it; otherwise on a Linux machine) and the passphrase.
+- **Copy refusal:**
+  - DPAPI: tested as a second Windows user, and on a second VM if one is available. The second user stands in for "another machine"; the README says so.
+  - TPM: tested with a second `swtpm` instance.
+- **Removed:** the machine-bound code and the #14 binding.
+- **Not done in this task; follow-up tasks, listed as open:**
+  - the macOS keychain round trip, which needs the owner's signed build (until then macOS uses the next protector);
+  - the Secret Service check, if (b) is kept.
 
-**Where each is tested:**
-- **Windows (DPAPI):** on the Windows test machine, including "another
-  Windows user can't open it".
-- **Linux:** in CI. The TPM protector runs against a software TPM
-  (`swtpm`) where CI has one, and Secret Service against a headless
-  `gnome-keyring` if practical.
-- **macOS keychain:** needs the owner's signed build, so it is checked
-  on a Mac when that build exists. Until then, macOS uses the passphrase
-  protector.
-
-Built in that order: Windows first (it can be tested here), then
-Linux, then macOS.
+Built in that order: Windows first (it can be tested here), then Linux, then macOS.
 
 ---
 
