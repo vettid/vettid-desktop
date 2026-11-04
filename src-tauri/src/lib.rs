@@ -6,6 +6,7 @@ pub mod session;
 pub mod commands;
 pub mod state;
 pub mod tray;
+pub mod uninstall;
 #[cfg(feature = "webrtc")]
 pub mod webrtc;
 

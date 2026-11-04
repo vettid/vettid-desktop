@@ -814,6 +814,15 @@ fn wipe_locked(config_dir: &Path) -> Result<(), CredentialError> {
     confirm_wiped(config_dir)
 }
 
+/// Whether a pairing may be saved in `config_dir`: this build's device
+/// file, the earlier builds' `connection.enc`, or a temporary copy of
+/// either. True also when that can't be ruled out (a stat or listing error
+/// other than "not found"), as [`exists`]. For the uninstaller's wipe
+/// (`uninstall`), which says "this desktop was paired" only on this.
+pub fn pairing_may_be_present(config_dir: &Path) -> bool {
+    confirm_wiped(config_dir).is_err()
+}
+
 /// Ok only if the file system confirms that neither the pairing file nor
 /// a temporary copy of it is in `config_dir`. Anything that can't be
 /// checked (a stat or listing error other than "not found") is an error:
