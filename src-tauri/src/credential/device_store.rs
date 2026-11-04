@@ -459,8 +459,14 @@ pub(crate) mod tests {
         assert!(!exists(&dir), "nothing was written back");
         let mut after = store_in(&dir);
         after.save(STATE).unwrap();
+        let later = fs::read(dir.join(DEVICE_FILE)).unwrap();
+        // The old store still can't write over the later pairing.
+        assert_eq!(before.save(b"{\"v\":1,\"ik_seed\":\"b2xkLXN0b3Jl\"}"), Err(StoreError::Io));
+        assert!(matches!(before.take_failure(), Some(CredentialError::LoggedOutMeanwhile)));
+        assert_eq!(fs::read(dir.join(DEVICE_FILE)).unwrap(), later, "the later pairing is byte for byte as it was");
         before.clear().unwrap();
         assert!(exists(&dir), "the later pairing stays");
+        assert_eq!(fs::read(dir.join(DEVICE_FILE)).unwrap(), later, "and untouched by the clear");
     }
 
     #[test]

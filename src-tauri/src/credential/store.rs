@@ -1102,7 +1102,9 @@ pub(crate) mod tests {
         fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o000)).unwrap();
         let root_ignores_modes = fs::read_dir(&config_dir).is_ok();
         let present = exists(&config_dir);
-        let update = store_for_tests(&config_dir).save(b"update");
+        let mut s = store_for_tests(&config_dir);
+        let update = s.save(b"update");
+        let why = s.take_failure();
         let confirmed = confirm_wiped(&config_dir);
         fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
         if root_ignores_modes {
@@ -1110,6 +1112,7 @@ pub(crate) mod tests {
         }
         assert!(present, "can't be ruled out, so it may be there");
         assert!(update.is_err(), "no save on a guess");
+        assert!(matches!(why, Some(CredentialError::IoError(_))), "said as an I/O error: {why:?}");
         assert!(confirmed.is_err(), "not confirmed gone");
     }
 
