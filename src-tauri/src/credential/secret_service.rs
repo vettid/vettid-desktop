@@ -15,10 +15,11 @@
 //! `org.freedesktop.secrets` is neither owned on it nor activatable. Any
 //! other error is failing.
 //!
-//! **Removal** (log-out) sweeps every item of this app's service whose
-//! entry is a device key (this build's per-file entries and the single
-//! `device-key-v2` entry of the build before it) and then searches again:
-//! Ok only when none is left. The earlier format's `master-key-v1` entry
+//! **Removal** (log-out) deletes every device key item of this app (this
+//! build's per-file entries, found by their `kind` attribute, and the
+//! single `device-key-v2` entry of the build before it, by name) and then
+//! searches again: Ok only when none is left. Searches are by exact
+//! attributes only, which the Secret Service matches on locked items too. The earlier format's `master-key-v1` entry
 //! ([`LegacyEntry`]) is swept the same way. The earlier builds used the
 //! `keyring` crate 3.6 with `linux-native` and `sync-secret-service`, whose
 //! default store is the Secret Service (keyutils was only compiled in), so
@@ -53,6 +54,9 @@ const SERVICE: &str = "vettid-desktop";
 /// Device key entries: `device-key-v2.<hex id>`, and the build before
 /// this one's single `device-key-v2`.
 const ENTRY_PREFIX: &str = "device-key-v2";
+/// The `kind` attribute of this build's device key entries, which removal
+/// searches by.
+const ENTRY_KIND: &str = "device-key-v2";
 /// The earlier format's entry, only ever deleted.
 const LEGACY_ACCOUNT: &str = "master-key-v1";
 /// The Secret Service's well-known bus name.
@@ -193,30 +197,42 @@ fn connect() -> Result<Service, dbus_secret_service::Error> {
     Service::connect_with_max_prompt_timeout(EncryptionType::Dh, PROMPT_TIMEOUT_S)
 }
 
-/// This app's items whose `username` passes `wanted`, locked or not.
-fn matching<'a>(ss: &'a Service, wanted: &dyn Fn(&str) -> bool) -> Result<Vec<Item<'a>>, dbus_secret_service::Error> {
-    let found = ss.search_items(HashMap::from([("service", SERVICE)]))?;
-    let mut items = Vec::new();
-    for item in found.unlocked.into_iter().chain(found.locked) {
-        let attrs = item.get_attributes()?;
-        if attrs.get("service").map(String::as_str) == Some(SERVICE) && attrs.get("username").is_some_and(|u| wanted(u)) {
-            items.push(item);
+/// An attribute search: every item having all of these attributes.
+type Search = &'static [(&'static str, &'static str)];
+
+/// The device key entries: this build's (marked by `kind`) and the single
+/// entry of the build before it.
+const DEVICE_ENTRIES: &[Search] = &[&[("service", SERVICE), ("kind", ENTRY_KIND)], &[("service", SERVICE), ("username", ENTRY_PREFIX)]];
+/// The earlier format's entry, as `keyring` 3.6 wrote it.
+const LEGACY_ENTRIES: &[Search] = &[&[("service", SERVICE), ("username", LEGACY_ACCOUNT)]];
+
+/// The items the searches find, locked or not, each once. Only searches by
+/// exact attributes: the Secret Service matches them on locked items too,
+/// where it may not show their attributes.
+fn matching<'a>(ss: &'a Service, searches: &[&[(&str, &str)]]) -> Result<Vec<Item<'a>>, dbus_secret_service::Error> {
+    let mut items: Vec<Item<'a>> = Vec::new();
+    for search in searches {
+        let found = ss.search_items(search.iter().copied().collect())?;
+        for item in found.unlocked.into_iter().chain(found.locked) {
+            if !items.iter().any(|i| i.path == item.path) {
+                items.push(item);
+            }
         }
     }
     Ok(items)
 }
 
-/// Delete every item `wanted` picks, then search again: Ok only when none
-/// is left. With the Secret Service absent, there is nothing to reach
+/// Delete every item the searches find, then search again: Ok only when
+/// none is left. With the Secret Service absent, there is nothing to reach
 /// (module doc).
-fn sweep(bus: &BusSource, wanted: &dyn Fn(&str) -> bool, what: &'static str) -> Result<(), ProtectorError> {
+fn sweep(bus: &BusSource, searches: &[Search], what: &'static str) -> Result<(), ProtectorError> {
     if let Availability::Absent(why) = bus.availability() {
         log::info!("protector secret-service: {what}: nothing to remove here ({why}); any left in a keyring file goes at the next log-out with a Secret Service");
         return Ok(());
     }
     let not_removed = |detail: String| ProtectorError::NotRemoved { what, detail };
     let ss = connect().map_err(|e| not_removed(format!("connect: {e}")))?;
-    let items = matching(&ss, wanted).map_err(|e| not_removed(format!("search: {e}")))?;
+    let items = matching(&ss, searches).map_err(|e| not_removed(format!("search: {e}")))?;
     if !items.is_empty() {
         let mut locked = Vec::new();
         for item in &items {
@@ -231,17 +247,11 @@ fn sweep(bus: &BusSource, wanted: &dyn Fn(&str) -> bool, what: &'static str) -> 
             item.delete().map_err(|e| not_removed(format!("delete: {e}")))?;
         }
     }
-    match matching(&ss, wanted) {
+    match matching(&ss, searches) {
         Ok(left) if left.is_empty() => Ok(()),
         Ok(left) => Err(not_removed(format!("{} still there", left.len()))),
         Err(e) => Err(not_removed(format!("could not be checked: {e}"))),
     }
-}
-
-/// Whether `username` is a device key entry (this build's or the one
-/// before's).
-fn is_device_entry(username: &str) -> bool {
-    username == ENTRY_PREFIX || username.strip_prefix(ENTRY_PREFIX).is_some_and(|rest| rest.starts_with('.'))
 }
 
 /// The entry name in a header's `wrapped_key`, or why it isn't one.
@@ -283,7 +293,7 @@ impl Protector for SecretService {
         let ss = connect().map_err(|e| failing("connect", e))?;
         let collection = ss.get_default_collection().map_err(|e| failing("default collection", e))?;
         collection.ensure_unlocked().map_err(|e| failing("unlock", e))?;
-        let attrs = HashMap::from([("service", SERVICE), ("username", name.as_str())]);
+        let attrs = HashMap::from([("service", SERVICE), ("kind", ENTRY_KIND), ("username", name.as_str())]);
         let item = collection
             .create_item("VettID Desktop device key", attrs, key, false, "application/octet-stream")
             .map_err(|e| failing("write", e))?;
@@ -297,7 +307,8 @@ impl Protector for SecretService {
     fn unwrap(&self, wrapped: &[u8]) -> Result<DataKey, ProtectorError> {
         let name = entry_name(wrapped)?;
         let ss = connect().map_err(|e| failing("connect", e))?;
-        let mut items = matching(&ss, &|u| u == name).map_err(|e| failing("search", e))?;
+        let search = [("service", SERVICE), ("kind", ENTRY_KIND), ("username", name.as_str())];
+        let mut items = matching(&ss, &[&search]).map_err(|e| failing("search", e))?;
         let item = match items.len() {
             0 => return Err(ProtectorError::WontOpen("no keyring entry".into())),
             1 => items.remove(0),
@@ -313,7 +324,7 @@ impl Protector for SecretService {
         Ok(key)
     }
     fn remove_external(&self) -> Result<(), ProtectorError> {
-        sweep(&self.bus, &is_device_entry, "the keyring's device keys")
+        sweep(&self.bus, DEVICE_ENTRIES, "the keyring's device keys")
     }
 }
 
@@ -330,7 +341,7 @@ impl LegacyEntry {
 
 impl LegacyKey for LegacyEntry {
     fn remove(&self) -> Result<(), ProtectorError> {
-        sweep(&self.bus, &|u| u == LEGACY_ACCOUNT, "the earlier version's keyring key")
+        sweep(&self.bus, LEGACY_ENTRIES, "the earlier version's keyring key")
     }
 }
 
@@ -407,11 +418,10 @@ mod tests {
         for bad in [&b""[..], &[1u8; 16], &[1u8; 18], &[2u8; 17]] {
             assert!(matches!(entry_name(bad), Err(ProtectorError::WontOpen(_))), "{bad:?}");
         }
-        assert!(is_device_entry("device-key-v2"));
-        assert!(is_device_entry(&a));
-        for other in ["master-key-v1", "device-key-v20", "device-key-v3.ab", ""] {
-            assert!(!is_device_entry(other), "{other}");
-        }
+        // Removal finds this build's entries by `kind`, the build before's
+        // by its one name, and the earlier format's by its name: all exact.
+        assert_eq!(DEVICE_ENTRIES, &[&[("service", "vettid-desktop"), ("kind", "device-key-v2")][..], &[("service", "vettid-desktop"), ("username", "device-key-v2")][..]]);
+        assert_eq!(LEGACY_ENTRIES, &[&[("service", "vettid-desktop"), ("username", "master-key-v1")][..]]);
     }
 
     /// A live session bus with no Secret Service on it: absent. Needs
