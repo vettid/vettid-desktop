@@ -346,22 +346,36 @@ saved pairing works as above.
   assume the default folder; the two scripts below read that key.
 - **Uninstall:** `powershell -NoProfile -ExecutionPolicy Bypass -File uninstall-vettid.ps1`
   (`scripts/windows/uninstall-vettid.ps1`). It finds the folder and runs
-  `uninstall.exe /S /WIPEPAIRING _?=<folder>`, the one form that waits and wipes, and exits with its code:
-  0 when the saved pairing is confirmed gone, 2 when it isn't (event 1001, 1002 or 1003 in the Application
-  log, see Scripts). If the program is already gone, nothing can run the wipe: the script exits 2 while any
-  file is left in `%LOCALAPPDATA%\vettid-desktop`, without a new event, and 0 (removing the leftover
-  `uninstall.exe`) when none is. A management tool must count 2 as a failure, which Intune's default return
-  codes do.
+  `uninstall.exe /S /WIPEPAIRING _?=<folder>`, the one form that waits and wipes. It exits 0 only when the
+  saved pairing is confirmed gone, and 2 otherwise (event 1001, 1002 or 1003 in the Application log, see
+  Scripts). It also exits 2:
+  - when the program is there but its `uninstall.exe` is missing or won't run;
+  - on any error of its own (fail secure).
+
+  If the program is already gone, nothing can run the wipe. The script then exits 2, without a new event,
+  while anything is left in `%LOCALAPPDATA%\vettid-desktop` (hidden files and subfolders included; a folder
+  it can't read counts as left) or the earlier format's Credential Manager entry
+  (`vettid-desktop/master-key-v1/local`, checked with `cmdkey`) is still there. It exits 0 when neither is.
+  It deletes only the leftover `uninstall.exe`, and then the folder if that is empty: the install folder can
+  be shared with other files (`/D=`). A management tool must count 2 as a failure, which Intune's default
+  return codes do.
 - **Don't build the command yourself.** A plain `uninstall.exe /S` (Windows' `UninstallString`) returns 0 at
   once, before the wipe has run. `uninstall.exe /S _?=<folder>` without `/WIPEPAIRING` waits but **keeps the
   pairing**, and exits 0 with no event: it is the form an installer uses to update.
-- **Detection:** `scripts/windows/detect-vettid.ps1`, as a script detection rule (it prints a line when
-  detected). It reports the app while the program is there **or a saved pairing file is left**. A failed wipe
-  can still have removed the program (see the table below), so a rule on `vettid-desktop.exe` alone would show
-  "not installed" while the pairing is still on the disk, and the failure would drop off the dashboard. The
-  person, or IT, then deletes `%LOCALAPPDATA%\vettid-desktop`, as event 1001 says.
+- **Detection:** `scripts/windows/detect-vettid.ps1`, as a script detection rule run as the user. It always
+  exits 0, and prints a line when detected (Intune's rule for a detection script, from its documentation, not
+  checked against a live tenant). It reports the app while the program is there, **or anything of a saved
+  pairing is left** (the same checks as the uninstall script), and when it can't check.
+  - A failed wipe can still have removed the program (see the table below). A rule on `vettid-desktop.exe`
+    alone would then show "not installed" while the pairing is still on the disk, and the failure would drop
+    off the dashboard.
+  - With this rule, an uninstall assignment keeps retrying and keeps reporting 2 until the person, or IT,
+    deletes `%LOCALAPPDATA%\vettid-desktop` and the Credential Manager entry, as event 1001 says.
+  - The other side: while a pairing is left without the program, a required install assignment counts the
+    app as installed and doesn't reinstall it.
 - **After the uninstall:** run in place, the uninstaller can't delete itself, so `uninstall.exe` and its
-  folder stay. The Apps-list entry and the program are gone. The script's next run removes the folder.
+  folder stay. The Apps-list entry and the program are gone. The script's next run removes `uninstall.exe`,
+  and the folder if it is then empty.
 - **Not system context.** Neither the installer nor the scripts reach a person's install when run as SYSTEM:
   - the installer run as SYSTEM installs into SYSTEM's own profile;
   - the scripts run as SYSTEM look in SYSTEM's profile (`%LOCALAPPDATA%` and `HKCU` are SYSTEM's). They find
@@ -386,13 +400,19 @@ uninstaller and both scripts were run as that account through secondary logon (`
 | `uninstall.exe /S /WIPEPAIRING _?=…` | 0, no event | fixture, program and Apps-list entry gone; the folder left with `uninstall.exe` only; the product key kept |
 | The same, with the fixture held open | 2, event 1001 | fixture kept; the program and the Apps-list entry removed |
 | Run again after that | 2, event 1001 | fixture kept: the program is gone, so nothing can run the wipe. The person deletes `%LOCALAPPDATA%\vettid-desktop` by hand, as 1001 says |
-| `setup.exe /S /D=<another folder>`, then the detection script | 0; detected | detected with no pairing, and with one |
+| `setup.exe /S /D=<a folder holding another app's file>`, then the detection script | 0; detected | detected with no pairing, and with one |
 | `uninstall-vettid.ps1` | 0, no event | fixture gone; not detected |
-| `uninstall-vettid.ps1` again, nothing installed | 0 | the leftover folder removed |
+| `uninstall-vettid.ps1` again, nothing installed | 0 | the leftover `uninstall.exe` removed |
 | `setup.exe /S` again, without `/D=` | 0 | installed in the earlier folder, not the default one |
 | `uninstall-vettid.ps1`, fixture held open | 2, event 1001 | fixture kept; program gone; still detected (pairing left) |
 | `uninstall-vettid.ps1` again | 2, no new event | still detected |
-| The pairing folder deleted by hand, then `uninstall-vettid.ps1` | 0 | not detected; the leftover folder removed |
+| The pairing folder deleted by hand, then `uninstall-vettid.ps1` | 0 | not detected; `uninstall.exe` removed; the other app's file kept |
+| A fixture Credential Manager entry `vettid-desktop/master-key-v1/local`, program gone | 2 | detected (legacy entry); after deleting it, 0 and not detected |
+| The pairing folder unreadable (a deny ACE) | 2 | detected ("couldn't check") |
+| Only a hidden file in a subfolder of the pairing folder | 2 | detected |
+| Program there, `uninstall.exe` not a program | 2 | program kept |
+| Program there, `uninstall.exe` missing | 2 | program kept |
+| `uninstall.exe` put back, fixture, `uninstall-vettid.ps1`, then again | 0, 0 | fixture gone, not detected; only the other app's file left in the folder |
 | `windo`'s own profile | – | no install folder before or after |
 
 The events go to the machine's Application log, so a management tool or an administrator can read them. A
