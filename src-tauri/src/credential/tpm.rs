@@ -17,10 +17,16 @@
 //!   policy** (so firmware and kernel updates don't lock the person out)
 //!   and **no authValue**. Its commands use an HMAC session salted to the
 //!   parent, so the data key crosses to and from the TPM encrypted.
-//! - **The header's `wrapped_key`:** `[1, parent, len(public) as u16 BE,
-//!   public (TPMT_PUBLIC), len(private) as u16 BE, private (TPM2B_PRIVATE's
-//!   bytes)]`, where `parent` is 1 for the persistent SRK and 2 for the
-//!   template primary, so a load uses the parent the seal used.
+//! - **The header's `wrapped_key`:** `[2, parent, len(name) as u16 BE,
+//!   the parent's Name, len(public) as u16 BE, public (TPMT_PUBLIC),
+//!   len(private) as u16 BE, private (TPM2B_PRIVATE's bytes)]`, where
+//!   `parent` is 1 for the persistent SRK and 2 for the template primary,
+//!   so a load uses the parent the seal used. The parent's **Name is
+//!   pinned**: a load compares it with the parent it finds before starting
+//!   the session salted to it, and a different one (the SRK at 0x81000001
+//!   replaced, which any TPM user can do while the owner auth is empty, or
+//!   an interposer on the bus) won't open. The version 1 format (no Name)
+//!   is refused: it never shipped.
 //! - Nothing is kept outside the file: [`Protector::remove_external`] is Ok.
 //!
 //! **Absent** only when opening `/dev/tpmrm0` gives `ENOENT` (no TPM, or a
@@ -60,7 +66,7 @@ const DEVICE: &str = "/dev/tpmrm0";
 /// The conventional persistent handle of the storage root key.
 const SRK_HANDLE: u32 = 0x8100_0001;
 /// The first byte of the wrapped key.
-const WRAPPED_VERSION: u8 = 1;
+const WRAPPED_VERSION: u8 = 2;
 /// The parent byte: the persistent SRK, or a primary from the template.
 const PARENT_PERSISTENT: u8 = 1;
 const PARENT_TEMPLATE: u8 = 2;
@@ -219,6 +225,8 @@ fn is_our_sealed_object(public: &Public) -> bool {
 /// The parts of a wrapped key.
 struct Blob {
     parent: u8,
+    /// The parent's Name at seal.
+    parent_name: Vec<u8>,
     public: Public,
     private: Private,
 }
@@ -242,6 +250,7 @@ impl Blob {
     fn encode(&self) -> Result<Vec<u8>, ProtectorError> {
         let public = self.public.marshall().map_err(|e| failing("marshal", e))?;
         let mut out = vec![WRAPPED_VERSION, self.parent];
+        put_part(&mut out, &self.parent_name)?;
         put_part(&mut out, &public)?;
         put_part(&mut out, self.private.value())?;
         Ok(out)
@@ -258,6 +267,7 @@ impl Blob {
         if ![PARENT_PERSISTENT, PARENT_TEMPLATE].contains(&parent) {
             return Err(bad("an unknown parent"));
         }
+        let parent_name = take_part(&mut rest).filter(|n| !n.is_empty()).ok_or_else(|| bad("no parent name"))?.to_vec();
         let public_bytes = take_part(&mut rest).ok_or_else(|| bad("a short public part"))?;
         let private_bytes = take_part(&mut rest).ok_or_else(|| bad("a short private part"))?;
         if !rest.is_empty() {
@@ -272,7 +282,7 @@ impl Blob {
             return Err(bad("a public part of another kind"));
         }
         let private = Private::try_from(private_bytes.to_vec()).map_err(|_| bad("a private part of the wrong size"))?;
-        Ok(Blob { parent, public, private })
+        Ok(Blob { parent, parent_name, public, private })
     }
 }
 
@@ -282,6 +292,7 @@ struct Open {
     ctx: Context,
     parent: KeyHandle,
     parent_kind: u8,
+    parent_name: Vec<u8>,
     session: AuthSession,
 }
 
@@ -348,8 +359,9 @@ impl Tpm {
     }
 
     /// Open the TPM with the parent `want` (or, for a new seal, the best one
-    /// there) and a session salted to it.
-    fn open(&self, want: Option<u8>) -> Result<Open, ProtectorError> {
+    /// there) and a session salted to it. With `pinned`, the parent's Name
+    /// must be that one, checked before the session: else won't open.
+    fn open(&self, want: Option<u8>, pinned: Option<&[u8]>) -> Result<Open, ProtectorError> {
         let mut ctx = self.context()?;
         let (parent, parent_kind) = match want {
             Some(PARENT_PERSISTENT) => (
@@ -365,13 +377,19 @@ impl Tpm {
                 None => (Self::template_primary(&mut ctx)?, PARENT_TEMPLATE),
             },
         };
+        let (_, name, _) = ctx.execute_without_session(|c| c.read_public(parent)).map_err(|e| failing("read the parent key", e))?;
+        let parent_name = name.value().to_vec();
+        if pinned.is_some_and(|p| p != parent_name.as_slice()) {
+            log::warn!("protector tpm: the parent key isn't the one the pairing was sealed under (the SRK at 0x81000001 was replaced, or this is another TPM)");
+            return Err(ProtectorError::WontOpen("the parent key's Name differs from the one sealed with".into()));
+        }
         let session = ctx
             .execute_without_session(|c| {
                 c.start_auth_session(Some(parent), None, None, SessionType::Hmac, SymmetricDefinition::AES_128_CFB, HashingAlgorithm::Sha256)
             })
             .map_err(|e| failing("session", e))?
             .ok_or_else(|| ProtectorError::Failing { by: NAME, detail: "no session".into() })?;
-        Ok(Open { ctx, parent, parent_kind, session })
+        Ok(Open { ctx, parent, parent_kind, parent_name, session })
     }
 }
 
@@ -393,7 +411,7 @@ impl Open {
             .ctx
             .execute_with_session(Some(session), |c| c.create(parent, template, None, Some(data), None, None))
             .map_err(|e| failing("seal", e))?;
-        Ok(Blob { parent: self.parent_kind, public: created.out_public, private: created.out_private })
+        Ok(Blob { parent: self.parent_kind, parent_name: self.parent_name.clone(), public: created.out_public, private: created.out_private })
     }
 
     fn unseal(&mut self, blob: Blob) -> Result<DataKey, ProtectorError> {
@@ -437,10 +455,10 @@ impl Protector for Tpm {
     /// here) and a salted session started. Nothing is kept: the context's
     /// end flushes the transient primary and the session.
     fn probe(&self) -> Result<(), ProtectorError> {
-        self.open(None).map(drop)
+        self.open(None, None).map(drop)
     }
     fn wrap(&self, key: &[u8; 32]) -> Result<Vec<u8>, ProtectorError> {
-        let mut open = self.open(None)?;
+        let mut open = self.open(None, None)?;
         let blob = open.seal(key)?;
         let wrapped = blob.encode()?;
         // Read back: the pairing is saved only under a key this TPM opens.
@@ -452,7 +470,7 @@ impl Protector for Tpm {
     }
     fn unwrap(&self, wrapped: &[u8]) -> Result<DataKey, ProtectorError> {
         let blob = Blob::decode(wrapped)?;
-        let mut open = self.open(Some(blob.parent))?;
+        let mut open = self.open(Some(blob.parent), Some(&blob.parent_name))?;
         open.unseal(blob)
     }
     fn remove_external(&self) -> Result<(), ProtectorError> {
@@ -504,12 +522,21 @@ pub(super) mod tests {
 
     #[test]
     fn a_wrapped_key_that_doesnt_parse_wont_open() {
-        for bad in [&b""[..], &[1], &[2, 2, 0, 0, 0, 0], &[1, 3, 0, 0, 0, 0], &[1, 2, 0, 5, 1], &[1, 2, 0, 0, 0, 0], &[1, 2, 0, 0, 0, 0, 9]] {
+        for bad in [
+            &b""[..],
+            &[2],
+            &[3, 2, 0, 1, 7, 0, 0, 0, 0],
+            &[2, 3, 0, 1, 7, 0, 0, 0, 0],
+            &[2, 2, 0, 0, 0, 0, 0, 0],
+            &[2, 2, 0, 1, 7, 0, 5, 1],
+            &[2, 2, 0, 1, 7, 0, 0, 0, 0],
+            &[2, 2, 0, 1, 7, 0, 0, 0, 0, 9],
+        ] {
             assert!(matches!(Blob::decode(bad), Err(ProtectorError::WontOpen(_))), "{bad:?}");
         }
         // A well-formed public part of another kind (the SRK template).
         let srk = srk_template().unwrap().marshall().unwrap();
-        let mut w = vec![1, 2];
+        let mut w = vec![2, 2, 0, 1, 7];
         w.extend_from_slice(&(srk.len() as u16).to_be_bytes());
         w.extend_from_slice(&srk);
         w.extend_from_slice(&[0, 0]);
@@ -540,6 +567,10 @@ pub(super) mod tests {
         }
     }
 
+    /// A free pair of adjacent ports (the swtpm TCTI uses the next port for
+    /// control). Released before swtpm binds them, so [`Swtpm::start`]
+    /// holds [`STARTING`] until its swtpm is up on them: no other test of
+    /// this process can be handed the same pair meanwhile.
     fn free_port_pair() -> u16 {
         loop {
             let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -550,8 +581,12 @@ pub(super) mod tests {
         }
     }
 
+    /// One swtpm starting at a time.
+    static STARTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     impl Swtpm {
         pub(in crate::credential) fn start() -> Swtpm {
+            let _one_at_a_time = STARTING.lock().unwrap_or_else(|e| e.into_inner());
             let state = tempfile::tempdir().unwrap();
             for _ in 0..5 {
                 let port = free_port_pair();
@@ -564,14 +599,22 @@ pub(super) mod tests {
                     .spawn()
                     .expect("swtpm (apt install swtpm)");
                 let deadline = Instant::now() + Duration::from_secs(10);
+                let mut up = false;
                 while Instant::now() < deadline {
                     if let Ok(Some(_)) = child.try_wait() {
-                        break; // a port taken meanwhile: try another
+                        break; // the port was taken (by another process): another pair
                     }
-                    if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                        return Swtpm { child, port, _state: state };
+                    if TcpStream::connect(("127.0.0.1", port)).is_ok() && TcpStream::connect(("127.0.0.1", port + 1)).is_ok() {
+                        up = true;
+                        break;
                     }
                     std::thread::sleep(Duration::from_millis(50));
+                }
+                // Still running after the connects: the sockets are this
+                // swtpm's, not another's.
+                std::thread::sleep(Duration::from_millis(100));
+                if up && matches!(child.try_wait(), Ok(None)) {
+                    return Swtpm { child, port, _state: state };
                 }
                 let _ = child.kill();
                 let _ = child.wait();
@@ -643,6 +686,63 @@ pub(super) mod tests {
         // The earlier seal still opens under the template primary it names.
         assert_eq!(before[1], PARENT_TEMPLATE);
         assert_eq!(*p.unwrap(&before).unwrap(), key(3));
+    }
+
+    /// The version 1 format (no parent Name) is refused, even when its
+    /// parts parse.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it"]
+    fn tpm_the_unpinned_format_is_refused() {
+        let tpm = Swtpm::start();
+        let wrapped = tpm.protector().wrap(&key(7)).unwrap();
+        let name_len = u16::from_be_bytes([wrapped[2], wrapped[3]]) as usize;
+        let mut v1 = vec![1, wrapped[1]];
+        v1.extend_from_slice(&wrapped[4 + name_len..]);
+        assert!(matches!(tpm.protector().unwrap(&v1), Err(ProtectorError::WontOpen(_))));
+    }
+
+    /// The parent is pinned: the persistent SRK replaced by another key
+    /// after the seal (any TPM user can, with an empty owner auth), and the
+    /// pairing won't open, before any session is salted to the new key.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it"]
+    fn tpm_a_replaced_srk_wont_open() {
+        use tss_esapi::interface_types::dynamic_handles::Persistent;
+        use tss_esapi::interface_types::resource_handles::Provision;
+        use tss_esapi::structures::EccParameter;
+        let tpm = Swtpm::start();
+        let handle = PersistentTpmHandle::new(SRK_HANDLE).unwrap();
+        let mut ctx = tpm.context();
+        let primary = Tpm::template_primary(&mut ctx).unwrap();
+        ctx.execute_with_nullauth_session(|c| c.evict_control(Provision::Owner, primary.into(), Persistent::Persistent(handle))).unwrap();
+        drop(ctx);
+        let p = tpm.protector();
+        let wrapped = p.wrap(&key(8)).unwrap();
+        assert_eq!(wrapped[1], PARENT_PERSISTENT);
+        // Evict it, and put another storage key at the same handle.
+        let mut ctx = tpm.context();
+        let old = ctx.execute_without_session(|c| c.tr_from_tpm_public(TpmHandle::Persistent(handle))).unwrap();
+        ctx.execute_with_nullauth_session(|c| c.evict_control(Provision::Owner, old, Persistent::Persistent(handle))).unwrap();
+        let other = match srk_template().unwrap() {
+            Public::Ecc { object_attributes, name_hashing_algorithm, auth_policy, parameters, .. } => Public::Ecc {
+                object_attributes,
+                name_hashing_algorithm,
+                auth_policy,
+                parameters,
+                unique: EccPoint::new(EccParameter::try_from(vec![1u8; 32]).unwrap(), EccParameter::try_from(vec![2u8; 32]).unwrap()),
+            },
+            _ => unreachable!(),
+        };
+        let replacement = ctx
+            .execute_with_nullauth_session(|c| c.create_primary(Hierarchy::Owner, other, None, None, None, None))
+            .unwrap()
+            .key_handle;
+        ctx.execute_with_nullauth_session(|c| c.evict_control(Provision::Owner, replacement.into(), Persistent::Persistent(handle))).unwrap();
+        drop(ctx);
+        match p.unwrap(&wrapped) {
+            Err(ProtectorError::WontOpen(_)) => {}
+            other => panic!("expected won't open, got {:?}", other.map(|_| "a key")),
+        }
     }
 
     /// Copy refusal: a key sealed by one TPM doesn't open on another.
