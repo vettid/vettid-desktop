@@ -22,14 +22,17 @@
     machineFingerprint: string;
     appVersion: string;
     keyProtection: string;
+    keyBound: boolean;
   } | null>(null);
 
-  // Which key protects the saved pairing (#11). Read from the file's
-  // header by the backend: "keyring", "machine", "none" or "unknown";
-  // "unchecked" when get_status itself failed.
+  // What protects the saved pairing (#11, #13). Read from the file's
+  // header by the backend: "dpapi", "keyring", "legacy", "none" or
+  // "unknown"; "unchecked" when get_status itself failed. keyBound says
+  // whether it binds the pairing to this computer.
   const keyProtectionText: Record<string, string> = {
-    keyring: "Your computer's keyring",
-    machine: 'This computer only (no keyring)',
+    dpapi: 'Windows data protection, on this computer',
+    keyring: "Your computer's keyring, not bound to this computer",
+    legacy: 'An earlier version (not usable)',
     unknown: "Can't tell",
     unchecked: "Couldn't check",
   };
@@ -56,6 +59,7 @@
         machineFingerprint: status.machine_fingerprint || '',
         appVersion: status.app_version || '0.1.0',
         keyProtection: status.key_protection || 'unknown',
+        keyBound: !!status.key_bound,
       };
     } catch {
       deviceInfo = {
@@ -67,6 +71,7 @@
         machineFingerprint: '',
         appVersion: '0.1.0',
         keyProtection: 'unchecked',
+        keyBound: false,
       };
     } finally {
       loading = false;
@@ -152,23 +157,26 @@
           {#if deviceInfo.keyProtection !== 'none'}
             <div class="row stacked">
               <span class="label">Saved pairing protected by</span>
-              <span class="value" class:warn={deviceInfo.keyProtection !== 'keyring'}>
+              <span class="value" class:warn={!deviceInfo.keyBound}>
                 {keyProtectionText[deviceInfo.keyProtection] ?? keyProtectionText.unknown}
               </span>
-              {#if deviceInfo.keyProtection === 'keyring'}
+              {#if deviceInfo.keyProtection === 'dpapi'}
                 <p class="hint inline">
-                  The key that opens this desktop's saved pairing is kept in your computer's
-                  keyring, tied to your account. A copy of the file or the disk doesn't open it
-                  without your sign-in. Programs you run, and an administrator of this computer,
-                  may still be able to read it.
+                  The key that opens this desktop's saved pairing is locked by Windows to your
+                  account on this computer. A copy of the file alone doesn't open elsewhere.
+                  Programs you run, and an administrator of this computer, may still be able to
+                  open it.
                 </p>
-              {:else if deviceInfo.keyProtection === 'machine'}
+              {:else if deviceInfo.keyProtection === 'keyring'}
                 <p class="hint inline warn" role="status">
-                  No keyring was available when the pairing was saved, so its key is worked out
-                  from details of this computer. Any program you run, an administrator, or anyone
-                  with a copy of this computer's disk could open the saved pairing. The next time
-                  this desktop saves the pairing (when you end or extend a session, or pair again)
-                  while the keyring works, it moves to the keyring.
+                  The key that opens this desktop's saved pairing is kept in your keyring. It is
+                  not bound to this computer: a copy of your keyring opens on another computer
+                  with your sign-in password. Programs you run may still be able to read it.
+                </p>
+              {:else if deviceInfo.keyProtection === 'legacy'}
+                <p class="hint inline warn" role="status">
+                  The saved pairing was made by an earlier version and can't be used. It is
+                  deleted the next time this desktop starts; then pair again.
                 </p>
               {:else if deviceInfo.keyProtection === 'unchecked'}
                 <p class="hint inline warn" role="status">
