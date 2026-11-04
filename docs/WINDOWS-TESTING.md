@@ -91,7 +91,7 @@ shortcut) and the uninstall entry.
 
 I removed the leftovers by hand after each run.
 
-## Paired state after uninstall (read in the code, not run)
+## Paired state after uninstall, before AG3 and the uninstall hook (read in the code, not run)
 
 Nothing was paired on this machine: pairing needs a phone and a vault on staging. So no state file and no
 Credential Manager entry were created in either run (checked: neither exists).
@@ -115,14 +115,78 @@ From the code, a paired desktop keeps:
     it once the file is gone. AG3 (#13) removes the entry and confirms each part of a wipe.
   - doesn't unlink the desktop: a desktop can't unlink itself (VAULT-MESSAGING §7.4), only the phone can.
 
-AG3 (#13) replaces the Credential Manager entry with a DPAPI-wrapped key kept inside `device.enc`. That leaves
-one part to remove. Whether the uninstaller should remove it, or tell the person to log out or unlink first,
-is for the owner to decide.
+That was before AG3. With AG3 (#13) the data key is DPAPI-wrapped inside `device.enc`, so nothing else is kept
+outside the file; the earlier format's Credential Manager entry is only ever deleted.
+
+## Uninstall: the saved pairing (owner decision "a")
+
+**Not run on this machine yet.** The debug installer build was stopped for low memory before NSIS ran, so the
+hook below hasn't been compiled by `makensis` or tried. The wipe mode's unit tests pass. What follows is the
+design and what was read in the bundler's template (tauri-bundler 2.10.2, `installer.nsi`).
+
+**What the uninstaller removes now:** the saved pairing, always, silent `/S` included, but not on an update
+(`/UPDATE`). Its hook (`src-tauri/windows/installer-hooks.nsh`, `NSIS_HOOK_PREUNINSTALL`) runs
+`vettid-desktop.exe --uninstall-wipe` (`src-tauri/src/uninstall.rs`), which is log-out's local wipe
+(`store::wipe_for_logout`), each part confirmed on disk:
+- `%LOCALAPPDATA%\vettid-desktop\`, with `device.enc` and any temporary copy of it, and an earlier build's
+  `connection.enc`;
+- the protectors' external keys (none on Windows: DPAPI keeps nothing outside the file);
+- the earlier format's Credential Manager entry `vettid-desktop/master-key-v1/local`.
+
+**What it doesn't do:** it doesn't contact the vault, and doesn't tell the phone. A desktop can't unlink
+itself (VAULT-MESSAGING §7.4), and an uninstall shouldn't wait on the network. The vault lists the desktop
+until it is removed on the phone.
+
+**The order in the hook:**
+1. On `/UPDATE`, nothing: an update keeps the pairing.
+2. The running app is closed first (`CheckIfAppIsRunning`; the template checks only after the hook). Otherwise
+   it could save the pairing again after the wipe. If it can't be closed, or the person cancels, the uninstall
+   stops before anything is removed.
+3. The wipe. Its exit code:
+
+| Code | Meaning |
+|---|---|
+| 0 | Nothing was paired here (no pairing file before the wipe). |
+| 10 | A pairing was saved here, and every part is confirmed gone. |
+| 20 | Something couldn't be removed, or its removal couldn't be confirmed. Also: no user folder, or a panic. |
+
+4. Interactive: on 10, "This desktop was paired. Remove it on your phone too." On 20, any other code, or if the
+   program couldn't be started, a message that the saved pairing couldn't be removed, with the folder, and the
+   phone step. Both texts wait for the owner's approval. The uninstall goes on in every case.
+5. On 20 or a failure the uninstaller's exit code is 2, silent included, so a script can tell.
+
+A scripted uninstall that needs the exit code has to run the uninstaller in place:
+`uninstall.exe /S _?=<install folder>` (NSIS otherwise copies the uninstaller to `%TEMP%` and returns at once; NSIS's documented behaviour, not checked here).
+
+**Who can run `--uninstall-wipe`:** anyone who can run a program as this Windows user, who can already delete
+these files and entries. It opens no window, prints nothing and isn't passed to a running app.
+
+**Reinstall, upgrade and downgrade (read in `installer.nsi`, not run):**
+- A silent install (`/S`) over an existing install shows no pages, so it never runs the old uninstaller: the
+  pairing is kept.
+- With `/UPDATE` (with or without `/P`), the installer never runs the old uninstaller.
+- Interactive, same version: the default is "Add/Reinstall components", which keeps the pairing. Choosing
+  "Uninstall VettID Desktop" runs the old uninstaller without `/UPDATE`, so the pairing is deleted.
+- Interactive, upgrade or downgrade: **the default is "Uninstall before installing"**, which runs the old
+  uninstaller without `/UPDATE`, so the pairing is deleted, and the person sees the message. "Do not
+  uninstall" keeps it. (Downgrades are allowed by default.)
+- Passive (`/P`) without `/UPDATE`: the reinstall page's choice is read from a control that isn't there. From
+  the code, a same-version reinstall then uninstalls first (pairing deleted), and an upgrade or downgrade
+  doesn't. To be checked on this machine.
+
+**Still left behind after uninstall:** `%LOCALAPPDATA%\com.vettid.desktop\EBWebView\` and
+`HKCU\Software\vettid\VettID Desktop`, unless "Delete the application data" is ticked (see above). Neither
+holds the pairing.
+
+**Not covered:** a per-machine install (`installMode: perMachine`, not used): the uninstaller runs elevated,
+and an administrator's elevation as another account would wipe that account's folder, not the user's.
 
 ## Not tested yet
 
 - Interactive install and uninstall, and what SmartScreen and Defender show a person (left for the owner).
 - An upgrade from an older version.
+- The uninstall hook end to end: a fixture `device.enc` removed by `/S`; a held file reported (exit code 2) and
+  kept; a clean uninstall; a reinstall (`/S`, `/S /UPDATE`, `/P`) keeping the fixture.
 - A standard (non-administrator) account, and a second Windows user.
 - Anything that needs pairing: the state file and its ACL on disk, sessions, sleep and resume, fast user
   switching, a wrong clock.
