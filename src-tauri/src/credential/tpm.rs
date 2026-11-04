@@ -105,11 +105,30 @@ fn rc_kind(e: &TssError) -> Option<(bool, Tss2ResponseCodeKind)> {
     }
 }
 
+/// The raw response code of a format-one TPM error. tss-esapi keeps it
+/// private; its `Display` is "Response code value: 0x…".
+fn format_one_raw(e: &TssError) -> Option<u32> {
+    let TssError::Tss2Error(Tss2ResponseCode::FormatOne(rc)) = e else {
+        return None;
+    };
+    let text = rc.to_string();
+    u32::from_str_radix(text.rsplit("0x").next()?, 16).ok()
+}
+
 /// Whether a load's error says the blob isn't this TPM's or isn't well
 /// formed (won't open), rather than that the TPM couldn't do it now
-/// (failing). Only parameter errors of the TPM itself (format one) count.
+/// (failing). Only format-one errors of the TPM itself (layer 0) that name
+/// Load's parameter 1 (inPrivate) or 2 (inPublic) count; handle- or
+/// session-indexed errors are failing.
 fn is_bad_blob(e: &TssError) -> bool {
     use Tss2ResponseCodeKind as K;
+    let Some(raw) = format_one_raw(e) else {
+        return false;
+    };
+    let (layer, parameter, number) = (raw >> 16, raw & 0x40 != 0, (raw >> 8) & 0xF);
+    if layer != 0 || !parameter || !(1..=2).contains(&number) {
+        return false;
+    }
     matches!(
         rc_kind(e),
         Some((
@@ -334,8 +353,10 @@ impl Tpm {
         let mut ctx = self.context()?;
         let (parent, parent_kind) = match want {
             Some(PARENT_PERSISTENT) => (
+                // Gone (evicted, or the TPM cleared): it won't come back
+                // by trying again. Nothing is re-sealed elsewhere.
                 Self::persistent_srk(&mut ctx)?
-                    .ok_or_else(|| ProtectorError::Failing { by: NAME, detail: "the SRK at 0x81000001 is gone".into() })?,
+                    .ok_or_else(|| ProtectorError::WontOpen("the SRK at 0x81000001 it was sealed under is gone".into()))?,
                 PARENT_PERSISTENT,
             ),
             Some(_) => (Self::template_primary(&mut ctx)?, PARENT_TEMPLATE),
@@ -455,6 +476,30 @@ pub(super) mod tests {
             assert_eq!(device_availability(Err(os(errno))), Availability::Present, "errno {errno}");
         }
         assert_eq!(device_availability(Ok(())), Availability::Present);
+    }
+
+    /// Only Load's parameters 1 and 2, in TPM-layer format-one errors, make
+    /// a blob "won't open".
+    #[test]
+    fn only_parameter_errors_on_the_blob_wont_open() {
+        let rc = |raw: u32| TssError::Tss2Error(Tss2ResponseCode::from(raw));
+        // Integrity (0x1f), Value (0x04), Size (0x15) on parameter 1 or 2.
+        for raw in [0x1df, 0x2df, 0x1c4, 0x2d5] {
+            assert!(is_bad_blob(&rc(raw)), "{raw:#x}");
+        }
+        for raw in [
+            0x3df,      // integrity, parameter 3
+            0x19f,      // integrity, handle 1
+            0x99f,      // integrity, session 1
+            0x9a2,      // bad auth, session 1
+            0x1ce,      // auth fail, parameter 1 (not a blob error)
+            0x0b01df,   // integrity, parameter 1, from the resource manager layer
+            0x922,      // a format-zero warning (retry)
+            0x70001,    // an ESYS-layer error
+        ] {
+            assert!(!is_bad_blob(&rc(raw)), "{raw:#x}");
+        }
+        assert!(!is_bad_blob(&TssError::WrapperError(tss_esapi::WrapperErrorKind::InternalError)));
     }
 
     #[test]
