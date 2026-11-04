@@ -25,12 +25,16 @@
 //! default store is the Secret Service (keyutils was only compiled in), so
 //! that entry can only ever have been written there.
 //!
-//! When the Secret Service is absent, removal has nothing it can reach,
-//! and succeeds for that part. An entry written while a Secret Service
-//! was running stays in its keyring file, sealed under the login password,
-//! where no process of this session can read it without starting one; the
-//! next log-out with the Secret Service present sweeps it, since the sweep
-//! is by name, not by file. That is logged.
+//! Before searching, every locked collection is unlocked (a prompt may
+//! appear); one that stays locked makes removal "not removed" and a load
+//! failing, never "no entry".
+//!
+//! When the Secret Service is absent (as far as this process can see: it
+//! may only be unreachable from here), removal succeeds only when nothing
+//! being wiped could have an item there: the device file's header, read
+//! before the wipe, names another protector, and no earlier format's
+//! pairing is involved. Otherwise it is "not removed". Only GNOME Keyring
+//! has been tried; KWallet is untested.
 //!
 //! Tests never reach this computer's Secret Service: a test that gets as
 //! far as connecting to it panics.
@@ -44,7 +48,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use zeroize::Zeroizing;
 
-use super::protector::{Availability, DataKey, LegacyKey, Protector, ProtectorError};
+use super::protector::{Availability, DataKey, LegacyKey, Protector, ProtectorError, Wiping};
 
 /// The protector's plain name, for the person.
 pub(super) const NAME: &str = "your computer's keyring";
@@ -222,16 +226,38 @@ fn matching<'a>(ss: &'a Service, searches: &[&[(&str, &str)]]) -> Result<Vec<Ite
     Ok(items)
 }
 
+/// Whether any collection is locked (an error counts as locked).
+fn any_locked(ss: &Service) -> bool {
+    match ss.get_all_collections() {
+        Ok(all) => all.iter().any(|c| c.is_locked().unwrap_or(true)),
+        Err(_) => true,
+    }
+}
+
+/// Unlock every locked collection (the Secret Service may prompt), so that
+/// a search sees every item. Err if one stays locked.
+fn unlock_all_collections(ss: &Service) -> Result<(), dbus_secret_service::Error> {
+    for c in ss.get_all_collections()? {
+        c.ensure_unlocked()?;
+    }
+    Ok(())
+}
+
 /// Delete every item the searches find, then search again: Ok only when
-/// none is left. With the Secret Service absent, there is nothing to reach
-/// (module doc).
-fn sweep(bus: &BusSource, searches: &[Search], what: &'static str) -> Result<(), ProtectorError> {
+/// none is left and no collection is locked. With the Secret Service
+/// absent, Ok only when nothing being wiped could have an item there
+/// (`could_hold` false); otherwise "not removed", never a guess.
+fn sweep(bus: &BusSource, searches: &[Search], what: &'static str, could_hold: bool) -> Result<(), ProtectorError> {
+    let not_removed = |detail: String| ProtectorError::NotRemoved { what, detail };
     if let Availability::Absent(why) = bus.availability() {
-        log::info!("protector secret-service: {what}: nothing to remove here ({why}); any left in a keyring file goes at the next log-out with a Secret Service");
+        if could_hold {
+            return Err(not_removed(format!("the Secret Service can't be reached here ({why}), so it can't be checked")));
+        }
+        log::info!("protector secret-service: {what}: nothing of the wiped pairing was kept there ({why})");
         return Ok(());
     }
-    let not_removed = |detail: String| ProtectorError::NotRemoved { what, detail };
     let ss = connect().map_err(|e| not_removed(format!("connect: {e}")))?;
+    unlock_all_collections(&ss).map_err(|e| not_removed(format!("unlock: {e}")))?;
     let items = matching(&ss, searches).map_err(|e| not_removed(format!("search: {e}")))?;
     if !items.is_empty() {
         let mut locked = Vec::new();
@@ -248,6 +274,7 @@ fn sweep(bus: &BusSource, searches: &[Search], what: &'static str) -> Result<(),
         }
     }
     match matching(&ss, searches) {
+        Ok(left) if left.is_empty() && any_locked(&ss) => Err(not_removed("a keyring collection is locked, so it can't be checked".into())),
         Ok(left) if left.is_empty() => Ok(()),
         Ok(left) => Err(not_removed(format!("{} still there", left.len()))),
         Err(e) => Err(not_removed(format!("could not be checked: {e}"))),
@@ -298,18 +325,31 @@ impl Protector for SecretService {
             .create_item("VettID Desktop device key", attrs, key, false, "application/octet-stream")
             .map_err(|e| failing("write", e))?;
         // Read back: the pairing is saved only under a key that is there.
-        let back = Zeroizing::new(item.get_secret().map_err(|e| failing("read back", e))?);
-        if back.as_slice() != key.as_slice() {
-            return Err(ProtectorError::Failing { by: NAME, detail: "the entry read back differs".into() });
+        // One that doesn't read back is deleted (best effort; log-out
+        // removes any left).
+        let read_back = match item.get_secret().map(Zeroizing::new) {
+            Ok(back) if back.as_slice() == key.as_slice() => Ok(()),
+            Ok(_) => Err(ProtectorError::Failing { by: NAME, detail: "the entry read back differs".into() }),
+            Err(e) => Err(failing("read back", e)),
+        };
+        if let Err(e) = read_back {
+            if let Err(d) = item.delete() {
+                log::warn!("protector secret-service: the entry that didn't read back wasn't deleted: {d}");
+            }
+            return Err(e);
         }
         Ok(wrapped)
     }
     fn unwrap(&self, wrapped: &[u8]) -> Result<DataKey, ProtectorError> {
         let name = entry_name(wrapped)?;
         let ss = connect().map_err(|e| failing("connect", e))?;
+        // Unlocked first: a locked or unanswering keyring is failing (it
+        // may open later), never "no entry".
+        ss.get_default_collection().and_then(|c| c.ensure_unlocked()).map_err(|e| failing("unlock", e))?;
         let search = [("service", SERVICE), ("kind", ENTRY_KIND), ("username", name.as_str())];
         let mut items = matching(&ss, &[&search]).map_err(|e| failing("search", e))?;
         let item = match items.len() {
+            0 if any_locked(&ss) => return Err(ProtectorError::Failing { by: NAME, detail: "no entry found while a collection is locked".into() }),
             0 => return Err(ProtectorError::WontOpen("no keyring entry".into())),
             1 => items.remove(0),
             n => return Err(ProtectorError::Failing { by: NAME, detail: format!("{n} entries for one file") }),
@@ -324,7 +364,12 @@ impl Protector for SecretService {
         Ok(key)
     }
     fn remove_external(&self) -> Result<(), ProtectorError> {
-        sweep(&self.bus, DEVICE_ENTRIES, "the keyring's device keys")
+        self.remove_external_for(&Wiping::unknown())
+    }
+    /// Unreachable is Ok only when the wiped file was sealed by another
+    /// protector (#69's Linux `keyring` was this one too).
+    fn remove_external_for(&self, wiping: &Wiping) -> Result<(), ProtectorError> {
+        sweep(&self.bus, DEVICE_ENTRIES, "the keyring's device keys", wiping.may_be_sealed_by(&["secret-service", "keyring"]))
     }
 }
 
@@ -341,7 +386,11 @@ impl LegacyEntry {
 
 impl LegacyKey for LegacyEntry {
     fn remove(&self) -> Result<(), ProtectorError> {
-        sweep(&self.bus, LEGACY_ENTRIES, "the earlier version's keyring key")
+        self.remove_for(&Wiping::unknown())
+    }
+    /// Unreachable is Ok only when no earlier format's pairing is involved.
+    fn remove_for(&self, wiping: &Wiping) -> Result<(), ProtectorError> {
+        sweep(&self.bus, LEGACY_ENTRIES, "the earlier version's keyring key", wiping.legacy)
     }
 }
 
@@ -385,11 +434,12 @@ mod tests {
         }
     }
 
-    /// No session bus reachable: absent, and log-out has nothing to remove
-    /// (the device keys and the legacy entry both succeed, without ever
-    /// connecting to a Secret Service).
+    /// No session bus reachable: absent. Log-out then succeeds for the
+    /// Secret Service only when nothing wiped could have an item there (a
+    /// TPM-sealed file, no earlier format); otherwise "not removed". It
+    /// never connects to a Secret Service.
     #[test]
-    fn with_no_bus_it_is_absent_and_removal_succeeds() {
+    fn with_no_bus_it_is_absent_and_removal_is_confirmed_or_not_removed() {
         let dir = tempfile::tempdir().unwrap();
         // A socket path with nothing there, and one that refuses.
         let missing = Bus::Address(unix_path_address(&dir.path().join("dead")));
@@ -399,8 +449,21 @@ mod tests {
         for bus in [Bus::None, missing, refusing] {
             let ss = SecretService { bus: fixed(bus.clone()) };
             assert!(matches!(ss.availability(), Availability::Absent(_)), "{bus:?}");
-            ss.remove_external().unwrap();
-            LegacyEntry { bus: fixed(bus.clone()) }.remove().unwrap();
+            let legacy = LegacyEntry { bus: fixed(bus.clone()) };
+            let tpm_only = Wiping { sealed_by: Some("tpm".into()), legacy: false };
+            ss.remove_external_for(&tpm_only).unwrap();
+            legacy.remove_for(&tpm_only).unwrap();
+            let not_removed = |r: Result<(), ProtectorError>| matches!(r, Err(ProtectorError::NotRemoved { .. }));
+            for sealed_by in [Some("secret-service"), Some("keyring"), None] {
+                let w = Wiping { sealed_by: sealed_by.map(String::from), legacy: false };
+                assert!(not_removed(ss.remove_external_for(&w)), "{sealed_by:?}");
+                legacy.remove_for(&w).unwrap();
+            }
+            for w in [Wiping { sealed_by: Some("tpm".into()), legacy: true }, Wiping::legacy_file(), Wiping::unknown()] {
+                assert!(not_removed(legacy.remove_for(&w)), "{w:?}");
+            }
+            assert!(not_removed(ss.remove_external()), "nothing known: not removed");
+            assert!(not_removed(legacy.remove()));
         }
     }
 

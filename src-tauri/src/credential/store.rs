@@ -584,17 +584,23 @@ pub fn remove_legacy_pairing(config_dir: &Path) -> Result<(), CredentialError> {
 /// no folder. Ok only if the pairing and the keys are confirmed gone; with
 /// no folder, `NoConfigDir`.
 pub fn wipe_for_logout(config_dir: Option<&Path>) -> Result<(), CredentialError> {
-    wipe_then(config_dir, || super::protector::Protectors::system().remove_external_keys().map_err(CredentialError::from))
+    wipe_then(config_dir, |wiping| super::protector::Protectors::system().remove_external_keys(wiping).map_err(CredentialError::from))
 }
 
-fn wipe_then(config_dir: Option<&Path>, remove_keys: impl FnOnce() -> Result<(), CredentialError>) -> Result<(), CredentialError> {
+/// The wipe, then `remove_keys` with what the device file's header said
+/// before it (read under the lock; no folder: nothing known).
+fn wipe_then(
+    config_dir: Option<&Path>,
+    remove_keys: impl FnOnce(&super::protector::Wiping) -> Result<(), CredentialError>,
+) -> Result<(), CredentialError> {
     let _one_at_a_time = writer_lock();
     WIPES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let wiping = config_dir.map_or_else(super::protector::Wiping::unknown, super::device_store::what_is_sealed);
     let wiped = match config_dir {
         Some(dir) => wipe_locked(dir),
         None => Err(CredentialError::NoConfigDir),
     };
-    let keys = remove_keys();
+    let keys = remove_keys(&wiping);
     if let Err(e) = &keys {
         log::error!("Credential store: a key was not removed: {}", e);
     }
@@ -1143,7 +1149,7 @@ pub(crate) mod tests {
         device_pairing(&config_dir);
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut saver = None;
-        wipe_then(Some(&config_dir), || {
+        wipe_then(Some(&config_dir), |_| {
             let (order2, other2) = (order.clone(), other.clone());
             let handle = std::thread::spawn(move || {
                 store_for_tests(&other2).save_raw_for_tests();
@@ -1182,7 +1188,7 @@ pub(crate) mod tests {
     fn logout_with_no_folder_still_deletes_the_key() {
         let mut deleted = false;
         let since = wipe_epoch();
-        let wiped = wipe_then(None, || {
+        let wiped = wipe_then(None, |_| {
             deleted = true;
             Ok(())
         });
@@ -1200,7 +1206,7 @@ pub(crate) mod tests {
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
         let b = std::sync::Arc::new(Behaviour::default());
-        let remove = || protectors(&b).remove_external_keys().map_err(CredentialError::from);
+        let remove = |w: &super::super::protector::Wiping| protectors(&b).remove_external_keys(w).map_err(CredentialError::from);
         device_pairing(&config_dir);
         Behaviour::set(&b.fail_remove, true);
         assert!(matches!(wipe_then(Some(&config_dir), remove), Err(CredentialError::IoError(_))));

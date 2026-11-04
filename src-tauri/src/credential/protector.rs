@@ -89,12 +89,55 @@ pub(crate) trait Protector: Send + Sync {
     /// Remove any key this protector keeps outside the file, and confirm
     /// it is gone. Ok when it keeps none.
     fn remove_external(&self) -> Result<(), ProtectorError>;
+    /// As [`Protector::remove_external`], knowing what is being wiped. A
+    /// protector that can't be reached here may then say there is nothing
+    /// of its to confirm (the Secret Service); the rest ignore it.
+    fn remove_external_for(&self, wiping: &Wiping) -> Result<(), ProtectorError> {
+        let _ = wiping;
+        self.remove_external()
+    }
 }
 
 /// The earlier format's master key entry (`master-key-v1`): deleted and
 /// confirmed gone, never read for use.
 pub(crate) trait LegacyKey: Send + Sync {
     fn remove(&self) -> Result<(), ProtectorError>;
+    /// As [`LegacyKey::remove`], knowing what is being wiped.
+    fn remove_for(&self, wiping: &Wiping) -> Result<(), ProtectorError> {
+        let _ = wiping;
+        self.remove()
+    }
+}
+
+/// What a wipe removes, read before it from the device file's header
+/// (unauthenticated: nothing is decrypted), so that a protector that can't
+/// be reached knows whether it could hold anything of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Wiping {
+    /// The header's `protector`; `None` when there is no device file, or
+    /// one that can't be read or parsed: then anything could have been
+    /// kept, by any protector.
+    pub(crate) sealed_by: Option<String>,
+    /// Whether an earlier format's pairing (a v1 `device.enc`, or
+    /// `connection.enc`) is involved, or can't be ruled out.
+    pub(crate) legacy: bool,
+}
+
+impl Wiping {
+    /// Nothing known: every protector confirms.
+    pub(crate) fn unknown() -> Self {
+        Wiping { sealed_by: None, legacy: true }
+    }
+
+    /// Retiring an earlier format's file.
+    pub(crate) fn legacy_file() -> Self {
+        Wiping { sealed_by: Some("legacy".into()), legacy: true }
+    }
+
+    /// Whether a file sealed by one of `ids` may be involved.
+    pub(crate) fn may_be_sealed_by(&self, ids: &[&str]) -> bool {
+        self.sealed_by.as_deref().is_none_or(|id| ids.contains(&id))
+    }
 }
 
 /// The TPM protector's plain name, for the person (the notices give other
@@ -172,10 +215,11 @@ impl Protectors {
     }
 
     /// Remove every external key (each protector's, then the legacy entry),
-    /// each confirmed gone. All are tried; the first failure is returned.
-    pub(crate) fn remove_external_keys(&self) -> Result<(), ProtectorError> {
+    /// each confirmed gone, for the wipe of `wiping`. All are tried; the
+    /// first failure is returned.
+    pub(crate) fn remove_external_keys(&self, wiping: &Wiping) -> Result<(), ProtectorError> {
         let mut first = None;
-        let results = self.ranked.iter().map(|p| p.remove_external()).chain(std::iter::once(self.legacy.remove()));
+        let results = self.ranked.iter().map(|p| p.remove_external_for(wiping)).chain(std::iter::once(self.legacy.remove_for(wiping)));
         for r in results {
             if let Err(e) = r {
                 log::error!("key store: {}", e);
@@ -187,7 +231,7 @@ impl Protectors {
 
     /// Remove the legacy entry alone, confirmed gone.
     pub(crate) fn remove_legacy_key(&self) -> Result<(), ProtectorError> {
-        self.legacy.remove()
+        self.legacy.remove_for(&Wiping::legacy_file())
     }
 }
 
@@ -445,14 +489,25 @@ pub(crate) mod testing {
     fn removing_external_keys_tries_them_all_and_reports_a_failure() {
         let b = Arc::new(Behaviour::default());
         let p = protectors(&b);
-        p.remove_external_keys().unwrap();
+        let w = Wiping::unknown();
+        p.remove_external_keys(&w).unwrap();
         Behaviour::set(&b.fail_remove, true);
-        assert!(matches!(p.remove_external_keys(), Err(ProtectorError::NotRemoved { .. })));
+        assert!(matches!(p.remove_external_keys(&w), Err(ProtectorError::NotRemoved { .. })));
         assert_eq!(Behaviour::count(&b.removes), 2);
         assert_eq!(Behaviour::count(&b.legacy_removes), 2, "the legacy entry too, after the failure");
         Behaviour::set(&b.fail_remove, false);
         Behaviour::set(&b.fail_legacy_remove, true);
-        assert!(matches!(p.remove_external_keys(), Err(ProtectorError::NotRemoved { .. })));
+        assert!(matches!(p.remove_external_keys(&w), Err(ProtectorError::NotRemoved { .. })));
+    }
+
+    #[test]
+    fn what_a_wipe_may_involve() {
+        let unknown = Wiping::unknown();
+        assert!(unknown.may_be_sealed_by(&["secret-service"]) && unknown.legacy);
+        let tpm = Wiping { sealed_by: Some("tpm".into()), legacy: false };
+        assert!(!tpm.may_be_sealed_by(&["secret-service", "keyring"]));
+        assert!(tpm.may_be_sealed_by(&["tpm"]));
+        assert!(Wiping::legacy_file().legacy);
     }
 
     #[test]

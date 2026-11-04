@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 use vettid_device::store::{Persist, StoreError};
 use zeroize::Zeroizing;
 
-use super::protector::{self, DataKey, ProtectorError, Protectors};
+use super::protector::{self, DataKey, ProtectorError, Protectors, Wiping};
 use super::store::{self, CredentialError, WipeEpoch, DEVICE_FILE};
 
 /// The device file's format version.
@@ -281,7 +281,12 @@ impl DeviceStore {
         let wrapped = Zeroizing::new(B64.decode(&h.wrapped_key).map_err(|_| corrupt("wrapped key"))?);
         let ciphertext = B64.decode(&file.ciphertext).map_err(|_| corrupt("ciphertext"))?;
         // A protector this build doesn't have here: kept, reported.
-        let p = self.protectors.by_id(&h.protector).ok_or_else(|| corrupt("unknown protector"))?;
+        // (#69's Linux `keyring` is one.) Unreadable: the person is told to
+        // log out and pair again.
+        let p = self.protectors.by_id(&h.protector).ok_or_else(|| {
+            log::warn!("device store: a protector this build doesn't have here");
+            (CredentialError::Unreadable, StoreError::Corrupt)
+        })?;
         let key = p.unwrap(&wrapped).map_err(load_error)?;
         let cipher = XChaCha20Poly1305::new_from_slice(&key[..]).map_err(|_| corrupt("cipher"))?;
         let plain = cipher
@@ -307,8 +312,9 @@ impl DeviceStore {
             return Ok(());
         }
         self.sealing = None;
+        let wiping = what_is_sealed(&self.dir);
         let file = store::remove_file_locked(&self.dir, DEVICE_FILE).and_then(|()| store::confirm_gone(&self.dir, DEVICE_FILE));
-        let keys = self.protectors.remove_external_keys().map_err(CredentialError::from);
+        let keys = self.protectors.remove_external_keys(&wiping).map_err(CredentialError::from);
         file.and(keys)
     }
 }
@@ -414,6 +420,24 @@ pub fn retire_legacy(config_dir: &Path) -> Result<bool, CredentialError> {
 /// be ruled out (nothing treats the pairing as gone on a guess).
 pub fn exists(config_dir: &Path) -> bool {
     !matches!(fs::symlink_metadata(config_dir.join(DEVICE_FILE)), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// What a wipe of `config_dir` removes, from the device file's header
+/// read unauthenticated (nothing is decrypted). No file, or one that can't
+/// be read or parsed: nothing is known ([`Wiping::unknown`]). An earlier
+/// format's file, or a `connection.enc` that may be there, involves the
+/// legacy entry.
+pub(crate) fn what_is_sealed(config_dir: &Path) -> Wiping {
+    let raw = match read_file(config_dir) {
+        Ok(Some(raw)) => raw,
+        _ => return Wiping::unknown(),
+    };
+    let legacy_pairing = store::exists(config_dir);
+    match serde_json::from_slice::<SealedFile>(&raw) {
+        Ok(f) if f.header.v == FORMAT_VERSION => Wiping { sealed_by: Some(f.header.protector), legacy: legacy_pairing },
+        Err(_) if is_legacy(&raw) => Wiping::legacy_file(),
+        _ => Wiping::unknown(),
+    }
 }
 
 /// What protects the device file, for Settings (#11), from its header;
@@ -804,6 +828,41 @@ pub(crate) mod tests {
             assert_eq!(stored_key_protection(&dir).protector, "unknown");
         }
         assert_eq!(Behaviour::count(&b.legacy_removes), 0);
+    }
+
+    /// A protector this build doesn't have here (#69's Linux `keyring`):
+    /// kept, and reported unreadable, so the notice says to log out and
+    /// pair again. Settings can't tell what protects it.
+    #[test]
+    fn an_unknown_protector_is_unreadable_and_kept() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        store_in(&dir).save(STATE).unwrap();
+        let mut f = read_sealed(&dir);
+        f.header.protector = "keyring-of-another-build".into();
+        write_sealed(&dir, &f);
+        let mut s = store_in(&dir);
+        assert_eq!(s.load(), Err(StoreError::Corrupt));
+        assert!(matches!(s.take_failure(), Some(CredentialError::Unreadable)));
+        assert!(exists(&dir));
+        assert_eq!(stored_key_protection(&dir), KeyProtection { protector: "unknown", bound: false });
+    }
+
+    /// What a wipe learns from the header, before removing anything.
+    #[test]
+    fn a_wipe_reads_what_the_file_was_sealed_with() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        assert_eq!(what_is_sealed(&dir), Wiping::unknown(), "no file: nothing known");
+        store_in(&dir).save(STATE).unwrap();
+        assert_eq!(what_is_sealed(&dir), Wiping { sealed_by: Some("test".into()), legacy: false });
+        fs::write(dir.join("connection.enc"), b"old").unwrap();
+        assert_eq!(what_is_sealed(&dir), Wiping { sealed_by: Some("test".into()), legacy: true });
+        fs::remove_file(dir.join("connection.enc")).unwrap();
+        fs::write(dir.join(DEVICE_FILE), legacy_bytes()).unwrap();
+        assert_eq!(what_is_sealed(&dir), Wiping::legacy_file());
+        fs::write(dir.join(DEVICE_FILE), b"not json").unwrap();
+        assert_eq!(what_is_sealed(&dir), Wiping::unknown());
     }
 
     #[test]
