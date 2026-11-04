@@ -155,7 +155,13 @@ pub async fn register(
     let name = collect_device_fingerprint().hostname;
 
     let mut store = DeviceStore::new(&config_dir, since);
-    let pairing = match vettid_device::pairing::start(code, &name, Http::new, &mut store, SystemClock).await {
+    // Until the first save (the pending pairing, stored by start): no unlock
+    // opens the store meanwhile. After it, the pairing count keeps unlock
+    // away.
+    let opening = state.opening.lock().await;
+    let started = vettid_device::pairing::start(code, &name, Http::new, &mut store, SystemClock).await;
+    drop(opening);
+    let pairing = match started {
         Ok(p) => p,
         Err(e) => {
             log::warn!("register: pairing not started: {}", e);
@@ -422,9 +428,16 @@ pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String
     // #43: likewise a lock or End session, including one under way now.
     let mark = reset_mark(&state);
 
+    // One opening at a time, from this check to the install below (two
+    // unlocks can't both open the store), and none while a pairing is under
+    // way.
+    let Some(_opening) = begin_opening(&state.pairing, &state.opening).await else {
+        return Ok(UnlockResponse { unlocked: false, notice: None });
+    };
     // Review MEDIUM 3: open already, or a pairing under way: the store is
-    // left alone.
-    if let Some(r) = already_open(&state.pairing, &state.link).await {
+    // left alone. A busy link (a Start New Session waiting for the phone)
+    // is not waited for.
+    if let Some(r) = already_open(&state.pairing, &state.link, state.snapshot().unlocked).await {
         return Ok(r);
     }
 
@@ -491,17 +504,37 @@ impl Drop for PairingUnderWay<'_> {
     }
 }
 
+/// The right to open the device store (see `AppState::opening`), or
+/// `None` while a pairing is under way. The count is read before waiting
+/// (a pairing's start isn't waited for) and again after.
+async fn begin_opening<'a>(
+    pairing: &std::sync::atomic::AtomicUsize,
+    opening: &'a tokio::sync::Mutex<()>,
+) -> Option<tokio::sync::MutexGuard<'a, ()>> {
+    use std::sync::atomic::Ordering::SeqCst;
+    if pairing.load(SeqCst) > 0 {
+        return None;
+    }
+    let guard = opening.lock().await;
+    (pairing.load(SeqCst) == 0).then_some(guard)
+}
+
 /// What unlock answers without touching the device store: the link that
 /// is open (a second unlock reopens nothing), or nothing while a pairing
-/// is under way (opening the store would remove its pending state).
+/// is under way (opening the store would remove its pending state). A
+/// link someone holds (a Start New Session waits for the phone with it) is
+/// not waited for: it is open, as the last snapshot says (`busy_unlocked`).
 async fn already_open<T: vettid_device::transport::Transport, C: vettid_device::pairing::Clock>(
     pairing: &std::sync::atomic::AtomicUsize,
     link: &tokio::sync::Mutex<Option<Link<T, C>>>,
+    busy_unlocked: bool,
 ) -> Option<UnlockResponse> {
     if pairing.load(std::sync::atomic::Ordering::SeqCst) > 0 {
         return Some(UnlockResponse { unlocked: false, notice: None });
     }
-    let slot = link.lock().await;
+    let Ok(slot) = link.try_lock() else {
+        return Some(UnlockResponse { unlocked: busy_unlocked, notice: None });
+    };
     let l = slot.as_ref()?;
     let notice = l.refused().then(|| link::REFUSED_NOTICE.to_string());
     Some(UnlockResponse { unlocked: true, notice })
@@ -1169,23 +1202,68 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
         let pairing = AtomicUsize::new(0);
         let none: tokio::sync::Mutex<Option<Link>> = tokio::sync::Mutex::new(None);
-        assert!(already_open(&pairing, &none).await.is_none(), "nothing open: unlock goes on");
+        assert!(already_open(&pairing, &none, false).await.is_none(), "nothing open: unlock goes on");
         {
             let _p = PairingUnderWay::new(&pairing);
-            let r = already_open(&pairing, &none).await.expect("left alone");
+            let r = already_open(&pairing, &none, false).await.expect("left alone");
             assert!(!r.unlocked && r.notice.is_none());
         }
-        assert!(already_open(&pairing, &none).await.is_none(), "the count drops with the pairing");
+        assert!(already_open(&pairing, &none, false).await.is_none(), "the count drops with the pairing");
 
         let dir = tempfile::tempdir().unwrap();
         let (vault, l) = FakeVault::paired(dir.path());
         let open = tokio::sync::Mutex::new(Some(l));
-        let r = already_open(&pairing, &open).await.expect("open already");
+        let r = already_open(&pairing, &open, false).await.expect("open already");
         assert!(r.unlocked && r.notice.is_none());
         vault.revoke(false);
         let _ = open.lock().await.as_mut().unwrap().read_status().await;
-        let r = already_open(&pairing, &open).await.unwrap();
+        let r = already_open(&pairing, &open, false).await.unwrap();
         assert_eq!(r.notice.as_deref(), Some(link::REFUSED_NOTICE));
+    }
+
+    /// Re-check 1: a link held for the whole phone wait (Start New
+    /// Session) isn't waited for: it counts as open, as the snapshot says.
+    #[tokio::test]
+    async fn unlock_doesnt_wait_for_a_busy_link() {
+        use std::sync::atomic::AtomicUsize;
+        let pairing = AtomicUsize::new(0);
+        let link: tokio::sync::Mutex<Option<Link>> = tokio::sync::Mutex::new(None);
+        let _held = link.lock().await;
+        let r = tokio::time::timeout(std::time::Duration::from_secs(1), already_open(&pairing, &link, true))
+            .await
+            .expect("not blocked by the held link")
+            .expect("answered");
+        assert!(r.unlocked && r.notice.is_none());
+        let r = already_open(&pairing, &link, false).await.unwrap();
+        assert!(!r.unlocked, "as the snapshot says");
+    }
+
+    /// Re-check 2: one opening at a time. A second unlock waits for the
+    /// first; one that waited out a pairing's start (which counted itself
+    /// first) leaves the store alone; with a pairing counted it doesn't
+    /// wait at all.
+    #[tokio::test]
+    async fn openings_dont_overlap_and_yield_to_a_pairing() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        let pairing = Arc::new(AtomicUsize::new(0));
+        let opening = Arc::new(tokio::sync::Mutex::new(()));
+        let first = begin_opening(&pairing, &opening).await.expect("free");
+        let second = {
+            let (p, o) = (pairing.clone(), opening.clone());
+            tokio::spawn(async move { begin_opening(&p, &o).await.is_some() })
+        };
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished(), "waits for the first");
+        // A pairing counts itself, then waits for the opening (as register).
+        let counted = PairingUnderWay::new(&pairing);
+        drop(first);
+        assert!(!second.await.unwrap(), "after the wait, the pairing is seen");
+        // With a pairing counted, no wait at all, even if the opening is held.
+        let _held = opening.lock().await;
+        let r = tokio::time::timeout(std::time::Duration::from_secs(1), begin_opening(&pairing, &opening)).await;
+        assert!(r.expect("not waited").is_none());
+        drop(counted);
     }
 
     /// LOW 11: an earlier build's pairing goes whenever it is there; the

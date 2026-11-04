@@ -40,6 +40,12 @@ pub struct AppState {
     /// device store alone (opening it would remove the pending pairing).
     pub pairing: Arc<std::sync::atomic::AtomicUsize>,
 
+    /// One opening of the device store at a time: held by `unlock` from its
+    /// first check to the link's install, and by `register` until its first
+    /// save (the end of `pairing::start`). Taken before `link`, never
+    /// while holding it or `session_op`.
+    pub opening: Arc<Mutex<()>>,
+
     /// Held for the whole of End session and of Start New Session, so the
     /// two never overlap (#33).
     pub session_op: Arc<Mutex<()>>,
@@ -70,6 +76,7 @@ impl AppState {
             delegation: Arc::new(Mutex::new(DelegationManager::new())),
             is_registered: Arc::new(RwLock::new(false)),
             pairing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            opening: Arc::new(Mutex::new(())),
             session_op: Arc::new(Mutex::new(())),
             resets_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             resets_finished: Arc::new(std::sync::atomic::AtomicU64::new(0)),
