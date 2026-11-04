@@ -389,13 +389,20 @@ pub(super) fn retire_legacy_with(dir: &Path, protectors: &Protectors) -> Result<
         _ => return Ok(false),
     }
     // The marker first, so a log-out after a retirement that left the key
-    // knows an earlier format was here.
-    let wiping = store::begin_wipe(dir, Wiping::legacy_file());
+    // knows an earlier format was here. An earlier wipe's marker is kept
+    // in it, and restored once the v1 parts are confirmed gone: this
+    // removes only those, never what that wipe left.
+    let earlier = store::pending_wipe(dir);
+    let this = Wiping::legacy_file();
+    store::record_wipe(dir, &earlier.clone().map_or_else(|| this.clone(), |e| e.and(this.clone())));
     let file = store::remove_file_locked(dir, DEVICE_FILE).and_then(|()| store::confirm_gone(dir, DEVICE_FILE));
-    let key = protectors.remove_legacy_key(&wiping);
+    let key = protectors.remove_legacy_key(&this);
     match (file, key) {
         (Ok(()), Ok(())) => {
-            store::finish_wipe(dir);
+            match earlier {
+                Some(e) => store::record_wipe(dir, &e),
+                None => store::finish_wipe(dir),
+            }
             Ok(true)
         }
         (file, key) => {

@@ -571,8 +571,19 @@ pub(crate) fn wipe(config_dir: &Path) -> Result<(), CredentialError> {
 /// that reached the vault over NATS), which this build can't use, with its
 /// live marker. The folder, the keyring key and this build's device file
 /// are left. Ok only if the file system confirms it gone.
+///
+/// The earlier builds kept that pairing's key as `master-key-v1`, which this
+/// doesn't remove (log-out does): the pending-wipe marker records that an
+/// earlier format was here, first, and stays until a log-out confirms the
+/// key gone.
 pub fn remove_legacy_pairing(config_dir: &Path) -> Result<(), CredentialError> {
     let _one_at_a_time = writer_lock();
+    let legacy = super::protector::Wiping { legacy: true, ..super::protector::Wiping::nothing() };
+    let wiping = match pending_wipe(config_dir) {
+        Some(pending) => pending.and(legacy),
+        None => legacy,
+    };
+    record_wipe(config_dir, &wiping);
     delete_locked(config_dir)?;
     confirm_gone(config_dir, CREDENTIAL_FILE)
 }
@@ -627,19 +638,31 @@ static PENDING_WIPES: std::sync::LazyLock<std::sync::Mutex<std::collections::Has
 /// memory. The caller holds the writer lock, and calls [`finish_wipe`]
 /// only once every part is confirmed gone.
 pub(super) fn begin_wipe(config_dir: &Path, on_disk: super::protector::Wiping) -> super::protector::Wiping {
-    let mut pending = PENDING_WIPES.lock().unwrap_or_else(|e| e.into_inner());
-    let mut wiping = on_disk;
-    if let Some(marked) = wipe_marker::read(config_dir) {
-        wiping = marked.and(wiping);
+    let wiping = match pending_wipe(config_dir) {
+        Some(pending) => pending.and(on_disk),
+        None => on_disk,
+    };
+    record_wipe(config_dir, &wiping);
+    wiping
+}
+
+/// A wipe of `config_dir` that hasn't finished: its marker and this
+/// process's memory of it, together. The caller holds the writer lock.
+pub(super) fn pending_wipe(config_dir: &Path) -> Option<super::protector::Wiping> {
+    let remembered = PENDING_WIPES.lock().unwrap_or_else(|e| e.into_inner()).get(config_dir).cloned();
+    match (wipe_marker::read(config_dir), remembered) {
+        (Some(m), Some(r)) => Some(m.and(r)),
+        (m, r) => m.or(r),
     }
-    if let Some(remembered) = pending.get(config_dir) {
-        wiping = remembered.clone().and(wiping);
-    }
-    if let Err(e) = wipe_marker::write(config_dir, &wiping) {
+}
+
+/// Record `wiping` as the pending wipe of `config_dir` (the marker, and
+/// memory). The caller holds the writer lock.
+pub(super) fn record_wipe(config_dir: &Path, wiping: &super::protector::Wiping) {
+    if let Err(e) = wipe_marker::write(config_dir, wiping) {
         log::warn!("Credential store: the wipe's marker wasn't written ({}); this process remembers it, a restart loses it", e);
     }
-    pending.insert(config_dir.to_path_buf(), wiping.clone());
-    wiping
+    PENDING_WIPES.lock().unwrap_or_else(|e| e.into_inner()).insert(config_dir.to_path_buf(), wiping.clone());
 }
 
 /// After a wipe of `config_dir` whose every part is confirmed gone: the
@@ -1580,6 +1603,49 @@ pub(crate) mod tests {
         assert!(marker(&dir).exists());
         assert!(matches!(wipe_then(Some(&dir), remove_unreachable), Err(CredentialError::IoError(_))));
         assert!(marker(&dir).exists());
+    }
+
+    /// `connection.enc` removed at unlock: its `master-key-v1` isn't, so the
+    /// marker records it, and a log-out with the Secret Service unreachable
+    /// is "not removed".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn removing_connection_enc_leaves_the_legacy_key_to_log_out() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        ensure_config_dir(&dir).unwrap();
+        fs::write(dir.join(CREDENTIAL_FILE), b"old").unwrap();
+        remove_legacy_pairing(&dir).unwrap();
+        assert!(!exists(&dir));
+        assert!(marker(&dir).exists());
+        assert!(matches!(wipe_then(Some(&dir), remove_unreachable), Err(CredentialError::IoError(_))));
+        // With the key confirmed gone (the test protectors), the marker goes.
+        let b = std::sync::Arc::new(crate::credential::protector::testing::Behaviour::default());
+        wipe_then(Some(&dir), |w| crate::credential::protector::testing::protectors(&b).remove_external_keys(w).map_err(CredentialError::from)).unwrap();
+        assert!(!marker(&dir).exists());
+    }
+
+    /// Retiring a v1 file doesn't clear the marker of an earlier wipe that
+    /// left a Secret Service key: it is restored after, so log-out still
+    /// checks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retiring_a_v1_file_keeps_an_earlier_wipes_marker() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        sealed_by(&dir, "secret-service");
+        assert!(wipe_then(Some(&dir), remove_unreachable).is_err(), "left the key");
+        ensure_config_dir(&dir).unwrap();
+        fs::write(dir.join(DEVICE_FILE), br#"{"version":1,"binding":"keyring","nonce":[7,7],"ciphertext":[9]}"#).unwrap();
+        let b = std::sync::Arc::new(crate::credential::protector::testing::Behaviour::default());
+        let retired = super::super::device_store::retire_legacy_with(&dir, &crate::credential::protector::testing::protectors(&b));
+        assert!(retired.unwrap(), "the v1 parts confirmed gone");
+        assert!(marker(&dir).exists(), "the earlier wipe's marker stays");
+        let err = wipe_then(Some(&dir), |w| {
+            assert_eq!(w.sealed_by.as_deref(), Some("secret-service"));
+            remove_unreachable(w)
+        });
+        assert!(err.is_err());
     }
 
     /// device.unlinked's clear of a Secret Service file that left the key:
