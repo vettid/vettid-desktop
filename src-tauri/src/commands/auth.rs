@@ -1296,10 +1296,10 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let dir = base.path().join("vettid-desktop");
         assert_eq!(retire_legacy_pairing(&dir), None);
-        store::tests::save_pairing_with_live_session(&dir, "legacy");
+        store::tests::legacy_pairing_for_tests(&dir);
         assert_eq!(retire_legacy_pairing(&dir), Some(store::UNREADABLE_NOTICE));
         assert!(!store::exists(&dir));
-        store::tests::save_pairing_with_live_session(&dir, "legacy-2");
+        store::tests::legacy_pairing_for_tests(&dir);
         crate::credential::device_store::tests::store_for_tests(&dir).save_raw_for_tests();
         assert_eq!(retire_legacy_pairing(&dir), None, "silent next to a device file");
         assert!(!store::exists(&dir));
