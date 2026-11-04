@@ -1,24 +1,18 @@
-//! The master key in Windows Credential Manager, kept on this machine.
-//!
-//! The `keyring` crate (3.6.3) writes every credential with
-//! `CRED_PERSIST_ENTERPRISE`, which roams with a domain profile: the key
-//! follows the user to other PCs and the profile server, and a logout on
-//! one PC deletes the key another PC uses. This module writes the entry
-//! itself with `CRED_PERSIST_LOCAL_MACHINE` (owner decision 3a,
-//! 2026-11-01). It is still per user: Credential Manager protects it with
-//! the user's DPAPI keys, and other users can't read it. Any process
-//! running as the same user can.
-//!
-//! The entry is a generic credential whose blob is the 32-byte key.
+//! The earlier format's master key in Windows Credential Manager
+//! (`vettid-desktop/master-key-v1/local`, a generic credential kept on this
+//! machine with `CRED_PERSIST_LOCAL_MACHINE`). The device file is now
+//! protected by DPAPI (`dpapi`), so this entry is never read for use or
+//! written: it is only deleted, and confirmed gone, when an earlier
+//! format's file is retired and at every wipe (DESKTOP-REWORK-PLAN §4,
+//! "Migration: none").
 
 use std::ffi::c_void;
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{GetLastError, ERROR_NOT_FOUND};
-use windows_sys::Win32::Security::Credentials::{
-    CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE,
-    CRED_TYPE_GENERIC,
-};
+use windows_sys::Win32::Security::Credentials::{CredDeleteW, CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC};
+#[cfg(test)]
+use windows_sys::Win32::Security::Credentials::{CredWriteW, CRED_PERSIST_LOCAL_MACHINE};
 use zeroize::Zeroizing;
 
 /// The credential's target name. Distinct from the name the `keyring`
@@ -32,14 +26,9 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// The stored key: `Ok(None)` when there is no entry.
-pub(crate) fn read() -> Result<Option<Zeroizing<[u8; KEY_LEN]>>, String> {
-    read_target(TARGET)
-}
-
-/// Store `key`, replacing any entry, persisted on this machine only.
-pub(crate) fn write(key: &[u8; KEY_LEN]) -> Result<(), String> {
-    write_target(TARGET, key)
+/// Whether the entry is there. Its bytes are wiped unread.
+pub(crate) fn is_present() -> Result<bool, String> {
+    read_target(TARGET).map(|key| key.is_some())
 }
 
 /// Delete the entry. A missing entry counts as deleted.
@@ -91,6 +80,7 @@ fn read_target(target: &str) -> Result<Option<Zeroizing<[u8; KEY_LEN]>>, String>
     result
 }
 
+#[cfg(test)]
 fn write_target(target: &str, key: &[u8; KEY_LEN]) -> Result<(), String> {
     let mut target_w = wide(target);
     // CredWriteW takes a mutable blob pointer but does not write to it;
