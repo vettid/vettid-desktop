@@ -1,24 +1,8 @@
 use serde::Serialize;
 use tauri::State;
 
-use crate::session::manager::SessionState;
+use crate::link::Snapshot;
 use crate::state::AppState;
-
-/// True if the NATS client is currently connected — the desktop's
-/// link to the vault. We surface this as `phone_reachable` because
-/// the only way the phone can hear from us is via NATS; a disconnected
-/// NATS means the phone cannot respond to approval prompts.
-///
-/// This is a proxy, not a direct heartbeat — until the vault sends a
-/// per-device phone-heartbeat push, link liveness is the best signal
-/// we have.
-async fn phone_reachable(state: &AppState) -> bool {
-    let client = state.nats.lock().await;
-    matches!(
-        client.connection_state(),
-        Some(async_nats::connection::State::Connected),
-    )
-}
 
 #[derive(Debug, Serialize)]
 pub struct SessionStatus {
@@ -28,6 +12,8 @@ pub struct SessionStatus {
     pub seconds_remaining: Option<i64>,
     pub extended_count: Option<i32>,
     pub max_extensions: Option<i32>,
+    /// Whether the last exchange with the vault (through the relay) got an
+    /// answer. A proxy, not a heartbeat from the phone.
     pub phone_reachable: bool,
 }
 
@@ -39,88 +25,69 @@ pub struct SessionTimer {
     pub warn_5min: bool,
 }
 
-/// Get current session status from the SessionManager.
+/// The session's state, from the link's last snapshot: "active" only while
+/// [`Snapshot::active_at`] says so, "expired" when unlocked without a live
+/// session, "inactive" when locked or not paired.
+fn status_of(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> SessionStatus {
+    let none = |state: &str, reachable: bool| SessionStatus {
+        state: state.to_string(),
+        session_id: None,
+        expires_at: None,
+        seconds_remaining: None,
+        extended_count: None,
+        max_extensions: None,
+        phone_reachable: reachable,
+    };
+    match snap.live_until.filter(|_| snap.active_at(now)) {
+        Some(until) => SessionStatus {
+            state: "active".to_string(),
+            session_id: snap.session_id.clone(),
+            expires_at: Some(until.timestamp()),
+            seconds_remaining: Some((until - now).num_seconds().max(0)),
+            // The vault doesn't count extensions; reported as 0.
+            extended_count: Some(0),
+            max_extensions: Some(3),
+            phone_reachable: snap.reachable,
+        },
+        None if snap.unlocked => none("expired", snap.reachable),
+        None => none("inactive", false),
+    }
+}
+
+/// Get current session status.
 #[tauri::command]
 pub async fn get_session_status(state: State<'_, AppState>) -> Result<SessionStatus, String> {
-    // Take the link-reachability snapshot first so we hold the NATS
-    // lock briefly and don't tangle it with the session read lock.
-    let reachable = phone_reachable(&state).await;
-
-    let session_mgr = state.session.read().await;
-    let current = session_mgr.state();
-
-    match current {
-        SessionState::Active { expires_at, session_id } => {
-            let remaining = session_mgr.seconds_remaining().unwrap_or(0);
-            // extended_count: the vault doesn't track per-session
-            // extensions in DeviceSessionInfo today, so we report 0
-            // honestly rather than the misleading ttl_hours (which is
-            // a duration, not a count). When the vault grows an
-            // extensions counter this becomes `info.extensions`.
-            Ok(SessionStatus {
-                state: "active".to_string(),
-                session_id: Some(session_id),
-                expires_at: Some(expires_at),
-                seconds_remaining: Some(remaining),
-                extended_count: Some(0),
-                max_extensions: Some(3),
-                phone_reachable: reachable,
-            })
-        }
-        SessionState::Suspended => Ok(SessionStatus {
-            state: "suspended".to_string(),
-            session_id: None,
-            expires_at: None,
-            seconds_remaining: None,
-            extended_count: None,
-            max_extensions: None,
-            phone_reachable: reachable,
-        }),
-        SessionState::Expired => Ok(SessionStatus {
-            state: "expired".to_string(),
-            session_id: None,
-            expires_at: None,
-            seconds_remaining: None,
-            extended_count: None,
-            max_extensions: None,
-            phone_reachable: false,
-        }),
-        SessionState::Revoked => Ok(SessionStatus {
-            state: "revoked".to_string(),
-            session_id: None,
-            expires_at: None,
-            seconds_remaining: None,
-            extended_count: None,
-            max_extensions: None,
-            phone_reachable: false,
-        }),
-        SessionState::Inactive => Ok(SessionStatus {
-            state: "inactive".to_string(),
-            session_id: None,
-            expires_at: None,
-            seconds_remaining: None,
-            extended_count: None,
-            max_extensions: None,
-            phone_reachable: false,
-        }),
-    }
+    Ok(status_of(&state.snapshot(), chrono::Utc::now()))
 }
 
 /// Get session timer for countdown display.
 #[tauri::command]
 pub async fn get_session_timer(state: State<'_, AppState>) -> Result<SessionTimer, String> {
-    let session_mgr = state.session.read().await;
-    let remaining = session_mgr.seconds_remaining().unwrap_or(0);
-
-    let expires_at = match session_mgr.state() {
-        SessionState::Active { expires_at, .. } => expires_at,
-        _ => chrono::Utc::now().timestamp(),
-    };
-
+    let now = chrono::Utc::now();
+    let status = status_of(&state.snapshot(), now);
+    let remaining = status.seconds_remaining.unwrap_or(0);
     Ok(SessionTimer {
         seconds_remaining: remaining,
-        expires_at,
+        expires_at: status.expires_at.unwrap_or_else(|| now.timestamp()),
         warn_30min: remaining <= 1800 && remaining > 0,
         warn_5min: remaining <= 300 && remaining > 0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_only_while_the_snapshot_is_live() {
+        let now = chrono::Utc::now();
+        assert_eq!(status_of(&Snapshot::default(), now).state, "inactive");
+        let mut snap = Snapshot { unlocked: true, reachable: true, ..Default::default() };
+        assert_eq!(status_of(&snap, now).state, "expired");
+        snap.live_until = Some(now + chrono::TimeDelta::seconds(30));
+        snap.session_id = Some("s".into());
+        let s = status_of(&snap, now);
+        assert_eq!((s.state.as_str(), s.seconds_remaining), ("active", Some(30)));
+        assert_eq!(status_of(&snap, now + chrono::TimeDelta::seconds(31)).state, "expired");
+    }
 }

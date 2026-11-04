@@ -6,7 +6,7 @@ Desktop companion app for VettID, built with Tauri v2, Rust, and Svelte.
 
 ## Overview
 
-VettID Desktop extends your VettID vault to desktop environments. Sessions are time-limited and capability-scoped — your phone stays in control. The desktop can browse connections, read feeds, and view audit logs independently, but any sensitive operation (retrieving secrets, updating credentials, approving agents) requires real-time phone approval over an encrypted NATS channel.
+VettID Desktop extends your VettID vault to desktop environments. Sessions are time-limited and capability-scoped — your phone stays in control. The desktop can browse connections, read feeds, and view audit logs independently, but any sensitive operation (retrieving secrets, updating credentials, approving agents) requires real-time phone approval. The desktop reaches its vault through the vault's relay; in this build only pairing and sessions do, and other vault operations answer "not available yet".
 
 ## Features
 
@@ -23,24 +23,9 @@ VettID Desktop extends your VettID vault to desktop environments. Sessions are t
 - Node.js 18+
 - Tauri v2 system dependencies ([see Tauri prerequisites](https://v2.tauri.app/start/prerequisites/))
 
-### Pairing bootstrap (no creds shipped in the binary)
+### Pairing (no creds shipped in the binary)
 
-Pairing reads the vault-published invitation from the `INVITATIONS` JetStream using NATS credentials that are **minted server-side per pairing attempt** — no long-lived credential is distributed with the desktop binary.
-
-Flow:
-
-1. User types the 8-char invite code into the desktop.
-2. Desktop POSTs `{ "code": "..." }` to `https://api.vettid.dev/pair/device/bootstrap` (override via `VETTID_BOOTSTRAP_URL` for dev/staging).
-3. Lambda returns a freshly-generated NATS user JWT + seed, scoped to INVITATIONS stream JetStream ops, with a 60-second TTL.
-4. Desktop connects to NATS with those creds, pulls `invite.<code>`, disconnects. The creds expire by themselves seconds later.
-
-Security properties:
-
-- Reverse-engineering the binary gives you nothing — there are no static creds in it.
-- A captured bootstrap response is useless in 60 s and only authorizes INVITATIONS stream reads (no user spaces).
-- Each pairing is auditable at the Lambda boundary (source IP + code prefix are logged; the full code is never logged).
-
-See `vettid-dev/docs/DESKTOP-CONNECTION-FLOW.md` §"Invite delivery" for the full protocol.
+The member's phone shows a desktop pairing code. The desktop reads it and pairs with the vault through the relay (VAULT-MESSAGING §6.7, `src-tauri/crates/vettid-device`): a handshake, a six-digit code the member compares on the phone, and the owner's approval there. The keys are made on the desktop and kept sealed under a key in the OS keyring; without a keyring the desktop doesn't pair.
 
 ## Project Structure
 
@@ -61,19 +46,14 @@ src-tauri/src/
 │   ├── hkdf.rs             # HKDF-SHA256 key derivation
 │   └── keys.rs             # X25519 keypair generation
 ├── credential/
-│   └── store.rs            # On-disk encrypted credential storage
+│   ├── device_store.rs     # The device engine's state, sealed (keyring only)
+│   └── store.rs            # On-disk encrypted storage (shared parts)
 ├── fingerprint/
 │   ├── binary.rs           # Binary self-hash
 │   ├── platform_key.rs     # Platform key abstraction
 │   └── platform_linux.rs   # Linux-specific platform key
-├── nats/
-│   ├── client.rs           # async-nats connection management
-│   └── messages.rs         # Envelope, ConnectionRequest, wire types
-├── registration/
-│   ├── flow.rs             # End-to-end pairing orchestration
-│   └── shortlink.rs        # Short-link code generation/resolution
+├── link.rs                 # Session and access session with the vault (relay)
 └── session/
-    ├── manager.rs          # SessionManager state machine
     ├── capabilities.rs     # Independent vs. phone-required capability lists
     └── delegation.rs       # Phone-delegated operation requests
 
@@ -86,7 +66,6 @@ src/
     │   ├── SessionTimer.svelte
     │   └── StatusBar.svelte
     ├── stores/
-    │   ├── nats.ts         # NATS connection state
     │   └── session.ts      # Session state
     └── views/
         ├── Pairing.svelte  # Device registration flow
@@ -132,10 +111,10 @@ All intermediate key material (shared secrets, derived keys, concatenated inputs
 ## Architecture
 
 ```
-Phone App → NATS (E2E encrypted) → Vault Manager (Nitro Enclave) → NATS → Desktop Client
+Phone App → Vault (Nitro Enclave) ← relay (E2E encrypted) ← Desktop Client
 ```
 
-The desktop never holds the vault master key. It receives a session token and scoped capabilities from the vault after phone-approved pairing. Independent operations (feed, connections, audit) are served directly; sensitive operations are forwarded to the phone for approval via the vault's NATS message bus.
+The desktop never holds the vault master key. After phone-approved pairing it holds its own device keys, and asks the vault for time-limited access sessions, which the owner's phone approves (VAULT-MESSAGING §6.8).
 
 ## Related Repositories
 

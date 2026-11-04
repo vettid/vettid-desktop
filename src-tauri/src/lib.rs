@@ -1,8 +1,7 @@
 pub mod crypto;
 pub mod fingerprint;
 pub mod credential;
-pub mod nats;
-pub mod registration;
+pub mod link;
 pub mod session;
 pub mod commands;
 pub mod state;
@@ -23,7 +22,7 @@ pub fn run() {
     // and pairing failures left no breadcrumb in stderr.
     let _ = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or(
-            "info,vettid_desktop=debug,async_nats=info,reqwest=warn",
+            "info,vettid_desktop=debug,reqwest=warn",
         ),
     )
     .format_timestamp_millis()
@@ -34,7 +33,7 @@ pub fn run() {
         // docs so it can short-circuit before any other setup runs.
         // On a second launch the callback fires in the running
         // process — we show + focus the existing window instead of
-        // letting two binaries fight over the NATS subscription.
+        // letting two binaries fight over the relay mailbox.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.show();
@@ -47,6 +46,16 @@ pub fn run() {
         .manage(AppState::new())
         .setup(|app| {
             tray::install(app.handle())?;
+            // What the background refresh finds (a device refused or
+            // removed by its vault) reaches the window as `vault:notice`.
+            {
+                use tauri::Emitter;
+                let handle = app.handle().clone();
+                let tell: std::sync::Arc<dyn Fn(String) + Send + Sync> = std::sync::Arc::new(move |notice: String| {
+                    let _ = handle.emit(link::NOTICE_EVENT, notice);
+                });
+                *app.state::<AppState>().notify.write().unwrap_or_else(|p| p.into_inner()) = Some(tell);
+            }
             // Compute the device fingerprint now, on a background
             // thread. Hashing the executable is slow on a debug build;
             // doing it at startup means it is ready before the user
@@ -55,8 +64,8 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing the main window only hides it — the listener and tray
-            // keep running. The user quits via the tray menu (or Cmd+Q on macOS).
+            // Closing the main window only hides it — the session refresh and
+            // tray keep running. The user quits via the tray menu (or Cmd+Q on macOS).
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     let _ = window.hide();

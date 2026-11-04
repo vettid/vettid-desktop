@@ -62,8 +62,8 @@
     statusMessage = '';
     sessionNotice.set(null);
     try {
-      // The session always ends in this run; `notice` says when that
-      // couldn't be recorded on this computer (#26).
+      // The session stops being shown as live at once; `notice` says when
+      // the vault didn't confirm the end (or a newer session runs on).
       const result = await invoke<{ notice: string | null }>('end_session');
       statusMessage = result.notice ?? 'Session ended.';
       // This view is replaced at once; the notice is shown on the next.
@@ -100,7 +100,7 @@
 
 {#if busy}
   <!-- Full-view takeover while end-session / lock is in flight. The
-       end-session round-trip (publish + NATS flush + on-disk reset)
+       end-session round-trip with the vault (through the relay)
        can take a beat; without this the user sees a frozen, still-
        clickable screen and assumes nothing happened. -->
   <div class="busy-overlay">

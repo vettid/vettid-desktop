@@ -20,7 +20,9 @@
 
 use webrtc::ice_transport::ice_server::RTCIceServer;
 
-use crate::nats::operations;
+// Not available in this build: the fetch fails, and the call falls back to
+// STUN (see `commands::unavailable`).
+use crate::commands::unavailable as operations;
 use crate::state::AppState;
 
 /// Fetch TURN credentials from the vault, parse into a list of ICE

@@ -45,10 +45,10 @@ cargo test --manifest-path src-tauri/Cargo.toml -- fingerprint    # Fingerprint 
 
 ### IPC Flow
 ```
-Svelte Frontend → Tauri IPC (invoke) → commands/*.rs → Rust modules → NATS → Vault Manager
+Svelte Frontend → Tauri IPC (invoke) → commands/*.rs → link.rs → crates/vettid-device → relay → Vault
 ```
 
-The frontend calls Tauri commands via `@tauri-apps/api`. Commands in `src-tauri/src/commands/` delegate to the core Rust modules. External communication goes through NATS to the vault-manager running inside a Nitro Enclave.
+The frontend calls Tauri commands via `@tauri-apps/api`. Commands in `src-tauri/src/commands/` delegate to the core Rust modules. The desktop reaches its vault through the relay, with the device engine in `src-tauri/crates/vettid-device` (pairing, sessions and access sessions, VAULT-MESSAGING §6–§8). Other vault operations are not carried over yet: they answer one plain "not available" error (`commands/unavailable.rs`).
 
 ### Module Map
 
@@ -56,10 +56,9 @@ The frontend calls Tauri commands via `@tauri-apps/api`. Commands in `src-tauri/
 |--------|---------|
 | `crypto/` | X25519 keypairs, ECIES encrypt/decrypt, HKDF-SHA256, Argon2id, zeroization |
 | `fingerprint/` | Binary self-hash, platform key (Linux-specific), machine identity |
-| `credential/` | On-disk encrypted credential store |
-| `nats/` | async-nats client, Envelope wire format, message types |
-| `registration/` | Pairing flow orchestration, short-link code handling |
-| `session/` | SessionManager state machine, capability tiers, phone delegation |
+| `credential/` | On-disk encrypted stores: `device_store.rs` (the device engine's state, keyring only), `store.rs` (shared parts; the earlier builds' pairing) |
+| `link.rs` | The paired device's session and access session with its vault, and the background refresh |
+| `session/` | Capability tiers, phone delegation |
 | `commands/` | Tauri IPC command handlers (auth, vault, session) |
 
 ### Frontend Structure
@@ -67,7 +66,7 @@ The frontend calls Tauri commands via `@tauri-apps/api`. Commands in `src-tauri/
 | Path | Purpose |
 |------|---------|
 | `src/lib/views/` | Page-level Svelte components (Pairing, Session, Settings, Vault) |
-| `src/lib/stores/` | Svelte stores for NATS and session state |
+| `src/lib/stores/` | Svelte stores for session and vault state |
 | `src/lib/components/` | Reusable UI (PendingApproval, SessionTimer, StatusBar) |
 
 ## Security Patterns
@@ -94,26 +93,15 @@ Input is `passphrase || platform_key`, binding derived keys to both user knowled
 - **Independent** (`capabilities.rs`): `profile.view`, `connection.list`, `feed.list`, `audit.query`, `message.list`, `secrets.catalog`, etc.
 - **Phone-required** (`capabilities.rs`): `secrets.retrieve`, `secrets.add`, `connection.create`, `credential.get`, `agent.approve`, etc.
 
-### Session State Machine
-`SessionManager` tracks: `Inactive → Active → Suspended/Expired/Revoked`. Suspended sessions can resume when the phone reconnects.
+### Session State
+A session is live only while the vault's access session is (VAULT-MESSAGING §6.8): `link.rs` follows `Access::active_at` after this run's own `vault.status`, and the UI reads a snapshot of it. An end the vault hasn't confirmed is never shown as ended.
 
 ## Naming Conventions
 
 - **Rust**: `snake_case` for functions, modules, variables
 - **TypeScript/Svelte**: `camelCase` for variables/functions, `PascalCase` for components
-- **NATS message types**: `snake_case` constants (`device_connection_request`, `device_op_request`)
-- **NATS topics**: `Control.enclave.{id}.*`, `MessageSpace.{ownerSpace}.*`
 - **Tauri commands**: `snake_case` in Rust, invoked as `camelCase` from frontend
 
 ## Wire Format
 
-All NATS messages use a JSON `Envelope`:
-```json
-{
-  "type": "device_connection_request",
-  "key_id": "...",
-  "payload": [...],
-  "timestamp": "ISO 8601",
-  "sequence": 1
-}
-```
+The device engine's messages are VAULT-MESSAGING's envelopes (`crates/vettid-vms`), sent through the relay (`crates/vettid-relay`). The specifications in `vettid/vettid.org` `docs/` decide.

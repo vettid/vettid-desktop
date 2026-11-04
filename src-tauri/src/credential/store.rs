@@ -56,8 +56,14 @@ const LEGACY_STORE_VERSION_V2: i32 = 2;
 /// Domain-separation label baked into the AEAD AAD.
 const AAD_LABEL: &[u8] = b"vettid-desktop-credential-v3";
 
-/// Credential file name within the config directory.
+/// Credential file name within the config directory: the pairing of the
+/// builds that reached the vault over NATS. This build doesn't use it: it
+/// is removed at unlock (`commands::auth`) and by log-out.
 const CREDENTIAL_FILE: &str = "connection.enc";
+
+/// The paired device's state (vettid-device's `DeviceState`), sealed by
+/// [`super::device_store`]. Log-out removes it with the folder.
+pub(super) const DEVICE_FILE: &str = "device.enc";
 
 /// Marks the saved pairing's session as live (#26). A session is treated
 /// as live only while this file holds the tag of the saved session id: it
@@ -72,18 +78,12 @@ const SESSION_LIVE_FILE: &str = "session.live";
 const CONFIG_SUBDIR: &str = "vettid-desktop";
 
 /// XChaCha20-Poly1305 nonce size (24 bytes).
-const NONCE_SIZE: usize = 24;
+pub(super) const NONCE_SIZE: usize = 24;
 
 /// What the person is told when a saved pairing can't be opened. Shown
 /// as is, so it must stay plain: no error codes, no crypto terms.
 pub const UNREADABLE_NOTICE: &str =
     "This desktop's saved pairing can't be opened. Remove this desktop on your phone, then pair again.";
-
-/// Shown when a pairing saved by an earlier build was found and deleted,
-/// and `device.revoke` was sent with its credentials (#15). The vault
-/// doesn't acknowledge a revoke, so this says only that it was asked.
-pub const OLD_BUILD_REVOKED_NOTICE: &str =
-    "This desktop's saved pairing was made by an earlier version and can't be used, so it was deleted, and this desktop asked your vault to remove it. Check on your phone that this desktop is gone, then pair again.";
 
 /// Shown when the pairing can't be saved because the system keyring
 /// (Credential Manager on Windows) can't be reached and a weaker key is
@@ -157,9 +157,8 @@ pub const NOT_PRIVATE_FOLDER_NOTICE: &str =
 /// Shown after unlock when another account can open the saved pairing's
 /// folder or file, and the pairing is keyring-bound (#24).
 ///
-/// Log out (Settings > Danger zone) is the way out: it sends the revoke,
-/// removes the folder and deletes the keyring key, and says if a step
-/// failed. Pairing again into the same folder would not fix it (Windows
+/// Log out (Settings > Danger zone) is the way out: it removes the folder
+/// and deletes the keyring key, and says if a step failed. Pairing again into the same folder would not fix it (Windows
 /// refuses the folder; on unix the file's mode is kept on rewrite).
 pub const NOT_PRIVATE_KEYRING_NOTICE: &str =
     "Another account on this computer can open this desktop's saved pairing. It is still locked by your keyring, but to be safe: in Settings, open Danger zone and choose Log out this desktop. Then check on your phone that this desktop is gone, and pair again.";
@@ -195,19 +194,6 @@ pub enum CredentialError {
     /// public fingerprint, and kept it otherwise. Displays
     /// [`UNREADABLE_NOTICE`].
     Unreadable,
-    /// From [`load`] only: the file was sealed by an earlier build under the
-    /// public fingerprint, and its deletion was attempted; `deleted` is
-    /// true only if the file system confirms it gone. It carries the
-    /// credentials it held, so the caller can send `device.revoke` with
-    /// them (#15): use `registration::pairing::load_saved`, which does.
-    /// Displays [`UNREADABLE_NOTICE`].
-    OldBuildPairing { creds: OldBuildCredentials, deleted: bool },
-    /// An earlier build's pairing was found (#15): `revoke_sent` says
-    /// whether `device.revoke` was sent with it, `deleted` whether it is
-    /// confirmed gone. Displays [`OLD_BUILD_REVOKED_NOTICE`] only if both
-    /// are true, else [`UNREADABLE_NOTICE`], which claims neither. A file
-    /// that is still there is found, and revoked, again at the next load.
-    OldBuildRemoved { revoke_sent: bool, deleted: bool },
     /// The keyring failed and the save may not fall back to the
     /// machine-bound key: on Windows, or because the store on disk is
     /// keyring-bound. Nothing was written. Displays
@@ -253,11 +239,6 @@ impl fmt::Display for CredentialError {
                 write!(f, "unsupported store version: {}", v)
             }
             CredentialError::Unreadable => f.write_str(UNREADABLE_NOTICE),
-            CredentialError::OldBuildPairing { .. } => f.write_str(UNREADABLE_NOTICE),
-            CredentialError::OldBuildRemoved { revoke_sent: true, deleted: true } => {
-                f.write_str(OLD_BUILD_REVOKED_NOTICE)
-            }
-            CredentialError::OldBuildRemoved { .. } => f.write_str(UNREADABLE_NOTICE),
             CredentialError::KeyringUnavailable => f.write_str(KEYRING_UNAVAILABLE_NOTICE),
             CredentialError::NoConfigDir => f.write_str(NO_CONFIG_DIR_NOTICE),
             CredentialError::NoMachineId => f.write_str(NO_MACHINE_ID_NOTICE),
@@ -270,30 +251,6 @@ impl fmt::Display for CredentialError {
 }
 
 impl std::error::Error for CredentialError {}
-
-/// The credentials of an earlier build's pairing, carried out of [`load`]
-/// so `device.revoke` can be sent with them (#15). Its `Debug` shows
-/// nothing of them, so an error logged with `{:?}` leaks no key. They are
-/// zeroized when dropped, as all `ConnectionCredentials` are. The field is
-/// private, so they can't be printed through it by mistake either.
-pub struct OldBuildCredentials(Box<ConnectionCredentials>);
-
-impl OldBuildCredentials {
-    pub(crate) fn new(creds: Box<ConnectionCredentials>) -> Self {
-        Self(creds)
-    }
-
-    /// The credentials, for the revoke.
-    pub(crate) fn into_inner(self) -> Box<ConnectionCredentials> {
-        self.0
-    }
-}
-
-impl fmt::Debug for OldBuildCredentials {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("OldBuildCredentials(..)")
-    }
-}
 
 impl From<KeystoreError> for CredentialError {
     fn from(e: KeystoreError) -> Self {
@@ -335,7 +292,8 @@ pub struct ConnectionCredentials {
     pub device_public_key: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub vault_public_key: Vec<u8>,
-    /// JWT+seed block for the device's scoped NATS account.
+    /// JWT+seed block for the device's scoped NATS account (earlier builds;
+    /// this one never uses it).
     pub message_space_token: String,
     pub message_space_url: String,
     pub owner_guid: String,
@@ -643,7 +601,7 @@ pub(crate) trait KeySource {
 
 /// The storage binding's failure as the store reports it: no machine id
 /// gets its own plain notice.
-fn binding_error(e: FingerprintError) -> CredentialError {
+pub(super) fn binding_error(e: FingerprintError) -> CredentialError {
     match e {
         FingerprintError::MissingMachineId => CredentialError::NoMachineId,
         e => CredentialError::FingerprintError(e),
@@ -704,24 +662,17 @@ fn load_with(
             // AAD over all five attributes), or a machine id that changed
             // and may change back. Pairing again or "Remove this desktop"
             // replaces it.
-            let old_build = keys
+            let sealed_by_old_build = keys
                 .legacy_fingerprint()
-                .ok()
-                .and_then(|fp| decrypt_store(&store, &fp, &fp).ok());
-            if let Some(old) = old_build {
+                .map(|fp| decrypt_store(&store, &fp, &fp).is_ok())
+                .unwrap_or(false);
+            if sealed_by_old_build {
                 log::warn!(
                     "credential store: machine-bound file was sealed under the public fingerprint by an earlier build; deleting it"
                 );
                 if let Err(de) = delete(config_dir) {
                     log::error!("credential store: could not delete the old file: {}", de);
                 }
-                // #15: only what the file system confirms counts as deleted.
-                let deleted = matches!(pairing_present(config_dir), Ok(false));
-                // Its credentials go to the caller, for the revoke.
-                return Err(CredentialError::OldBuildPairing {
-                    creds: OldBuildCredentials::new(Box::new(old)),
-                    deleted,
-                });
             } else {
                 log::warn!(
                     "credential store: machine-bound file does not decrypt on this machine ({}); keeping it",
@@ -743,7 +694,7 @@ fn load_with(
 ///
 /// A save holds it while it fetches the master key, which may wait on a
 /// keyring prompt; a log-out started meanwhile waits for that save.
-fn writer_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(super) fn writer_lock() -> std::sync::MutexGuard<'static, ()> {
     static WRITER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     WRITER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -864,7 +815,7 @@ fn save_since(
 /// moved over `name`, so a crash or a full disk leaves the old file whole
 /// (#12). On Windows the temporary file is created with the user-only
 /// DACL, inside the folder held open (#16, #23).
-fn write_private(config_dir: &Path, name: &str, data: &[u8]) -> Result<(), CredentialError> {
+pub(super) fn write_private(config_dir: &Path, name: &str, data: &[u8]) -> Result<(), CredentialError> {
     #[cfg(windows)]
     {
         super::winacl::write_private_file(config_dir, name, data).map_err(|e| acl_error(&config_dir.join(name), e))
@@ -1130,6 +1081,16 @@ pub(crate) fn wipe(config_dir: &Path) -> Result<(), CredentialError> {
     wipe_locked(config_dir)
 }
 
+/// Remove an earlier build's pairing (`connection.enc`, from the builds
+/// that reached the vault over NATS), which this build can't use, with its
+/// live marker. The folder, the keyring key and this build's device file
+/// are left. Ok only if the file system confirms it gone.
+pub fn remove_legacy_pairing(config_dir: &Path) -> Result<(), CredentialError> {
+    let _one_at_a_time = writer_lock();
+    delete_locked(config_dir)?;
+    confirm_gone(config_dir, CREDENTIAL_FILE)
+}
+
 /// Log-out's local half (#30): as [`wipe`] when the folder is known, then,
 /// still holding the writer lock, delete the keyring key. A save can't run
 /// between the two, so none is sealed under a key that is then deleted.
@@ -1154,7 +1115,9 @@ fn wipe_then(config_dir: Option<&Path>, delete_key: impl FnOnce()) -> Result<(),
 fn wipe_locked(config_dir: &Path) -> Result<(), CredentialError> {
     let is_link = fs::symlink_metadata(config_dir).map(|m| m.file_type().is_symlink()).unwrap_or(false);
     if is_link {
-        delete_locked(config_dir)?;
+        let legacy = delete_locked(config_dir);
+        remove_file_locked(config_dir, DEVICE_FILE)?;
+        legacy?;
         confirm_wiped(config_dir)?;
         // The pairing is gone; the link is tidied up on a best-effort basis.
         if fs::remove_file(config_dir).or_else(|_| fs::remove_dir(config_dir)).is_err() {
@@ -1165,7 +1128,10 @@ fn wipe_locked(config_dir: &Path) -> Result<(), CredentialError> {
     if config_dir.exists() {
         if let Err(e) = fs::remove_dir_all(config_dir) {
             log::warn!("Credential store: could not remove {}: {}", config_dir.display(), e);
-            delete_locked(config_dir)?;
+            // Both, even if the first fails.
+            let legacy = delete_locked(config_dir);
+            remove_file_locked(config_dir, DEVICE_FILE)?;
+            legacy?;
         }
     }
     confirm_wiped(config_dir)
@@ -1176,15 +1142,22 @@ fn wipe_locked(config_dir: &Path) -> Result<(), CredentialError> {
 /// checked (a stat or listing error other than "not found") is an error:
 /// the pairing is not reported gone on a guess.
 fn confirm_wiped(config_dir: &Path) -> Result<(), CredentialError> {
+    confirm_gone(config_dir, CREDENTIAL_FILE)?;
+    confirm_gone(config_dir, DEVICE_FILE)
+}
+
+/// Ok only if the file system confirms that neither `config_dir/name` nor
+/// a temporary copy of it is there (see [`confirm_wiped`]).
+pub(super) fn confirm_gone(config_dir: &Path, name: &str) -> Result<(), CredentialError> {
     let not_confirmed = |what: String| {
         Err(CredentialError::IoError(format!("the pairing in {} {}", config_dir.display(), what)))
     };
-    match pairing_present(config_dir) {
-        Ok(false) => {}
-        Ok(true) => return not_confirmed("is still there".into()),
+    match fs::symlink_metadata(config_dir.join(name)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return not_confirmed("is still there".into()),
         Err(e) => return not_confirmed(format!("could not be checked: {}", e)),
     }
-    let prefix = format!("{CREDENTIAL_FILE}.tmp-");
+    let prefix = format!("{name}.tmp-");
     match fs::read_dir(config_dir) {
         Ok(entries) => {
             for entry in entries {
@@ -1205,9 +1178,15 @@ fn confirm_wiped(config_dir: &Path) -> Result<(), CredentialError> {
 
 fn delete_locked(config_dir: &Path) -> Result<(), CredentialError> {
     remove_session_marker(config_dir);
-    let path = config_dir.join(CREDENTIAL_FILE);
+    remove_file_locked(config_dir, CREDENTIAL_FILE)
+}
+
+/// Remove `config_dir/name` and its temporary copies; the caller holds the
+/// writer lock. Ok if it is removed or wasn't there.
+pub(super) fn remove_file_locked(config_dir: &Path, name: &str) -> Result<(), CredentialError> {
+    let path = config_dir.join(name);
     // Temporary files from an interrupted save hold the same ciphertext.
-    let prefix = format!("{CREDENTIAL_FILE}.tmp-");
+    let prefix = format!("{name}.tmp-");
     if let Ok(entries) = fs::read_dir(config_dir) {
         for entry in entries.flatten() {
             if entry.file_name().to_string_lossy().starts_with(&prefix) {
@@ -1304,7 +1283,11 @@ pub fn not_private_extension_notice(config_dir: &Path) -> &'static str {
 #[cfg(windows)]
 fn is_private(config_dir: &Path) -> bool {
     use super::winacl::{check_private, AclError};
-    for path in [config_dir.to_path_buf(), config_dir.join(CREDENTIAL_FILE)] {
+    for path in [config_dir.to_path_buf(), config_dir.join(CREDENTIAL_FILE), config_dir.join(DEVICE_FILE)] {
+        // A pairing file that isn't there has nothing to warn about.
+        if path.as_path() != config_dir && matches!(fs::symlink_metadata(&path), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound) {
+            continue;
+        }
         match check_private(&path) {
             Ok(()) => {}
             Err(AclError::NotPrivate(why)) => {
@@ -1325,18 +1308,18 @@ fn is_private(config_dir: &Path) -> bool {
 #[cfg(unix)]
 fn is_private(config_dir: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    let path = config_dir.join(CREDENTIAL_FILE);
-    match fs::metadata(&path) {
-        Ok(meta) if meta.permissions().mode() & 0o077 != 0 => {
-            log::warn!("Credential store: {} is readable by other accounts", path.display());
-            false
-        }
-        Ok(_) => true,
-        Err(e) => {
-            log::warn!("Credential store: could not check {}: {}", path.display(), e);
-            true
+    for path in [config_dir.join(CREDENTIAL_FILE), config_dir.join(DEVICE_FILE)] {
+        match fs::metadata(&path) {
+            Ok(meta) if meta.permissions().mode() & 0o077 != 0 => {
+                log::warn!("Credential store: {} is readable by other accounts", path.display());
+                return false;
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("Credential store: could not check {}: {}", path.display(), e),
         }
     }
+    true
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1400,8 +1383,15 @@ fn read_store(config_dir: &Path) -> Result<EncryptedStore, CredentialError> {
 /// "copied the file + the keyring entry to my own laptop" path.
 /// See SECURITY-REVIEW-2026-05-25.md D-HIGH-3.
 fn compute_blob_aad(binding: &str, platform_key: &[u8; 32]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(AAD_LABEL.len() + 1 + binding.len() + 1 + platform_key.len());
-    aad.extend_from_slice(AAD_LABEL);
+    aad_with_label(AAD_LABEL, binding, platform_key)
+}
+
+/// [`compute_blob_aad`] under another domain-separation label, for another
+/// file sealed with the same master key ([`super::device_store`]): a blob
+/// of one can't be opened as the other.
+pub(super) fn aad_with_label(label: &[u8], binding: &str, platform_key: &[u8; 32]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(label.len() + 1 + binding.len() + 1 + platform_key.len());
+    aad.extend_from_slice(label);
     aad.push(b'|');
     aad.extend_from_slice(binding.as_bytes());
     aad.push(b'|');
@@ -1454,7 +1444,7 @@ fn decrypt_store(
 /// Encrypt plaintext with XChaCha20-Poly1305, binding the ciphertext
 /// to `aad` (machine-derived AAD — see [`compute_blob_aad`]). Returns
 /// `(nonce, ciphertext)`.
-fn encrypt_xchacha20(
+pub(super) fn encrypt_xchacha20(
     key: &[u8; 32],
     plaintext: &[u8],
     aad: &[u8],
@@ -1527,22 +1517,6 @@ pub(crate) mod tests {
         assert!(end_saved_session_if(&config_dir, "s-shared").unwrap());
         assert!(!config_dir.join(SESSION_LIVE_FILE).exists());
         assert!(exists(&config_dir), "the pairing stays");
-    }
-
-    /// For tests elsewhere in the crate (#15): an earlier build's pairing
-    /// (`sample_creds`, sealed under the public fingerprint) in `dir`.
-    /// It names the legacy message server, as such pairings did.
-    pub(crate) fn save_old_build_pairing(dir: &Path) {
-        let old_build = FixedKeys { binding: BindingMode::MachineBound, master: FINGERPRINT, platform: FINGERPRINT };
-        let mut creds = sample_creds();
-        creds.message_space_url = "tls://nats.vettid.dev:443".into();
-        save_with(&old_build, dir, &creds).expect("save");
-    }
-
-    /// For tests elsewhere in the crate (#15): `load` as this build, with
-    /// fixed keys.
-    pub(crate) fn load_as_this_build(dir: &Path) -> Result<(ConnectionCredentials, BindingMode), CredentialError> {
-        load_with(&FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: PLATFORM }, dir)
     }
 
     #[test]
@@ -1645,10 +1619,23 @@ pub(crate) mod tests {
         assert_eq!(loaded.session_expires_at, creds.session_expires_at);
     }
 
+    /// An earlier build's pairing (`connection.enc`) is removed with its
+    /// live marker; this build's device file stays.
+    #[test]
+    fn removing_the_legacy_pairing_leaves_the_device_file() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        save_pairing_with_live_session(&dir, "legacy");
+        write_private(&dir, DEVICE_FILE, b"sealed").unwrap();
+        remove_legacy_pairing(&dir).unwrap();
+        assert!(!exists(&dir));
+        assert!(!dir.join(SESSION_LIVE_FILE).exists());
+        assert!(dir.join(DEVICE_FILE).exists());
+        remove_legacy_pairing(&dir).unwrap();
+    }
+
     /// A file sealed by an earlier build, whose machine-bound key was the
     /// public machine fingerprint, gives the plain notice and is deleted.
-    /// Its credentials come back with the error, for the revoke (#15), and
-    /// don't show in its `Debug`.
     #[test]
     fn blob_sealed_under_the_fingerprint_is_unreadable_and_deleted() {
         let dir = tempfile::tempdir().unwrap();
@@ -1659,55 +1646,10 @@ pub(crate) mod tests {
 
         let this_build = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: PLATFORM };
         let err = load_with(&this_build, dir.path()).err().expect("must not load");
+        assert!(matches!(err, CredentialError::Unreadable), "got {err}");
         assert_eq!(err.to_string(), UNREADABLE_NOTICE);
         assert!(!err.to_string().contains("decrypt"));
         assert!(!exists(dir.path()), "the unreadable file must be deleted");
-        let debug = format!("{err:?}");
-        match err {
-            CredentialError::OldBuildPairing { creds, deleted } => {
-                assert!(deleted);
-                let old = creds.into_inner();
-                let want = sample_creds();
-                assert_eq!(old.connection_id, want.connection_id);
-                assert_eq!(old.message_space_token, want.message_space_token);
-                assert_eq!(old.owner_guid, want.owner_guid);
-                assert!(!debug.contains(&want.connection_id), "{debug}");
-                assert!(!debug.contains(&want.message_space_token), "{debug}");
-            }
-            other => panic!("got {other:?}"),
-        }
-    }
-
-    /// #15: an earlier build's file that can't be deleted (held open for
-    /// reading without delete sharing, as antivirus may) is reported as not
-    /// deleted, and is still there.
-    #[cfg(windows)]
-    #[test]
-    fn an_old_build_file_that_cant_be_deleted_says_so() {
-        use std::os::windows::fs::OpenOptionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let old_build = FixedKeys { binding: BindingMode::MachineBound, master: FINGERPRINT, platform: FINGERPRINT };
-        save_with(&old_build, dir.path(), &sample_creds()).expect("save");
-        let held = fs::OpenOptions::new().read(true).share_mode(0x1).open(dir.path().join(CREDENTIAL_FILE)).unwrap(); // FILE_SHARE_READ only
-        let this_build = FixedKeys { binding: BindingMode::MachineBound, master: BOUND_KEY, platform: PLATFORM };
-        let err = load_with(&this_build, dir.path()).err().expect("must not load");
-        drop(held);
-        assert!(matches!(err, CredentialError::OldBuildPairing { deleted: false, .. }), "got {err:?}");
-        assert!(exists(dir.path()));
-    }
-
-    /// #15: the notice says the pairing was deleted and the vault asked
-    /// only if both happened; otherwise it claims neither.
-    #[test]
-    fn old_build_notice_follows_the_revoke_and_the_delete() {
-        for (revoke_sent, deleted, want) in [
-            (true, true, OLD_BUILD_REVOKED_NOTICE),
-            (true, false, UNREADABLE_NOTICE),
-            (false, true, UNREADABLE_NOTICE),
-            (false, false, UNREADABLE_NOTICE),
-        ] {
-            assert_eq!(CredentialError::OldBuildRemoved { revoke_sent, deleted }.to_string(), want);
-        }
     }
 
     /// The machine id changed (since #14 the only input): the machine-bound

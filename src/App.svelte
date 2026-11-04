@@ -1,9 +1,9 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
 
   import { sessionStore, type SessionState, refreshSessionFromBackend } from './lib/stores/session';
-  import { initNatsListener } from './lib/stores/nats';
   import { themeStore } from './lib/stores/theme';
   import { initCallListener } from './lib/stores/calls';
   import { initVaultListeners } from './lib/stores/vault';
@@ -70,9 +70,10 @@
       const result = await invoke<{ unlocked: boolean; notice?: string | null }>('unlock');
       if (result?.notice) {
         pairingNotice = result.notice;
-        // The file may have been deleted (an earlier build's) or kept.
-        await refreshRegistration();
       }
+      // Always: unlock may have removed a pairing (an earlier build's, or
+      // one the vault removed) with or without a notice.
+      await refreshRegistration();
     } catch (e) {
       console.warn('Auto-unlock failed:', e);
       pairingNotice = "This desktop couldn't open its saved pairing. If this keeps happening, remove this desktop on your phone and pair again.";
@@ -80,8 +81,14 @@
   }
 
   onMount(async () => {
-    initNatsListener();
     initVaultListeners();
+    // What the backend's background refresh found (the vault refused or
+    // removed this desktop): shown like the unlock notice.
+    listen<string>('vault:notice', async (event) => {
+      pairingNotice = event.payload;
+      await refreshRegistration();
+      await refreshSessionFromBackend();
+    });
     initCallListener();
     initNotifications();
     const unsub = themeStore.subscribe(() => {});

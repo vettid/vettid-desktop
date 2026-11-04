@@ -1,17 +1,15 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import QRCode from 'qrcode';
   import { onDestroy } from 'svelte';
   import { activateSession, sessionNotice } from '../stores/session';
 
   let step = $state<'idle' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error' | 'removed-unconfirmed'>('idle');
   let removedNotice = $state('');
   let errorMessage = $state('');
-  let qrDataUrl = $state('');
-  let unlistenQr: UnlistenFn | null = null;
+  let unlistenRequested: UnlistenFn | null = null;
 
-  onDestroy(() => { unlistenQr?.(); });
+  onDestroy(() => { unlistenRequested?.(); });
 
   interface RegisterResponse {
     success: boolean;
@@ -22,23 +20,16 @@
   }
 
   /**
-   * Starts a fresh session against the existing pairing. The desktop
-   * publishes device.request-session with new ephemeral keys; the
-   * phone gets a notification + auto-navigates to the authorize
-   * screen; the user scans the QR shown here to approve. No
-   * passphrase — the on-disk creds are unlocked by the OS keyring
-   * (or the machine-bound fallback).
+   * Starts a fresh session against the existing pairing: the desktop asks
+   * its vault for an access session (device.session.request), and the
+   * owner's phone is asked to approve it. The backend emits
+   * `session:requested` once the vault has taken the request.
    */
   async function start() {
     errorMessage = '';
     step = 'awaiting-qr';
 
-    unlistenQr = await listen<{ connection_id: string; qr_payload: string }>('pairing:qr-ready', async (event) => {
-      try {
-        qrDataUrl = await QRCode.toDataURL(event.payload.qr_payload, { margin: 1, width: 280 });
-      } catch (e) {
-        errorMessage = `Failed to render QR: ${e}`;
-      }
+    unlistenRequested = await listen('session:requested', () => {
       step = 'awaiting-approval';
     });
 
@@ -59,7 +50,7 @@
 
   /**
    * Logout removes this desktop's pairing entirely — wipes the
-   * on-disk credentials + asks the vault to revoke the device. The
+   * on-disk pairing (this build can't tell the vault yet). The
    * user has to re-pair after this. Distinct from "End session,
    * keep pairing" which is the default reason to be on this screen.
    */
@@ -85,9 +76,8 @@
   function reset() {
     step = 'idle';
     errorMessage = '';
-    qrDataUrl = '';
-    unlistenQr?.();
-    unlistenQr = null;
+    unlistenRequested?.();
+    unlistenRequested = null;
   }
 </script>
 
@@ -96,8 +86,7 @@
     <h1>Start a new session</h1>
     <p class="subtitle">
       Your pairing is in place — tap Start to ask your phone to authorize this
-      desktop again. You'll see a QR here that your phone will scan to approve.
-      Your data stays hidden until the phone approves.
+      desktop again. Your data stays hidden until the phone approves.
     </p>
 
     {#if $sessionNotice}
@@ -116,10 +105,6 @@
       <div class="waiting"><div class="spinner"></div><p>Requesting authorization…</p></div>
 
     {:else if step === 'awaiting-approval'}
-      <p class="subtitle">Scan this QR with your phone.</p>
-      {#if qrDataUrl}
-        <img src={qrDataUrl} alt="Authorization QR" class="qr" />
-      {/if}
       <div class="waiting">
         <div class="spinner"></div>
         <p>Awaiting approval on your phone…</p>
@@ -154,7 +139,6 @@
   .btn.primary:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn.ghost { background: transparent; color: var(--text-muted);
                border: 1px solid rgba(255,255,255,0.1); }
-  .qr { display: block; margin: 0 auto 16px; background: white; padding: 10px; border-radius: 8px; }
   .waiting { display: flex; align-items: center; gap: 12px; padding: 16px;
              background: rgba(15, 52, 96, 0.3); border-radius: 8px; margin-top: 16px; }
   .waiting p { color: var(--text-muted); }

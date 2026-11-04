@@ -6,7 +6,7 @@
   let theme = $derived($themeStore);
 
   // Sub-pages cover persistent preferences only — live session ops
-  // (Lock, End session, NATS diagnostics) moved to the Session
+  // (Lock, End session) moved to the Session
   // screen since they're transient operations the user reaches via
   // the top-bar pill. Settings keeps Device / Appearance / Danger
   // Zone (Log out) / About.
@@ -214,8 +214,9 @@
           <div>
             <div class="label">Log out this desktop</div>
             <div class="hint inline">
-              Wipes the credentials on disk + the keyring entry and notifies
-              the vault. You'll need to pair again from your phone.
+              Ends this desktop's access to your vault if it can, and deletes
+              its pairing from this computer. Your phone still lists this
+              desktop: remove it there. You'll need to pair again from your phone.
             </div>
           </div>
           {#if !showLogoutPrompt}

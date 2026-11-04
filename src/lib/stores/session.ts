@@ -33,6 +33,10 @@ export const sessionStore = writable<SessionState>(initialState);
  */
 export const sessionNotice = writable<string | null>(null);
 
+/** The stale-session notice last shown from `get_session_info`, so it is
+ *  cleared once the vault confirms the session again. */
+let staleNoticeShown: string | null = null;
+
 export function activateSession(
   sessionId: string,
   expiresAt: number,
@@ -75,7 +79,7 @@ export function resetSession() {
 
 /**
  * Ask the backend for the current session state from the loaded credentials
- * and update the store. Cheap and offline — no NATS calls. Callers should
+ * and update the store. Cheap and offline — no vault calls. Callers should
  * invoke on app launch and periodically (e.g., every 30s) to drive the
  * expiry UI.
  */
@@ -88,9 +92,16 @@ export async function refreshSessionFromBackend(): Promise<void> {
       expires_at: number;
       seconds_remaining: number;
       is_active: boolean;
+      notice?: string | null;
     }>('get_session_info');
 
     if (info.is_active) {
+      // Confirmed again: the stale-session notice no longer applies.
+      if (staleNoticeShown) {
+        const shown = staleNoticeShown;
+        sessionNotice.update(n => (n === shown ? null : n));
+        staleNoticeShown = null;
+      }
       sessionStore.set({
         state: 'active',
         sessionId: info.session_id,
@@ -103,6 +114,12 @@ export async function refreshSessionFromBackend(): Promise<void> {
         phoneReachable: true,
       });
     } else {
+      // The vault hasn't confirmed the session lately: say so (shown on
+      // the Start-a-new-session screen).
+      if (info.notice) {
+        sessionNotice.set(info.notice);
+        staleNoticeShown = info.notice;
+      }
       sessionStore.update(s => ({ ...s, state: 'expired', secondsRemaining: 0 }));
     }
   } catch {

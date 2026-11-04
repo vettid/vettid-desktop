@@ -447,6 +447,14 @@ impl<T: Transport, C: Clock> Session<T, C> {
         std::mem::take(&mut self.maybe_sent)
     }
 
+    /// Take the messages for the caller that a [`Session::request`] collected
+    /// while it waited for its answer (the next [`Session::poll`] would
+    /// return them first), without collecting more: for a caller that only
+    /// sends requests and must not wait on a long-poll to see them.
+    pub fn take_held(&mut self) -> Vec<Inner> {
+        std::mem::take(&mut self.held)
+    }
+
     fn own_pk(&self) -> VerifyingKey {
         self.relay_key.verifying_key()
     }

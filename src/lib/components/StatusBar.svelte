@@ -1,25 +1,27 @@
 <script lang="ts">
   import { sessionStore } from '../stores/session';
-  import { natsStore } from '../stores/nats';
   import SessionTimer from './SessionTimer.svelte';
 
   let session = $derived($sessionStore);
-  let nats = $derived($natsStore);
+
+  // What the bar says for each session state (NEW TEXT, owner approval
+  // needed): words, not the raw state.
+  function stateLabel(state: string): string {
+    switch (state) {
+      case 'active': return 'Session active';
+      case 'suspended': return 'Session paused';
+      default: return 'No active session';
+    }
+  }
 </script>
 
 <div class="status-bar">
   {#if session.state === 'inactive'}
-    <!-- No session yet — the NATS connection state is the only useful
-         signal the user can act on (it tells them whether pairing
-         will even reach the vault). Once a session exists this row
-         is redundant: any successful vault op implies NATS is fine,
-         and async-nats reconnects transparently between calls, so
-         a "Disconnected" pill next to "Session active" was alarming
-         the user for a state that doesn't matter. Raw NATS state is
-         still surfaced in Settings → Network for debugging. -->
+    <!-- No session yet. The desktop reaches its vault through the relay
+         only for a pairing or a session, so there is no link state to
+         show here. -->
     <div class="status-item">
-      <span class="dot" class:connected={nats.connected} class:disconnected={!nats.connected}></span>
-      <span>{nats.connected ? 'Connected' : 'Disconnected'}</span>
+      <span>{stateLabel(session.state)}</span>
     </div>
   {:else}
     <div class="status-item">
@@ -28,7 +30,7 @@
         class:suspended={session.state === 'suspended'}
         class:expired={session.state === 'expired' || session.state === 'revoked'}
       ></span>
-      <span>Session: {session.state}</span>
+      <span>{stateLabel(session.state)}</span>
     </div>
 
     {#if session.state === 'active'}
