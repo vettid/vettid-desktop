@@ -23,6 +23,7 @@
     appVersion: string;
     keyProtection: string;
     keyBound: boolean;
+    keyNotices: string[];
   } | null>(null);
 
   // What protects the saved pairing (#11, #13). Read from the file's
@@ -30,7 +31,7 @@
   // "unknown"; "unchecked" when get_status itself failed. keyBound says
   // whether it binds the pairing to this computer.
   const keyProtectionText: Record<string, string> = {
-    dpapi: 'Windows data protection, on this computer',
+    dpapi: 'Windows data protection, for your account',
     keyring: "Your computer's keyring, not bound to this computer",
     legacy: 'An earlier version (not usable)',
     unknown: "Can't tell",
@@ -60,6 +61,7 @@
         appVersion: status.app_version || '0.1.0',
         keyProtection: status.key_protection || 'unknown',
         keyBound: !!status.key_bound,
+        keyNotices: Array.isArray(status.key_notices) ? status.key_notices : [],
       };
     } catch {
       deviceInfo = {
@@ -72,6 +74,7 @@
         appVersion: '0.1.0',
         keyProtection: 'unchecked',
         keyBound: false,
+        keyNotices: [],
       };
     } finally {
       loading = false;
@@ -163,10 +166,14 @@
               {#if deviceInfo.keyProtection === 'dpapi'}
                 <p class="hint inline">
                   The key that opens this desktop's saved pairing is locked by Windows to your
-                  account on this computer. A copy of the file alone doesn't open elsewhere.
-                  Programs you run, and an administrator of this computer, may still be able to
-                  open it.
+                  account. A copy of the file alone doesn't open elsewhere, but a copy of your
+                  Windows profile with your password can open it. Programs you run, and an
+                  administrator of this computer or of your organisation's domain, may still be
+                  able to open it.
                 </p>
+                {#each deviceInfo.keyNotices as notice}
+                  <p class="hint inline warn" role="status">{notice}</p>
+                {/each}
               {:else if deviceInfo.keyProtection === 'keyring'}
                 <p class="hint inline warn" role="status">
                   The key that opens this desktop's saved pairing is kept in your keyring. It is
@@ -175,7 +182,7 @@
                 </p>
               {:else if deviceInfo.keyProtection === 'legacy'}
                 <p class="hint inline warn" role="status">
-                  The saved pairing was made by an earlier version and can't be used. It is
+                  The saved pairing was made by an earlier version and can't be used. It will be
                   deleted the next time this desktop starts; then pair again.
                 </p>
               {:else if deviceInfo.keyProtection === 'unchecked'}
