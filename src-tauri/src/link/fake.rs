@@ -35,6 +35,10 @@ struct State {
     session: Option<(String, DateTime<Utc>)>,
     /// Refuse every deposit with `token_revoked`.
     revoked: bool,
+    /// What answering `device.session.request` brings: a grant of this
+    /// session, or (`deny`) a denial.
+    on_request: Option<(String, DateTime<Utc>)>,
+    deny: bool,
     collects: usize,
     n: u64,
 }
@@ -54,17 +58,21 @@ impl State {
     }
 
     fn inner(kind: &str, response: Option<Response>, body: String) -> Inner {
-        let now = Utc::now();
-        Inner { id: new_ulid(now).expect("ulid"), kind: kind.into(), ts: now, seq: None, response, exp: None, body: Zeroizing::new(body) }
+        Self::inner_at(kind, response, body, Utc::now())
+    }
+
+    fn inner_at(kind: &str, response: Option<Response>, body: String, ts: DateTime<Utc>) -> Inner {
+        Inner { id: new_ulid(ts).expect("ulid"), kind: kind.into(), ts, seq: None, response, exp: None, body: Zeroizing::new(body) }
+    }
+
+    fn session_body(id: &str, exp: DateTime<Utc>) -> String {
+        Builder::new().string("session_id", id).string("expires_at", &vettid_vms::envelope::format_ts(exp)).finish()
     }
 
     fn status_body(&self) -> String {
         match &self.session {
             None => "{\"session\":null}".into(),
-            Some((id, exp)) => {
-                let s = Builder::new().string("session_id", id).string("expires_at", &vettid_vms::envelope::format_ts(*exp)).finish();
-                Builder::new().raw("session", &s).finish()
-            }
+            Some((id, exp)) => Builder::new().raw("session", &Self::session_body(id, *exp)).finish(),
         }
     }
 }
@@ -127,6 +135,8 @@ impl FakeVault {
             mailbox: Vec::new(),
             session: None,
             revoked: false,
+            on_request: None,
+            deny: false,
             collects: 0,
             n: 0,
         })));
@@ -156,6 +166,23 @@ impl FakeVault {
         s.collects = 0;
     }
 
+    /// Put a vault event, stamped `ts`, in the device's mailbox.
+    pub(crate) fn event(&self, kind: &str, body: &str, ts: DateTime<Utc>) {
+        let m = State::inner_at(kind, None, body.into(), ts);
+        self.lock().send(m);
+    }
+
+    /// Answer the next `device.session.request`, then grant `session` (and
+    /// name it in `vault.status`).
+    pub(crate) fn grant_on_request(&self, session: (&str, DateTime<Utc>)) {
+        self.lock().on_request = Some((session.0.to_string(), session.1));
+    }
+
+    /// Answer the next `device.session.request`, then deny it.
+    pub(crate) fn deny_on_request(&self) {
+        self.lock().deny = true;
+    }
+
     /// How many collects since [`FakeVault::revoke`].
     pub(crate) fn collects(&self) -> usize {
         self.lock().collects
@@ -179,6 +206,22 @@ impl Transport for FakeVault {
             let body = s.status_body();
             let answer = State::inner("vault.status", Some(Response { re: inner.id.clone(), status: Status::Ok }), body);
             s.send(answer);
+        }
+        if inner.response.is_none() && inner.kind == "device.session.request" {
+            let now = Utc::now();
+            let body = Builder::new().string("request_id", "req-1").string("exp", &vettid_vms::envelope::format_ts(now + TimeDelta::minutes(5))).finish();
+            let answer = State::inner("device.session.request", Some(Response { re: inner.id.clone(), status: Status::Ok }), body);
+            s.send(answer);
+            let later = now + TimeDelta::milliseconds(5);
+            if let Some((id, exp)) = s.on_request.take() {
+                let grant = State::inner_at("device.session.granted", None, State::session_body(&id, exp), later);
+                s.send(grant);
+                s.session = Some((id, exp));
+            }
+            if std::mem::take(&mut s.deny) {
+                let denial = State::inner_at("device.session.ended", None, "{\"reason\":\"denied\"}".into(), later);
+                s.send(denial);
+            }
         }
         s.n += 1;
         Ok(format!("d{}", s.n))

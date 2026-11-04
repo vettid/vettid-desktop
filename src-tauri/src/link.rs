@@ -20,9 +20,9 @@ use std::sync::{Arc, RwLock};
 use chrono::{DateTime, TimeDelta, Utc};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use vettid_device::access::{Access, AccessError, AccessEvent, EndOutcome, RequestOutcome};
+use vettid_device::access::{parse_request_answer, Access, AccessError, AccessEvent, EndOutcome, RequestOutcome, TYPE_REQUEST};
 use vettid_device::pairing::{Clock, SystemClock};
-use vettid_device::session::{Session, SessionError};
+use vettid_device::session::{Session, SessionError, REQUEST_TIMEOUT};
 use vettid_device::store::Persist;
 use vettid_device::transport::{Http, Transport};
 
@@ -284,6 +284,17 @@ impl<T: Transport, C: Clock> Link<T, C> {
         }
     }
 
+    /// Hand the messages a request collected while it waited (the engine
+    /// holds them for the next poll) to [`Access::observe`], and drop
+    /// them: this link only polls while it waits for a grant, so they
+    /// would otherwise pile up. Missed session events are recovered by
+    /// `vault.status` anyway (§6.8).
+    fn drain_held(&mut self) {
+        for m in self.session.take_held() {
+            let _ = self.access.observe(&mut self.session, &mut self.store, &m);
+        }
+    }
+
     /// Read `vault.status`: the baseline [`Access::active_at`] needs. An
     /// unanswered end it reports is left to [`Link::refresh`] (the
     /// background refresh), so opening the pairing doesn't wait for it; a
@@ -294,6 +305,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
         if r.is_ok() {
             self.confirmed = Some(Utc::now());
         }
+        self.drain_held();
         self.note_refused().await;
         r
     }
@@ -314,6 +326,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
             Err(e) => Err(e),
         };
         self.reachable = r.as_ref().err().is_none_or(answered);
+        self.drain_held();
         self.note_refused().await;
         r
     }
@@ -374,7 +387,18 @@ impl<T: Transport, C: Clock> Link<T, C> {
         if self.refused() {
             return Err(RequestFailed::Access(AccessError::Session(SessionError::Refused)));
         }
-        let exp = match self.access.request(&mut self.session, &mut self.store, None).await {
+        // As Access::request (the vault's default length: nothing to check;
+        // the ordering rule settled first), keeping the answer's ts: a
+        // denial the vault sent before it is about an earlier request.
+        let answer = match self.access.settle(&mut self.session, &mut self.store).await {
+            Ok(_) => self.session.request(&mut self.store, TYPE_REQUEST, "{}", REQUEST_TIMEOUT).await.map_err(AccessError::from),
+            Err(e) => Err(e),
+        };
+        let (answered_at, outcome) = match answer {
+            Ok(a) => (a.ts, parse_request_answer(&a)),
+            Err(e) => (Utc::now(), Err(e)),
+        };
+        let exp = match outcome {
             Ok(RequestOutcome::Requested { exp, .. }) => exp,
             Ok(RequestOutcome::TooSoon { .. }) => {
                 self.reachable = true;
@@ -401,7 +425,9 @@ impl<T: Transport, C: Clock> Link<T, C> {
                     for m in &msgs {
                         match self.access.observe(&mut self.session, &mut self.store, m) {
                             Ok(Some(AccessEvent::Granted(_))) => granted = true,
-                            Ok(Some(AccessEvent::Denied)) if !granted => return Err(RequestFailed::Denied),
+                            // A denial from before this request's answer is
+                            // about an earlier one.
+                            Ok(Some(AccessEvent::Denied)) if !granted && m.ts >= answered_at => return Err(RequestFailed::Denied),
                             _ => {}
                         }
                     }
@@ -690,6 +716,46 @@ mod tests {
         assert!(link.keep_refreshing(Utc::now()), "no baseline yet");
         link.read_status().await.unwrap();
         assert!(!link.keep_refreshing(Utc::now()), "no session, nothing to keep up");
+    }
+
+    /// MEDIUM 4: what a status read collected besides its answer is handed
+    /// to Access and dropped, not kept for a poll that never comes.
+    #[tokio::test]
+    async fn a_status_read_drains_what_it_collected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.event("device.session.ended", "{\"reason\":\"ended\"}", Utc::now());
+        link.read_status().await.unwrap();
+        assert!(link.session.take_held().is_empty());
+    }
+
+    /// MEDIUM 4: a denial the vault sent before this request's answer (an
+    /// earlier request's) doesn't end the wait; the grant that follows is
+    /// confirmed by vault.status.
+    #[tokio::test]
+    async fn an_earlier_denial_doesnt_end_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        link.read_status().await.unwrap();
+        vault.event("device.session.ended", "{\"reason\":\"denied\"}", Utc::now() - TimeDelta::seconds(30));
+        vault.grant_on_request(("s-2", Utc::now() + TimeDelta::hours(1)));
+        let mut asked = false;
+        link.request_access(|| asked = true, || false).await.expect("granted");
+        assert!(asked);
+        let snap = link.snapshot(Utc::now());
+        assert!(snap.active_at(Utc::now()));
+        assert_eq!(snap.session_id.as_deref(), Some("s-2"));
+    }
+
+    /// A denial sent after the request's answer ends the wait.
+    #[tokio::test]
+    async fn a_denial_of_this_request_ends_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        link.read_status().await.unwrap();
+        vault.deny_on_request();
+        assert_eq!(link.request_access(|| {}, || false).await, Err(RequestFailed::Denied));
+        assert!(!link.snapshot(Utc::now()).active_at(Utc::now()));
     }
 
     /// A request from a refused device isn't sent, and says why.
