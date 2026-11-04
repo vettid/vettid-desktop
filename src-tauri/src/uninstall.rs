@@ -25,12 +25,14 @@ use crate::credential::store::{self, CredentialError};
 /// The command-line switch, the only argument.
 pub const ARG: &str = "--uninstall-wipe";
 
-/// Exit code: nothing was paired here (no pairing file), and nothing that
-/// was asked to be removed is left.
-pub const NOTHING_PAIRED: i32 = 0;
 /// Exit code: a pairing was saved here, and every part of it is confirmed
 /// gone.
 pub const PAIRING_REMOVED: i32 = 10;
+/// Exit code: nothing was paired here (no pairing file), and nothing that
+/// was asked to be removed is left. Not 0: a program that ignores the
+/// switch (an older build, which would open its window) exits 0, and the
+/// uninstaller treats 0 as a failure.
+pub const NOTHING_PAIRED: i32 = 11;
 /// Exit code: something couldn't be removed, or its removal couldn't be
 /// confirmed (also: no user folder, or a panic). Never reported as gone.
 pub const NOT_REMOVED: i32 = 20;
@@ -96,6 +98,16 @@ mod tests {
         assert!(!requested(args(&["vettid-desktop.exe", "x", "--uninstall-wipe"])));
         assert!(!requested(args(&["vettid-desktop.exe", "--uninstall-wipe=1"])));
         assert!(!requested(args(&["--uninstall-wipe"])));
+    }
+
+    #[test]
+    fn no_code_is_zero_and_all_differ() {
+        for code in [NOTHING_PAIRED, PAIRING_REMOVED, NOT_REMOVED] {
+            assert_ne!(code, 0);
+        }
+        assert_ne!(NOTHING_PAIRED, PAIRING_REMOVED);
+        assert_ne!(NOTHING_PAIRED, NOT_REMOVED);
+        assert_ne!(PAIRING_REMOVED, NOT_REMOVED);
     }
 
     #[test]
