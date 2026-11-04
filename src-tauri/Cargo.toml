@@ -96,15 +96,6 @@ hostname = "0.4"
 dirs = "5"
 serde_bytes = "0.11"
 
-# OS keyring (Secret Service on Linux, Keychain on macOS). Off Windows it
-# holds the device file's data key (credential/protector.rs, the interim
-# protector until the TPM, keychain and passphrase ones, #13). On Linux
-# that is the Secret Service alone (`sync-secret-service`, the plan's
-# choice (b)), with its D-Bus session encrypted (`crypto-rust`), not the
-# kernel keyring; on macOS the platform store is the Keychain. Windows
-# does not use it: the device file is protected by DPAPI there.
-keyring = { version = "3", default-features = false, features = ["apple-native", "sync-secret-service", "crypto-rust"] }
-
 # Win32 calls for the Windows machine fingerprint (registry, disk serial,
 # network adapters), DPAPI (Win32_Security_Cryptography: the device file's
 # protector; NetManagement, GroupPolicy and UI_Shell for its domain and
@@ -136,6 +127,26 @@ windows-sys = { version = "0.59", features = [
 # geteuid, for checking who owns the pairing folder (credential/store.rs, #28).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# macOS: the OS keyring (the login keychain) holds the device file's data
+# key, the interim protector until the keychain and passphrase ones (#13;
+# credential/protector.rs). Windows uses DPAPI and Linux the TPM or the
+# Secret Service, so neither builds this crate.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
+
+# Linux protectors (#13, credential/tpm.rs and credential/secret_service.rs):
+# - tss-esapi: the TPM 2.0 through /dev/tpmrm0. It links libtss2 (esys,
+#   tctildr, mu, sys; 2.4.6 or later), which becomes a runtime dependency of
+#   the package; built and tested against 4.1.3.
+# - dbus-secret-service: the Secret Service (the plan's choice (b)), with its
+#   D-Bus session encrypted (`crypto-rust`); dbus, for checking that a
+#   session bus and `org.freedesktop.secrets` are there before using it.
+#   Both were already in the tree, through `keyring`.
+[target.'cfg(target_os = "linux")'.dependencies]
+tss-esapi = "7.7"
+dbus = "0.9"
+dbus-secret-service = { version = "4.1", features = ["crypto-rust"] }
 
 [dev-dependencies]
 tempfile = "3"

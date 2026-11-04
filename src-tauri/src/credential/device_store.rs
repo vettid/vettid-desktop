@@ -77,8 +77,9 @@ struct Header {
     v: u32,
     /// The protector's id (see `protector::describe`).
     protector: String,
-    /// The wrapped data key, base64; empty when the protector keeps the
-    /// key itself (the keyring).
+    /// The wrapped data key, base64: what the protector returned (DPAPI's
+    /// blob, the TPM's sealed object, the Secret Service entry's id);
+    /// empty when the protector keeps the key itself (the macOS keyring).
     wrapped_key: String,
     /// The nonce, base64. Fresh for each save.
     nonce: String,
@@ -419,8 +420,9 @@ pub fn exists(config_dir: &Path) -> bool {
 /// nothing is decrypted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyProtection {
-    /// "dpapi", "keyring", "none" (no file), "legacy" (the earlier format,
-    /// deleted at the next unlock) or "unknown" (a file that can't be read).
+    /// "dpapi", "tpm", "secret-service", "keyring", "none" (no file),
+    /// "legacy" (the earlier format, deleted at the next unlock) or
+    /// "unknown" (a file that can't be read).
     pub protector: &'static str,
     /// Whether that protector binds the file to this computer.
     pub bound: bool,
@@ -613,7 +615,7 @@ pub(crate) mod tests {
             assert!(exists(&dir), "kept");
         }
         // Another format version or protector isn't opened at all.
-        for change in [|h: &mut Header| h.v = 3, |h: &mut Header| h.protector = "tpm".into()] {
+        for change in [|h: &mut Header| h.v = 3, |h: &mut Header| h.protector = "passphrase".into()] {
             let mut f = SealedFile { header: good.header.clone(), ciphertext: good.ciphertext.clone() };
             change(&mut f.header);
             write_sealed(&dir, &f);

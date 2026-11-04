@@ -4,20 +4,26 @@
 //! - **Windows: DPAPI, user scope** (`super::dpapi`). The wrapped key is in
 //!   the file's header; DPAPI keeps nothing outside it. Bound to this
 //!   computer and this account.
-//! - **Elsewhere, for now: the OS keyring** through the `keyring` crate
-//!   (Secret Service on Linux, the owner's choice (b); the login keychain
-//!   on macOS until the keychain and passphrase protectors land). The data
-//!   key is the keyring entry itself, so the header's wrapped key is empty.
-//!   Not bound to this computer: a copy of the keyring opens elsewhere with
-//!   the login password. Settings says so.
+//! - **Linux: the TPM 2.0** (`super::tpm`), through `/dev/tpmrm0`: the data
+//!   key sealed under the storage root key, the sealed object in the
+//!   header. Bound to this computer.
+//! - **Linux without a TPM this user can use: the Secret Service**
+//!   (`super::secret_service`, the owner's choice (b)): one keyring item
+//!   per file, named by an id in the header. Not bound to this computer.
+//! - **macOS, for now: the OS keyring** through the `keyring` crate (the
+//!   login keychain, until the keychain and passphrase protectors land).
+//!   The data key is the keyring entry itself, so the header's wrapped key
+//!   is empty. Not bound to this computer: Settings says so.
 //!
 //! **Absent and failing are different.** A protector says it is absent
 //! only from a fixed, detected condition ([`Availability::Absent`]), never
 //! from an error; the next one is then tried. Every error of a protector
 //! that is present is [`ProtectorError::Failing`]: pairing or loading stops
-//! with the reason and never falls back. Neither protector here is ever
-//! absent: DPAPI is part of Windows, and the keyring's "no Secret Service
-//! on the session bus" check comes with the Linux protectors.
+//! with the reason and never falls back. DPAPI and the macOS keyring are
+//! never absent. On Linux the TPM is absent when `/dev/tpmrm0` is missing
+//! or not usable by this user, and the Secret Service when there is no
+//! session bus or no `org.freedesktop.secrets` on it; with both absent,
+//! pairing is refused with the no-protector notice.
 //!
 //! The legacy `master-key-v1` entry of the earlier format is only ever
 //! deleted here ([`LegacyKey`]); nothing reads it.
@@ -37,7 +43,7 @@ pub(crate) type DataKey = Zeroizing<[u8; 32]>;
 pub(crate) enum Availability {
     Present,
     /// Detected as not there, with what was detected (for the log).
-    #[allow(dead_code)] // no protector of this build is ever absent (see the module doc)
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only Linux's protectors can be absent
     Absent(&'static str),
 }
 
@@ -91,12 +97,21 @@ pub(crate) trait LegacyKey: Send + Sync {
     fn remove(&self) -> Result<(), ProtectorError>;
 }
 
+/// The TPM protector's plain name, for the person (the notices give other
+/// advice for it than for the keyring, see `store`).
+pub(crate) const TPM_NAME: &str = "this computer's TPM";
+
 /// What a header's `protector` says, for Settings: the id as shown, and
 /// whether it binds the file to this computer. `None` for an id this build
 /// doesn't know.
 pub(crate) fn describe(id: &str) -> Option<(&'static str, bool)> {
     match id {
         "dpapi" => Some(("dpapi", true)),
+        "tpm" => Some(("tpm", true)),
+        "secret-service" => Some(("secret-service", false)),
+        // Linux has no keyring protector (a file of the build before this
+        // one, sealed by it, is unreadable here: re-pair).
+        #[cfg(not(target_os = "linux"))]
         "keyring" => Some(("keyring", false)),
         #[cfg(test)]
         "test" => Some(("test", true)),
@@ -117,7 +132,14 @@ impl Protectors {
         {
             Protectors { ranked: vec![Box::new(super::dpapi::Dpapi::user())], legacy: Box::new(super::dpapi::LegacyCredential) }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            Protectors {
+                ranked: vec![Box::new(super::tpm::Tpm::system()), Box::new(super::secret_service::SecretService::system())],
+                legacy: Box::new(super::secret_service::LegacyEntry::system()),
+            }
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             Protectors { ranked: vec![Box::new(keyring_store::Keyring)], legacy: Box::new(keyring_store::LegacyEntry) }
         }
@@ -169,9 +191,9 @@ impl Protectors {
     }
 }
 
-/// The OS keyring through the `keyring` crate: the interim protector off
-/// Windows (see the module doc).
-#[cfg(not(windows))]
+/// The OS keyring through the `keyring` crate: the interim protector on
+/// macOS (see the module doc).
+#[cfg(not(any(windows, target_os = "linux")))]
 mod keyring_store {
     use super::{Availability, DataKey, LegacyKey, Protector, ProtectorError};
     use zeroize::Zeroizing;
@@ -436,8 +458,13 @@ pub(crate) mod testing {
     #[test]
     fn settings_knows_which_protectors_bind() {
         assert_eq!(describe("dpapi"), Some(("dpapi", true)));
+        assert_eq!(describe("tpm"), Some(("tpm", true)));
+        assert_eq!(describe("secret-service"), Some(("secret-service", false)));
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(describe("keyring"), Some(("keyring", false)));
-        assert_eq!(describe("tpm"), None);
+        #[cfg(target_os = "linux")]
+        assert_eq!(describe("keyring"), None);
+        assert_eq!(describe("passphrase"), None);
         assert_eq!(describe(""), None);
     }
 }
