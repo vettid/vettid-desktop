@@ -96,18 +96,18 @@ hostname = "0.4"
 dirs = "5"
 serde_bytes = "0.11"
 
-# OS keyring (Secret Service on Linux, Keychain on macOS). Used to hold
-# the master encryption key for the on-disk credential blob, so users
-# don't have to enter a passphrase at pairing time. `linux-native`
+# OS keyring (Secret Service on Linux, Keychain on macOS). Off Windows it
+# holds the device file's data key (credential/protector.rs, the interim
+# protector until the TPM, keychain and passphrase ones, #13). `linux-native`
 # avoids the Secret Service D-Bus dependency mismatch some distros
 # have; on macOS the default platform store is the Keychain. Windows
-# does not use it: credential/wincred.rs writes the entry itself so that
-# it stays on the machine (the crate's Windows entries roam).
+# does not use it: the device file is protected by DPAPI there.
 keyring = { version = "3", default-features = false, features = ["apple-native", "linux-native", "sync-secret-service"] }
 
 # Win32 calls for the Windows machine fingerprint (registry, disk serial,
-# network adapters) and the Credential Manager entry. See
-# fingerprint/platform_windows.rs and credential/wincred.rs. Wdk_Storage_FileSystem
+# network adapters), DPAPI (Win32_Security_Cryptography: the device file's
+# protector) and deleting the earlier format's Credential Manager entry. See
+# fingerprint/platform_windows.rs, credential/dpapi.rs and credential/wincred.rs. Wdk_Storage_FileSystem
 # is for NtSetInformationFile: renaming the pairing by handle, relative to its
 # folder's handle (credential/winacl.rs, #28).
 [target.'cfg(windows)'.dependencies]
@@ -119,6 +119,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
     "Win32_Security_Credentials",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
