@@ -179,8 +179,10 @@ Var VettidWipe
         ; Refused, before anything is removed: going on would delete the
         ; program, the uninstaller and this account's registry entries,
         ; and leave the installing account's pairing with no app to log
-        ; out from and no uninstaller to run. Exit code 2 (Abort in a
-        ; section), an event, and the box if someone is watching.
+        ; out from and no uninstaller to run. Exit code 2, an event, and the
+        ; box if someone is watching. Quit, not Abort: an aborted section
+        ; leaves the progress page open, waiting for a click, and under /P
+        ; nobody gives it (seen in the mock).
         StrCpy $VettidWipe -2
         SetErrorLevel 2
         ; NEW TEXT (owner approval needed).
@@ -191,7 +193,7 @@ Var VettidWipe
           ; NEW TEXT (owner approval needed).
           MessageBox MB_OK|MB_ICONEXCLAMATION "VettID Desktop wasn't uninstalled. This Windows account isn't the one that installed it, and uninstalling it from here would leave that account's saved pairing on this computer. Sign in as the account that installed VettID Desktop, and uninstall it there." /SD IDOK
         ${EndIf}
-        Abort
+        Quit
       ${Else}
         ; Close a running app first, so it can't save the pairing again
         ; after the wipe. This check can silently do nothing (when the

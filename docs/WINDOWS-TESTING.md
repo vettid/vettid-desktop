@@ -257,6 +257,7 @@ temporary copy runs, so its exit code is seen):**
 | 10b. only `InstallLocation` records it, code 11 | 0 | yes |
 | 10c. only the product key records it, code 11 | 0 | yes |
 | 10d. neither key there, code 11 (refused: program kept, one event 1002) | 2 | no |
+| 10e. another account under `/P` and under `/S` (refused at once: no progress page left open) | 2 | no |
 | 11. in place with `/WIPEPAIRING`, code 11 | 0 | yes |
 | 11b. in place with `/WIPEPAIRING`, code 10 | 0 | yes |
 | 11c. in place with `/WIPEPAIRING`, code 20 (one event logged) | 2 | yes |
