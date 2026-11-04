@@ -133,6 +133,10 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# A fake vault for the link's tests (src/link/fake.rs).
+vettid-vms = { path = "crates/vettid-vms" }
+vettid-relay = { path = "crates/vettid-relay" }
+ed25519-dalek = "2"
 
 [features]
 default = ["custom-protocol"]

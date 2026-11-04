@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
-use crate::link::{Link, Shared, Snapshot};
+use crate::link::{Link, Notify, Shared, Snapshot};
 use crate::session::delegation::DelegationManager;
 
 #[cfg(feature = "webrtc")]
@@ -25,6 +25,10 @@ pub struct AppState {
     /// by every session-ending path: lock, log-out, End session; it stops
     /// itself when the session has expired and no end waits.
     pub refresh_task: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
+
+    /// Tells the frontend what the background refresh found (set up in
+    /// `lib.rs` once there is a window).
+    pub notify: Notify,
 
     /// Pending phone-approval tracker.
     pub delegation: Arc<Mutex<DelegationManager>>,
@@ -58,6 +62,7 @@ impl AppState {
             link: Arc::new(Mutex::new(None)),
             snapshot: Arc::new(std::sync::RwLock::new(Snapshot::default())),
             refresh_task: Arc::new(std::sync::Mutex::new(None)),
+            notify: Arc::new(std::sync::RwLock::new(None)),
             delegation: Arc::new(Mutex::new(DelegationManager::new())),
             is_registered: Arc::new(RwLock::new(false)),
             session_op: Arc::new(Mutex::new(())),
@@ -70,7 +75,12 @@ impl AppState {
 
     /// The handles the background refresh shares.
     pub fn shared(&self) -> Shared {
-        Shared { link: self.link.clone(), snapshot: self.snapshot.clone(), is_registered: self.is_registered.clone() }
+        Shared {
+            link: self.link.clone(),
+            snapshot: self.snapshot.clone(),
+            is_registered: self.is_registered.clone(),
+            notify: self.notify.clone(),
+        }
     }
 
     /// What the UI may know now.

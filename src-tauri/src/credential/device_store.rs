@@ -250,8 +250,14 @@ pub fn stored_key_protection(config_dir: &Path) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// For tests elsewhere in the crate: a store in `dir` with fixed test
+    /// keys (never the real keyring) and no log-out check.
+    pub(crate) fn store_for_tests(dir: &Path) -> DeviceStore {
+        DeviceStore::with_keys(dir, None, keys())
+    }
 
     const MASTER: [u8; 32] = [0x5a; 32];
     const PLATFORM: [u8; 32] = [0x17; 32];

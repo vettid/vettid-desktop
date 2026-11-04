@@ -21,10 +21,10 @@ use chrono::{DateTime, TimeDelta, Utc};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use vettid_device::access::{Access, AccessError, AccessEvent, EndOutcome, RequestOutcome};
-use vettid_device::pairing::SystemClock;
+use vettid_device::pairing::{Clock, SystemClock};
 use vettid_device::session::{Session, SessionError};
 use vettid_device::store::Persist;
-use vettid_device::transport::Http;
+use vettid_device::transport::{Http, Transport};
 
 use crate::credential::device_store::DeviceStore;
 use crate::credential::store::CredentialError;
@@ -117,6 +117,8 @@ pub struct Snapshot {
     pub live_until: Option<DateTime<Utc>>,
     /// The last exchange with the vault got an answer.
     pub reachable: bool,
+    /// The vault's mailbox refused this device (§8.6): no session is live.
+    pub refused: bool,
 }
 
 impl Snapshot {
@@ -198,16 +200,21 @@ pub fn request_notice(f: &RequestFailed, store: Option<&CredentialError>) -> Str
     }
 }
 
-/// The paired device, open.
-pub struct Link {
-    pub session: DeviceSession,
+/// The paired device, open. Generic over the relay transport and the clock
+/// only so tests can run it against a fake vault; the app uses
+/// `Link<Http, SystemClock>`.
+pub struct Link<T: Transport = Http, C: Clock = SystemClock> {
+    pub session: Session<T, C>,
     pub store: DeviceStore,
     pub access: Access,
     /// The last exchange with the vault got an answer.
     pub reachable: bool,
+    /// The mailbox was collected once after the refusal (§8.6: a
+    /// `device.unlinked` may still wait there).
+    refusal_polled: bool,
 }
 
-impl std::fmt::Debug for Link {
+impl<T: Transport, C: Clock> std::fmt::Debug for Link<T, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Link").field("access", &self.access).field("reachable", &self.reachable).finish_non_exhaustive()
     }
@@ -219,14 +226,45 @@ impl Link {
     /// the store's own failure comes with it.
     pub fn open(mut store: DeviceStore) -> Result<Option<Link>, (SessionError, Option<CredentialError>)> {
         match Session::open(&mut store, Http::new, SystemClock) {
-            Ok(Some(session)) => {
-                if session.access_end_unreadable() {
-                    log::warn!("link: the stored unanswered end didn't read; it is settled through vault.status");
-                }
-                Ok(Some(Link { session, store, access: Access::new(), reachable: false }))
-            }
+            Ok(Some(session)) => Ok(Some(Link::new(session, store))),
             Ok(None) => Ok(None),
             Err(e) => Err((e, store.take_failure())),
+        }
+    }
+}
+
+impl<T: Transport, C: Clock> Link<T, C> {
+    /// The link for an opened `session` and its `store`.
+    pub fn new(session: Session<T, C>, store: DeviceStore) -> Self {
+        if session.access_end_unreadable() {
+            log::warn!("link: the stored unanswered end didn't read; it is settled through vault.status");
+        }
+        Link { session, store, access: Access::new(), reachable: false, refusal_polled: false }
+    }
+
+    /// The vault's mailbox refused this device (`token_revoked`, §8.6), or
+    /// the vault unlinked it: nothing more is sent, and nothing it held is
+    /// live.
+    pub fn refused(&self) -> bool {
+        self.session.is_refused()
+    }
+
+    /// After an operation: if the device has just been found refused,
+    /// collect its mailbox once, where a `device.unlinked` may still wait
+    /// (§8.6); [`Link::unlinked`] then says so.
+    async fn note_refused(&mut self) {
+        if !self.refused() || self.refusal_polled {
+            return;
+        }
+        self.refusal_polled = true;
+        log::warn!("link: the vault's mailbox refused this device");
+        match self.session.poll(&mut self.store).await {
+            Ok(msgs) => {
+                for m in &msgs {
+                    let _ = self.access.observe(&mut self.session, &mut self.store, m);
+                }
+            }
+            Err(e) => log::info!("link: collecting after the refusal: {}", e),
         }
     }
 
@@ -237,6 +275,7 @@ impl Link {
     pub async fn read_status(&mut self) -> Result<(), AccessError> {
         let r = self.access.read_status(&mut self.session, &mut self.store).await.map(drop);
         self.reachable = r.as_ref().err().is_none_or(answered);
+        self.note_refused().await;
         r
     }
 
@@ -249,6 +288,7 @@ impl Link {
             Err(e) => Err(e),
         };
         self.reachable = r.as_ref().err().is_none_or(answered);
+        self.note_refused().await;
         r
     }
 
@@ -258,14 +298,16 @@ impl Link {
     }
 
     /// Whether the background refresh still has something to do: a live
-    /// session to keep in view, or an end to settle.
+    /// session to keep in view, or an end to settle. Never for a refused
+    /// device.
     pub fn keep_refreshing(&self, now: DateTime<Utc>) -> bool {
-        self.access.active_at(now) || self.session.access_end().is_some()
+        !self.refused() && (self.access.active_at(now) || self.session.access_end().is_some())
     }
 
-    /// What the UI may see now.
+    /// What the UI may see now. A refused device shows no session.
     pub fn snapshot(&self, now: DateTime<Utc>) -> Snapshot {
-        let live_until = live_until(&self.access, now);
+        let refused = self.refused();
+        let live_until = if refused { None } else { live_until(&self.access, now) };
         let current = live_until.and(self.access.current());
         Snapshot {
             unlocked: true,
@@ -274,6 +316,7 @@ impl Link {
             expires_at: current.map(|c| c.expires_at),
             live_until,
             reachable: self.reachable,
+            refused,
         }
     }
 
@@ -283,8 +326,20 @@ impl Link {
     /// `on_requested` runs once the vault has taken the request; `stop`
     /// is checked between polls (each at most 25 s).
     pub async fn request_access(&mut self, on_requested: impl FnOnce(), stop: impl Fn() -> bool) -> Result<(), RequestFailed> {
+        let r = self.request_and_wait(on_requested, stop).await;
+        self.note_refused().await;
+        if self.unlinked() {
+            return Err(RequestFailed::Unlinked);
+        }
+        r
+    }
+
+    async fn request_and_wait(&mut self, on_requested: impl FnOnce(), stop: impl Fn() -> bool) -> Result<(), RequestFailed> {
         if stop() {
             return Err(RequestFailed::Stopped);
+        }
+        if self.refused() {
+            return Err(RequestFailed::Access(AccessError::Session(SessionError::Refused)));
         }
         let exp = match self.access.request(&mut self.session, &mut self.store, None).await {
             Ok(RequestOutcome::Requested { exp, .. }) => exp,
@@ -334,7 +389,7 @@ impl Link {
         // The vault is the only source of a device's own session (§6.8):
         // its grant is confirmed by vault.status before it is shown.
         self.refresh().await.map_err(RequestFailed::Access)?;
-        if self.access.active_at(Utc::now()) {
+        if self.access.active_at(Utc::now()) && !self.refused() {
             Ok(())
         } else {
             Err(RequestFailed::NotConfirmed)
@@ -346,6 +401,7 @@ impl Link {
     pub async fn end(&mut self) -> Result<EndOutcome, AccessError> {
         let r = self.access.end(&mut self.session, &mut self.store, None).await;
         self.reachable = r.as_ref().err().is_none_or(answered);
+        self.note_refused().await;
         r
     }
 
@@ -356,12 +412,21 @@ impl Link {
     }
 }
 
+/// Something the person must be told that no command they ran returns
+/// (the background refresh found the device refused or removed): the
+/// frontend shows it ([`NOTICE_EVENT`]).
+pub type Notify = Arc<RwLock<Option<Arc<dyn Fn(String) + Send + Sync>>>>;
+
+/// The Tauri event that carries a [`Notify`] notice to the frontend.
+pub const NOTICE_EVENT: &str = "vault:notice";
+
 /// The handles the background refresh needs (clones of `AppState`'s).
 #[derive(Clone)]
 pub struct Shared {
     pub link: Arc<Mutex<Option<Link>>>,
     pub snapshot: Arc<RwLock<Snapshot>>,
     pub is_registered: Arc<tokio::sync::RwLock<bool>>,
+    pub notify: Notify,
 }
 
 impl Shared {
@@ -372,12 +437,58 @@ impl Shared {
     pub fn read(&self) -> Snapshot {
         self.snapshot.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
+
+    /// Tell the person `notice` (logged only, before the app is set up).
+    pub fn tell(&self, notice: &str) {
+        match self.notify.read().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            Some(f) => f(notice.to_string()),
+            None => log::warn!("link: no window to tell: {}", notice),
+        }
+    }
 }
 
-/// The background refresh: after `first`, then every [`REFRESH_EVERY`],
-/// `vault.status` (and settling an unanswered end), until there is nothing
-/// left to keep up ([`Link::keep_refreshing`]), the link is gone, or the
-/// vault removed the device (whose state is then erased).
+/// How one round of the background refresh came out.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Round {
+    /// No link: nothing to do.
+    Gone,
+    /// Show this, and carry on.
+    Continue(Snapshot),
+    /// Show this, tell the person the notice if any, and stop.
+    Stop(Snapshot, Option<&'static str>),
+    /// The vault removed this device; its state was erased if `erased`.
+    /// The link is gone from the slot.
+    Unlinked { erased: bool },
+}
+
+/// One round of the background refresh on the link in `slot`: refresh,
+/// then decide. A device the vault removed is erased and taken out; a
+/// refused one stops with [`REFUSED_NOTICE`].
+pub async fn refresh_round<T: Transport, C: Clock>(slot: &mut Option<Link<T, C>>) -> Round {
+    let Some(link) = slot.as_mut() else { return Round::Gone };
+    if let Err(e) = link.refresh().await {
+        log::info!("link: refresh: {}", e);
+    }
+    if link.unlinked() {
+        let link = slot.take().expect("checked above");
+        return Round::Unlinked { erased: link.erase() };
+    }
+    let now = Utc::now();
+    let snap = link.snapshot(now);
+    if link.refused() {
+        Round::Stop(snap, Some(REFUSED_NOTICE))
+    } else if link.keep_refreshing(now) {
+        Round::Continue(snap)
+    } else {
+        Round::Stop(snap, None)
+    }
+}
+
+/// The background refresh: after `first`, then every [`REFRESH_EVERY`], a
+/// [`refresh_round`], until there is nothing left to keep up
+/// ([`Link::keep_refreshing`]), the link is gone, the device is refused, or
+/// the vault removed it (whose state is then erased). Refused and removed
+/// are told to the person.
 pub fn spawn_refresh(shared: Shared, first: std::time::Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut wait = first;
@@ -385,33 +496,40 @@ pub fn spawn_refresh(shared: Shared, first: std::time::Duration) -> JoinHandle<(
             tokio::time::sleep(wait).await;
             wait = REFRESH_EVERY;
             let mut slot = shared.link.lock().await;
-            let Some(link) = slot.as_mut() else { return };
-            if let Err(e) = link.refresh().await {
-                log::info!("link: refresh: {}", e);
-            }
-            let now = Utc::now();
-            if link.unlinked() {
-                let link = slot.take().expect("checked above");
-                shared.publish(Snapshot::default());
-                if link.erase() {
-                    *shared.is_registered.write().await = false;
-                    log::warn!("link: the vault removed this device; its state is erased");
-                } else {
-                    log::error!("link: the vault removed this device; its state couldn't be erased");
+            match refresh_round(&mut slot).await {
+                Round::Gone => return,
+                Round::Continue(snap) => shared.publish(snap),
+                Round::Stop(snap, notice) => {
+                    shared.publish(snap);
+                    if let Some(n) = notice {
+                        shared.tell(n);
+                    }
+                    return;
                 }
-                return;
-            }
-            shared.publish(link.snapshot(now));
-            if !link.keep_refreshing(now) {
-                return;
+                Round::Unlinked { erased } => {
+                    shared.publish(Snapshot::default());
+                    if erased {
+                        *shared.is_registered.write().await = false;
+                        log::warn!("link: the vault removed this device; its state is erased");
+                        shared.tell(UNLINKED_ERASED_NOTICE);
+                    } else {
+                        log::error!("link: the vault removed this device; its state couldn't be erased");
+                        shared.tell(UNLINKED_NOT_ERASED_NOTICE);
+                    }
+                    return;
+                }
             }
         }
     })
 }
 
 #[cfg(test)]
+pub(crate) mod fake;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use fake::FakeVault;
 
     #[test]
     fn a_snapshot_is_live_only_up_to_live_until() {
@@ -446,5 +564,75 @@ mod tests {
         assert_eq!(request_notice(&RequestFailed::Denied, None), REQUEST_DENIED_NOTICE);
         assert!(!answered(&AccessError::Session(SessionError::TimedOut)));
         assert!(answered(&AccessError::Vault("x".into())));
+    }
+
+    /// The fake vault answers `vault.status` with a live session: the link
+    /// shows it live after its own status read.
+    #[tokio::test]
+    async fn a_session_the_vault_names_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.set_session(Some(("s-1", Utc::now() + TimeDelta::hours(1))));
+        link.read_status().await.unwrap();
+        let snap = link.snapshot(Utc::now());
+        assert!(snap.active_at(Utc::now()));
+        assert_eq!(snap.session_id.as_deref(), Some("s-1"));
+        assert!(!snap.refused);
+    }
+
+    /// HIGH 1: a live session, then the vault's mailbox refuses the device
+    /// (`token_revoked`, §8.6): the refresh shows no session, stops, and
+    /// says so.
+    #[tokio::test]
+    async fn a_refused_device_is_not_live_and_the_refresh_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.set_session(Some(("s-1", Utc::now() + TimeDelta::hours(1))));
+        link.read_status().await.unwrap();
+        assert!(link.snapshot(Utc::now()).active_at(Utc::now()));
+
+        vault.revoke(false);
+        let mut slot = Some(link);
+        match refresh_round(&mut slot).await {
+            Round::Stop(snap, notice) => {
+                assert!(!snap.active_at(Utc::now()), "a refused device shows no session");
+                assert!(snap.refused);
+                assert_eq!(snap.session_id, None);
+                assert_eq!(notice, Some(REFUSED_NOTICE));
+            }
+            other => panic!("got {other:?}"),
+        }
+        let link = slot.as_ref().unwrap();
+        assert!(!link.keep_refreshing(Utc::now()));
+        assert!(!link.unlinked());
+        assert_eq!(vault.collects(), 1, "collected once after the refusal");
+    }
+
+    /// HIGH 1: a refused device whose mailbox still holds `device.unlinked`
+    /// takes the unlinked path: its state is erased.
+    #[tokio::test]
+    async fn a_refusal_with_device_unlinked_waiting_is_unlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.set_session(Some(("s-1", Utc::now() + TimeDelta::hours(1))));
+        link.read_status().await.unwrap();
+        vault.revoke(true);
+        let mut slot = Some(link);
+        assert_eq!(refresh_round(&mut slot).await, Round::Unlinked { erased: true });
+        assert!(slot.is_none());
+        assert!(!crate::credential::device_store::exists(dir.path()), "its state is erased");
+    }
+
+    /// A request from a refused device isn't sent, and says why.
+    #[tokio::test]
+    async fn a_refused_device_doesnt_ask_for_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.revoke(false);
+        let _ = link.read_status().await;
+        assert!(link.refused());
+        let r = link.request_access(|| panic!("not requested"), || false).await;
+        assert_eq!(r, Err(RequestFailed::Access(AccessError::Session(SessionError::Refused))));
+        assert_eq!(request_notice(&r.unwrap_err(), None), REFUSED_NOTICE);
     }
 }

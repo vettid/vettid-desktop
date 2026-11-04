@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
 
   import { sessionStore, type SessionState, refreshSessionFromBackend } from './lib/stores/session';
   import { themeStore } from './lib/stores/theme';
@@ -80,6 +81,13 @@
 
   onMount(async () => {
     initVaultListeners();
+    // What the backend's background refresh found (the vault refused or
+    // removed this desktop): shown like the unlock notice.
+    listen<string>('vault:notice', async (event) => {
+      pairingNotice = event.payload;
+      await refreshRegistration();
+      await refreshSessionFromBackend();
+    });
     initCallListener();
     initNotifications();
     const unsub = themeStore.subscribe(() => {});

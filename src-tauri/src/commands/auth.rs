@@ -454,10 +454,16 @@ pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String
         let notice = erase_unlinked(&state, link).await;
         return Ok(UnlockResponse { unlocked: false, notice: Some(notice) });
     }
+    // HIGH 1: a device the vault's mailbox refuses (§8.6) opens, with no
+    // session, and says so (Log out is the way on).
+    let refused = link.refused();
     if install(&state, link, since, mark).await.is_none() {
         return Ok(UnlockResponse { unlocked: false, notice: None });
     }
     *state.is_registered.write().await = true;
+    if refused {
+        return Ok(UnlockResponse { unlocked: true, notice: Some(link::REFUSED_NOTICE.to_string()) });
+    }
 
     // Warn (never refuse) when another account can open the saved
     // pairing's folder or file (#24).
@@ -1110,6 +1116,7 @@ mod tests {
             expires_at: Some(until + chrono::TimeDelta::seconds(60)),
             live_until: Some(until),
             reachable: true,
+            refused: false,
         };
         let info = session_info(&snap, now).unwrap();
         assert!(info.is_active);

@@ -46,6 +46,16 @@ pub fn run() {
         .manage(AppState::new())
         .setup(|app| {
             tray::install(app.handle())?;
+            // What the background refresh finds (a device refused or
+            // removed by its vault) reaches the window as `vault:notice`.
+            {
+                use tauri::Emitter;
+                let handle = app.handle().clone();
+                let tell: std::sync::Arc<dyn Fn(String) + Send + Sync> = std::sync::Arc::new(move |notice: String| {
+                    let _ = handle.emit(link::NOTICE_EVENT, notice);
+                });
+                *app.state::<AppState>().notify.write().unwrap_or_else(|p| p.into_inner()) = Some(tell);
+            }
             // Compute the device fingerprint now, on a background
             // thread. Hashing the executable is slow on a debug build;
             // doing it at startup means it is ready before the user
