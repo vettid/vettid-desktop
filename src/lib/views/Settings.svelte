@@ -214,8 +214,9 @@
           <div>
             <div class="label">Log out this desktop</div>
             <div class="hint inline">
-              Wipes the credentials on disk + the keyring entry and notifies
-              the vault. You'll need to pair again from your phone.
+              Ends this desktop's access to your vault if it can, and deletes
+              its pairing from this computer. Your phone still lists this
+              desktop: remove it there. You'll need to pair again from your phone.
             </div>
           </div>
           {#if !showLogoutPrompt}

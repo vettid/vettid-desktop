@@ -3,6 +3,16 @@
   import SessionTimer from './SessionTimer.svelte';
 
   let session = $derived($sessionStore);
+
+  // What the bar says for each session state (NEW TEXT, owner approval
+  // needed): words, not the raw state.
+  function stateLabel(state: string): string {
+    switch (state) {
+      case 'active': return 'Session active';
+      case 'suspended': return 'Session paused';
+      default: return 'No active session';
+    }
+  }
 </script>
 
 <div class="status-bar">
@@ -11,7 +21,7 @@
          only for a pairing or a session, so there is no link state to
          show here. -->
     <div class="status-item">
-      <span>Session: {session.state}</span>
+      <span>{stateLabel(session.state)}</span>
     </div>
   {:else}
     <div class="status-item">
@@ -20,7 +30,7 @@
         class:suspended={session.state === 'suspended'}
         class:expired={session.state === 'expired' || session.state === 'revoked'}
       ></span>
-      <span>Session: {session.state}</span>
+      <span>{stateLabel(session.state)}</span>
     </div>
 
     {#if session.state === 'active'}
