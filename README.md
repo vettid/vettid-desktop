@@ -25,7 +25,7 @@ VettID Desktop extends your VettID vault to desktop environments. Sessions are t
 
 ### Pairing (no creds shipped in the binary)
 
-The member's phone shows a desktop pairing code. The desktop reads it and pairs with the vault through the relay (VAULT-MESSAGING §6.7, `src-tauri/crates/vettid-device`): a handshake, a six-digit code the member compares on the phone, and the owner's approval there. The keys are made on the desktop and kept sealed under a key in the OS keyring; without a keyring the desktop doesn't pair.
+The member's phone shows a desktop pairing code. The desktop reads it and pairs with the vault through the relay (VAULT-MESSAGING §6.7, `src-tauri/crates/vettid-device`): a handshake, a six-digit code the member compares on the phone, and the owner's approval there. The keys are made on the desktop and kept sealed under a data key that a platform protector wraps (see Credential Binding); with no protector available the desktop doesn't pair.
 
 ## Project Structure
 
@@ -47,7 +47,9 @@ src-tauri/src/
 │   └── keys.rs             # X25519 keypair generation
 ├── credential/
 │   ├── device_store.rs     # The device engine's state, sealed (device.enc v2)
-│   ├── protector.rs        # What wraps its data key: DPAPI on Windows, the keyring elsewhere
+│   ├── protector.rs        # What wraps its data key: DPAPI (Windows), TPM or Secret Service (Linux), keyring (macOS, for now)
+│   ├── tpm.rs              # Linux: the TPM 2.0 protector (/dev/tpmrm0)
+│   ├── secret_service.rs   # Linux: the Secret Service protector, ranked after the TPM
 │   └── store.rs            # On-disk encrypted storage (shared parts)
 ├── fingerprint/
 │   ├── binary.rs           # Binary self-hash
@@ -104,7 +106,7 @@ npm run check
 - **Argon2id** — Password hashing (t=3, m=64MB, p=4) matching OWASP recommendations
 
 ### Credential Binding
-The paired device's state (`device.enc`) is sealed under a random data key made at pairing, and that key is wrapped by a platform protector (DESKTOP-REWORK-PLAN §4 "At-rest protectors"). On Windows it is DPAPI for the user's account: a copy of the file alone doesn't open elsewhere, but a copy of the whole profile with the user's password does, and an administrator can unwrap it while the user is logged on. Elsewhere, for now, the key is kept in the OS keyring, which is not bound to the computer. An old copy of the file recovered from a backup or the disk still opens for the same user on the same computer.
+The paired device's state (`device.enc`) is sealed under a random data key made at pairing, and that key is wrapped by a platform protector (DESKTOP-REWORK-PLAN §4 "At-rest protectors"). On Windows it is DPAPI for the user's account: a copy of the file alone doesn't open elsewhere, but a copy of the whole profile with the user's password does, and an administrator can unwrap it while the user is logged on. On Linux it is the TPM 2.0 through `/dev/tpmrm0`: the data key is sealed under the storage root key, with no PCR policy and no auth value, so it opens only on this TPM, but root, or any user who can read the file and use the TPM (any process of this user included), can unseal it, and clearing the TPM loses the pairing. Many distributions give `/dev/tpmrm0` to `root:tss` only, and a Flatpak has none; without a TPM this user can use, the key is kept in the Secret Service (GNOME Keyring, KWallet), one item per pairing, which is not bound to the computer: a copy of the keyring file opens elsewhere with the login password. With neither, the desktop doesn't pair. The TPM protector links `libtss2` (esys, tctildr, mu, and the device TCTI at run time). On macOS, for now, the key is kept in the OS keyring, which is not bound to the computer. An old copy of the file recovered from a backup or the disk still opens for the same user on the same computer.
 
 The machine fingerprint shown in Settings is not a key, and is not unique: a cloned disk image or VM shows the same one.
 

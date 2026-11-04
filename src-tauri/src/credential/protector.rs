@@ -4,20 +4,26 @@
 //! - **Windows: DPAPI, user scope** (`super::dpapi`). The wrapped key is in
 //!   the file's header; DPAPI keeps nothing outside it. Bound to this
 //!   computer and this account.
-//! - **Elsewhere, for now: the OS keyring** through the `keyring` crate
-//!   (Secret Service on Linux, the owner's choice (b); the login keychain
-//!   on macOS until the keychain and passphrase protectors land). The data
-//!   key is the keyring entry itself, so the header's wrapped key is empty.
-//!   Not bound to this computer: a copy of the keyring opens elsewhere with
-//!   the login password. Settings says so.
+//! - **Linux: the TPM 2.0** (`super::tpm`), through `/dev/tpmrm0`: the data
+//!   key sealed under the storage root key, the sealed object in the
+//!   header. Bound to this computer.
+//! - **Linux without a TPM this user can use: the Secret Service**
+//!   (`super::secret_service`, the owner's choice (b)): one keyring item
+//!   per file, named by an id in the header. Not bound to this computer.
+//! - **macOS, for now: the OS keyring** through the `keyring` crate (the
+//!   login keychain, until the keychain and passphrase protectors land).
+//!   The data key is the keyring entry itself, so the header's wrapped key
+//!   is empty. Not bound to this computer: Settings says so.
 //!
 //! **Absent and failing are different.** A protector says it is absent
 //! only from a fixed, detected condition ([`Availability::Absent`]), never
 //! from an error; the next one is then tried. Every error of a protector
 //! that is present is [`ProtectorError::Failing`]: pairing or loading stops
-//! with the reason and never falls back. Neither protector here is ever
-//! absent: DPAPI is part of Windows, and the keyring's "no Secret Service
-//! on the session bus" check comes with the Linux protectors.
+//! with the reason and never falls back. DPAPI and the macOS keyring are
+//! never absent. On Linux the TPM is absent when `/dev/tpmrm0` is missing
+//! or not usable by this user, and the Secret Service when there is no
+//! session bus or no `org.freedesktop.secrets` on it; with both absent,
+//! pairing is refused with the no-protector notice.
 //!
 //! The legacy `master-key-v1` entry of the earlier format is only ever
 //! deleted here ([`LegacyKey`]); nothing reads it.
@@ -37,7 +43,7 @@ pub(crate) type DataKey = Zeroizing<[u8; 32]>;
 pub(crate) enum Availability {
     Present,
     /// Detected as not there, with what was detected (for the log).
-    #[allow(dead_code)] // no protector of this build is ever absent (see the module doc)
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only Linux's protectors can be absent
     Absent(&'static str),
 }
 
@@ -83,13 +89,80 @@ pub(crate) trait Protector: Send + Sync {
     /// Remove any key this protector keeps outside the file, and confirm
     /// it is gone. Ok when it keeps none.
     fn remove_external(&self) -> Result<(), ProtectorError>;
+    /// As [`Protector::remove_external`], knowing what is being wiped. A
+    /// protector that can't be reached here may then say there is nothing
+    /// of its to confirm (the Secret Service); the rest ignore it.
+    fn remove_external_for(&self, wiping: &Wiping) -> Result<(), ProtectorError> {
+        let _ = wiping;
+        self.remove_external()
+    }
 }
 
 /// The earlier format's master key entry (`master-key-v1`): deleted and
 /// confirmed gone, never read for use.
 pub(crate) trait LegacyKey: Send + Sync {
     fn remove(&self) -> Result<(), ProtectorError>;
+    /// As [`LegacyKey::remove`], knowing what is being wiped.
+    fn remove_for(&self, wiping: &Wiping) -> Result<(), ProtectorError> {
+        let _ = wiping;
+        self.remove()
+    }
 }
+
+/// What a wipe removes, read before it from the device file's header
+/// (unauthenticated: nothing is decrypted), so that a protector that can't
+/// be reached knows whether it could hold anything of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Wiping {
+    /// The header's `protector`; `None` when there is no device file, or
+    /// one that can't be read or parsed: then anything could have been
+    /// kept, by any protector.
+    pub(crate) sealed_by: Option<String>,
+    /// Whether an earlier format's pairing (a v1 `device.enc`, or
+    /// `connection.enc`) is involved, or can't be ruled out.
+    pub(crate) legacy: bool,
+}
+
+impl Wiping {
+    /// Nothing known: every protector confirms.
+    pub(crate) fn unknown() -> Self {
+        Wiping { sealed_by: None, legacy: true }
+    }
+
+    /// Retiring an earlier format's file.
+    pub(crate) fn legacy_file() -> Self {
+        Wiping { sealed_by: Some("legacy".into()), legacy: true }
+    }
+
+    /// No device file, and no earlier format's pairing: nothing of a
+    /// pairing can be in any protector (a key left without its file is an
+    /// orphan, see `secret_service`).
+    pub(crate) fn nothing() -> Self {
+        Wiping { sealed_by: Some("none".into()), legacy: false }
+    }
+
+    /// Both together (a pending wipe's marker and what is on disk now):
+    /// the same protector, or one side with no file, keeps it; two
+    /// different ones are unknown. Legacy if either is.
+    pub(crate) fn and(self, other: Wiping) -> Wiping {
+        let sealed_by = match (self.sealed_by, other.sealed_by) {
+            (Some(a), Some(b)) if a == b => Some(a),
+            (Some(a), Some(b)) if b == "none" => Some(a),
+            (Some(a), Some(b)) if a == "none" => Some(b),
+            _ => None,
+        };
+        Wiping { sealed_by, legacy: self.legacy || other.legacy }
+    }
+
+    /// Whether a file sealed by one of `ids` may be involved.
+    pub(crate) fn may_be_sealed_by(&self, ids: &[&str]) -> bool {
+        self.sealed_by.as_deref().is_none_or(|id| ids.contains(&id))
+    }
+}
+
+/// The TPM protector's plain name, for the person (the notices give other
+/// advice for it than for the keyring, see `store`).
+pub(crate) const TPM_NAME: &str = "this computer's TPM";
 
 /// What a header's `protector` says, for Settings: the id as shown, and
 /// whether it binds the file to this computer. `None` for an id this build
@@ -97,6 +170,11 @@ pub(crate) trait LegacyKey: Send + Sync {
 pub(crate) fn describe(id: &str) -> Option<(&'static str, bool)> {
     match id {
         "dpapi" => Some(("dpapi", true)),
+        "tpm" => Some(("tpm", true)),
+        "secret-service" => Some(("secret-service", false)),
+        // Linux has no keyring protector (a file of the build before this
+        // one, sealed by it, is unreadable here: re-pair).
+        #[cfg(not(target_os = "linux"))]
         "keyring" => Some(("keyring", false)),
         #[cfg(test)]
         "test" => Some(("test", true)),
@@ -117,7 +195,14 @@ impl Protectors {
         {
             Protectors { ranked: vec![Box::new(super::dpapi::Dpapi::user())], legacy: Box::new(super::dpapi::LegacyCredential) }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            Protectors {
+                ranked: vec![Box::new(super::tpm::Tpm::system()), Box::new(super::secret_service::SecretService::system())],
+                legacy: Box::new(super::secret_service::LegacyEntry::system()),
+            }
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             Protectors { ranked: vec![Box::new(keyring_store::Keyring)], legacy: Box::new(keyring_store::LegacyEntry) }
         }
@@ -150,10 +235,11 @@ impl Protectors {
     }
 
     /// Remove every external key (each protector's, then the legacy entry),
-    /// each confirmed gone. All are tried; the first failure is returned.
-    pub(crate) fn remove_external_keys(&self) -> Result<(), ProtectorError> {
+    /// each confirmed gone, for the wipe of `wiping`. All are tried; the
+    /// first failure is returned.
+    pub(crate) fn remove_external_keys(&self, wiping: &Wiping) -> Result<(), ProtectorError> {
         let mut first = None;
-        let results = self.ranked.iter().map(|p| p.remove_external()).chain(std::iter::once(self.legacy.remove()));
+        let results = self.ranked.iter().map(|p| p.remove_external_for(wiping)).chain(std::iter::once(self.legacy.remove_for(wiping)));
         for r in results {
             if let Err(e) = r {
                 log::error!("key store: {}", e);
@@ -164,14 +250,14 @@ impl Protectors {
     }
 
     /// Remove the legacy entry alone, confirmed gone.
-    pub(crate) fn remove_legacy_key(&self) -> Result<(), ProtectorError> {
-        self.legacy.remove()
+    pub(crate) fn remove_legacy_key(&self, wiping: &Wiping) -> Result<(), ProtectorError> {
+        self.legacy.remove_for(wiping)
     }
 }
 
-/// The OS keyring through the `keyring` crate: the interim protector off
-/// Windows (see the module doc).
-#[cfg(not(windows))]
+/// The OS keyring through the `keyring` crate: the interim protector on
+/// macOS (see the module doc).
+#[cfg(not(any(windows, target_os = "linux")))]
 mod keyring_store {
     use super::{Availability, DataKey, LegacyKey, Protector, ProtectorError};
     use zeroize::Zeroizing;
@@ -423,21 +509,43 @@ pub(crate) mod testing {
     fn removing_external_keys_tries_them_all_and_reports_a_failure() {
         let b = Arc::new(Behaviour::default());
         let p = protectors(&b);
-        p.remove_external_keys().unwrap();
+        let w = Wiping::unknown();
+        p.remove_external_keys(&w).unwrap();
         Behaviour::set(&b.fail_remove, true);
-        assert!(matches!(p.remove_external_keys(), Err(ProtectorError::NotRemoved { .. })));
+        assert!(matches!(p.remove_external_keys(&w), Err(ProtectorError::NotRemoved { .. })));
         assert_eq!(Behaviour::count(&b.removes), 2);
         assert_eq!(Behaviour::count(&b.legacy_removes), 2, "the legacy entry too, after the failure");
         Behaviour::set(&b.fail_remove, false);
         Behaviour::set(&b.fail_legacy_remove, true);
-        assert!(matches!(p.remove_external_keys(), Err(ProtectorError::NotRemoved { .. })));
+        assert!(matches!(p.remove_external_keys(&w), Err(ProtectorError::NotRemoved { .. })));
+    }
+
+    #[test]
+    fn what_a_wipe_may_involve() {
+        let unknown = Wiping::unknown();
+        assert!(unknown.may_be_sealed_by(&["secret-service"]) && unknown.legacy);
+        let tpm = Wiping { sealed_by: Some("tpm".into()), legacy: false };
+        assert!(!tpm.may_be_sealed_by(&["secret-service", "keyring"]));
+        assert!(tpm.may_be_sealed_by(&["tpm"]));
+        assert!(Wiping::legacy_file().legacy);
+        assert!(!Wiping::nothing().may_be_sealed_by(&["secret-service"]) && !Wiping::nothing().legacy);
+        let ss = Wiping { sealed_by: Some("secret-service".into()), legacy: false };
+        assert_eq!(ss.clone().and(Wiping::nothing()), ss);
+        assert_eq!(Wiping::nothing().and(ss.clone()), ss);
+        assert_eq!(ss.clone().and(tpm.clone()).sealed_by, None);
+        assert!(tpm.and(Wiping::legacy_file()).legacy);
     }
 
     #[test]
     fn settings_knows_which_protectors_bind() {
         assert_eq!(describe("dpapi"), Some(("dpapi", true)));
+        assert_eq!(describe("tpm"), Some(("tpm", true)));
+        assert_eq!(describe("secret-service"), Some(("secret-service", false)));
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(describe("keyring"), Some(("keyring", false)));
-        assert_eq!(describe("tpm"), None);
+        #[cfg(target_os = "linux")]
+        assert_eq!(describe("keyring"), None);
+        assert_eq!(describe("passphrase"), None);
         assert_eq!(describe(""), None);
     }
 }

@@ -60,22 +60,46 @@ pub const UNREADABLE_NOTICE: &str =
 /// is its plain name ("Windows data protection", "your computer's
 /// keyring"). At pairing, the vault may already list the desktop, hence
 /// the phone step. Replaces the keyring-unavailable notice.
+///
+/// NEW TEXT (#13, Linux, owner approval needed): for the TPM, signing out
+/// doesn't help (it may be busy or in lockout, its storage hierarchy may
+/// have a password, or a libtss2 library may be missing), so the advice is
+/// to retry and then whoever manages the computer.
 fn not_protected_notice(by: &str) -> String {
+    if by == super::protector::TPM_NAME {
+        return format!("This desktop couldn't lock its pairing with {by}, so nothing was saved. If your phone lists this desktop, remove it there. Then try pairing again. If it keeps happening, whoever manages this computer needs to check its TPM and the TPM software: the TPM may be busy or set up with a password this desktop can't use, or a library this desktop needs may be missing.");
+    }
     format!("This desktop couldn't lock its pairing with {by}, so nothing was saved. If your phone lists this desktop, remove it there. Then sign out of your computer and back in, and pair again.")
 }
 
 /// NEW TEXT (owner approval needed): shown at unlock when the saved
 /// pairing's protector is there but couldn't open it (#13). The file is
 /// kept: it may open later (after signing in again), or the person re-pairs.
+///
+/// NEW TEXT (#13, Linux, owner approval needed): for the TPM, "restart this
+/// desktop" in place of signing out.
 fn not_opened_notice(by: &str) -> String {
+    if by == super::protector::TPM_NAME {
+        return format!("This desktop couldn't open its saved pairing with {by} just now. The pairing is kept. Restart this desktop to try again. If it keeps happening, remove this desktop on your phone; then, in Settings, open Danger zone and choose Log out this desktop, and pair again.");
+    }
     format!("This desktop couldn't open its saved pairing with {by} just now. The pairing is kept. Sign out of your computer and back in to try again. If it keeps happening, remove this desktop on your phone; then, in Settings, open Danger zone and choose Log out this desktop, and pair again.")
 }
 
 /// NEW TEXT (owner approval needed): shown when this computer offers no
-/// protector at all (#13). Not reachable in this build (every platform has
-/// one that is never absent); the passphrase protector will replace it.
+/// protector at all (#13). Not reachable on Windows or macOS (each has one
+/// that is never absent). The passphrase protector will take this case.
+#[cfg(not(target_os = "linux"))]
 pub const NO_PROTECTOR_NOTICE: &str =
     "This computer offers no way for this desktop to lock its pairing, so nothing was saved. If your phone lists this desktop, remove it there.";
+
+/// NEW TEXT (#13, Linux, owner approval needed): shown at pairing when this
+/// account can't use the TPM (`/dev/tpmrm0` missing or not permitted) and no
+/// Secret Service is on the session bus. Pairing is refused before the
+/// vault lists the desktop; the phone step covers a later save. Says only
+/// what the person can do now (the passphrase protector comes later).
+#[cfg(target_os = "linux")]
+pub const NO_PROTECTOR_NOTICE: &str =
+    "This computer offers no way for this desktop to lock its pairing: your account can't use the computer's TPM, and this desktop couldn't find a keyring service, such as GNOME Keyring or KWallet. Nothing was saved. If your phone lists this desktop, remove it there. To pair, start your keyring service, or ask whoever manages this computer to give your account access to the TPM, then pair again.";
 
 /// NEW TEXT (owner approval needed): shown at unlock when the saved pairing
 /// was made by an earlier version, whose format this one can't read, and it
@@ -547,8 +571,19 @@ pub(crate) fn wipe(config_dir: &Path) -> Result<(), CredentialError> {
 /// that reached the vault over NATS), which this build can't use, with its
 /// live marker. The folder, the keyring key and this build's device file
 /// are left. Ok only if the file system confirms it gone.
+///
+/// The earlier builds kept that pairing's key as `master-key-v1`, which this
+/// doesn't remove (log-out does): the pending-wipe marker records that an
+/// earlier format was here, first, and stays until a log-out confirms the
+/// key gone.
 pub fn remove_legacy_pairing(config_dir: &Path) -> Result<(), CredentialError> {
     let _one_at_a_time = writer_lock();
+    let legacy = super::protector::Wiping { legacy: true, ..super::protector::Wiping::nothing() };
+    let wiping = match pending_wipe(config_dir) {
+        Some(pending) => pending.and(legacy),
+        None => legacy,
+    };
+    record_wipe(config_dir, &wiping);
     delete_locked(config_dir)?;
     confirm_gone(config_dir, CREDENTIAL_FILE)
 }
@@ -561,21 +596,196 @@ pub fn remove_legacy_pairing(config_dir: &Path) -> Result<(), CredentialError> {
 /// no folder. Ok only if the pairing and the keys are confirmed gone; with
 /// no folder, `NoConfigDir`.
 pub fn wipe_for_logout(config_dir: Option<&Path>) -> Result<(), CredentialError> {
-    wipe_then(config_dir, || super::protector::Protectors::system().remove_external_keys().map_err(CredentialError::from))
+    wipe_then(config_dir, |wiping| super::protector::Protectors::system().remove_external_keys(wiping).map_err(CredentialError::from))
 }
 
-fn wipe_then(config_dir: Option<&Path>, remove_keys: impl FnOnce() -> Result<(), CredentialError>) -> Result<(), CredentialError> {
+/// The wipe, then `remove_keys` with what the device file's header said
+/// before it (read under the lock; no folder: nothing known).
+fn wipe_then(
+    config_dir: Option<&Path>,
+    remove_keys: impl FnOnce(&super::protector::Wiping) -> Result<(), CredentialError>,
+) -> Result<(), CredentialError> {
     let _one_at_a_time = writer_lock();
     WIPES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let wiping = match config_dir {
+        Some(dir) => begin_wipe(dir, super::device_store::what_is_sealed(dir)),
+        None => super::protector::Wiping::unknown(),
+    };
     let wiped = match config_dir {
         Some(dir) => wipe_locked(dir),
         None => Err(CredentialError::NoConfigDir),
     };
-    let keys = remove_keys();
+    let keys = remove_keys(&wiping);
     if let Err(e) = &keys {
         log::error!("Credential store: a key was not removed: {}", e);
     }
-    wiped.and(keys)
+    let done = wiped.and(keys);
+    if let (Ok(()), Some(dir)) = (&done, config_dir) {
+        finish_wipe(dir);
+    }
+    done
+}
+
+/// Wipes of `config_dir`s that haven't finished, in this process: kept
+/// as well as the marker, for when the marker couldn't be written.
+static PENDING_WIPES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, super::protector::Wiping>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Before a wipe of `config_dir` (log-out, a store's clear on
+/// device.unlinked, an earlier format's retirement) removes anything: what
+/// it removes, `on_disk` together with any wipe of it that hasn't finished
+/// (its marker, or this process's memory), recorded in the marker and in
+/// memory. The caller holds the writer lock, and calls [`finish_wipe`]
+/// only once every part is confirmed gone.
+pub(super) fn begin_wipe(config_dir: &Path, on_disk: super::protector::Wiping) -> super::protector::Wiping {
+    let wiping = match pending_wipe(config_dir) {
+        Some(pending) => pending.and(on_disk),
+        None => on_disk,
+    };
+    record_wipe(config_dir, &wiping);
+    wiping
+}
+
+/// A wipe of `config_dir` that hasn't finished: its marker and this
+/// process's memory of it, together. The caller holds the writer lock.
+pub(super) fn pending_wipe(config_dir: &Path) -> Option<super::protector::Wiping> {
+    let remembered = PENDING_WIPES.lock().unwrap_or_else(|e| e.into_inner()).get(config_dir).cloned();
+    match (wipe_marker::read(config_dir), remembered) {
+        (Some(m), Some(r)) => Some(m.and(r)),
+        (m, r) => m.or(r),
+    }
+}
+
+/// Record `wiping` as the pending wipe of `config_dir` (the marker, and
+/// memory). The caller holds the writer lock.
+pub(super) fn record_wipe(config_dir: &Path, wiping: &super::protector::Wiping) {
+    if let Err(e) = wipe_marker::write(config_dir, wiping) {
+        log::warn!("Credential store: the wipe's marker wasn't written ({}); this process remembers it, a restart loses it", e);
+    }
+    PENDING_WIPES.lock().unwrap_or_else(|e| e.into_inner()).insert(config_dir.to_path_buf(), wiping.clone());
+}
+
+/// After a wipe of `config_dir` whose every part is confirmed gone: the
+/// marker goes (last), and the memory of it.
+pub(super) fn finish_wipe(config_dir: &Path) {
+    if let Err(e) = wipe_marker::remove(config_dir) {
+        log::warn!("Credential store: the wipe's marker wasn't removed: {}", e);
+    }
+    PENDING_WIPES.lock().unwrap_or_else(|e| e.into_inner()).remove(config_dir);
+}
+
+/// The marker of a log-out's wipe that hasn't finished
+/// (`vettid-desktop.wipe-pending`, next to the pairing folder, which the
+/// wipe removes): what the device file's header said before it, so a retry
+/// after the file is gone still knows which protector kept a key. Holds no
+/// secret (a protector id and a flag), written `0600` and synced. It is not
+/// a pairing: nothing else reads it. Written on Linux and macOS
+/// (`cfg(unix)`); only Linux's Secret Service protector reads what it
+/// says, so on macOS it is harmless and unused. Not written on Windows,
+/// where DPAPI keeps nothing outside the file.
+mod wipe_marker {
+    use super::super::protector::Wiping;
+    use std::path::{Path, PathBuf};
+
+    const SUFFIX: &str = ".wipe-pending";
+    const TAG: &str = "vettid-desktop-wipe-v1";
+
+    pub(super) fn path(config_dir: &Path) -> Option<PathBuf> {
+        let mut name = config_dir.file_name()?.to_os_string();
+        name.push(SUFFIX);
+        Some(config_dir.with_file_name(name))
+    }
+
+    fn encode(w: &Wiping) -> String {
+        let id = match w.sealed_by.as_deref() {
+            Some(id) if !id.is_empty() && id != "?" && !id.contains(['\n', '\r']) => id,
+            _ => "?",
+        };
+        format!("{TAG}\n{id}\n{}\n", u8::from(w.legacy))
+    }
+
+    fn decode(text: &str) -> Wiping {
+        let mut lines = text.lines();
+        match (lines.next(), lines.next(), lines.next(), lines.next()) {
+            (Some(TAG), Some(id), Some(legacy @ ("0" | "1")), None) => {
+                Wiping { sealed_by: (id != "?").then(|| id.to_string()), legacy: legacy == "1" }
+            }
+            _ => Wiping::unknown(),
+        }
+    }
+
+    /// The pending wipe, if a marker is there; one that can't be read or
+    /// parsed is "nothing known".
+    #[cfg(unix)]
+    pub(super) fn read(config_dir: &Path) -> Option<Wiping> {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = path(config_dir)?;
+        match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path) {
+            Ok(f) => {
+                let mut text = String::new();
+                Some(match f.take(256).read_to_string(&mut text) {
+                    Ok(_) => decode(&text),
+                    Err(_) => Wiping::unknown(),
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => Some(Wiping::unknown()),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn write(config_dir: &Path, w: &Wiping) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = path(config_dir).ok_or_else(|| std::io::Error::other("no folder name"))?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        f.write_all(encode(w).as_bytes())?;
+        f.sync_all()?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(super) fn remove(config_dir: &Path) -> std::io::Result<()> {
+        let Some(path) = path(config_dir) else { return Ok(()) };
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn read(_: &Path) -> Option<Wiping> {
+        None
+    }
+    #[cfg(not(unix))]
+    pub(super) fn write(_: &Path, _: &Wiping) -> std::io::Result<()> {
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    pub(super) fn remove(_: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn the_marker_round_trips() {
+        for w in [Wiping::unknown(), Wiping::nothing(), Wiping::legacy_file(), Wiping { sealed_by: Some("secret-service".into()), legacy: false }] {
+            assert_eq!(decode(&encode(&w)), w);
+        }
+        assert_eq!(decode(&encode(&Wiping { sealed_by: Some("a\nb".into()), legacy: false })).sealed_by, None);
+        assert_eq!(decode("garbage"), Wiping::unknown());
+        assert_eq!(path(Path::new("/x/vettid-desktop")).unwrap(), Path::new("/x/vettid-desktop.wipe-pending"));
+    }
 }
 
 /// [`wipe`]'s work; the caller holds the writer lock.
@@ -1120,7 +1330,7 @@ pub(crate) mod tests {
         device_pairing(&config_dir);
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut saver = None;
-        wipe_then(Some(&config_dir), || {
+        wipe_then(Some(&config_dir), |_| {
             let (order2, other2) = (order.clone(), other.clone());
             let handle = std::thread::spawn(move || {
                 store_for_tests(&other2).save_raw_for_tests();
@@ -1159,7 +1369,7 @@ pub(crate) mod tests {
     fn logout_with_no_folder_still_deletes_the_key() {
         let mut deleted = false;
         let since = wipe_epoch();
-        let wiped = wipe_then(None, || {
+        let wiped = wipe_then(None, |_| {
             deleted = true;
             Ok(())
         });
@@ -1177,7 +1387,7 @@ pub(crate) mod tests {
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
         let b = std::sync::Arc::new(Behaviour::default());
-        let remove = || protectors(&b).remove_external_keys().map_err(CredentialError::from);
+        let remove = |w: &super::super::protector::Wiping| protectors(&b).remove_external_keys(w).map_err(CredentialError::from);
         device_pairing(&config_dir);
         Behaviour::set(&b.fail_remove, true);
         assert!(matches!(wipe_then(Some(&config_dir), remove), Err(CredentialError::IoError(_))));
@@ -1280,6 +1490,207 @@ pub(crate) mod tests {
         let err = s.take_failure().expect("why");
         assert!(matches!(err, CredentialError::NotPrivate), "got {err}");
         assert_eq!(fs::read(&file).unwrap(), before, "not truncated");
+    }
+
+    /// The TPM failing gets advice that fits it (signing out doesn't help);
+    /// the keyring keeps its own. None claims anything was saved.
+    #[test]
+    fn a_failing_tpm_is_not_told_to_sign_out() {
+        let tpm = super::super::protector::TPM_NAME;
+        for e in [CredentialError::NotProtected { by: tpm }, CredentialError::NotOpened { by: tpm }] {
+            let text = e.to_string();
+            assert!(text.contains(tpm) && !text.to_lowercase().contains("sign out"), "{text}");
+        }
+        assert!(CredentialError::NotProtected { by: tpm }.to_string().contains("nothing was saved"));
+        assert!(CredentialError::NotOpened { by: tpm }.to_string().contains("The pairing is kept"));
+        let keyring = CredentialError::NotProtected { by: "your computer's keyring" }.to_string();
+        assert!(keyring.contains("sign out of your computer and back in"), "{keyring}");
+        assert!(CredentialError::NoProtector.to_string().to_lowercase().contains("nothing was saved"));
+    }
+
+    /// A device file whose header names `protector` (nothing else of it is
+    /// read by a wipe).
+    #[cfg(target_os = "linux")]
+    fn sealed_by(dir: &Path, protector: &str) {
+        ensure_config_dir(dir).unwrap();
+        let header = format!(
+            r#"{{"header":{{"v":2,"protector":"{protector}","wrapped_key":"","nonce":"","created_at":0,"notice_shown":false}},"ciphertext":""}}"#
+        );
+        fs::write(dir.join(DEVICE_FILE), header).unwrap();
+    }
+
+    /// The real Linux protectors' removal, with the Secret Service
+    /// unreachable (no bus; nothing is connected to).
+    #[cfg(target_os = "linux")]
+    fn remove_unreachable(w: &super::super::protector::Wiping) -> Result<(), CredentialError> {
+        let (ss, legacy) = super::super::secret_service::unreachable_for_tests();
+        super::super::protector::Protectors::new(vec![Box::new(ss)], Box::new(legacy)).remove_external_keys(w).map_err(CredentialError::from)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn marker(dir: &Path) -> PathBuf {
+        wipe_marker::path(dir).unwrap()
+    }
+
+    /// A wipe that removed the file but not a key, retried: the marker says
+    /// what the file was (TPM), so the retry with the Secret Service
+    /// unreachable is Ok, and the marker goes last.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_partial_wipe_retried_is_ok() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        sealed_by(&dir, "tpm");
+        let first = wipe_then(Some(&dir), |_| Err(CredentialError::IoError("a key, this time".into())));
+        assert!(first.is_err());
+        assert!(!dir.exists(), "the file went");
+        assert!(marker(&dir).exists(), "the marker stays for the retry");
+        wipe_then(Some(&dir), |w| {
+            assert_eq!(w.sealed_by.as_deref(), Some("tpm"));
+            remove_unreachable(w)
+        })
+        .unwrap();
+        assert!(!marker(&dir).exists(), "removed once everything is gone");
+    }
+
+    /// No device file and no marker: nothing of a pairing; Ok with the
+    /// Secret Service unreachable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_file_and_no_marker_is_ok() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        wipe_then(Some(&dir), remove_unreachable).unwrap();
+        ensure_config_dir(&dir).unwrap();
+        wipe_then(Some(&dir), remove_unreachable).unwrap();
+        assert!(!marker(&dir).exists());
+    }
+
+    /// A file sealed by the Secret Service, with it unreachable: "not
+    /// removed", and still so on the retry (from the marker).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_secret_service_file_unreachable_is_not_removed_on_retry_too() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        sealed_by(&dir, "secret-service");
+        assert!(wipe_then(Some(&dir), remove_unreachable).is_err());
+        assert!(!dir.exists());
+        assert!(marker(&dir).exists());
+        assert!(wipe_then(Some(&dir), remove_unreachable).is_err(), "the marker remembers");
+        assert!(marker(&dir).exists());
+        // The marker isn't a pairing.
+        assert!(!exists(&dir));
+        assert!(!super::super::device_store::exists(&dir));
+    }
+
+    /// An earlier format's file with the Secret Service unreachable: its
+    /// retirement can't confirm the legacy key (LEGACY_NOT_REMOVED), and
+    /// the log-out after it remembers (the marker): "not removed", never a
+    /// guess. (A v1 file exists only where an earlier build had a keyring.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_retirement_without_a_secret_service_then_log_out() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        ensure_config_dir(&dir).unwrap();
+        fs::write(dir.join(DEVICE_FILE), br#"{"version":1,"binding":"keyring","nonce":[7,7],"ciphertext":[9]}"#).unwrap();
+        let (ss, legacy) = super::super::secret_service::unreachable_for_tests();
+        let p = super::super::protector::Protectors::new(vec![Box::new(ss)], Box::new(legacy));
+        let retired = super::super::device_store::retire_legacy_with(&dir, &p);
+        assert!(matches!(retired, Err(CredentialError::LegacyNotRemoved)));
+        assert!(!dir.join(DEVICE_FILE).exists(), "the file itself went");
+        assert!(marker(&dir).exists());
+        assert!(matches!(wipe_then(Some(&dir), remove_unreachable), Err(CredentialError::IoError(_))));
+        assert!(marker(&dir).exists());
+    }
+
+    /// `connection.enc` removed at unlock: its `master-key-v1` isn't, so the
+    /// marker records it, and a log-out with the Secret Service unreachable
+    /// is "not removed".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn removing_connection_enc_leaves_the_legacy_key_to_log_out() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        ensure_config_dir(&dir).unwrap();
+        fs::write(dir.join(CREDENTIAL_FILE), b"old").unwrap();
+        remove_legacy_pairing(&dir).unwrap();
+        assert!(!exists(&dir));
+        assert!(marker(&dir).exists());
+        assert!(matches!(wipe_then(Some(&dir), remove_unreachable), Err(CredentialError::IoError(_))));
+        // With the key confirmed gone (the test protectors), the marker goes.
+        let b = std::sync::Arc::new(crate::credential::protector::testing::Behaviour::default());
+        wipe_then(Some(&dir), |w| crate::credential::protector::testing::protectors(&b).remove_external_keys(w).map_err(CredentialError::from)).unwrap();
+        assert!(!marker(&dir).exists());
+    }
+
+    /// Retiring a v1 file doesn't clear the marker of an earlier wipe that
+    /// left a Secret Service key: it is restored after, so log-out still
+    /// checks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retiring_a_v1_file_keeps_an_earlier_wipes_marker() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        sealed_by(&dir, "secret-service");
+        assert!(wipe_then(Some(&dir), remove_unreachable).is_err(), "left the key");
+        ensure_config_dir(&dir).unwrap();
+        fs::write(dir.join(DEVICE_FILE), br#"{"version":1,"binding":"keyring","nonce":[7,7],"ciphertext":[9]}"#).unwrap();
+        let b = std::sync::Arc::new(crate::credential::protector::testing::Behaviour::default());
+        let retired = super::super::device_store::retire_legacy_with(&dir, &crate::credential::protector::testing::protectors(&b));
+        assert!(retired.unwrap(), "the v1 parts confirmed gone");
+        assert!(marker(&dir).exists(), "the earlier wipe's marker stays");
+        let err = wipe_then(Some(&dir), |w| {
+            assert_eq!(w.sealed_by.as_deref(), Some("secret-service"));
+            remove_unreachable(w)
+        });
+        assert!(err.is_err());
+    }
+
+    /// device.unlinked's clear of a Secret Service file that left the key:
+    /// the log-out after it remembers it (the marker).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_clear_that_left_a_key_then_log_out_is_not_removed() {
+        use vettid_device::store::Persist;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        sealed_by(&dir, "secret-service");
+        let (ss, legacy) = super::super::secret_service::unreachable_for_tests();
+        let p = super::super::protector::Protectors::new(vec![Box::new(ss)], Box::new(legacy));
+        let mut store = super::super::device_store::DeviceStore::with_protectors(&dir, None, p);
+        assert!(store.clear().is_err());
+        assert!(!dir.join(DEVICE_FILE).exists(), "the file went");
+        assert!(marker(&dir).exists());
+        assert!(wipe_then(Some(&dir), remove_unreachable).is_err());
+        assert!(marker(&dir).exists());
+    }
+
+    /// The marker couldn't be written and the wipe failed partway: a retry
+    /// in the same process still knows (memory).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_wipe_whose_marker_wasnt_written_is_remembered() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("parent");
+        let dir = parent.join("vettid-desktop");
+        sealed_by(&dir, "secret-service");
+        // A parent this user can't write to: no marker, and the folder
+        // can't be removed either (the wipe fails partway).
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
+        let first = wipe_then(Some(&dir), remove_unreachable);
+        let second = wipe_then(Some(&dir), |w| {
+            assert_eq!(w.sealed_by.as_deref(), Some("secret-service"), "remembered");
+            remove_unreachable(w)
+        });
+        let marker_written = marker(&dir).exists();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(first.is_err() && second.is_err());
+        assert!(root || !marker_written, "root can write it anyway");
     }
 
     /// No known folder, or a relative one, is refused: never the current

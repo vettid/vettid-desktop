@@ -27,11 +27,13 @@
   } | null>(null);
 
   // What protects the saved pairing (#11, #13). Read from the file's
-  // header by the backend: "dpapi", "keyring", "legacy", "none" or
-  // "unknown"; "unchecked" when get_status itself failed. keyBound says
-  // whether it binds the pairing to this computer.
+  // header by the backend: "dpapi", "tpm", "secret-service", "keyring",
+  // "legacy", "none" or "unknown"; "unchecked" when get_status itself
+  // failed. keyBound says whether it binds the pairing to this computer.
   const keyProtectionText: Record<string, string> = {
     dpapi: 'Windows data protection, for your account',
+    tpm: "This computer's TPM, bound to this computer",
+    'secret-service': "Your computer's keyring, not bound to this computer",
     keyring: "Your computer's keyring, not bound to this computer",
     legacy: 'An earlier version (not usable)',
     unknown: "Can't tell",
@@ -174,7 +176,15 @@
                 {#each deviceInfo.keyNotices as notice}
                   <p class="hint inline warn" role="status">{notice}</p>
                 {/each}
-              {:else if deviceInfo.keyProtection === 'keyring'}
+              {:else if deviceInfo.keyProtection === 'tpm'}
+                <p class="hint inline">
+                  The key that opens this desktop's saved pairing is sealed by this computer's TPM.
+                  A copy of the file doesn't open on another computer. On this computer, the
+                  administrator (root), and any account that can read the file and use the TPM,
+                  including programs you run, can still open it. If the TPM is cleared, the pairing
+                  can't be opened any more and you pair again.
+                </p>
+              {:else if deviceInfo.keyProtection === 'keyring' || deviceInfo.keyProtection === 'secret-service'}
                 <p class="hint inline warn" role="status">
                   The key that opens this desktop's saved pairing is kept in your keyring. It is
                   not bound to this computer: a copy of your keyring opens on another computer

@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 use vettid_device::store::{Persist, StoreError};
 use zeroize::Zeroizing;
 
-use super::protector::{self, DataKey, ProtectorError, Protectors};
+use super::protector::{self, DataKey, ProtectorError, Protectors, Wiping};
 use super::store::{self, CredentialError, WipeEpoch, DEVICE_FILE};
 
 /// The device file's format version.
@@ -77,8 +77,9 @@ struct Header {
     v: u32,
     /// The protector's id (see `protector::describe`).
     protector: String,
-    /// The wrapped data key, base64; empty when the protector keeps the
-    /// key itself (the keyring).
+    /// The wrapped data key, base64: what the protector returned (DPAPI's
+    /// blob, the TPM's sealed object, the Secret Service entry's id);
+    /// empty when the protector keeps the key itself (the macOS keyring).
     wrapped_key: String,
     /// The nonce, base64. Fresh for each save.
     nonce: String,
@@ -280,7 +281,12 @@ impl DeviceStore {
         let wrapped = Zeroizing::new(B64.decode(&h.wrapped_key).map_err(|_| corrupt("wrapped key"))?);
         let ciphertext = B64.decode(&file.ciphertext).map_err(|_| corrupt("ciphertext"))?;
         // A protector this build doesn't have here: kept, reported.
-        let p = self.protectors.by_id(&h.protector).ok_or_else(|| corrupt("unknown protector"))?;
+        // (#69's Linux `keyring` is one.) Unreadable: the person is told to
+        // log out and pair again.
+        let p = self.protectors.by_id(&h.protector).ok_or_else(|| {
+            log::warn!("device store: a protector this build doesn't have here");
+            (CredentialError::Unreadable, StoreError::Corrupt)
+        })?;
         let key = p.unwrap(&wrapped).map_err(load_error)?;
         let cipher = XChaCha20Poly1305::new_from_slice(&key[..]).map_err(|_| corrupt("cipher"))?;
         let plain = cipher
@@ -306,9 +312,16 @@ impl DeviceStore {
             return Ok(());
         }
         self.sealing = None;
+        // The marker first (`store::begin_wipe`), so a log-out after a
+        // clear that left a key knows what the file was.
+        let wiping = store::begin_wipe(&self.dir, what_is_sealed(&self.dir));
         let file = store::remove_file_locked(&self.dir, DEVICE_FILE).and_then(|()| store::confirm_gone(&self.dir, DEVICE_FILE));
-        let keys = self.protectors.remove_external_keys().map_err(CredentialError::from);
-        file.and(keys)
+        let keys = self.protectors.remove_external_keys(&wiping).map_err(CredentialError::from);
+        let done = file.and(keys);
+        if done.is_ok() {
+            store::finish_wipe(&self.dir);
+        }
+        done
     }
 }
 
@@ -367,7 +380,7 @@ impl Persist for DeviceStore {
 /// format's `master-key-v1` entry. `Ok(false)`: there is no such file
 /// (nothing else is touched, whatever is there). `Ok(true)`: both are
 /// confirmed gone. An error: something may be left, and the person is told.
-fn retire_legacy_with(dir: &Path, protectors: &Protectors) -> Result<bool, CredentialError> {
+pub(super) fn retire_legacy_with(dir: &Path, protectors: &Protectors) -> Result<bool, CredentialError> {
     let _one_at_a_time = store::writer_lock();
     // A file that can't be read isn't known to be the earlier format: the
     // load reports it.
@@ -375,10 +388,23 @@ fn retire_legacy_with(dir: &Path, protectors: &Protectors) -> Result<bool, Crede
         Ok(Some(raw)) if is_legacy(&raw) => {}
         _ => return Ok(false),
     }
+    // The marker first, so a log-out after a retirement that left the key
+    // knows an earlier format was here. An earlier wipe's marker is kept
+    // in it, and restored once the v1 parts are confirmed gone: this
+    // removes only those, never what that wipe left.
+    let earlier = store::pending_wipe(dir);
+    let this = Wiping::legacy_file();
+    store::record_wipe(dir, &earlier.clone().map_or_else(|| this.clone(), |e| e.and(this.clone())));
     let file = store::remove_file_locked(dir, DEVICE_FILE).and_then(|()| store::confirm_gone(dir, DEVICE_FILE));
-    let key = protectors.remove_legacy_key();
+    let key = protectors.remove_legacy_key(&this);
     match (file, key) {
-        (Ok(()), Ok(())) => Ok(true),
+        (Ok(()), Ok(())) => {
+            match earlier {
+                Some(e) => store::record_wipe(dir, &e),
+                None => store::finish_wipe(dir),
+            }
+            Ok(true)
+        }
         (file, key) => {
             if let Err(e) = file {
                 log::error!("device store: the earlier version's file: {}", e);
@@ -415,12 +441,34 @@ pub fn exists(config_dir: &Path) -> bool {
     !matches!(fs::symlink_metadata(config_dir.join(DEVICE_FILE)), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// What a wipe of `config_dir` removes, from the device file's header
+/// read unauthenticated (nothing is decrypted). A file that can't be read
+/// or parsed: nothing is known ([`Wiping::unknown`]). No file: nothing of
+/// a pairing ([`Wiping::nothing`]), unless a `connection.enc` may be there.
+/// An earlier format's file, or a `connection.enc`, involves the legacy
+/// entry. A wipe that was interrupted is known from its marker
+/// (`store::wipe_for_logout`), not from this.
+pub(crate) fn what_is_sealed(config_dir: &Path) -> Wiping {
+    let legacy_pairing = store::exists(config_dir);
+    let raw = match read_file(config_dir) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return Wiping { legacy: legacy_pairing, ..Wiping::nothing() },
+        Err(_) => return Wiping::unknown(),
+    };
+    match serde_json::from_slice::<SealedFile>(&raw) {
+        Ok(f) if f.header.v == FORMAT_VERSION => Wiping { sealed_by: Some(f.header.protector), legacy: legacy_pairing },
+        Err(_) if is_legacy(&raw) => Wiping::legacy_file(),
+        _ => Wiping::unknown(),
+    }
+}
+
 /// What protects the device file, for Settings (#11), from its header;
 /// nothing is decrypted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyProtection {
-    /// "dpapi", "keyring", "none" (no file), "legacy" (the earlier format,
-    /// deleted at the next unlock) or "unknown" (a file that can't be read).
+    /// "dpapi", "tpm", "secret-service", "keyring", "none" (no file),
+    /// "legacy" (the earlier format, deleted at the next unlock) or
+    /// "unknown" (a file that can't be read).
     pub protector: &'static str,
     /// Whether that protector binds the file to this computer.
     pub bound: bool,
@@ -613,7 +661,7 @@ pub(crate) mod tests {
             assert!(exists(&dir), "kept");
         }
         // Another format version or protector isn't opened at all.
-        for change in [|h: &mut Header| h.v = 3, |h: &mut Header| h.protector = "tpm".into()] {
+        for change in [|h: &mut Header| h.v = 3, |h: &mut Header| h.protector = "passphrase".into()] {
             let mut f = SealedFile { header: good.header.clone(), ciphertext: good.ciphertext.clone() };
             change(&mut f.header);
             write_sealed(&dir, &f);
@@ -804,6 +852,45 @@ pub(crate) mod tests {
         assert_eq!(Behaviour::count(&b.legacy_removes), 0);
     }
 
+    /// A protector this build doesn't have here (#69's Linux `keyring`):
+    /// kept, and reported unreadable, so the notice says to log out and
+    /// pair again. Settings can't tell what protects it.
+    #[test]
+    fn an_unknown_protector_is_unreadable_and_kept() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        store_in(&dir).save(STATE).unwrap();
+        let mut f = read_sealed(&dir);
+        f.header.protector = "keyring-of-another-build".into();
+        write_sealed(&dir, &f);
+        let mut s = store_in(&dir);
+        assert_eq!(s.load(), Err(StoreError::Corrupt));
+        assert!(matches!(s.take_failure(), Some(CredentialError::Unreadable)));
+        assert!(exists(&dir));
+        assert_eq!(stored_key_protection(&dir), KeyProtection { protector: "unknown", bound: false });
+    }
+
+    /// What a wipe learns from the header, before removing anything.
+    #[test]
+    fn a_wipe_reads_what_the_file_was_sealed_with() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        assert_eq!(what_is_sealed(&dir), Wiping::nothing(), "no file: nothing of a pairing");
+        store::ensure_config_dir(&dir).unwrap();
+        fs::write(dir.join("connection.enc"), b"old").unwrap();
+        assert_eq!(what_is_sealed(&dir), Wiping { legacy: true, ..Wiping::nothing() });
+        fs::remove_file(dir.join("connection.enc")).unwrap();
+        store_in(&dir).save(STATE).unwrap();
+        assert_eq!(what_is_sealed(&dir), Wiping { sealed_by: Some("test".into()), legacy: false });
+        fs::write(dir.join("connection.enc"), b"old").unwrap();
+        assert_eq!(what_is_sealed(&dir), Wiping { sealed_by: Some("test".into()), legacy: true });
+        fs::remove_file(dir.join("connection.enc")).unwrap();
+        fs::write(dir.join(DEVICE_FILE), legacy_bytes()).unwrap();
+        assert_eq!(what_is_sealed(&dir), Wiping::legacy_file());
+        fs::write(dir.join(DEVICE_FILE), b"not json").unwrap();
+        assert_eq!(what_is_sealed(&dir), Wiping::unknown());
+    }
+
     #[test]
     fn clear_removes_the_file_and_the_keys_and_says_so() {
         let base = tempfile::tempdir().unwrap();
@@ -873,6 +960,45 @@ pub(crate) mod tests {
         assert_eq!(format!("{s:?}"), "DeviceStore(..)");
         s.save(STATE).unwrap();
         assert_eq!(format!("{s:?}"), "DeviceStore(..)", "nor with a data key in memory");
+    }
+
+    /// Linux: the whole store through the real TPM protector, against a
+    /// software TPM (the legacy entry is the test one, so no Secret Service
+    /// is touched). Needs swtpm; CI runs it by name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs swtpm; CI runs it"]
+    fn linux_round_trip_through_the_tpm() {
+        use super::super::tpm::tests::Swtpm;
+        let swtpm = Swtpm::start();
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        let b = Arc::new(Behaviour::default());
+        let tpm = || Protectors::new(vec![Box::new(swtpm.protector())], Box::new(testing::TestLegacy(b.clone())));
+        DeviceStore::with_protectors(&dir, None, tpm()).save(STATE).unwrap();
+        assert_eq!(stored_key_protection(&dir), KeyProtection { protector: "tpm", bound: true });
+        let good = read_sealed(&dir);
+        assert!(!good.header.wrapped_key.is_empty());
+        assert_eq!(DeviceStore::with_protectors(&dir, None, tpm()).load().unwrap().as_deref().map(|v| &v[..]), Some(STATE));
+        // A changed sealed object: the TPM refuses it, the file is kept.
+        let mut f = SealedFile { header: good.header.clone(), ciphertext: good.ciphertext.clone() };
+        let mut w = B64.decode(&f.header.wrapped_key).unwrap();
+        let last = w.len() - 1;
+        w[last] ^= 1;
+        f.header.wrapped_key = B64.encode(w);
+        write_sealed(&dir, &f);
+        let mut s = DeviceStore::with_protectors(&dir, None, tpm());
+        assert_eq!(s.load(), Err(StoreError::Corrupt));
+        assert!(matches!(s.take_failure(), Some(CredentialError::Unreadable)));
+        assert!(exists(&dir));
+        // The clear: the file, and the (test) legacy entry; the TPM keeps
+        // nothing outside the file.
+        write_sealed(&dir, &good);
+        let mut s = DeviceStore::with_protectors(&dir, None, tpm());
+        assert!(s.load().unwrap().is_some());
+        s.clear().unwrap();
+        assert!(!exists(&dir));
+        assert_eq!(Behaviour::count(&b.legacy_removes), 1);
     }
 
     /// Windows: the whole store through the real DPAPI protector (DPAPI
