@@ -55,8 +55,8 @@ The frontend calls Tauri commands via `@tauri-apps/api`. Commands in `src-tauri/
 | Module | Purpose |
 |--------|---------|
 | `crypto/` | X25519 keypairs, ECIES encrypt/decrypt, HKDF-SHA256, Argon2id, zeroization |
-| `fingerprint/` | Binary self-hash, platform key (Linux-specific), machine identity |
-| `credential/` | On-disk encrypted stores: `device_store.rs` (the device engine's state, keyring only), `store.rs` (shared parts; the earlier builds' pairing) |
+| `fingerprint/` | Binary self-hash, the displayed machine fingerprint (not a key) |
+| `credential/` | On-disk encrypted stores: `device_store.rs` (the device engine's state, `device.enc` v2: a random data key wrapped by a protector), `protector.rs` (the protectors: DPAPI on Windows in `dpapi.rs`, the keyring elsewhere for now), `store.rs` (shared parts; wipes; the earlier builds' pairing) |
 | `link.rs` | The paired device's session and access session with its vault, and the background refresh |
 | `session/` | Capability tiers, phone delegation |
 | `commands/` | Tauri IPC command handlers (auth, vault, session) |
@@ -87,7 +87,7 @@ All intermediate key material (`zeroize` crate) is wiped after use. Look for `//
 - Parallelism: 4 threads
 - Output: 32 bytes
 
-Input is `passphrase || platform_key`, binding derived keys to both user knowledge and device identity.
+`crypto::argon2` takes `passphrase || platform_key`. The device file uses neither: it is sealed under a random data key wrapped by a platform protector, with no machine id in the key or the associated data (DESKTOP-REWORK-PLAN §4 "At-rest protectors").
 
 ### Capability Tiers
 - **Independent** (`capabilities.rs`): `profile.view`, `connection.list`, `feed.list`, `audit.query`, `message.list`, `secrets.catalog`, etc.
