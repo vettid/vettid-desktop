@@ -56,7 +56,7 @@ The frontend calls Tauri commands via `@tauri-apps/api`. Commands in `src-tauri/
 |--------|---------|
 | `crypto/` | X25519 keypairs, ECIES encrypt/decrypt, HKDF-SHA256, Argon2id, zeroization |
 | `fingerprint/` | Binary self-hash, the displayed machine fingerprint (not a key) |
-| `credential/` | On-disk encrypted stores: `device_store.rs` (the device engine's state, `device.enc` v2: a random data key wrapped by a protector), `protector.rs` (the protectors: DPAPI on Windows in `dpapi.rs`, the keyring elsewhere for now), `store.rs` (shared parts; wipes; the earlier builds' pairing) |
+| `credential/` | On-disk encrypted stores: `device_store.rs` (the device engine's state, `device.enc` v2: a random data key wrapped by a protector), `protector.rs` (the protectors: DPAPI on Windows in `dpapi.rs`; on Linux the TPM in `tpm.rs`, then the Secret Service in `secret_service.rs`; the keyring on macOS for now), `store.rs` (shared parts; wipes; the earlier builds' pairing) |
 | `link.rs` | The paired device's session and access session with its vault, and the background refresh |
 | `session/` | Capability tiers, phone delegation |
 | `commands/` | Tauri IPC command handlers (auth, vault, session) |
