@@ -62,11 +62,12 @@ pub const UNREADABLE_NOTICE: &str =
 /// the phone step. Replaces the keyring-unavailable notice.
 ///
 /// NEW TEXT (#13, Linux, owner approval needed): for the TPM, signing out
-/// doesn't help (it is busy, in lockout, or its storage hierarchy has a
-/// password), so the advice is to retry and then whoever manages the computer.
+/// doesn't help (it may be busy or in lockout, its storage hierarchy may
+/// have a password, or a libtss2 library may be missing), so the advice is
+/// to retry and then whoever manages the computer.
 fn not_protected_notice(by: &str) -> String {
     if by == super::protector::TPM_NAME {
-        return format!("This desktop couldn't lock its pairing with {by}, so nothing was saved. If your phone lists this desktop, remove it there. Then try pairing again. If it keeps happening, whoever manages this computer needs to check its TPM: it may be busy, or set up with a password this desktop can't use.");
+        return format!("This desktop couldn't lock its pairing with {by}, so nothing was saved. If your phone lists this desktop, remove it there. Then try pairing again. If it keeps happening, whoever manages this computer needs to check its TPM and the TPM software: the TPM may be busy or set up with a password this desktop can't use, or a library this desktop needs may be missing.");
     }
     format!("This desktop couldn't lock its pairing with {by}, so nothing was saved. If your phone lists this desktop, remove it there. Then sign out of your computer and back in, and pair again.")
 }
@@ -98,7 +99,7 @@ pub const NO_PROTECTOR_NOTICE: &str =
 /// what the person can do now (the passphrase protector comes later).
 #[cfg(target_os = "linux")]
 pub const NO_PROTECTOR_NOTICE: &str =
-    "This computer offers no way for this desktop to lock its pairing: your account can't use the computer's TPM, and no keyring service (such as GNOME Keyring or KWallet) is running. Nothing was saved. If your phone lists this desktop, remove it there. To pair, start your keyring service, or ask whoever manages this computer to give your account access to the TPM, then pair again.";
+    "This computer offers no way for this desktop to lock its pairing: your account can't use the computer's TPM, and this desktop couldn't find a keyring service, such as GNOME Keyring or KWallet. Nothing was saved. If your phone lists this desktop, remove it there. To pair, start your keyring service, or ask whoever manages this computer to give your account access to the TPM, then pair again.";
 
 /// NEW TEXT (owner approval needed): shown at unlock when the saved pairing
 /// was made by an earlier version, whose format this one can't read, and it
