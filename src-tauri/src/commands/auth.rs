@@ -197,6 +197,10 @@ pub async fn register(
     if let Err(e) = link.read_status().await {
         log::info!("register: vault.status: {}", e);
     }
+    // As at unlock: the vault removed this device already.
+    if link.unlinked() {
+        return Ok(RegisterResponse::failed(erase_unlinked(&state, link).await));
+    }
     match install(&state, link, since, mark).await {
         Some(snap) if snap.active_at(chrono::Utc::now()) => Ok(RegisterResponse::live(&snap)),
         Some(_) => Ok(RegisterResponse::paired_without_session(link::PAIRED_NO_ACCESS_NOTICE)),
@@ -712,6 +716,14 @@ fn logout_end(r: Option<Option<Result<EndOutcome, vettid_device::access::AccessE
     }
 }
 
+/// Logout's end of access on `l`, cut short at `deadline`.
+async fn end_for_logout<T: vettid_device::transport::Transport, C: vettid_device::pairing::Clock>(
+    l: &mut Link<T, C>,
+    deadline: tokio::time::Instant,
+) -> LogoutEnd {
+    logout_end(Some(tokio::time::timeout_at(deadline, l.end()).await.ok()))
+}
+
 /// What logout tells the person: "access ended" only when the vault
 /// confirmed it; otherwise the "your vault was not told" texts.
 fn logout_end_notice(end: LogoutEnd, local_wiped: bool) -> Option<&'static str> {
@@ -816,7 +828,7 @@ async fn log_out(
             None => LogoutEnd::NoLink,
             // Unnamed: all of this desktop's access (§6.8). An end cut short
             // by the bound is dropped with the link.
-            Some(l) => logout_end(Some(tokio::time::timeout_at(deadline, l.end()).await.ok())),
+            Some(l) => end_for_logout(l, deadline).await,
         },
     };
     // Whatever the outcome. From here, no save of a pairing or session
@@ -866,21 +878,7 @@ async fn end_access(state: &AppState) -> EndSessionResponse {
             None => Some(link::END_UNCONFIRMED_NOTICE.to_string()),
             Some(l) => {
                 let result = l.end().await;
-                let notice = match &result {
-                    Ok(EndOutcome::Ended) => None,
-                    Ok(EndOutcome::Unconfirmed) => Some(link::END_UNCONFIRMED_NOTICE.to_string()),
-                    Ok(EndOutcome::Replaced) => Some(link::END_REPLACED_NOTICE.to_string()),
-                    Err(vettid_device::access::AccessError::EndUnconfirmed) => Some(link::END_UNCONFIRMED_NOTICE.to_string()),
-                    Err(e) => {
-                        log::warn!("end_session: not confirmed: {}", e);
-                        if l.session.access_end().is_some() {
-                            Some(link::END_NOT_SENT_NOTICE.to_string())
-                        } else {
-                            let failure = l.store.take_failure();
-                            Some(link::access_notice(e, failure.as_ref()))
-                        }
-                    }
-                };
+                let notice = end_notice(&result, l);
                 if l.unlinked() {
                     let l = slot.take().expect("checked above");
                     Some(erase_unlinked(state, l).await)
@@ -898,6 +896,31 @@ async fn end_access(state: &AppState) -> EndSessionResponse {
     };
     finish_reset(state);
     EndSessionResponse { notice }
+}
+
+/// What End session tells the person about `result`: nothing for a
+/// confirmed end; otherwise why not. A refused device (§8.6) never sends
+/// again, so it says so rather than that it keeps trying.
+fn end_notice<T: vettid_device::transport::Transport, C: vettid_device::pairing::Clock>(
+    result: &Result<EndOutcome, vettid_device::access::AccessError>,
+    l: &mut Link<T, C>,
+) -> Option<String> {
+    match result {
+        Ok(EndOutcome::Ended) => None,
+        Ok(EndOutcome::Unconfirmed) => Some(link::END_UNCONFIRMED_NOTICE.to_string()),
+        Ok(EndOutcome::Replaced) => Some(link::END_REPLACED_NOTICE.to_string()),
+        Err(_) if l.refused() => Some(link::REFUSED_NOTICE.to_string()),
+        Err(vettid_device::access::AccessError::EndUnconfirmed) => Some(link::END_UNCONFIRMED_NOTICE.to_string()),
+        Err(e) => {
+            log::warn!("end_session: not confirmed: {}", e);
+            if l.session.access_end().is_some() {
+                Some(link::END_NOT_SENT_NOTICE.to_string())
+            } else {
+                let failure = l.store.take_failure();
+                Some(link::access_notice(e, failure.as_ref()))
+            }
+        }
+    }
 }
 
 /// #43: a memory reset is starting; see [`AppState::resets_started`].
@@ -1314,6 +1337,69 @@ mod tests {
         let r = log_out(&state, None, |_| true, std::time::Duration::from_secs(5)).await;
         assert!(started.elapsed() < std::time::Duration::from_secs(2), "the bound wasn't spent waiting");
         assert!(r.local_wiped);
+    }
+
+    /// Item 1: End session on a refused device says it is refused, not that
+    /// it keeps trying. Item 4: the other outcomes, from the fake vault.
+    #[tokio::test]
+    async fn end_session_notices_follow_the_outcome() {
+        use crate::link::fake::{EndMode, FakeVault};
+        let live = |v: &FakeVault| v.set_session(Some(("s-1", chrono::Utc::now() + chrono::TimeDelta::hours(1))));
+
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut l) = FakeVault::paired(dir.path());
+        live(&vault);
+        l.read_status().await.unwrap();
+        vault.revoke(false);
+        let r = l.end().await;
+        assert!(r.is_err());
+        assert_eq!(end_notice(&r, &mut l).as_deref(), Some(link::REFUSED_NOTICE));
+
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut l) = FakeVault::paired(dir.path());
+        live(&vault);
+        l.read_status().await.unwrap();
+        let r = l.end().await;
+        assert_eq!(end_notice(&r, &mut l), None, "Ended: the frontend says Session ended.");
+
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut l) = FakeVault::paired(dir.path());
+        live(&vault);
+        l.read_status().await.unwrap();
+        vault.end_mode(EndMode::Replace("s-2".into(), chrono::Utc::now() + chrono::TimeDelta::hours(1)));
+        let r = l.end().await;
+        assert_eq!(end_notice(&r, &mut l).as_deref(), Some(link::END_REPLACED_NOTICE));
+
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut l) = FakeVault::paired(dir.path());
+        live(&vault);
+        l.read_status().await.unwrap();
+        vault.end_mode(EndMode::Silent);
+        vault.absent_session_member();
+        let r = l.end().await;
+        assert_eq!(end_notice(&r, &mut l).as_deref(), Some(link::END_UNCONFIRMED_NOTICE));
+    }
+
+    /// Item 4: logout's end, against the fake vault: Ended when it answers,
+    /// NotConfirmed when it doesn't (within the bound).
+    #[tokio::test]
+    async fn logout_ends_access_when_the_vault_answers() {
+        use crate::link::fake::{EndMode, FakeVault};
+        let deadline = || tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut l) = FakeVault::paired(dir.path());
+        vault.set_session(Some(("s-1", chrono::Utc::now() + chrono::TimeDelta::hours(1))));
+        l.read_status().await.unwrap();
+        assert_eq!(end_for_logout(&mut l, deadline()).await, LogoutEnd::Ended);
+        assert_eq!(logout_end_notice(LogoutEnd::Ended, true), Some(ACCESS_ENDED_LOGOUT_NOTICE));
+
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut l) = FakeVault::paired(dir.path());
+        vault.set_session(Some(("s-1", chrono::Utc::now() + chrono::TimeDelta::hours(1))));
+        l.read_status().await.unwrap();
+        vault.end_mode(EndMode::Silent);
+        let short = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+        assert_eq!(end_for_logout(&mut l, short).await, LogoutEnd::NotConfirmed, "cut short by the bound");
     }
 
     /// #43: every memory reset is counted as started and finished, so an

@@ -9,7 +9,8 @@ use chrono::{DateTime, TimeDelta, Utc};
 use ed25519_dalek::SigningKey;
 use vettid_device::pairing::SystemClock;
 use vettid_device::session::Session;
-use vettid_device::store::{DeviceState, Phase, VaultRecord};
+use vettid_device::access::Access;
+use vettid_device::store::{DeviceState, PendingEnd, Phase, VaultRecord};
 use vettid_device::transport::Transport;
 use vettid_relay::auth::{encode_key, mailbox_id};
 use vettid_relay::client::{DepositError, Message, Registration, RelayError};
@@ -25,6 +26,18 @@ use crate::credential::device_store;
 
 const VAULT_RELAY: &str = "https://relay.example.test";
 
+/// How the fake vault treats `device.session.end`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EndMode {
+    /// Answer `ok {}` and end the session.
+    Answer,
+    /// Never answer, and change nothing.
+    Silent,
+    /// Never answer; an end that names a session (the resend under a new
+    /// id) finds this newer session granted meanwhile.
+    Replace(String, DateTime<Utc>),
+}
+
 struct State {
     /// The vault's side of the session epoch.
     epoch: Epoch,
@@ -35,6 +48,9 @@ struct State {
     session: Option<(String, DateTime<Utc>)>,
     /// Refuse every deposit with `token_revoked`.
     revoked: bool,
+    end_mode: EndMode,
+    /// `vault.status` has no `session` member (a vault before 0.41.0).
+    absent: bool,
     /// What answering `device.session.request` brings: a grant of this
     /// session, or (`deny`) a denial.
     on_request: Option<(String, DateTime<Utc>)>,
@@ -70,6 +86,9 @@ impl State {
     }
 
     fn status_body(&self) -> String {
+        if self.absent {
+            return "{}".into();
+        }
         match &self.session {
             None => "{\"session\":null}".into(),
             Some((id, exp)) => Builder::new().raw("session", &Self::session_body(id, *exp)).finish(),
@@ -85,6 +104,12 @@ impl FakeVault {
     /// A paired device in `dir` (its state saved through the device store
     /// with test keys) and its open [`Link`] against this vault.
     pub(crate) fn paired(dir: &std::path::Path) -> (FakeVault, Link<FakeVault, SystemClock>) {
+        Self::paired_with(dir, false)
+    }
+
+    /// [`FakeVault::paired`], with a `device.session.end` stored unanswered
+    /// by an earlier run if `end_pending`.
+    pub(crate) fn paired_with(dir: &std::path::Path, end_pending: bool) -> (FakeVault, Link<FakeVault, SystemClock>) {
         let now = Utc::now();
         let sched = Schedule::derive(&[1; 32], &[2; 32], [3; 32], [4; 32]);
         let (mut device, mut vault) = (
@@ -124,7 +149,7 @@ impl FakeVault {
             refused: false,
             unlinked: None,
             inbox: Vec::new(),
-            access_end: None,
+            access_end: end_pending.then(|| PendingEnd { id: new_ulid(now).expect("ulid"), session_id: None, attempts: 1 }),
             access_end_unreadable: false,
         };
         let mut store = device_store::tests::store_for_tests(dir);
@@ -135,6 +160,8 @@ impl FakeVault {
             mailbox: Vec::new(),
             session: None,
             revoked: false,
+            end_mode: EndMode::Answer,
+            absent: false,
             on_request: None,
             deny: false,
             collects: 0,
@@ -142,7 +169,10 @@ impl FakeVault {
         })));
         let t = fake.clone();
         let session = Session::open(&mut store, move |_| t, SystemClock).expect("open").expect("paired");
-        (fake, Link::new(session, store))
+        let mut link = Link::new(session, store);
+        // Unanswered requests (an end the vault ignores) wait 1 s, not 30.
+        link.access = Access::with_timeout(TimeDelta::seconds(1));
+        (fake, link)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -183,6 +213,16 @@ impl FakeVault {
         self.lock().deny = true;
     }
 
+    /// How `device.session.end` is treated from now on.
+    pub(crate) fn end_mode(&self, m: EndMode) {
+        self.lock().end_mode = m;
+    }
+
+    /// `vault.status` without its `session` member from now on.
+    pub(crate) fn absent_session_member(&self) {
+        self.lock().absent = true;
+    }
+
     /// How many collects since [`FakeVault::revoke`].
     pub(crate) fn collects(&self) -> usize {
         self.lock().collects
@@ -206,6 +246,21 @@ impl Transport for FakeVault {
             let body = s.status_body();
             let answer = State::inner("vault.status", Some(Response { re: inner.id.clone(), status: Status::Ok }), body);
             s.send(answer);
+        }
+        if inner.response.is_none() && inner.kind == "device.session.end" {
+            match s.end_mode.clone() {
+                EndMode::Answer => {
+                    let answer = State::inner("device.session.end", Some(Response { re: inner.id.clone(), status: Status::Ok }), "{}".into());
+                    s.send(answer);
+                    s.session = None;
+                }
+                EndMode::Silent => {}
+                EndMode::Replace(id, exp) => {
+                    if inner.body.contains("session_id") {
+                        s.session = Some((id, exp));
+                    }
+                }
+            }
         }
         if inner.response.is_none() && inner.kind == "device.session.request" {
             let now = Utc::now();

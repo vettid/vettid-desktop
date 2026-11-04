@@ -51,6 +51,9 @@ pub const PAIRED_NO_ACCESS_NOTICE: &str = "This desktop is paired, but your vaul
 pub const REQUEST_TOO_SOON_NOTICE: &str = "Your vault asks this desktop to wait before asking again. Try again in a few minutes.";
 /// NEW TEXT (owner approval needed): the owner declined the request.
 pub const REQUEST_DENIED_NOTICE: &str = "Your phone declined the request. This desktop has no access.";
+/// NEW TEXT (owner approval needed): the owner declined a renewal while a
+/// session is still live: it runs on (0.77.0).
+pub const RENEWAL_DENIED_NOTICE: &str = "Your phone declined the request. The current session continues until it ends.";
 /// NEW TEXT (owner approval needed): the request lapsed unanswered.
 pub const REQUEST_LAPSED_NOTICE: &str = "Your phone didn't answer in time. This desktop has no access. Try again.";
 /// NEW TEXT (owner approval needed): a lock, log-out or End session here
@@ -175,6 +178,8 @@ fn live_until(access: &Access, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
 pub enum RequestFailed {
     TooSoon,
     Denied,
+    /// Declined while a session is live: that one runs on (0.77.0).
+    DeniedWhileLive,
     Lapsed,
     Stopped,
     NotConfirmed,
@@ -204,6 +209,7 @@ pub fn request_notice(f: &RequestFailed, store: Option<&CredentialError>) -> Str
     match f {
         RequestFailed::TooSoon => REQUEST_TOO_SOON_NOTICE.into(),
         RequestFailed::Denied => REQUEST_DENIED_NOTICE.into(),
+        RequestFailed::DeniedWhileLive => RENEWAL_DENIED_NOTICE.into(),
         RequestFailed::Lapsed => REQUEST_LAPSED_NOTICE.into(),
         RequestFailed::Stopped => REQUEST_STOPPED_NOTICE.into(),
         RequestFailed::NotConfirmed => ACCESS_NOT_CONFIRMED_NOTICE.into(),
@@ -427,7 +433,9 @@ impl<T: Transport, C: Clock> Link<T, C> {
                             Ok(Some(AccessEvent::Granted(_))) => granted = true,
                             // A denial from before this request's answer is
                             // about an earlier one.
-                            Ok(Some(AccessEvent::Denied)) if !granted && m.ts >= answered_at => return Err(RequestFailed::Denied),
+                            Ok(Some(AccessEvent::Denied)) if !granted && m.ts >= answered_at => {
+                                return Err(if self.access.active_at(Utc::now()) { RequestFailed::DeniedWhileLive } else { RequestFailed::Denied });
+                            }
                             _ => {}
                         }
                     }
@@ -756,6 +764,88 @@ mod tests {
         vault.deny_on_request();
         assert_eq!(link.request_access(|| {}, || false).await, Err(RequestFailed::Denied));
         assert!(!link.snapshot(Utc::now()).active_at(Utc::now()));
+    }
+
+    /// Item 3: a renewal declined while a session is live doesn't say "no
+    /// access": the session runs on.
+    #[tokio::test]
+    async fn a_denied_renewal_leaves_the_live_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.set_session(Some(("s-1", Utc::now() + TimeDelta::hours(1))));
+        link.read_status().await.unwrap();
+        vault.deny_on_request();
+        let r = link.request_access(|| {}, || false).await;
+        assert_eq!(r, Err(RequestFailed::DeniedWhileLive));
+        assert_eq!(request_notice(&r.unwrap_err(), None), RENEWAL_DENIED_NOTICE);
+        assert!(link.snapshot(Utc::now()).active_at(Utc::now()), "it runs on");
+    }
+
+    /// Item 4: an end the vault answers is Ended, and nothing is live.
+    #[tokio::test]
+    async fn an_answered_end_is_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.set_session(Some(("s-1", Utc::now() + TimeDelta::hours(1))));
+        link.read_status().await.unwrap();
+        assert_eq!(link.end().await, Ok(EndOutcome::Ended));
+        assert!(!link.snapshot(Utc::now()).active_at(Utc::now()));
+        assert!(link.session.access_end().is_none());
+    }
+
+    /// Item 4: no answer from a vault without the `session` member:
+    /// Unconfirmed (never "ended").
+    #[tokio::test]
+    async fn an_unanswered_end_at_an_old_vault_is_unconfirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.set_session(Some(("s-1", Utc::now() + TimeDelta::hours(1))));
+        link.read_status().await.unwrap();
+        vault.end_mode(fake::EndMode::Silent);
+        vault.absent_session_member();
+        assert_eq!(link.end().await, Ok(EndOutcome::Unconfirmed));
+    }
+
+    /// Item 4: no answer while the vault still shows the session: the end
+    /// stays stored, unconfirmed (it is sent again later).
+    #[tokio::test]
+    async fn an_unanswered_end_with_the_session_current_stays_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.set_session(Some(("s-1", Utc::now() + TimeDelta::hours(1))));
+        link.read_status().await.unwrap();
+        vault.end_mode(fake::EndMode::Silent);
+        assert_eq!(link.end().await, Err(AccessError::EndUnconfirmed));
+        assert!(link.session.access_end().is_some());
+        assert!(link.keep_refreshing(Utc::now()), "settled later by the refresh");
+    }
+
+    /// Item 4: no answer, and the session the resend named was replaced by
+    /// a newer one: Replaced, and this desktop shows the newer session live.
+    #[tokio::test]
+    async fn an_end_overtaken_by_a_newer_session_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.set_session(Some(("s-1", Utc::now() + TimeDelta::hours(1))));
+        link.read_status().await.unwrap();
+        vault.end_mode(fake::EndMode::Replace("s-2".into(), Utc::now() + TimeDelta::hours(1)));
+        assert_eq!(link.end().await, Ok(EndOutcome::Replaced));
+        let snap = link.snapshot(Utc::now());
+        assert!(snap.active_at(Utc::now()));
+        assert_eq!(snap.session_id.as_deref(), Some("s-2"));
+    }
+
+    /// Item 4: an end an earlier run left unanswered (end_pending after a
+    /// restart) is settled by the refresh.
+    #[tokio::test]
+    async fn an_end_left_by_an_earlier_run_is_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_vault, mut link) = FakeVault::paired_with(dir.path(), true);
+        assert!(link.session.access_end().is_some());
+        assert!(link.keep_refreshing(Utc::now()));
+        link.refresh().await.unwrap();
+        assert!(link.session.access_end().is_none(), "answered");
+        assert!(!link.keep_refreshing(Utc::now()));
     }
 
     /// A request from a refused device isn't sent, and says why.
