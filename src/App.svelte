@@ -61,8 +61,8 @@
 
   /**
    * If the desktop is paired (credentials on disk) but the in-memory
-   * state is empty, auto-unlock it. Master key comes from the OS
-   * keyring (or the machine-bound fallback); no user input.
+   * state is empty, auto-unlock it. The data key is unwrapped by the
+   * platform protector (DPAPI, or the keyring); no user input.
    */
   async function autoUnlockIfNeeded() {
     if (!isRegistered) return;

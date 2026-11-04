@@ -46,7 +46,8 @@ src-tauri/src/
 │   ├── hkdf.rs             # HKDF-SHA256 key derivation
 │   └── keys.rs             # X25519 keypair generation
 ├── credential/
-│   ├── device_store.rs     # The device engine's state, sealed (keyring only)
+│   ├── device_store.rs     # The device engine's state, sealed (device.enc v2)
+│   ├── protector.rs        # What wraps its data key: DPAPI on Windows, the keyring elsewhere
 │   └── store.rs            # On-disk encrypted storage (shared parts)
 ├── fingerprint/
 │   ├── binary.rs           # Binary self-hash
@@ -103,7 +104,9 @@ npm run check
 - **Argon2id** — Password hashing (t=3, m=64MB, p=4) matching OWASP recommendations
 
 ### Credential Binding
-Derived keys are bound to both the user's passphrase and the device's platform key material, preventing credential extraction to a different machine.
+The paired device's state (`device.enc`) is sealed under a random data key made at pairing, and that key is wrapped by a platform protector (DESKTOP-REWORK-PLAN §4 "At-rest protectors"). On Windows it is DPAPI for the user's account: a copy of the file alone doesn't open elsewhere, but a copy of the whole profile with the user's password does, and an administrator can unwrap it while the user is logged on. Elsewhere, for now, the key is kept in the OS keyring, which is not bound to the computer. An old copy of the file recovered from a backup or the disk still opens for the same user on the same computer.
+
+The machine fingerprint shown in Settings is not a key, and is not unique: a cloned disk image or VM shows the same one.
 
 ### Zeroization
 All intermediate key material (shared secrets, derived keys, concatenated inputs) is zeroized immediately after use via the `zeroize` crate.

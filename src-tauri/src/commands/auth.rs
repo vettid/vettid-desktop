@@ -3,7 +3,6 @@ use std::sync::OnceLock;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::credential::device_store::{self, DeviceStore};
-use crate::credential::keystore::BindingMode;
 use crate::credential::store::{self, CredentialError, WipeEpoch};
 use crate::link::{self, Link, Snapshot};
 use crate::state::AppState;
@@ -25,10 +24,16 @@ pub struct AuthStatus {
     pub binary_fingerprint: String,
     pub machine_fingerprint: String,
     pub app_version: String,
-    /// Which key protects the saved pairing, from the file's header:
-    /// "keyring", "none" (no pairing saved) or "unknown" (a file that
-    /// can't be read). Shown in Settings (#11).
+    /// What protects the saved pairing, from the file's header (#11, #13):
+    /// "dpapi", "keyring", "none" (no pairing saved), "legacy" (an earlier
+    /// version's file, deleted at the next unlock) or "unknown" (a file
+    /// that can't be read). Shown in Settings.
     pub key_protection: String,
+    /// Whether that protection binds the saved pairing to this computer.
+    pub key_bound: bool,
+    /// Plain notices on who else may open it (Windows: a domain-joined
+    /// computer, a roaming profile). None is not a guarantee.
+    pub key_notices: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,8 +54,6 @@ pub struct RegisterResponse {
     /// Unix seconds: when this desktop stops treating the session as live
     /// (a margin before the vault's `expires_at`).
     pub expires_at: Option<i64>,
-    /// On success, the key the saved pairing is sealed under: "keyring".
-    pub key_protection: Option<String>,
     /// Not a success, but the pairing is saved: there is no access session
     /// (yet). The pairing screen shows `error` and continues to Start New
     /// Session instead of offering to pair again.
@@ -65,7 +68,6 @@ impl RegisterResponse {
             connection_id: None,
             session_id: None,
             expires_at: None,
-            key_protection: None,
             paired_without_session: false,
         }
     }
@@ -82,7 +84,6 @@ impl RegisterResponse {
             connection_id: snap.device_id.clone(),
             session_id: snap.session_id.clone(),
             expires_at: snap.live_until.map(|t| t.timestamp()),
-            key_protection: Some(BindingMode::Keyring.as_str().to_string()),
             paired_without_session: false,
         }
     }
@@ -124,7 +125,7 @@ fn pair_notice(e: &PairError, store: Option<&CredentialError>) -> String {
 ///
 /// Fail secure: the desktop is paired only once the vault's
 /// `device.paired` is stored (see `vettid_device::pairing`); nothing is
-/// stored without the keyring.
+/// stored unless a protector wraps its data key (#13).
 #[tauri::command]
 pub async fn register(
     app: AppHandle,
@@ -139,12 +140,10 @@ pub async fn register(
     let _pairing = PairingUnderWay::new(&state.pairing);
     let config_dir = store::default_config_dir().map_err(|e| e.to_string())?;
     // Checked before pairing starts, so a folder another account can open,
-    // a computer without the machine id the pairing is bound to (#14), or a
-    // keyring that can't be reached is refused before the vault ever lists
-    // this desktop.
+    // or a protector that fails or isn't there (#13), is refused before the
+    // vault ever lists this desktop.
     store::ensure_config_dir_since(&config_dir, since).map_err(|e| e.to_string())?;
-    store::check_machine_binding().map_err(|e| e.to_string())?;
-    device_store::keyring_ready().map_err(|e| e.to_string())?;
+    device_store::protection_ready().map_err(|e| e.to_string())?;
 
     // The code is read as it is (it holds base64): only surrounding
     // whitespace from a paste is dropped.
@@ -244,7 +243,8 @@ async fn install(state: &AppState, link: Link, since: WipeEpoch, mark: ResetMark
 }
 
 /// The vault removed this device (`device.unlinked`): erase its stored
-/// state (not the folder or the keyring key), and say what happened.
+/// state and the protector's key, each confirmed gone (not the folder),
+/// and say what happened.
 async fn erase_unlinked(state: &AppState, link: Link) -> String {
     state.publish(Snapshot::default());
     if link.erase() {
@@ -408,20 +408,21 @@ pub struct UnlockResponse {
 }
 
 /// What the person is told when the saved pairing could not be opened for
-/// any reason other than [`crate::credential::store::UNREADABLE_NOTICE`]'s (a missing keyring
-/// entry, for example). The detail goes to the log only.
-const UNLOCK_FAILED_NOTICE: &str = "This desktop couldn't open its saved pairing. If this keeps happening, remove this desktop on your phone and pair again.";
+/// a reason without a plain notice of its own. The detail goes to the log
+/// only.
+const UNLOCK_FAILED_NOTICE: &str = "This desktop couldn't open its saved pairing. If this keeps happening, remove this desktop on your phone; then, in Settings, open Danger zone and choose Log out this desktop, and pair again.";
 
-/// Open the saved pairing: the device state, sealed under the master key
-/// in the OS keyring (no user input: the keyring is unlocked by the
-/// user's OS login session). Then read `vault.status`, and settle an end
+/// Open the saved pairing: the device state, sealed under a data key that
+/// a protector wraps (DPAPI on Windows, the keyring elsewhere; no user
+/// input: both are unlocked by the user's OS login session). Then read `vault.status`, and settle an end
 /// left unanswered by an earlier run (§6.8). A session counts as live only
 /// once this run's own `vault.status` names it.
 ///
 /// A pairing saved by an earlier build (the NATS-era `connection.enc`)
 /// can't be used by this one: it is removed, with the plain "can't be
 /// opened" notice. Nothing is sent for it (#39's revoke went to a server
-/// that no longer exists).
+/// that no longer exists). A `device.enc` in the earlier format is deleted
+/// unread, with its key, and the person told to re-pair (#13).
 ///
 /// A saved pairing that can't be opened is not an error here: the response
 /// carries a plain notice for the person, and the detail goes to the log.
@@ -489,7 +490,7 @@ pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String
 
     // Warn (never refuse) when another account can open the saved
     // pairing's folder or file (#24).
-    Ok(UnlockResponse { unlocked: true, notice: store::privacy_warning(&config_dir, BindingMode::Keyring).map(str::to_string) })
+    Ok(UnlockResponse { unlocked: true, notice: store::privacy_warning(&config_dir).map(str::to_string) })
 }
 
 /// Counts a pairing under way while it lives (see `AppState::pairing`).
@@ -545,17 +546,35 @@ async fn already_open<T: vettid_device::transport::Transport, C: vettid_device::
 }
 
 /// Review LOW 11: remove an earlier build's pairing (`connection.enc`)
-/// whenever it is there. The person is told only if it was the only
-/// pairing (this build's `device.enc` absent): the plain "can't be opened"
-/// notice. Next to a device file it goes silently.
+/// whenever it is there. Then (#13) a `device.enc` in the earlier format,
+/// with its key: the person is told to re-pair once both are confirmed
+/// gone, or that they couldn't be. Otherwise the person is told only if
+/// `connection.enc` was the only pairing (this build's `device.enc`
+/// absent): the plain "can't be opened" notice. Next to a device file it
+/// goes silently.
 fn retire_legacy_pairing(config_dir: &std::path::Path) -> Option<&'static str> {
-    if !store::exists(config_dir) {
-        return None;
+    retire_legacy_pairing_with(config_dir, device_store::retire_legacy)
+}
+
+fn retire_legacy_pairing_with(
+    config_dir: &std::path::Path,
+    retire_device_file: impl FnOnce(&std::path::Path) -> Result<bool, CredentialError>,
+) -> Option<&'static str> {
+    let connection = store::exists(config_dir);
+    if connection {
+        if let Err(e) = store::remove_legacy_pairing(config_dir) {
+            log::error!("unlock: an earlier build's pairing couldn't be removed: {}", e);
+        }
     }
-    if let Err(e) = store::remove_legacy_pairing(config_dir) {
-        log::error!("unlock: an earlier build's pairing couldn't be removed: {}", e);
+    match retire_device_file(config_dir) {
+        Ok(true) => return Some(store::LEGACY_REMOVED_NOTICE),
+        Ok(false) => {}
+        Err(e) => {
+            log::error!("unlock: {}", e);
+            return Some(store::LEGACY_NOT_REMOVED_NOTICE);
+        }
     }
-    (!device_store::exists(config_dir)).then_some(store::UNREADABLE_NOTICE)
+    (connection && !device_store::exists(config_dir)).then_some(store::UNREADABLE_NOTICE)
 }
 
 /// Session info the frontend uses to decide which view to render
@@ -751,16 +770,16 @@ fn logout_notice(revoke_sent: bool, local_wiped: bool) -> Option<&'static str> {
     }
 }
 
-/// Delete the desktop's config directory and the keyring key. Returns
-/// whether the saved pairing is gone afterwards: checked on disk, not
-/// assumed. With no usable folder only the key is deleted, and false is
-/// returned.
+/// Delete the desktop's config directory and the protectors' keys (and the
+/// earlier format's). Returns whether the saved pairing and the keys are
+/// gone afterwards: checked, not assumed. With no usable folder only the
+/// keys are deleted, and false is returned.
 fn wipe_local_pairing(config_dir: Option<&std::path::Path>) -> bool {
     wipe_local_pairing_with(config_dir, crate::credential::store::wipe_for_logout)
 }
 
 /// [`wipe_local_pairing`] with the store step passed in, so tests can run
-/// it without deleting this machine's real keyring key.
+/// it without deleting this machine's real keys.
 fn wipe_local_pairing_with(
     config_dir: Option<&std::path::Path>,
     wipe: impl FnOnce(Option<&std::path::Path>) -> Result<(), crate::credential::store::CredentialError>,
@@ -792,7 +811,7 @@ fn wipe_local_pairing_with(
 
 /// Log out: end this desktop's access at the vault (an unnamed
 /// `device.session.end`, within [`LOGOUT_END_BOUND`]), then wipe the saved
-/// pairing (folder and keyring key) whatever came of that, and drop the
+/// pairing (folder and keys) whatever came of that, and drop the
 /// link. The vault can't be told to remove the desktop (see
 /// [`LogoutResponse::revoke_sent`]); the response says what happened, and
 /// says access ended only if the vault confirmed it.
@@ -1016,10 +1035,14 @@ pub async fn get_status(state: State<'_, AppState>) -> Result<AuthStatus, String
     let fp = collect_device_fingerprint();
 
     // With no known folder nothing can have been saved.
-    let key_protection = config_dir.as_deref().map_or("none", device_store::stored_key_protection).to_string();
+    let protection = config_dir
+        .as_deref()
+        .map_or(device_store::KeyProtection { protector: "none", bound: false }, device_store::stored_key_protection);
 
     Ok(AuthStatus {
-        key_protection,
+        key_protection: protection.protector.to_string(),
+        key_bound: protection.bound,
+        key_notices: device_store::protection_notices(protection).into_iter().map(str::to_string).collect(),
         is_registered,
         is_unlocked: snap.unlocked,
         has_active_session: snap.active_at(chrono::Utc::now()),
@@ -1065,7 +1088,7 @@ mod tests {
             mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
         };
         assert_eq!(fingerprint_hex_of(Ok(attrs.clone())), hex::encode(compute_machine_fingerprint(&attrs)));
-        assert_eq!(fingerprint_hex_of(Err(FingerprintError::MissingMachineId)), "");
+        assert_eq!(fingerprint_hex_of(Err(FingerprintError::CollectionFailed("test".into()))), "");
         // Live: a 64-digit hex value, or empty if nothing could be collected.
         let shown = machine_fingerprint_hex();
         assert!(shown.is_empty() || (shown.len() == 64 && shown.bytes().all(|b| b.is_ascii_hexdigit())));
@@ -1323,6 +1346,21 @@ mod tests {
         assert!(device_store::exists(&dir));
     }
 
+    /// #13: an earlier format's device file is reported as removed only
+    /// once that is confirmed; otherwise as not removed. (The removal
+    /// itself is `device_store`'s, tested there; here it is the seam.)
+    #[test]
+    fn the_earlier_device_file_is_reported_as_retired_only_when_confirmed() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        assert_eq!(retire_legacy_pairing_with(&dir, |_| Ok(true)), Some(store::LEGACY_REMOVED_NOTICE));
+        assert_eq!(retire_legacy_pairing_with(&dir, |_| Err(CredentialError::LegacyNotRemoved)), Some(store::LEGACY_NOT_REMOVED_NOTICE));
+        assert_eq!(retire_legacy_pairing_with(&dir, |_| Ok(false)), None);
+        store::tests::legacy_pairing_for_tests(&dir);
+        assert_eq!(retire_legacy_pairing_with(&dir, |_| Ok(true)), Some(store::LEGACY_REMOVED_NOTICE));
+        assert!(!store::exists(&dir), "connection.enc goes too");
+    }
+
     /// LOW 5: Start New Session overtaken by a reset says it stopped, even
     /// with a live grant.
     #[test]
@@ -1475,13 +1513,16 @@ mod tests {
         assert_eq!(pair_notice(&PairError::AlreadyPaired, None), link::PAIR_ALREADY_NOTICE);
         assert_eq!(pair_notice(&PairError::BadAnswer, None), link::PAIR_FAILED_NOTICE);
         let store = PairError::Store(StoreError::Io);
-        assert_eq!(pair_notice(&store, Some(&CredentialError::KeyringUnavailable)), store::KEYRING_UNAVAILABLE_NOTICE);
+        assert_eq!(pair_notice(&store, Some(&CredentialError::NoProtector)), store::NO_PROTECTOR_NOTICE);
+        let failing = CredentialError::NotProtected { by: "Windows data protection" };
+        assert_eq!(pair_notice(&store, Some(&failing)), failing.to_string());
+        assert!(failing.to_string().contains("Windows data protection"));
         assert_eq!(pair_notice(&store, Some(&CredentialError::LoggedOutMeanwhile)), store::LOGGED_OUT_MEANWHILE_NOTICE);
         assert_eq!(pair_notice(&store, None), link::PAIR_FAILED_NOTICE);
         assert_eq!(pair_notice(&PairError::NotCleared(Box::new(PairError::Rejected)), None), vettid_device::display::REJECTED_ON_PHONE);
     }
 
-    /// The store step of log-out, without deleting the real keyring key.
+    /// The store step of log-out, without deleting the real keys.
     fn wipe_only(dir: Option<&std::path::Path>) -> Result<(), crate::credential::store::CredentialError> {
         match dir {
             Some(dir) => crate::credential::store::wipe(dir),

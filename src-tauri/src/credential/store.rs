@@ -5,15 +5,16 @@
 //!   ([`write_private`]; `winacl` on Windows), the folder check
 //!   ([`ensure_config_dir`]), the one-writer lock and the wipe count
 //!   ([`WipeEpoch`]) that stop a save from outliving a log-out (#30), and
-//!   the sealing helpers;
-//! - the wipe ([`wipe_for_logout`]) and the check that it is confirmed;
+//!   the confirmed removal of a file and its temporary copies;
+//! - the wipe ([`wipe_for_logout`]): the folder, then every protector's
+//!   external key and the earlier format's entry, each confirmed gone;
 //! - the warning when another account can open the folder or file
 //!   ([`privacy_warning`]);
 //! - the earlier builds' pairing, `connection.enc`, which this build can't
 //!   open: [`exists`] finds it and [`remove_legacy_pairing`] deletes it
 //!   without decrypting it. Nothing here reads or writes its contents.
 //!
-//! See [`keystore`](super::keystore) for the key-source details.
+//! See [`protector`](super::protector) for what protects the device file.
 
 use std::fmt;
 use std::fs;
@@ -23,15 +24,10 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use chacha20poly1305::aead::{Aead, Payload};
-use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
+#[cfg(not(windows))]
 use rand::rngs::OsRng;
-use rand::RngCore;
-use serde::{Deserialize, Serialize};
 
-use crate::credential::keystore::{BindingMode, KeystoreError};
-use crate::fingerprint::platform_key;
-use crate::fingerprint::platform_linux::FingerprintError;
+use super::protector::ProtectorError;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -54,26 +50,44 @@ const SESSION_LIVE_FILE: &str = "session.live";
 /// Subdirectory name appended to the OS config dir.
 const CONFIG_SUBDIR: &str = "vettid-desktop";
 
-/// XChaCha20-Poly1305 nonce size (24 bytes).
-pub(super) const NONCE_SIZE: usize = 24;
-
 /// What the person is told when a saved pairing can't be opened. Shown
 /// as is, so it must stay plain: no error codes, no crypto terms.
 pub const UNREADABLE_NOTICE: &str =
-    "This desktop's saved pairing can't be opened. Remove this desktop on your phone, then pair again.";
+    "This desktop's saved pairing can't be opened. Remove this desktop on your phone. Then, in Settings, open Danger zone and choose Log out this desktop, and pair again.";
 
-/// Shown when the pairing can't be saved because the system keyring
-/// (Credential Manager on Windows) can't be reached and a weaker key is
-/// not allowed. Nothing on disk has changed. At pairing, the vault may
-/// already list the desktop, hence the phone step.
-pub const KEYRING_UNAVAILABLE_NOTICE: &str =
-    "This desktop can't reach your computer's keyring, so it couldn't save the pairing safely, and nothing was saved. If your phone lists this desktop, remove it there. Then sign out of your computer and back in, and pair again.";
+/// NEW TEXT (owner approval needed): shown when the protector this
+/// computer offers is there but failed, so nothing was saved (#13). `by`
+/// is its plain name ("Windows data protection", "your computer's
+/// keyring"). At pairing, the vault may already list the desktop, hence
+/// the phone step. Replaces the keyring-unavailable notice.
+fn not_protected_notice(by: &str) -> String {
+    format!("This desktop couldn't lock its pairing with {by}, so nothing was saved. If your phone lists this desktop, remove it there. Then sign out of your computer and back in, and pair again.")
+}
 
-/// Shown when this computer has no usable machine id (#14): the saved
-/// pairing is bound to it, so without one nothing can be kept or opened,
-/// keyring or not. Checked before pairing starts and at unlock.
-pub const NO_MACHINE_ID_NOTICE: &str =
-    "This computer has no machine id, so this desktop can't keep or open a saved pairing on it. If your phone lists this desktop, remove it there.";
+/// NEW TEXT (owner approval needed): shown at unlock when the saved
+/// pairing's protector is there but couldn't open it (#13). The file is
+/// kept: it may open later (after signing in again), or the person re-pairs.
+fn not_opened_notice(by: &str) -> String {
+    format!("This desktop couldn't open its saved pairing with {by} just now. The pairing is kept. Sign out of your computer and back in to try again. If it keeps happening, remove this desktop on your phone; then, in Settings, open Danger zone and choose Log out this desktop, and pair again.")
+}
+
+/// NEW TEXT (owner approval needed): shown when this computer offers no
+/// protector at all (#13). Not reachable in this build (every platform has
+/// one that is never absent); the passphrase protector will replace it.
+pub const NO_PROTECTOR_NOTICE: &str =
+    "This computer offers no way for this desktop to lock its pairing, so nothing was saved. If your phone lists this desktop, remove it there.";
+
+/// NEW TEXT (owner approval needed): shown at unlock when the saved pairing
+/// was made by an earlier version, whose format this one can't read, and it
+/// was deleted with its key, both confirmed (#13, "Migration: none"). The
+/// vault still lists the old desktop, hence the phone step.
+pub const LEGACY_REMOVED_NOTICE: &str =
+    "This desktop's saved pairing was made by an earlier version and can't be used, so it was deleted. Remove this desktop on your phone, then pair again.";
+
+/// NEW TEXT (owner approval needed): the same when the earlier version's
+/// file or key couldn't be confirmed deleted.
+pub const LEGACY_NOT_REMOVED_NOTICE: &str =
+    "This desktop's saved pairing was made by an earlier version and can't be used, and it couldn't be deleted from this computer. In Settings, open Danger zone and choose Log out this desktop. Then remove this desktop on your phone and pair again.";
 
 /// Windows: shown when the folder that holds the pairing folder
 /// (`%LOCALAPPDATA%`) lets another account remove, rename or replace what
@@ -119,17 +133,15 @@ pub const NOT_PRIVATE_FOLDER_NOTICE: &str =
     "Another account on this computer can change the folder this desktop keeps its pairing in. It can't read your pairing, but it could remove it. To be safe: in Settings, open Danger zone and choose Log out this desktop, then pair again.";
 
 /// Shown after unlock when another account can open the saved pairing's
-/// folder or file, and the pairing is keyring-bound (#24).
+/// folder or file (#24). CHANGED TEXT (#13, owner approval needed): "locked
+/// by your keyring" is now "locked to your account", since on Windows it
+/// is DPAPI.
 ///
 /// Log out (Settings > Danger zone) is the way out: it removes the folder
-/// and deletes the keyring key, and says if a step failed. Pairing again into the same folder would not fix it (Windows
+/// and the keys, and says if a step failed. Pairing again into the same folder would not fix it (Windows
 /// refuses the folder; on unix the file's mode is kept on rewrite).
-pub const NOT_PRIVATE_KEYRING_NOTICE: &str =
-    "Another account on this computer can open this desktop's saved pairing. It is still locked by your keyring, but to be safe: in Settings, open Danger zone and choose Log out this desktop. Then check on your phone that this desktop is gone, and pair again.";
-
-/// The same for a machine-bound pairing, which may have been read.
-pub const NOT_PRIVATE_MACHINE_NOTICE: &str =
-    "Another account on this computer can open this desktop's saved pairing, and it isn't locked by a keyring, so it may have been read. In Settings, open Danger zone and choose Log out this desktop. Then check on your phone that this desktop is gone, and pair again.";
+pub const NOT_PRIVATE_LOCKED_NOTICE: &str =
+    "Another account on this computer can open this desktop's saved pairing. It is still locked to your account, but to be safe: in Settings, open Danger zone and choose Log out this desktop. Then check on your phone that this desktop is gone, and pair again.";
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -144,20 +156,22 @@ pub enum CredentialError {
     SerializationError(String),
     /// Encryption or decryption failed.
     CryptoError(String),
-    /// Fingerprint collection or computation failed.
-    FingerprintError(FingerprintError),
-    /// The keystore couldn't fetch a master key (keyring unavailable
-    /// AND machine-bound fallback failed).
-    KeystoreError(String),
     /// A saved pairing can't be opened: a device file that does not open
-    /// with this machine's key, or the earlier builds' `connection.enc`.
+    /// with its data key, or the earlier builds' `connection.enc`.
     /// Displays [`UNREADABLE_NOTICE`].
     Unreadable,
-    /// The keyring failed and the save may not fall back to the
-    /// machine-bound key: on Windows, or because the store on disk is
-    /// keyring-bound. Nothing was written. Displays
-    /// [`KEYRING_UNAVAILABLE_NOTICE`].
-    KeyringUnavailable,
+    /// Every protector is absent here: nothing was written. Displays
+    /// [`NO_PROTECTOR_NOTICE`].
+    NoProtector,
+    /// The protector `by` (its plain name) is present but failed: nothing
+    /// was written, and there is no fallback (#13).
+    NotProtected { by: &'static str },
+    /// The protector `by` is present but couldn't open the saved pairing,
+    /// which is kept (#13).
+    NotOpened { by: &'static str },
+    /// The earlier format's device file or key couldn't be confirmed
+    /// deleted. Displays [`LEGACY_NOT_REMOVED_NOTICE`].
+    LegacyNotRemoved,
     /// The platform's per-user folder is unknown or not absolute, so
     /// there is nowhere safe to keep a pairing. Displays
     /// [`NO_CONFIG_DIR_NOTICE`].
@@ -169,10 +183,6 @@ pub enum CredentialError {
     /// Windows: `%LOCALAPPDATA%` is a symlink or junction (#21). Nothing
     /// was changed. Displays [`PARENT_IS_LINK_NOTICE`].
     ParentIsLink,
-    /// This computer has no usable machine id, which the saved pairing is
-    /// bound to (#14). Nothing was saved or opened. Displays
-    /// [`NO_MACHINE_ID_NOTICE`].
-    NoMachineId,
     /// The folder or file for the pairing is not private to the current
     /// user. Windows: another account owns it or can open it, or it is a
     /// symlink or junction. Unix: another account owns the folder or can
@@ -191,12 +201,12 @@ impl fmt::Display for CredentialError {
                 write!(f, "serialization error: {}", msg)
             }
             CredentialError::CryptoError(msg) => write!(f, "crypto error: {}", msg),
-            CredentialError::FingerprintError(e) => write!(f, "fingerprint error: {}", e),
-            CredentialError::KeystoreError(msg) => write!(f, "keystore error: {}", msg),
             CredentialError::Unreadable => f.write_str(UNREADABLE_NOTICE),
-            CredentialError::KeyringUnavailable => f.write_str(KEYRING_UNAVAILABLE_NOTICE),
+            CredentialError::NoProtector => f.write_str(NO_PROTECTOR_NOTICE),
+            CredentialError::NotProtected { by } => f.write_str(&not_protected_notice(by)),
+            CredentialError::NotOpened { by } => f.write_str(&not_opened_notice(by)),
+            CredentialError::LegacyNotRemoved => f.write_str(LEGACY_NOT_REMOVED_NOTICE),
             CredentialError::NoConfigDir => f.write_str(NO_CONFIG_DIR_NOTICE),
-            CredentialError::NoMachineId => f.write_str(NO_MACHINE_ID_NOTICE),
             CredentialError::ParentNotPrivate => f.write_str(PARENT_NOT_PRIVATE_NOTICE),
             CredentialError::ParentIsLink => f.write_str(PARENT_IS_LINK_NOTICE),
             CredentialError::NotPrivate => f.write_str(NOT_PRIVATE_NOTICE),
@@ -207,45 +217,12 @@ impl fmt::Display for CredentialError {
 
 impl std::error::Error for CredentialError {}
 
-impl From<KeystoreError> for CredentialError {
-    fn from(e: KeystoreError) -> Self {
-        match e {
-            KeystoreError::KeyringUnavailable(_) => CredentialError::KeyringUnavailable,
-            // Shown as "can't be opened": remove on the phone, pair again.
-            // The file is kept, as for any other unreadable store.
-            KeystoreError::MachineBoundRefused => CredentialError::Unreadable,
-            other => CredentialError::KeystoreError(other.to_string()),
-        }
+/// A protector's failure outside a save or a load (a wipe's key removal):
+/// not a plain notice, so the caller says "not removed".
+impl From<ProtectorError> for CredentialError {
+    fn from(e: ProtectorError) -> Self {
+        CredentialError::IoError(e.to_string())
     }
-}
-
-impl From<FingerprintError> for CredentialError {
-    fn from(e: FingerprintError) -> Self {
-        CredentialError::FingerprintError(e)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Data types
-// ---------------------------------------------------------------------------
-
-/// The on-disk JSON format for encrypted credentials. v2.
-///
-/// `binding` records which keystore path was used to encrypt the
-/// store so a subsequent `load` can go straight to the right source
-/// (the keyring path on a system whose keyring is now broken would
-/// otherwise silently fall back to the machine-bound key and fail to
-/// decrypt the keyring-bound blob).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EncryptedStore {
-    pub version: i32,
-    /// "keyring" or "machine". See [`BindingMode`].
-    pub binding: String,
-    /// 24-byte XChaCha20-Poly1305 nonce. Fresh per save.
-    #[serde(with = "serde_bytes")]
-    pub nonce: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    pub ciphertext: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -442,22 +419,6 @@ pub fn wipe_epoch() -> WipeEpoch {
     WipeEpoch(WIPES.load(std::sync::atomic::Ordering::SeqCst))
 }
 
-/// The storage binding's failure as the store reports it: no machine id
-/// gets its own plain notice.
-pub(super) fn binding_error(e: FingerprintError) -> CredentialError {
-    match e {
-        FingerprintError::MissingMachineId => CredentialError::NoMachineId,
-        e => CredentialError::FingerprintError(e),
-    }
-}
-
-/// Whether this computer can keep a pairing at all: it needs a machine id
-/// for the storage binding (#14). Called before pairing starts, so the
-/// vault never lists a desktop that can't save its pairing.
-pub fn check_machine_binding() -> Result<(), CredentialError> {
-    platform_key::derive_storage_binding().map(|_| ()).map_err(binding_error)
-}
-
 /// One writer at a time in this process: a save, a delete or a wipe
 /// removes temporary files a crashed earlier save left behind, and must not
 /// remove another save's while it is running (e.g. an update racing a
@@ -465,8 +426,9 @@ pub fn check_machine_binding() -> Result<(), CredentialError> {
 /// first (#28). The app runs as a single instance, so this covers every
 /// writer.
 ///
-/// A save holds it while it fetches the master key, which may wait on a
-/// keyring prompt; a log-out started meanwhile waits for that save.
+/// A save holds it while its protector wraps a new data key, which may
+/// wait on a keyring prompt; a log-out started meanwhile waits for that
+/// save.
 pub(super) fn writer_lock() -> std::sync::MutexGuard<'static, ()> {
     static WRITER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     WRITER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -592,23 +554,28 @@ pub fn remove_legacy_pairing(config_dir: &Path) -> Result<(), CredentialError> {
 }
 
 /// Log-out's local half (#30): as [`wipe`] when the folder is known, then,
-/// still holding the writer lock, delete the keyring key. A save can't run
-/// between the two, so none is sealed under a key that is then deleted.
-/// The key is deleted even if the wipe fails or there is no folder. Ok
-/// only if the pairing is confirmed gone; with no folder, `NoConfigDir`.
+/// still holding the writer lock, remove every protector's external key
+/// and the earlier format's `master-key-v1` entry, each confirmed gone. A
+/// save can't run between the two, so none is sealed under a key that is
+/// then deleted. The keys are removed even if the wipe fails or there is
+/// no folder. Ok only if the pairing and the keys are confirmed gone; with
+/// no folder, `NoConfigDir`.
 pub fn wipe_for_logout(config_dir: Option<&Path>) -> Result<(), CredentialError> {
-    wipe_then(config_dir, super::keystore::delete_keyring_key)
+    wipe_then(config_dir, || super::protector::Protectors::system().remove_external_keys().map_err(CredentialError::from))
 }
 
-fn wipe_then(config_dir: Option<&Path>, delete_key: impl FnOnce()) -> Result<(), CredentialError> {
+fn wipe_then(config_dir: Option<&Path>, remove_keys: impl FnOnce() -> Result<(), CredentialError>) -> Result<(), CredentialError> {
     let _one_at_a_time = writer_lock();
     WIPES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let wiped = match config_dir {
         Some(dir) => wipe_locked(dir),
         None => Err(CredentialError::NoConfigDir),
     };
-    delete_key();
-    wiped
+    let keys = remove_keys();
+    if let Err(e) = &keys {
+        log::error!("Credential store: a key was not removed: {}", e);
+    }
+    wiped.and(keys)
 }
 
 /// [`wipe`]'s work; the caller holds the writer lock.
@@ -711,7 +678,7 @@ pub(super) fn remove_file_locked(config_dir: &Path, name: &str) -> Result<(), Cr
 // ---------------------------------------------------------------------------
 
 /// A warning for the person when another account can open the saved
-/// pairing's folder or file (#24), worded for how the pairing is sealed.
+/// pairing's folder or file (#24).
 /// Called after a successful load; it warns and never refuses, since
 /// refusing would not undo a disclosure and would lock out the pairing.
 /// AEAD already prevents a planted or edited file from being used.
@@ -721,12 +688,9 @@ pub(super) fn remove_file_locked(config_dir: &Path, name: &str) -> Result<(), Cr
 /// stronger notice whatever the folder. Not read-only on unix: the user's
 /// own folder that others can write to is set to `0700` here (see
 /// `unix_folder_check`).
-pub fn privacy_warning(config_dir: &Path, binding: BindingMode) -> Option<&'static str> {
+pub fn privacy_warning(config_dir: &Path) -> Option<&'static str> {
     if !is_private(config_dir) {
-        return Some(match binding {
-            BindingMode::Keyring => NOT_PRIVATE_KEYRING_NOTICE,
-            BindingMode::MachineBound => NOT_PRIVATE_MACHINE_NOTICE,
-        });
+        return Some(NOT_PRIVATE_LOCKED_NOTICE);
     }
     #[cfg(unix)]
     match unix_folder_check(config_dir) {
@@ -797,40 +761,6 @@ fn is_private(_config_dir: &Path) -> bool {
     true
 }
 
-/// [`compute_blob_aad`] under another domain-separation label, for another
-/// file sealed with the same master key ([`super::device_store`]): a blob
-/// of one can't be opened as the other.
-pub(super) fn aad_with_label(label: &[u8], binding: &str, platform_key: &[u8; 32]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(label.len() + 1 + binding.len() + 1 + platform_key.len());
-    aad.extend_from_slice(label);
-    aad.push(b'|');
-    aad.extend_from_slice(binding.as_bytes());
-    aad.push(b'|');
-    aad.extend_from_slice(platform_key);
-    aad
-}
-
-/// Encrypt plaintext with XChaCha20-Poly1305, binding the ciphertext
-/// to `aad` (machine-derived AAD — see [`compute_blob_aad`]). Returns
-/// `(nonce, ciphertext)`.
-pub(super) fn encrypt_xchacha20(
-    key: &[u8; 32],
-    plaintext: &[u8],
-    aad: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), CredentialError> {
-    let cipher = XChaCha20Poly1305::new_from_slice(key)
-        .map_err(|e| CredentialError::CryptoError(format!("cipher: {}", e)))?;
-    let mut nonce_bytes = [0u8; NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = XNonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad })
-        .map_err(|e| CredentialError::CryptoError(format!("encrypt: {}", e)))?;
-
-    Ok((nonce_bytes.to_vec(), ciphertext))
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -874,61 +804,13 @@ pub(crate) mod tests {
         remove_legacy_pairing(&dir).unwrap();
     }
 
-    #[test]
-    fn xchacha20_roundtrip() {
-        let key = [0x42u8; 32];
-        let aad = b"test-aad";
-        let plaintext = b"hello, VettID desktop!";
-        let (nonce, ct) = encrypt_xchacha20(&key, plaintext, aad).expect("encrypt");
-        assert_eq!(nonce.len(), NONCE_SIZE);
-
-        let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
-        let pt = cipher
-            .decrypt(
-                XNonce::from_slice(&nonce),
-                Payload { msg: ct.as_slice(), aad },
-            )
-            .expect("decrypt");
-        assert_eq!(&pt, plaintext);
-    }
-
-    #[test]
-    fn aad_mismatch_fails_decrypt() {
-        let key = [0x42u8; 32];
-        let (nonce, ct) = encrypt_xchacha20(&key, b"secret", b"aad-A").expect("encrypt");
-        let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
-        // Same key, same nonce, different AAD: AEAD must reject.
-        let result = cipher.decrypt(
-            XNonce::from_slice(&nonce),
-            Payload { msg: ct.as_slice(), aad: b"aad-B" },
-        );
-        assert!(result.is_err(), "AEAD must reject mismatched AAD");
-    }
-
-    /// Production values: where this computer has a machine id the check
-    /// passes; where it has none the error is the plain notice the person
-    /// sees.
-    #[test]
-    fn machine_binding_check_follows_the_machine_id() {
-        match platform_key::derive_storage_binding() {
-            Ok(binding) => {
-                if let Ok(fp) = platform_key::derive_platform_key() {
-                    assert_ne!(*binding, *fp);
-                }
-                assert!(check_machine_binding().is_ok());
-            }
-            Err(e) => assert!(matches!(binding_error(e), CredentialError::NoMachineId)),
-        }
-    }
-
     /// A device pairing saved normally is private: no warning.
     #[test]
     fn privately_saved_pairing_gives_no_warning() {
         let base = tempfile::tempdir().unwrap();
         let config_dir = base.path().join("vettid-desktop");
         device_pairing(&config_dir);
-        assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), None);
-        assert_eq!(privacy_warning(&config_dir, BindingMode::MachineBound), None);
+        assert_eq!(privacy_warning(&config_dir), None);
     }
 
     /// Windows: a folder or file another account can open gives the
@@ -943,15 +825,14 @@ pub(crate) mod tests {
         let file = config_dir.join(DEVICE_FILE);
         let before = fs::read(&file).unwrap();
         super::super::winacl::test_share_with_everyone(&file);
-        assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), Some(NOT_PRIVATE_KEYRING_NOTICE));
-        assert_eq!(privacy_warning(&config_dir, BindingMode::MachineBound), Some(NOT_PRIVATE_MACHINE_NOTICE));
+        assert_eq!(privacy_warning(&config_dir), Some(NOT_PRIVATE_LOCKED_NOTICE));
         assert_eq!(fs::read(&file).unwrap(), before, "a warning changes nothing");
 
         // A shared folder with a private file warns too.
         let other = base.path().join("other");
         device_pairing(&other);
         super::super::winacl::test_share_with_everyone(&other);
-        assert_eq!(privacy_warning(&other, BindingMode::Keyring), Some(NOT_PRIVATE_KEYRING_NOTICE));
+        assert_eq!(privacy_warning(&other), Some(NOT_PRIVATE_LOCKED_NOTICE));
     }
 
     /// Unix (#12): a new folder is 0700 and the file 0600; a rewrite goes
@@ -993,10 +874,9 @@ pub(crate) mod tests {
         device_pairing(&dir);
         let file = dir.join(DEVICE_FILE);
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(privacy_warning(&dir, BindingMode::Keyring), Some(NOT_PRIVATE_KEYRING_NOTICE));
-        assert_eq!(privacy_warning(&dir, BindingMode::MachineBound), Some(NOT_PRIVATE_MACHINE_NOTICE));
+        assert_eq!(privacy_warning(&dir), Some(NOT_PRIVATE_LOCKED_NOTICE));
         fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(privacy_warning(&dir, BindingMode::Keyring), None);
+        assert_eq!(privacy_warning(&dir), None);
     }
 
     /// Unix (#28): the user's own folder that others can write to (as
@@ -1037,12 +917,12 @@ pub(crate) mod tests {
         device_pairing(&config_dir);
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
         fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o770)).unwrap();
-        assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), None);
+        assert_eq!(privacy_warning(&config_dir), None);
         assert_eq!(mode(&config_dir), 0o700);
         let file = config_dir.join(DEVICE_FILE);
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
         fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o770)).unwrap();
-        assert_eq!(privacy_warning(&config_dir, BindingMode::Keyring), Some(NOT_PRIVATE_KEYRING_NOTICE));
+        assert_eq!(privacy_warning(&config_dir), Some(NOT_PRIVATE_LOCKED_NOTICE));
     }
 
     /// Unix (#28): a folder owned by another account (root's `/usr`) is
@@ -1250,6 +1130,7 @@ pub(crate) mod tests {
             assert!(!handle.is_finished(), "a save ran while log-out held the lock");
             order.lock().unwrap().push("key deleted");
             saver = Some(handle);
+            Ok(())
         })
         .expect("wiped");
         saver.unwrap().join().unwrap();
@@ -1278,9 +1159,34 @@ pub(crate) mod tests {
     fn logout_with_no_folder_still_deletes_the_key() {
         let mut deleted = false;
         let since = wipe_epoch();
-        assert!(matches!(wipe_then(None, || deleted = true), Err(CredentialError::NoConfigDir)));
+        let wiped = wipe_then(None, || {
+            deleted = true;
+            Ok(())
+        });
+        assert!(matches!(wiped, Err(CredentialError::NoConfigDir)));
         assert!(deleted);
         assert_ne!(wipe_epoch(), since, "a save that started before is still refused");
+    }
+
+    /// #13: a key that can't be confirmed gone fails the log-out's wipe,
+    /// even when the folder went: never "removed" on a guess. Every key is
+    /// tried.
+    #[test]
+    fn logout_reports_a_key_not_removed() {
+        use crate::credential::protector::testing::{protectors, Behaviour};
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("vettid-desktop");
+        let b = std::sync::Arc::new(Behaviour::default());
+        let remove = || protectors(&b).remove_external_keys().map_err(CredentialError::from);
+        device_pairing(&config_dir);
+        Behaviour::set(&b.fail_remove, true);
+        assert!(matches!(wipe_then(Some(&config_dir), remove), Err(CredentialError::IoError(_))));
+        assert!(!config_dir.exists(), "the folder itself went");
+        assert_eq!(Behaviour::count(&b.legacy_removes), 1, "the legacy entry was tried too");
+        Behaviour::set(&b.fail_remove, false);
+        device_pairing(&config_dir);
+        assert!(wipe_then(Some(&config_dir), remove).is_ok());
+        assert_eq!(Behaviour::count(&b.removes), 2);
     }
 
     /// Windows (#21): a save under a parent another account controls is
@@ -1400,15 +1306,5 @@ pub(crate) mod tests {
         let dir = default_config_dir().expect("config dir");
         assert_eq!(dir, dirs::config_local_dir().unwrap().join(CONFIG_SUBDIR));
         assert_ne!(dir.parent(), dirs::config_dir().as_deref(), "must not be the roaming folder");
-    }
-
-    #[test]
-    fn wrong_key_fails_decrypt() {
-        let key = [0x42u8; 32];
-        let bad = [0x43u8; 32];
-        let (nonce, ct) = encrypt_xchacha20(&key, b"secret", b"aad").expect("encrypt");
-        let cipher = XChaCha20Poly1305::new_from_slice(&bad).unwrap();
-        let result = cipher.decrypt(XNonce::from_slice(&nonce), ct.as_slice());
-        assert!(result.is_err());
     }
 }

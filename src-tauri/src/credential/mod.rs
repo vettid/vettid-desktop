@@ -1,5 +1,7 @@
 pub mod device_store;
-pub mod keystore;
+#[cfg(windows)]
+mod dpapi;
+pub(crate) mod protector;
 pub mod store;
 #[cfg(windows)]
 mod winacl;

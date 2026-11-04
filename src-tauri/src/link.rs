@@ -113,8 +113,8 @@ const POLL_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 pub fn plain_store_notice(e: &CredentialError) -> Option<String> {
     use CredentialError::*;
     match e {
-        Unreadable | KeyringUnavailable | NoConfigDir | ParentNotPrivate | ParentIsLink | NoMachineId | NotPrivate
-        | LoggedOutMeanwhile => Some(e.to_string()),
+        Unreadable | NoProtector | NotProtected { .. } | NotOpened { .. } | LegacyNotRemoved | NoConfigDir | ParentNotPrivate
+        | ParentIsLink | NotPrivate | LoggedOutMeanwhile => Some(e.to_string()),
         _ => None,
     }
 }
@@ -705,7 +705,7 @@ mod tests {
         assert_eq!(access_notice(&AccessError::Session(SessionError::Refused), None), REFUSED_NOTICE);
         let store = AccessError::Session(SessionError::Store(StoreError::Io));
         assert_eq!(access_notice(&store, None), NOT_SAVED_NOTICE);
-        assert_eq!(access_notice(&store, Some(&CredentialError::KeyringUnavailable)), CredentialError::KeyringUnavailable.to_string());
+        assert_eq!(access_notice(&store, Some(&CredentialError::NoProtector)), CredentialError::NoProtector.to_string());
         assert_eq!(access_notice(&store, Some(&CredentialError::IoError("x".into()))), NOT_SAVED_NOTICE);
         assert_eq!(request_notice(&RequestFailed::Denied, None), REQUEST_DENIED_NOTICE);
         assert!(!answered(&AccessError::Session(SessionError::TimedOut)));
