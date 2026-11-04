@@ -69,9 +69,66 @@
   ${EndIf}
 !macroend
 
+; The path in ${reg} in short (8.3) form, without a trailing backslash or
+; surrounding quotes, as VETTID_UNINSTALLER_IN_PLACE compares them. Uses $0.
+!macro VETTID_NORMALISE reg
+  StrCpy $0 ${reg} 1
+  ${If} $0 == '"'
+    StrCpy $0 ${reg} 1 -1
+    ${If} $0 == '"'
+      StrCpy ${reg} ${reg} -1 1
+    ${EndIf}
+  ${EndIf}
+  ClearErrors
+  GetFullPathName /SHORT $0 ${reg}
+  ${IfNot} ${Errors}
+  ${AndIf} $0 != ""
+    StrCpy ${reg} $0
+  ${EndIf}
+  ${If} ${reg} != ""
+  ${AndIf} ${reg} != "\"
+    StrCpy $0 ${reg} 1 -1
+    ${IfThen} $0 == "\" ${|} StrCpy ${reg} ${reg} -1 ${|}
+  ${EndIf}
+!macroend
+
+; $0 = 1 if the account this uninstaller runs as is the one that installed
+; at $INSTDIR: its own HKCU records $INSTDIR, as the product key's default
+; value or the uninstall entry's InstallLocation (written by the installer,
+; deleted by Section Uninstall only after NSIS_HOOK_PREUNINSTALL). Else 0.
+;
+; The wipe (the app's own, run by ExecWait as this account) deletes this
+; account's pairing, from its known folder and its Credential Manager. A
+; per-user install uninstalled as another account ("Run as administrator"
+; with an administrator's password) would otherwise wipe the
+; administrator's own pairing, report "nothing was paired", and keep the
+; installing user's. Uses $0 to $3.
+!macro VETTID_INSTALLED_FOR_THIS_USER
+  StrCpy $2 $INSTDIR
+  !insertmacro VETTID_NORMALISE $2
+  StrCpy $3 0
+  ReadRegStr $1 HKCU "${MANUPRODUCTKEY}" ""
+  !insertmacro VETTID_NORMALISE $1
+  ${If} $1 != ""
+  ${AndIf} $1 == $2
+    StrCpy $3 1
+  ${EndIf}
+  ${If} $3 = 0
+    ReadRegStr $1 HKCU "${UNINSTKEY}" "InstallLocation"
+    !insertmacro VETTID_NORMALISE $1
+    ${If} $1 != ""
+    ${AndIf} $1 == $2
+      StrCpy $3 1
+    ${EndIf}
+  ${EndIf}
+  StrCpy $0 $3
+!macroend
+
 ; The wipe's result, from NSIS_HOOK_PREUNINSTALL to NSIS_HOOK_POSTUNINSTALL:
 ; "" if the wipe was skipped (update, in place, no $INSTDIR), else its exit
-; code, or -1 if the program couldn't be started.
+; code, -1 if the program couldn't be started, or -2 if it wasn't run because
+; this account didn't install at $INSTDIR (or the install isn't per-user):
+; the installing user's pairing may be kept, so that is a failure too.
 Var VettidWipe
 
 ; Why these are macros, not functions: this file is included near the top
@@ -93,24 +150,81 @@ Var VettidWipe
   ; report a failure that didn't happen.
   ${If} $INSTDIR != ""
     !insertmacro VETTID_UNINSTALLER_IN_PLACE
+    ; /WIPEPAIRING: a script asks for the wipe in place, so that it can wait
+    ; for the uninstall and see its exit code (0, or 2 if the pairing
+    ; couldn't be removed or confirmed): `uninstall.exe /S /WIPEPAIRING
+    ; _?=<install folder>`. A plain `uninstall.exe /S` returns before its
+    ; temporary copy has run, always with 0. No installer passes this
+    ; switch, so an upgrade, downgrade or reinstall still keeps the pairing;
+    ; /UPDATE still skips the wipe, with or without it.
+    ${If} $0 = 1
+      ClearErrors
+      ${GetOptions} $CMDLINE "/WIPEPAIRING" $1
+      ${IfNot} ${Errors}
+        StrCpy $0 0
+      ${EndIf}
+    ${EndIf}
     ${If} $UpdateMode <> 1
     ${AndIf} $0 <> 1
-      ; Close a running app first, so it can't save the pairing again after
-      ; the wipe. This check can silently do nothing (when the Restart
-      ; Manager session or registration fails), and the app could be
-      ; started again before the wipe: the result is therefore decided in
-      ; NSIS_HOOK_POSTUNINSTALL, after the template's own app check and the
-      ; removal of the program, from what is on disk then. If the person
-      ; cancels, or the app can't be closed, the uninstall stops here.
-      !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+      ; Only a per-user install, uninstalled by the account that installed
+      ; it. A per-machine install would be uninstalled elevated, by any
+      ; account: whose pairing to delete can't be told.
+      !if "${INSTALLMODE}" == "currentUser"
+        !insertmacro VETTID_INSTALLED_FOR_THIS_USER
+      !else
+        StrCpy $0 0
+      !endif
+      ${If} $0 <> 1
+        StrCpy $VettidWipe -2
+      ${Else}
+        ; Close a running app first, so it can't save the pairing again
+        ; after the wipe. This check can silently do nothing (when the
+        ; Restart Manager session or registration fails), and the app could
+        ; be started again before the wipe: the result is therefore decided
+        ; in NSIS_HOOK_POSTUNINSTALL, after the template's own app check
+        ; and the removal of the program, from what is on disk then. If the
+        ; person cancels, or the app can't be closed, the uninstall stops
+        ; here.
+        ;
+        ; The path form of CheckIfAppIsRunning's first argument is
+        ; tauri-cli 2.12's (tested with 2.12.2). Earlier templates take a
+        ; process name there, and this check would silently do nothing: the
+        ; post-check below would then be the only safeguard. Build with
+        ; tauri-cli 2.12.2 or later.
+        !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
-      ClearErrors
-      ExecWait '"$INSTDIR\${MAINBINARYNAME}.exe" --uninstall-wipe' $0
-      ${If} ${Errors}
-        StrCpy $0 -1
+        ClearErrors
+        ExecWait '"$INSTDIR\${MAINBINARYNAME}.exe" --uninstall-wipe' $0
+        ${If} ${Errors}
+          StrCpy $0 -1
+        ${EndIf}
+        StrCpy $VettidWipe $0
       ${EndIf}
-      StrCpy $VettidWipe $0
     ${EndIf}
+  ${EndIf}
+!macroend
+
+; A Warning, event ID 1001, source "VettID Desktop", in the Application log,
+; for an uninstall whose pairing couldn't be removed or confirmed. The
+; source isn't registered (that needs an administrator), so Event Viewer
+; says the event's description isn't found and shows the text below as the
+; event's data. `Get-WinEvent -LogName Application -FilterXPath
+; "*[System[Provider[@Name='VettID Desktop']]]"` finds it (a ProviderName
+; filter doesn't, for an unregistered source). An account may write to the
+; Application log without elevation. If the write fails, nothing else
+; changes: the exit code is 2 regardless. The text names no person, folder
+; or account. Uses $4 to $7.
+!macro VETTID_REPORT_FAILURE
+  ; NEW TEXT (owner approval needed).
+  StrCpy $7 "VettID Desktop was uninstalled, but this desktop's saved pairing couldn't be removed from this computer, or its removal couldn't be confirmed (result $VettidWipe). If %LOCALAPPDATA%\vettid-desktop is still there for the account that installed it, delete it, and delete any vettid-desktop entry in that account's Windows Credential Manager. Remove this desktop on the phone too."
+  System::Call 'advapi32::RegisterEventSourceW(p 0, w "VettID Desktop") p .r4'
+  ${If} $4 != 0
+    System::Call '*(w r7) p .r5'
+    ${If} $5 != 0
+      System::Call 'advapi32::ReportEventW(p r4, i 2, i 0, i 1001, p 0, i 1, i 0, p r5, p 0) i .r6'
+      System::Free $5
+    ${EndIf}
+    System::Call 'advapi32::DeregisterEventSource(p r4)'
   ${EndIf}
 !macroend
 
@@ -127,7 +241,12 @@ Var VettidWipe
     StrCpy $2 0
     SetShellVarContext current
     StrCpy $1 $LOCALAPPDATA
-    ${If} $1 == ""
+    ${If} $VettidWipe = -2
+      ; Not wiped: this account isn't the one that installed. Its folder
+      ; isn't the installing user's, so the box names the folder generically.
+      StrCpy $2 1
+      StrCpy $1 "%LOCALAPPDATA%"
+    ${ElseIf} $1 == ""
       StrCpy $2 1
       StrCpy $1 "%LOCALAPPDATA%"
     ${ElseIf} ${FileExists} "$1\vettid-desktop\device.enc"
@@ -158,9 +277,13 @@ Var VettidWipe
     ${AndIf} $2 = 0
       ; Nothing was paired, and nothing is there.
     ${Else}
-      ; A scripted uninstall can tell: the uninstall finished, but its exit
-      ; code is 2, not 0.
+      ; A scripted uninstall that waits (/WIPEPAIRING, above) can tell: the
+      ; uninstall finished, but its exit code is 2, not 0.
       SetErrorLevel 2
+      ; Silent or not, the failure is also written to the Windows Application
+      ; event log, where it outlives the uninstall and where IT tools look: a
+      ; plain `uninstall.exe /S` returns 0 before this runs, and shows no box.
+      !insertmacro VETTID_REPORT_FAILURE
       ${If} $3 = 1
         ; NEW TEXT (owner approval needed).
         MessageBox MB_OK|MB_ICONEXCLAMATION "This desktop's saved pairing couldn't be removed from this computer, or its removal couldn't be confirmed. If the folder $1\vettid-desktop is still there, delete it, and delete any vettid-desktop entry in Windows Credential Manager. Remove this desktop on your phone too." /SD IDOK
