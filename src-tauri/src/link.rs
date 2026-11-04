@@ -91,11 +91,11 @@ pub const UNLINKED_NOT_ERASED_NOTICE: &str = "Your vault removed this desktop, b
 /// live (or an end waits for its answer).
 pub const REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 /// After a refusal (`token_revoked`): how long between collecting the
-/// mailbox again, for a `device.unlinked` that arrives later (§8.6), and
-/// how many times in all. Bounded: two hours at most, then nothing more
-/// until the next launch. Each collect waits at most one poll (25 s).
+/// mailbox again, for a `device.unlinked` that arrives later (§8.6: a
+/// refused device keeps collecting its own mailbox). It goes on for as long
+/// as the app runs and the device is refused but not unlinked. Each collect
+/// waits at most one poll (25 s).
 pub const REFUSED_RECHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(15 * 60);
-pub const REFUSED_RECHECKS: u32 = 8;
 /// How long after the vault last confirmed the session (a `vault.status`
 /// read, a grant confirmed by one, an answered end) it is still shown as
 /// active: two refreshes. Past it, the UI shows it as not confirmed.
@@ -366,9 +366,16 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// Whether the background refresh still has something to do: a live
     /// session to keep in view (and confirmed), an end to settle, or no
     /// baseline yet (`vault.status` failed: the session is learned once the
-    /// network is back). Never for a refused device.
+    /// network is back). A refused device has none of those (nothing is
+    /// sent to it), but its mailbox is still looked at for a
+    /// `device.unlinked` (§8.6): true while it is refused and not unlinked.
+    /// So whoever finds a refusal, or stops the refresh and restarts it
+    /// "if needed", restarts it for that too.
     pub fn keep_refreshing(&self, now: DateTime<Utc>) -> bool {
-        !self.refused() && (self.access.active_at(now) || self.session.access_end().is_some() || self.confirmed.is_none())
+        if self.refused() {
+            return !self.unlinked();
+        }
+        self.access.active_at(now) || self.session.access_end().is_some() || self.confirmed.is_none()
     }
 
     /// What the UI may see now. A refused device shows no session; a
@@ -598,52 +605,66 @@ async fn finish_unlinked(shared: &Shared, erased: bool) {
     }
 }
 
-/// The background refresh: after `first`, then every [`REFRESH_EVERY`], a
-/// [`refresh_round`], until there is nothing left to keep up
-/// ([`Link::keep_refreshing`]), the link is gone, the device is refused, or
-/// the vault removed it (whose state is then erased). Refused and removed
-/// are told to the person.
-pub fn spawn_refresh(shared: Shared, first: std::time::Duration) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut wait = first;
-        loop {
-            tokio::time::sleep(wait).await;
-            wait = REFRESH_EVERY;
-            let mut slot = shared.link.lock().await;
-            match refresh_round(&mut slot).await {
-                Round::Gone => return,
-                Round::Continue(snap) => shared.publish(snap),
-                Round::Stop(snap, notice) => {
-                    shared.publish(snap);
-                    let refused = notice == Some(REFUSED_NOTICE);
-                    if let Some(n) = notice {
-                        shared.tell(n);
-                    }
-                    if !refused {
-                        return;
-                    }
-                    // A refused device: a `device.unlinked` may still come.
-                    // Look again on a slow, bounded schedule.
-                    drop(slot);
-                    for _ in 0..REFUSED_RECHECKS {
-                        tokio::time::sleep(REFUSED_RECHECK_EVERY).await;
-                        let mut slot = shared.link.lock().await;
-                        match recheck_refused_round(&mut slot).await {
-                            Round::Unlinked { erased } => {
-                                finish_unlinked(&shared, erased).await;
-                                return;
-                            }
-                            Round::Gone => return,
-                            _ => {}
-                        }
-                    }
-                    return;
+/// The background refresh's loop over `link`: after `first`, a
+/// [`refresh_round`] every [`REFRESH_EVERY`] until there is nothing left to
+/// keep up ([`Link::keep_refreshing`]) or the link is gone. A refused
+/// device is told so once ([`REFUSED_NOTICE`]); from then on, and for as
+/// long as it is refused but not unlinked, the loop collects its mailbox
+/// every `refused_every` ([`recheck_refused_round`]), for a
+/// `device.unlinked` that comes later (§8.6). `Some(erased)` once the vault
+/// removed the device, `None` otherwise. Dropping or aborting the task
+/// stops it (lock, log-out, End session).
+pub async fn refresh_loop<T: Transport, C: Clock>(
+    link: &Mutex<Option<Link<T, C>>>,
+    first: std::time::Duration,
+    refused_every: std::time::Duration,
+    show: impl Fn(Snapshot),
+    tell: impl Fn(&'static str),
+) -> Option<bool> {
+    let mut wait = first;
+    loop {
+        tokio::time::sleep(wait).await;
+        let mut slot = link.lock().await;
+        if slot.as_ref().is_some_and(|l| l.refused()) {
+            // Already found refused (by this task, or by an operation that
+            // told the person): only the slow look for `device.unlinked`.
+            wait = refused_every;
+            match recheck_refused_round(&mut slot).await {
+                Round::Gone => return None,
+                Round::Unlinked { erased } => return Some(erased),
+                Round::Continue(snap) | Round::Stop(snap, _) => show(snap),
+            }
+            continue;
+        }
+        wait = REFRESH_EVERY;
+        match refresh_round(&mut slot).await {
+            Round::Gone => return None,
+            Round::Continue(snap) => show(snap),
+            Round::Stop(snap, notice) => {
+                show(snap);
+                if let Some(n) = notice {
+                    tell(n);
                 }
-                Round::Unlinked { erased } => {
-                    finish_unlinked(&shared, erased).await;
-                    return;
+                if notice == Some(REFUSED_NOTICE) {
+                    wait = refused_every;
+                } else {
+                    return None;
                 }
             }
+            Round::Unlinked { erased } => return Some(erased),
+        }
+    }
+}
+
+/// The background refresh as a task: [`refresh_loop`] over the shared link.
+/// Whoever finds a refusal (this task, extend_session, End session, unlock)
+/// starts it again if [`Link::keep_refreshing`], which holds for a device
+/// that is refused but not unlinked.
+pub fn spawn_refresh(shared: Shared, first: std::time::Duration) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let unlinked = refresh_loop(&shared.link, first, REFUSED_RECHECK_EVERY, |snap| shared.publish(snap), |n| shared.tell(n)).await;
+        if let Some(erased) = unlinked {
+            finish_unlinked(&shared, erased).await;
         }
     })
 }
@@ -728,7 +749,7 @@ mod tests {
             other => panic!("got {other:?}"),
         }
         let link = slot.as_ref().unwrap();
-        assert!(!link.keep_refreshing(Utc::now()));
+        assert!(link.keep_refreshing(Utc::now()), "kept up: only to look for device.unlinked");
         assert!(!link.unlinked());
         assert_eq!(vault.collects(), 1, "collected once after the refusal");
     }
@@ -764,6 +785,103 @@ mod tests {
         assert!(slot.is_none());
         assert!(!crate::credential::device_store::exists(dir.path()), "its state is erased");
         assert_eq!(recheck_refused_round(&mut slot).await, Round::Gone);
+    }
+
+    /// A refused link is rechecked for as long as it is refused: the loop
+    /// repeats well past any fixed count, with a snapshot that shows no
+    /// session each time.
+    #[tokio::test(start_paused = true)]
+    async fn the_recheck_loop_repeats_while_the_device_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.revoke(false);
+        let _ = link.read_status().await;
+        assert!(link.refused());
+        assert_eq!(vault.collects(), 1);
+        let shown = Arc::new(std::sync::Mutex::new(Vec::<Snapshot>::new()));
+        let slot = Arc::new(Mutex::new(Some(link)));
+        let (s2, sh2) = (slot.clone(), shown.clone());
+        let every = std::time::Duration::from_secs(900);
+        let task = tokio::spawn(async move {
+            refresh_loop(&s2, std::time::Duration::from_secs(1), every, |snap| sh2.lock().unwrap().push(snap), |_| {}).await
+        });
+        for _ in 0..12 {
+            tokio::time::advance(every).await;
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert!(vault.collects() >= 12, "collected at every period, uncapped: {}", vault.collects());
+        assert!(!task.is_finished());
+        assert!(shown.lock().unwrap().iter().all(|s| s.refused && !s.active_at(Utc::now())));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    /// Aborting the task (lock, log-out, End session) stops the rechecks.
+    #[tokio::test(start_paused = true)]
+    async fn an_aborted_recheck_loop_collects_no_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.revoke(false);
+        let _ = link.read_status().await;
+        let slot = Arc::new(Mutex::new(Some(link)));
+        let s2 = slot.clone();
+        let every = std::time::Duration::from_secs(900);
+        let task = tokio::spawn(async move { refresh_loop(&s2, every, every, |_| {}, |_| {}).await });
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(every).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let before = vault.collects();
+        assert!(before >= 2);
+        task.abort();
+        let _ = task.await;
+        tokio::time::advance(every * 4).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(vault.collects(), before, "no collect after the abort");
+    }
+
+    /// The loop ends when the link is gone, and when the vault's
+    /// `device.unlinked` arrives (the state is erased, `Some(true)`).
+    #[tokio::test(start_paused = true)]
+    async fn the_recheck_loop_ends_when_gone_or_unlinked() {
+        let every = std::time::Duration::from_secs(900);
+        // Gone: a lock or log-out took the link.
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.revoke(false);
+        let _ = link.read_status().await;
+        let slot = Arc::new(Mutex::new(Some(link)));
+        let s2 = slot.clone();
+        let task = tokio::spawn(async move { refresh_loop(&s2, every, every, |_| {}, |_| {}).await });
+        slot.lock().await.take();
+        tokio::time::advance(every).await;
+        assert_eq!(task.await.unwrap(), None);
+
+        // Unlinked: found at a later round.
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.revoke(false);
+        let _ = link.read_status().await;
+        let slot = Arc::new(Mutex::new(Some(link)));
+        let s2 = slot.clone();
+        let task = tokio::spawn(async move { refresh_loop(&s2, every, every, |_| {}, |_| {}).await });
+        tokio::time::advance(every).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!task.is_finished(), "refused, not unlinked: it goes on");
+        vault.event("device.unlinked", "{}", Utc::now());
+        tokio::time::advance(every).await;
+        assert_eq!(task.await.unwrap(), Some(true));
+        assert!(!crate::credential::device_store::exists(dir.path()), "its state is erased");
+        assert!(slot.lock().await.is_none());
     }
 
     /// #65: a link that isn't refused is not collected by a recheck.

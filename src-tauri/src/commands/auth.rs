@@ -610,6 +610,10 @@ pub async fn extend_session(app: AppHandle, state: State<'_, AppState>) -> Resul
     // #33: never overlaps End session; see AppState::session_op.
     let _session_op = state.session_op.lock().await;
     let mark = reset_mark(&state);
+    // As in end_access: a refused device's mailbox rechecks aren't waited for.
+    if state.snapshot().refused {
+        state.stop_refresh();
+    }
     let mut slot = state.link.lock().await;
     let Some(link) = slot.as_mut() else {
         return Ok(RegisterResponse::failed(UNLOCK_FAILED_NOTICE));
@@ -863,6 +867,12 @@ pub async fn end_session(state: State<'_, AppState>) -> Result<EndSessionRespons
 
 async fn end_access(state: &AppState) -> EndSessionResponse {
     begin_reset(state);
+    // A refused device's refresh is only collecting its mailbox, which can
+    // hold the link for a poll (25 s): stop it first, so this doesn't wait.
+    // It is restarted below if still needed.
+    if state.snapshot().refused {
+        state.stop_refresh();
+    }
     // Not live from here on, whatever the vault answers.
     state.publish(state.snapshot().without_session());
     let notice = {
