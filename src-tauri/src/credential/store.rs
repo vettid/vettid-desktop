@@ -60,22 +60,45 @@ pub const UNREADABLE_NOTICE: &str =
 /// is its plain name ("Windows data protection", "your computer's
 /// keyring"). At pairing, the vault may already list the desktop, hence
 /// the phone step. Replaces the keyring-unavailable notice.
+///
+/// NEW TEXT (#13, Linux, owner approval needed): for the TPM, signing out
+/// doesn't help (it is busy, in lockout, or its storage hierarchy has a
+/// password), so the advice is to retry and then whoever manages the computer.
 fn not_protected_notice(by: &str) -> String {
+    if by == super::protector::TPM_NAME {
+        return format!("This desktop couldn't lock its pairing with {by}, so nothing was saved. If your phone lists this desktop, remove it there. Then try pairing again. If it keeps happening, whoever manages this computer needs to check its TPM: it may be busy, or set up with a password this desktop can't use.");
+    }
     format!("This desktop couldn't lock its pairing with {by}, so nothing was saved. If your phone lists this desktop, remove it there. Then sign out of your computer and back in, and pair again.")
 }
 
 /// NEW TEXT (owner approval needed): shown at unlock when the saved
 /// pairing's protector is there but couldn't open it (#13). The file is
 /// kept: it may open later (after signing in again), or the person re-pairs.
+///
+/// NEW TEXT (#13, Linux, owner approval needed): for the TPM, "restart this
+/// desktop" in place of signing out.
 fn not_opened_notice(by: &str) -> String {
+    if by == super::protector::TPM_NAME {
+        return format!("This desktop couldn't open its saved pairing with {by} just now. The pairing is kept. Restart this desktop to try again. If it keeps happening, remove this desktop on your phone; then, in Settings, open Danger zone and choose Log out this desktop, and pair again.");
+    }
     format!("This desktop couldn't open its saved pairing with {by} just now. The pairing is kept. Sign out of your computer and back in to try again. If it keeps happening, remove this desktop on your phone; then, in Settings, open Danger zone and choose Log out this desktop, and pair again.")
 }
 
 /// NEW TEXT (owner approval needed): shown when this computer offers no
-/// protector at all (#13). Not reachable in this build (every platform has
-/// one that is never absent); the passphrase protector will replace it.
+/// protector at all (#13). Not reachable on Windows or macOS (each has one
+/// that is never absent). The passphrase protector will take this case.
+#[cfg(not(target_os = "linux"))]
 pub const NO_PROTECTOR_NOTICE: &str =
     "This computer offers no way for this desktop to lock its pairing, so nothing was saved. If your phone lists this desktop, remove it there.";
+
+/// NEW TEXT (#13, Linux, owner approval needed): shown at pairing when this
+/// account can't use the TPM (`/dev/tpmrm0` missing or not permitted) and no
+/// Secret Service is on the session bus. Pairing is refused before the
+/// vault lists the desktop; the phone step covers a later save. Says only
+/// what the person can do now (the passphrase protector comes later).
+#[cfg(target_os = "linux")]
+pub const NO_PROTECTOR_NOTICE: &str =
+    "This computer offers no way for this desktop to lock its pairing: your account can't use the computer's TPM, and no keyring service (such as GNOME Keyring or KWallet) is running. Nothing was saved. If your phone lists this desktop, remove it there. To pair, start your keyring service, or ask whoever manages this computer to give your account access to the TPM, then pair again.";
 
 /// NEW TEXT (owner approval needed): shown at unlock when the saved pairing
 /// was made by an earlier version, whose format this one can't read, and it
@@ -1280,6 +1303,22 @@ pub(crate) mod tests {
         let err = s.take_failure().expect("why");
         assert!(matches!(err, CredentialError::NotPrivate), "got {err}");
         assert_eq!(fs::read(&file).unwrap(), before, "not truncated");
+    }
+
+    /// The TPM failing gets advice that fits it (signing out doesn't help);
+    /// the keyring keeps its own. None claims anything was saved.
+    #[test]
+    fn a_failing_tpm_is_not_told_to_sign_out() {
+        let tpm = super::super::protector::TPM_NAME;
+        for e in [CredentialError::NotProtected { by: tpm }, CredentialError::NotOpened { by: tpm }] {
+            let text = e.to_string();
+            assert!(text.contains(tpm) && !text.to_lowercase().contains("sign out"), "{text}");
+        }
+        assert!(CredentialError::NotProtected { by: tpm }.to_string().contains("nothing was saved"));
+        assert!(CredentialError::NotOpened { by: tpm }.to_string().contains("The pairing is kept"));
+        let keyring = CredentialError::NotProtected { by: "your computer's keyring" }.to_string();
+        assert!(keyring.contains("sign out of your computer and back in"), "{keyring}");
+        assert!(CredentialError::NoProtector.to_string().to_lowercase().contains("nothing was saved"));
     }
 
     /// No known folder, or a relative one, is refused: never the current
