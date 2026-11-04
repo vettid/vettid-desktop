@@ -2,8 +2,8 @@
 //!
 //! Uses Tauri v2's TrayIconBuilder. The tray persists for the lifetime of the
 //! app and exposes Show / Hide / Quit. Closing the main window hides it
-//! instead of quitting (handled in `lib.rs`), so background NATS push events
-//! continue to flow into the OS notification center.
+//! instead of quitting (handled in `lib.rs`), so the background session
+//! refresh keeps running.
 //!
 //! ## macOS specifics
 //! - The icon is set via `with_icon(default_window_icon)` and macOS will

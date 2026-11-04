@@ -1,8 +1,7 @@
 pub mod crypto;
 pub mod fingerprint;
 pub mod credential;
-pub mod nats;
-pub mod registration;
+pub mod link;
 pub mod session;
 pub mod commands;
 pub mod state;
@@ -23,7 +22,7 @@ pub fn run() {
     // and pairing failures left no breadcrumb in stderr.
     let _ = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or(
-            "info,vettid_desktop=debug,async_nats=info,reqwest=warn",
+            "info,vettid_desktop=debug,reqwest=warn",
         ),
     )
     .format_timestamp_millis()
@@ -34,7 +33,7 @@ pub fn run() {
         // docs so it can short-circuit before any other setup runs.
         // On a second launch the callback fires in the running
         // process — we show + focus the existing window instead of
-        // letting two binaries fight over the NATS subscription.
+        // letting two binaries fight over the relay mailbox.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.show();
@@ -55,8 +54,8 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing the main window only hides it — the listener and tray
-            // keep running. The user quits via the tray menu (or Cmd+Q on macOS).
+            // Closing the main window only hides it — the session refresh and
+            // tray keep running. The user quits via the tray menu (or Cmd+Q on macOS).
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     let _ = window.hide();

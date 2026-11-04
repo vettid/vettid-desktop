@@ -1,8 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 
+use crate::credential::device_store::{self, DeviceStore};
+use crate::credential::keystore::BindingMode;
+use crate::credential::store::{self, CredentialError, WipeEpoch};
+use crate::link::{self, Link, Snapshot};
 use crate::state::AppState;
+use vettid_device::access::EndOutcome;
+use vettid_device::pairing::{PairError, SystemClock};
+use vettid_device::transport::Http;
 
 #[derive(Debug, Serialize)]
 pub struct AuthStatus {
@@ -10,10 +17,7 @@ pub struct AuthStatus {
     pub is_unlocked: bool,
     pub has_active_session: bool,
     // Device-identity fields surfaced in the Settings view so the
-    // user can confirm which desktop they're looking at and verify
-    // the binary + machine fingerprints match what the phone's
-    // Authorize Desktop screen displays at pairing time. Mirrors the
-    // DeviceMetadata we send to the vault in `device.request-session`.
+    // user can confirm which desktop they're looking at.
     pub hostname: String,
     pub platform: String,
     pub os_name: String,
@@ -22,16 +26,15 @@ pub struct AuthStatus {
     pub machine_fingerprint: String,
     pub app_version: String,
     /// Which key protects the saved pairing, from the file's header:
-    /// "keyring", "machine", "none" (no pairing saved) or "unknown" (a
-    /// file that can't be read). Shown in Settings (#11).
+    /// "keyring", "none" (no pairing saved) or "unknown" (a file that
+    /// can't be read). Shown in Settings (#11).
     pub key_protection: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
-    /// 12-char code the user typed in from the phone app, displayed
-    /// to them as `ABCD-EFGH-JKLM`. The frontend strips dashes/whitespace
-    /// before sending, but we also normalize defensively below.
+    /// The desktop pairing code the member's phone shows (VAULT-MESSAGING
+    /// §6.4: a link or the QR's text), pasted as it is.
     pub invite_code: String,
 }
 
@@ -39,221 +42,218 @@ pub struct RegisterRequest {
 pub struct RegisterResponse {
     pub success: bool,
     pub error: Option<String>,
+    /// The id the vault gave this device.
     pub connection_id: Option<String>,
+    /// The access session (§6.8), when one is live.
     pub session_id: Option<String>,
+    /// Unix seconds: when this desktop stops treating the session as live
+    /// (a margin before the vault's `expires_at`).
     pub expires_at: Option<i64>,
-    /// On success, the key the saved pairing was sealed under: "keyring"
-    /// or "machine". The pairing screen warns once when it is "machine".
+    /// On success, the key the saved pairing is sealed under: "keyring".
     pub key_protection: Option<String>,
-    /// Not a success, but the pairing is saved: the new session couldn't
-    /// be recorded (#33). The pairing screen shows `error` and continues to
-    /// Start New Session instead of offering to pair again.
+    /// Not a success, but the pairing is saved: there is no access session
+    /// (yet). The pairing screen shows `error` and continues to Start New
+    /// Session instead of offering to pair again.
     pub paired_without_session: bool,
 }
 
-/// Event emitted to the frontend with the QR payload the user should scan
-/// with their phone. Occurs after stage-1 completes, before the phone scan.
-#[derive(Debug, Clone, Serialize)]
-pub struct PairingQrEvent {
-    pub connection_id: String,
-    pub qr_payload: String,
+impl RegisterResponse {
+    fn failed(error: impl Into<String>) -> Self {
+        RegisterResponse {
+            success: false,
+            error: Some(error.into()),
+            connection_id: None,
+            session_id: None,
+            expires_at: None,
+            key_protection: None,
+            paired_without_session: false,
+        }
+    }
+
+    fn paired_without_session(error: impl Into<String>) -> Self {
+        RegisterResponse { paired_without_session: true, ..Self::failed(error) }
+    }
+
+    /// A live session, from `snap` (which must be active).
+    fn live(snap: &Snapshot) -> Self {
+        RegisterResponse {
+            success: true,
+            error: None,
+            connection_id: snap.device_id.clone(),
+            session_id: snap.session_id.clone(),
+            expires_at: snap.live_until.map(|t| t.timestamp()),
+            key_protection: Some(BindingMode::Keyring.as_str().to_string()),
+            paired_without_session: false,
+        }
+    }
 }
 
-/// Pair this desktop with a vault via a 12-char invite code typed by the user.
+/// Event emitted once the pairing handshake is done: the six-digit code
+/// the member compares with their phone (§6.7), and what to do.
+pub const PAIRING_SAS_EVENT: &str = "pairing:sas";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PairingSasEvent {
+    pub sas: String,
+    pub instruction: String,
+}
+
+/// Event emitted when the vault has taken a request for access: the
+/// owner's phone is being asked.
+pub const ACCESS_REQUESTED_EVENT: &str = "session:requested";
+
+/// What a failed pairing tells the person. The SAS mismatch and the
+/// timeout keep the engine's own texts (`vettid_device::display`).
+fn pair_notice(e: &PairError, store: Option<&CredentialError>) -> String {
+    match e {
+        PairError::Code(_) | PairError::NotForDesktop | PairError::Expired => link::PAIR_CODE_NOTICE.into(),
+        PairError::AlreadyPaired => link::PAIR_ALREADY_NOTICE.into(),
+        PairError::Rejected | PairError::TimedOut => e.to_string(),
+        PairError::Store(_) => store.and_then(link::plain_store_notice).unwrap_or_else(|| link::PAIR_FAILED_NOTICE.into()),
+        // The pending pairing's keys are removed at the next start too.
+        PairError::NotCleared(inner) => pair_notice(inner, store),
+        _ => link::PAIR_FAILED_NOTICE.into(),
+    }
+}
+
+/// Pair this desktop with its vault (VAULT-MESSAGING §6.7), through the
+/// relay: read the code the member's phone shows, run the handshake, show
+/// the SAS (`pairing:sas`) and wait for the owner's approval on the phone.
+/// Then open the session and read `vault.status`: an access session the
+/// approval granted is reported live only once the vault names it there.
 ///
-/// Two-stage flow (see vettid-dev/docs/DESKTOP-CONNECTION-FLOW.md):
-///   1. Resolve invite via the embedded guest NATS account → scoped creds +
-///      connection_id.
-///   2. Publish device.request-session, emit `pairing:qr-ready` so the UI can
-///      render the QR the user scans on their phone.
-///   3. Receive device.session.activated with the vault's pubkey; derive the
-///      session_key via HKDF; save encrypted credentials to disk.
+/// Fail secure: the desktop is paired only once the vault's
+/// `device.paired` is stored (see `vettid_device::pairing`); nothing is
+/// stored without the keyring.
 #[tauri::command]
 pub async fn register(
     app: AppHandle,
     state: State<'_, AppState>,
     request: RegisterRequest,
 ) -> Result<RegisterResponse, String> {
-    use crate::credential::store;
-    use crate::registration::pairing;
-
     // #30: first, before anything that waits. A log-out from here on means
     // this pairing is not saved.
     let since = store::wipe_epoch();
+    let mark = reset_mark(&state);
     let config_dir = store::default_config_dir().map_err(|e| e.to_string())?;
     // Checked before pairing starts, so a folder another account can open,
-    // or a computer without the machine id the pairing is bound to (#14),
-    // is refused before the vault ever lists this desktop.
-    // #30: under the store's lock, and not after a log-out since `since`.
+    // a computer without the machine id the pairing is bound to (#14), or a
+    // keyring that can't be reached is refused before the vault ever lists
+    // this desktop.
     store::ensure_config_dir_since(&config_dir, since).map_err(|e| e.to_string())?;
     store::check_machine_binding().map_err(|e| e.to_string())?;
+    device_store::keyring_ready().map_err(|e| e.to_string())?;
 
-    // Strip dashes/whitespace so users can paste either the grouped
-    // `ABCD-EFGH-JKLM` form they see on the phone or a flat 12-char run.
-    // Uppercase to match the vault's code alphabet exactly.
-    let invite_code: String = request
-        .invite_code
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '-')
-        .collect::<String>()
-        .to_uppercase();
-    if invite_code.len() != 12 {
-        return Ok(RegisterResponse {
-            success: false,
-            error: Some("Invite code must be 12 characters".to_string()),
-            connection_id: None,
-            session_id: None,
-            expires_at: None,
-            key_protection: None,
-            paired_without_session: false,
-        });
+    // The code is read as it is (it holds base64): only surrounding
+    // whitespace from a paste is dropped.
+    let code = request.invite_code.trim();
+    if code.is_empty() {
+        return Ok(RegisterResponse::failed(link::PAIR_CODE_NOTICE));
     }
+    let name = collect_device_fingerprint().hostname;
 
-    // Stage 1 — resolve invite via guest account
-    let (session, runtime) = match pairing::resolve_invite(&invite_code).await {
-        Ok(v) => v,
+    let mut store = DeviceStore::new(&config_dir, since);
+    let pairing = match vettid_device::pairing::start(code, &name, Http::new, &mut store, SystemClock).await {
+        Ok(p) => p,
         Err(e) => {
-            return Ok(RegisterResponse {
-                success: false,
-                error: Some(e.to_string()),
-                connection_id: None,
-                session_id: None,
-                expires_at: None,
-                key_protection: None,
-                paired_without_session: false,
-            });
+            log::warn!("register: pairing not started: {}", e);
+            return Ok(RegisterResponse::failed(pair_notice(&e, store.take_failure().as_ref())));
         }
     };
-
-    // Emit the QR payload so the UI can render it while we await approval.
     let _ = app.emit(
-        "pairing:qr-ready",
-        PairingQrEvent {
-            connection_id: session.connection_id.clone(),
-            qr_payload: session.qr_payload.clone(),
-        },
+        PAIRING_SAS_EVENT,
+        PairingSasEvent { sas: pairing.sas().to_string(), instruction: pairing.instruction().to_string() },
     );
-
-    let fingerprint = collect_device_fingerprint();
-
-    // Stage 2 — wait for activation, derive session_key, save credentials.
-    let outcome = match pairing::complete_pairing(
-        session,
-        runtime,
-        fingerprint,
-        &config_dir,
-        since,
-    )
-    .await
-    {
-        Ok(o) => o,
+    let paired = match pairing.wait_for_approval(&mut store).await {
+        // The returned state is dropped (its keys wipe themselves): the
+        // session opens it from the store.
+        Ok((paired, _state)) => paired,
         Err(e) => {
-            // #33: the pairing is saved, only the session isn't. Mark this
-            // desktop registered, so the next launch goes to Start New
-            // Session rather than pairing again.
-            let paired = matches!(e, crate::registration::flow::RegistrationError::SessionNotRecorded);
-            if paired {
-                *state.is_registered.write().await = true;
-                // #30: as on success, set then check: a log-out since
-                // means nothing is paired.
-                if store::wipe_epoch() != since {
-                    clear_logged_out_memory(&state).await;
-                    return Ok(RegisterResponse {
-                        success: false,
-                        error: Some(store::LOGGED_OUT_MEANWHILE_NOTICE.to_string()),
-                        connection_id: None,
-                        session_id: None,
-                        expires_at: None,
-                        key_protection: None,
-                        paired_without_session: false,
-                    });
-                }
-            }
-            return Ok(RegisterResponse {
-                success: false,
-                error: Some(e.to_string()),
-                connection_id: None,
-                session_id: None,
-                expires_at: None,
-                key_protection: None,
-                paired_without_session: paired,
-            });
+            log::warn!("register: not paired: {}", e);
+            return Ok(RegisterResponse::failed(pair_notice(&e, store.take_failure().as_ref())));
         }
     };
-
+    log::info!("register: paired");
     *state.is_registered.write().await = true;
-    let mut listener_conn_id: Option<String> = None;
-    if let Ok((creds, _)) = pairing::load_saved(&config_dir).await {
-        if creds.connection_key.len() == 32 {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&creds.connection_key);
-            *state.connection_key.write().await = Some(key);
+
+    let mut link = match Link::open(store) {
+        Ok(Some(l)) => l,
+        Ok(None) | Err(_) => {
+            log::error!("register: paired, but the saved pairing couldn't be opened");
+            return Ok(RegisterResponse::paired_without_session(link::PAIRED_NO_ACCESS_NOTICE));
         }
-        listener_conn_id = Some(creds.connection_id.clone());
-
-        // Reconnect the AppState NatsClient with the freshly-saved
-        // creds. complete_pairing uses its own ephemeral NatsClient
-        // that gets dropped on return, so the AppState client is
-        // whatever was last connected (could be the now-closed pre-
-        // end_session one). Without this rebind, spawn_listener
-        // below tries to subscribe on a dropped client and fails
-        // with "NATS client not connected". Mirrors unlock()'s
-        // reconnect dance.
-        if !creds.message_space_url.is_empty() && !creds.message_space_token.is_empty() {
-            if let Some((jwt, seed)) = crate::registration::pairing::parse_creds_block(&creds.message_space_token) {
-                let mut nats = state.nats.lock().await;
-                if let Err(e) = nats
-                    .connect_with_credentials(
-                        &creds.message_space_url,
-                        &jwt,
-                        &seed,
-                        &creds.owner_guid,
-                    )
-                    .await
-                {
-                    log::warn!("Failed to reconnect AppState NATS after pairing: {}", e);
-                }
-            } else {
-                log::warn!("Stored NATS creds malformed post-pairing — listener will fail until reconnect");
-            }
+    };
+    if link.session.device_id() != Some(paired.device_id.as_str()) {
+        log::warn!("register: the stored device id isn't the one device.paired named");
+    }
+    if let Err(e) = link.read_status().await {
+        log::info!("register: vault.status: {}", e);
+    }
+    match install(&state, link, since, mark).await {
+        Some(snap) if snap.active_at(chrono::Utc::now()) => Ok(RegisterResponse::live(&snap)),
+        Some(_) => Ok(RegisterResponse::paired_without_session(link::PAIRED_NO_ACCESS_NOTICE)),
+        None if store::wipe_epoch() != since => {
+            // A log-out ran meanwhile (and, if it ran after the save,
+            // removed it): nothing is paired.
+            *state.is_registered.write().await = false;
+            Ok(RegisterResponse::failed(store::LOGGED_OUT_MEANWHILE_NOTICE))
         }
-
-        *state.credentials.write().await = Some(creds);
-        *state.is_unlocked.write().await = true;
+        // A lock or End session meanwhile: the pairing is saved, the
+        // session not shown.
+        None => Ok(RegisterResponse::paired_without_session(link::PAIRED_NO_ACCESS_NOTICE)),
     }
+}
 
-    // #30: a log-out that ran after the save (its wipe removed it) cleared
-    // memory before or after the lines above. If it may have been before,
-    // what they set must go too: no connection, key or unlocked state is
-    // kept for a pairing the log-out reported removed.
-    if store::wipe_epoch() != since {
-        clear_logged_out_memory(&state).await;
-        return Ok(RegisterResponse {
-            success: false,
-            error: Some(store::LOGGED_OUT_MEANWHILE_NOTICE.to_string()),
-            connection_id: None,
-            session_id: None,
-            expires_at: None,
-            key_protection: None,
-            paired_without_session: false,
-        });
+/// Put `link` in place as the open pairing and show what it knows, unless
+/// a log-out (since `since`) or a reset (since `mark`) happened meanwhile:
+/// then it is dropped (its keys wipe themselves) and `None` returned. The
+/// background refresh is started if there is something to keep up.
+async fn install(state: &AppState, link: Link, since: WipeEpoch, mark: ResetMark) -> Option<Snapshot> {
+    let mut slot = state.link.lock().await;
+    if store::wipe_epoch() != since || overtaken_by_reset(state, mark) {
+        log::warn!("a log-out, lock or End session overlapped this; staying locked");
+        return None;
     }
-
-    // Start the response listener now that AppState.nats is bound to
-    // a live connection.
-    if let Some(conn_id) = listener_conn_id {
-        crate::nats::listener::spawn_listener(app.clone(), conn_id).await;
+    let now = chrono::Utc::now();
+    let snap = link.snapshot(now);
+    let keep = link.keep_refreshing(now);
+    // An end an earlier run left unanswered is settled at once, in the
+    // background (§6.8: after vault.status).
+    let end_pending = link.session.access_end().is_some();
+    *slot = Some(link);
+    state.publish(snap.clone());
+    // With the link locked: an old refresh isn't mid-operation.
+    if keep {
+        state.start_refresh(end_pending);
+    } else {
+        state.stop_refresh();
     }
+    Some(snap)
+}
 
-    Ok(RegisterResponse {
-        success: true,
-        error: None,
-        connection_id: Some(outcome.connection_id),
-        session_id: Some(outcome.session_id),
-        expires_at: Some(outcome.expires_at),
-        key_protection: Some(outcome.binding.as_str().to_string()),
-        paired_without_session: false,
-    })
+/// The vault removed this device (`device.unlinked`): erase its stored
+/// state (not the folder or the keyring key), and say what happened.
+async fn erase_unlinked(state: &AppState, link: Link) -> String {
+    state.publish(Snapshot::default());
+    if link.erase() {
+        *state.is_registered.write().await = false;
+        link::UNLINKED_ERASED_NOTICE.into()
+    } else {
+        link::UNLINKED_NOT_ERASED_NOTICE.into()
+    }
+}
+
+/// The device fingerprint shown in Settings. The device name sent at
+/// pairing is its hostname.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceFingerprint {
+    pub hostname: String,
+    pub platform: String,
+    pub os_name: String,
+    pub os_version: String,
+    pub app_version: String,
+    pub binary_fingerprint: String,
+    pub machine_fingerprint: String,
 }
 
 /// Cached device fingerprint. `compute_device_fingerprint` hashes the
@@ -261,12 +261,12 @@ pub async fn register(
 /// so it is computed exactly once. `warm_device_fingerprint()` kicks
 /// that off at app startup (see lib.rs) so a pairing's request-session
 /// never blocks on it; the value is known before the request is made.
-static DEVICE_FINGERPRINT: OnceLock<crate::registration::pairing::DeviceFingerprint> =
+static DEVICE_FINGERPRINT: OnceLock<DeviceFingerprint> =
     OnceLock::new();
 
 /// Return the device fingerprint, computing it once and caching it.
 /// Effectively instant after `warm_device_fingerprint()` has run.
-pub(crate) fn collect_device_fingerprint() -> crate::registration::pairing::DeviceFingerprint {
+pub(crate) fn collect_device_fingerprint() -> DeviceFingerprint {
     DEVICE_FINGERPRINT
         .get_or_init(compute_device_fingerprint)
         .clone()
@@ -281,9 +281,8 @@ pub(crate) fn warm_device_fingerprint() {
     });
 }
 
-fn compute_device_fingerprint() -> crate::registration::pairing::DeviceFingerprint {
+fn compute_device_fingerprint() -> DeviceFingerprint {
     use crate::fingerprint::binary::binary_fingerprint;
-    use crate::registration::pairing::DeviceFingerprint;
 
     let hostname = hostname::get()
         .ok()
@@ -401,392 +400,149 @@ pub struct UnlockResponse {
 /// entry, for example). The detail goes to the log only.
 const UNLOCK_FAILED_NOTICE: &str = "This desktop couldn't open its saved pairing. If this keeps happening, remove this desktop on your phone and pair again.";
 
-/// Unlock the credential store.
+/// Open the saved pairing: the device state, sealed under the master key
+/// in the OS keyring (no user input: the keyring is unlocked by the
+/// user's OS login session). Then read `vault.status`, and settle an end
+/// left unanswered by an earlier run (§6.8). A session counts as live only
+/// once this run's own `vault.status` names it.
 ///
-/// Loads the encrypted connection.enc file using the master key from
-/// the OS keyring (or the machine-bound fallback). No user input —
-/// the keyring is unlocked by the user's OS login session and that
-/// gate is the security factor at the local layer.
-/// Populates AppState with credentials and connection key.
+/// A pairing saved by an earlier build (the NATS-era `connection.enc`)
+/// can't be used by this one: it is removed, with the plain "can't be
+/// opened" notice. Nothing is sent for it (#39's revoke went to a server
+/// that no longer exists).
 ///
 /// A saved pairing that can't be opened is not an error here: the response
 /// carries a plain notice for the person, and the detail goes to the log.
 #[tauri::command]
-pub async fn unlock(app: AppHandle, state: State<'_, AppState>) -> Result<UnlockResponse, String> {
-    use crate::credential::store::{self, CredentialError};
-
+pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String> {
     // #30: first. A log-out from here on means nothing stays unlocked.
     let since = store::wipe_epoch();
-    // #43: likewise a lock, End session, or a session the vault ended,
-    // including one already under way now.
-    let reset_mark_at_start = reset_mark(&state);
+    // #43: likewise a lock or End session, including one under way now.
+    let mark = reset_mark(&state);
 
     let config_dir = match store::default_config_dir() {
         Ok(dir) => dir,
-        Err(e) => {
-            return Ok(UnlockResponse {
-                unlocked: false,
-                notice: Some(e.to_string()),
-            });
-        }
+        Err(e) => return Ok(UnlockResponse { unlocked: false, notice: Some(e.to_string()) }),
     };
 
-    // #15: an earlier build's pairing is deleted and revoked here; the
-    // notice says whether the revoke was sent.
-    let (creds, binding) = match crate::registration::pairing::load_saved(&config_dir).await {
-        Ok(loaded) => loaded,
-        Err(e @ (CredentialError::Unreadable | CredentialError::OldBuildRemoved { .. } | CredentialError::NoMachineId)) => {
-            return Ok(UnlockResponse {
-                unlocked: false,
-                notice: Some(e.to_string()),
-            });
-        }
-        Err(CredentialError::NotFound(_)) => {
+    if !device_store::exists(&config_dir) {
+        if !store::exists(&config_dir) {
             // Not paired: nothing to open and nothing to say.
-            return Ok(UnlockResponse {
-                unlocked: false,
-                notice: None,
-            });
+            return Ok(UnlockResponse { unlocked: false, notice: None });
         }
-        Err(e) => {
+        if let Err(e) = store::remove_legacy_pairing(&config_dir) {
+            log::error!("unlock: an earlier build's pairing couldn't be removed: {}", e);
+        }
+        return Ok(UnlockResponse { unlocked: false, notice: Some(store::UNREADABLE_NOTICE.to_string()) });
+    }
+
+    let mut link = match Link::open(DeviceStore::new(&config_dir, since)) {
+        Ok(Some(l)) => l,
+        // A pairing interrupted before the owner approved it was removed.
+        Ok(None) => return Ok(UnlockResponse { unlocked: false, notice: None }),
+        Err((e, failure)) => {
             log::warn!("unlock: saved pairing could not be opened: {}", e);
-            return Ok(UnlockResponse {
-                unlocked: false,
-                notice: Some(UNLOCK_FAILED_NOTICE.to_string()),
-            });
+            let notice = failure.as_ref().and_then(link::plain_store_notice).unwrap_or_else(|| UNLOCK_FAILED_NOTICE.to_string());
+            return Ok(UnlockResponse { unlocked: false, notice: Some(notice) });
         }
     };
-
-    // Load connection key (stored as raw bytes in ConnectionCredentials)
-    if creds.connection_key.len() == 32 {
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&creds.connection_key);
-        *state.connection_key.write().await = Some(key);
+    if let Err(e) = link.read_status().await {
+        // Still unlocked: the session just isn't shown as live.
+        log::info!("unlock: vault.status: {}", e);
     }
-
-    // Reconnect NATS so subsequent vault ops can publish + receive
-    // responses. The stored `message_space_token` is a NATS .creds
-    // block (JWT + seed), not a single auth token — so we have to
-    // parse it and go through connect_with_credentials, which also
-    // pins TLS-first + rustls (load-bearing for the NLB listener).
-    // The previous `nats.connect(.., token, ..)` call used `.token()`
-    // auth, which expects an opaque bearer string and never works
-    // against this account's JWT-based auth → every op hit
-    // "publish failed: NATS client not connected".
-    if !creds.message_space_url.is_empty() && !creds.message_space_token.is_empty() {
-        match crate::registration::pairing::parse_creds_block(&creds.message_space_token) {
-            Some((jwt, seed)) => {
-                let mut nats = state.nats.lock().await;
-                if let Err(e) = nats
-                    .connect_with_credentials(
-                        &creds.message_space_url,
-                        &jwt,
-                        &seed,
-                        &creds.owner_guid,
-                    )
-                    .await
-                {
-                    log::warn!("Failed to reconnect NATS on unlock: {}", e);
-                    // Don't fail unlock if NATS reconnect fails — user
-                    // can retry; some op paths re-establish on demand.
-                }
-            }
-            None => {
-                log::warn!(
-                    "Stored NATS creds malformed — unlock continues but vault ops will fail until re-pair"
-                );
-            }
-        }
+    if link.unlinked() {
+        let notice = erase_unlinked(&state, link).await;
+        return Ok(UnlockResponse { unlocked: false, notice: Some(notice) });
     }
-
-    let connection_id = creds.connection_id.clone();
-    *state.credentials.write().await = Some(creds);
-    *state.is_unlocked.write().await = true;
-
-    // #30: a log-out while this ran may have cleared memory before the
-    // lines above set it; then clear it again. Logout's own response tells
-    // the person what happened.
-    if store::wipe_epoch() != since {
-        clear_logged_out_memory(&state).await;
-        return Ok(UnlockResponse {
-            unlocked: false,
-            notice: None,
-        });
+    if install(&state, link, since, mark).await.is_none() {
+        return Ok(UnlockResponse { unlocked: false, notice: None });
     }
-
-    // Spawn the background NATS listener so device_op_response
-    // envelopes get decrypted + matched to pending request_ids.
-    // Without this, every vault op hits the 30-second timeout —
-    // the request reaches the vault, the response is published
-    // back to MessageSpace.{owner}.forOwner.device.{conn}, and
-    // nobody's subscribed to it.
-    crate::nats::listener::spawn_listener(app.clone(), connection_id).await;
-
-    // #43: a lock, End session or a session the vault ended that was under
-    // way when this started, or started since, may have cleared memory
-    // before the lines above set it. Then it stays locked, as that reset
-    // left it. Checked after the listener is started, so one started past
-    // the reset is stopped too. This lock may also clear an unlock or a
-    // pairing running alongside; that errs locked.
-    if overtaken_by_reset(&state, reset_mark_at_start) {
-        // Logged, so a reset that never finished (it would block every
-        // unlock until restart) can be told apart.
-        log::warn!("unlock: a lock, End session or vault end overlapped this unlock; staying locked");
-        lock_memory(&state).await;
-        return Ok(UnlockResponse {
-            unlocked: false,
-            notice: None,
-        });
-    }
+    *state.is_registered.write().await = true;
 
     // Warn (never refuse) when another account can open the saved
     // pairing's folder or file (#24).
-    Ok(UnlockResponse {
-        unlocked: true,
-        notice: store::privacy_warning(&config_dir, binding).map(str::to_string),
-    })
+    Ok(UnlockResponse { unlocked: true, notice: store::privacy_warning(&config_dir, BindingMode::Keyring).map(str::to_string) })
 }
 
 /// Session info the frontend uses to decide which view to render
 /// (active / expiring-soon / expired).
 #[derive(Debug, Serialize)]
 pub struct SessionInfoResponse {
+    /// The id the vault gave this device.
     pub connection_id: String,
     pub session_id: String,
-    /// Unix seconds. 0 means unknown/inactive.
+    /// Unix seconds at which this desktop stops treating the session as
+    /// live (a margin before the vault's `expires_at`). 0 when inactive.
     pub expires_at: i64,
     pub seconds_remaining: i64,
     pub is_active: bool,
 }
 
-/// Inspect the currently-loaded credentials and return session state. The
-/// frontend polls this (cheap, no network) to drive the expiry UI.
+/// What the frontend polls (cheap, no network) to drive the expiry UI:
+/// from the last snapshot of the link.
 #[tauri::command]
 pub async fn get_session_info(state: State<'_, AppState>) -> Result<SessionInfoResponse, String> {
-    let creds_guard = state.credentials.read().await;
-    let creds = creds_guard
-        .as_ref()
-        .ok_or_else(|| "not unlocked".to_string())?;
+    session_info(&state.snapshot(), chrono::Utc::now())
+}
 
-    let now = chrono::Utc::now().timestamp();
-    let remaining = (creds.session_expires_at - now).max(0);
+fn session_info(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> Result<SessionInfoResponse, String> {
+    if !snap.unlocked {
+        return Err("not unlocked".to_string());
+    }
+    let active = snap.active_at(now);
+    let until = snap.live_until.filter(|_| active);
     Ok(SessionInfoResponse {
-        connection_id: creds.connection_id.clone(),
-        session_id: creds.session_id.clone(),
-        expires_at: creds.session_expires_at,
-        seconds_remaining: remaining,
-        is_active: creds.session_expires_at > 0 && remaining > 0,
+        connection_id: snap.device_id.clone().unwrap_or_default(),
+        session_id: snap.session_id.clone().filter(|_| active).unwrap_or_default(),
+        expires_at: until.map_or(0, |t| t.timestamp()),
+        seconds_remaining: until.map_or(0, |t| (t - now).num_seconds().max(0)),
+        is_active: active,
     })
 }
 
-/// Start an extension: generate fresh ephemeral keys for the existing
-/// connection_id, publish device.request-session, emit a new `pairing:qr-ready`
-/// with the QR the user scans on their phone, wait for device.session.activated,
-/// derive a new session_key, save to disk.
+/// Start New Session: ask the owner's phone for an access session
+/// (`device.session.request`, §6.8), tell the frontend the phone is asked
+/// (`session:requested`), and wait for the answer until the request
+/// lapses. Success only once `vault.status` shows the new session.
 ///
-/// The phone-side UI is identical to initial pairing — the vault's
-/// HandleDeviceAuthorizeSession detects the existing DeviceSession and rotates.
+/// A lock, log-out or End session meanwhile stops the wait (checked
+/// between polls).
 #[tauri::command]
-pub async fn extend_session(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<RegisterResponse, String> {
-    use crate::credential::store;
-    use crate::registration::pairing;
-    // #30: first, before waiting for the lock. A log-out from here on
-    // means the new session is not saved.
-    let since = store::wipe_epoch();
+pub async fn extend_session(app: AppHandle, state: State<'_, AppState>) -> Result<RegisterResponse, String> {
     // #33: never overlaps End session; see AppState::session_op.
     let _session_op = state.session_op.lock().await;
-
-    let config_dir = match store::default_config_dir() {
-        Ok(dir) => dir,
-        Err(e) => {
-            return Ok(RegisterResponse {
-                success: false,
-                error: Some(e.to_string()),
-                connection_id: None,
-                session_id: None,
-                expires_at: None,
-                key_protection: None,
-                paired_without_session: false,
-            });
-        }
+    let mark = reset_mark(&state);
+    let mut slot = state.link.lock().await;
+    let Some(link) = slot.as_mut() else {
+        return Ok(RegisterResponse::failed(UNLOCK_FAILED_NOTICE));
     };
-
-    let (session, runtime) = match pairing::start_extension(&config_dir).await {
-        Ok(v) => v,
-        Err(e) => {
-            return Ok(RegisterResponse {
-                success: false,
-                error: Some(e.to_string()),
-                connection_id: None,
-                session_id: None,
-                expires_at: None,
-                key_protection: None,
-                paired_without_session: false,
-            });
-        }
+    let requested = || {
+        let _ = app.emit(ACCESS_REQUESTED_EVENT, ());
     };
-
-    let _ = app.emit(
-        "pairing:qr-ready",
-        PairingQrEvent {
-            connection_id: session.connection_id.clone(),
-            qr_payload: session.qr_payload.clone(),
-        },
-    );
-
-    let fingerprint = collect_device_fingerprint();
-
-    let outcome = match pairing::complete_pairing(
-        session,
-        runtime,
-        fingerprint,
-        &config_dir,
-        since,
-    )
-    .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            // #26: a refusal because the folder or file isn't private
-            // points at Log out; pairing again into it wouldn't help.
-            let error = match e {
-                crate::registration::flow::RegistrationError::NotPrivate => {
-                    store::not_private_extension_notice(&config_dir).to_string()
-                }
-                e => e.to_string(),
-            };
-            return Ok(RegisterResponse {
-                success: false,
-                error: Some(error),
-                connection_id: None,
-                session_id: None,
-                expires_at: None,
-                key_protection: None,
-                paired_without_session: false,
-            });
-        }
-    };
-
-    // Refresh AppState with the rotated session. If the saved pairing
-    // can't be read back, memory must not keep the old session as if it
-    // were current (#33): clear it and report a failure.
-    let mut listener_conn_id: Option<String> = None;
-    let reloaded = match pairing::load_saved(&config_dir).await {
-        Ok(loaded) => Some(loaded),
-        Err(e) => {
-            log::error!("extend_session: the new session was saved but couldn't be read back: {}", e);
-            // #30: a log-out since (its wipe may be why it can't be read):
-            // the pairing is gone, and so is anything in memory.
-            if store::wipe_epoch() != since {
-                clear_logged_out_memory(&state).await;
-                return Ok(RegisterResponse {
-                    success: false,
-                    error: Some(store::LOGGED_OUT_MEANWHILE_NOTICE.to_string()),
-                    connection_id: None,
-                    session_id: None,
-                    expires_at: None,
-                    key_protection: None,
-                    paired_without_session: false,
-                });
-            }
-            // The disk must match what the person is told: the session
-            // isn't treated as live at the next launch either. Not after a
-            // log-out, whose marker it would no longer be (#30).
-            if let Err(e) = store::end_saved_session_since(&config_dir, since) {
-                log::error!("extend_session: could not remove the live marker: {}", e);
-            }
-            // As End session: the listener stopped, NATS disconnected, the
-            // key zeroized, the credentials cleared (#40).
-            clear_in_memory_session(&state).await;
-            return Ok(RegisterResponse {
-                success: false,
-                error: Some(store::SESSION_NOT_RECORDED_NOTICE.to_string()),
-                connection_id: None,
-                session_id: None,
-                expires_at: None,
-                key_protection: None,
-                paired_without_session: false,
-            });
-        }
-    };
-    if let Some((creds, _)) = reloaded {
-        if creds.connection_key.len() == 32 {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&creds.connection_key);
-            *state.connection_key.write().await = Some(key);
-        }
-
-        // Reconnect the SHARED state.nats client with the rotated
-        // session's scoped creds. The Stage-2 handshake in
-        // complete_pairing ran on its own short-lived NatsClient, and
-        // the preceding end_session left state.nats disconnected.
-        // spawn_listener (below) subscribes through state.nats — so
-        // without this reconnect it fails with "NATS client not
-        // connected" and the desktop never receives vault op
-        // responses for the new session. Mirrors unlock()'s connect.
-        if !creds.message_space_url.is_empty() && !creds.message_space_token.is_empty() {
-            match pairing::parse_creds_block(&creds.message_space_token) {
-                Some((jwt, seed)) => {
-                    let mut nats = state.nats.lock().await;
-                    if let Err(e) = nats
-                        .connect_with_credentials(
-                            &creds.message_space_url,
-                            &jwt,
-                            &seed,
-                            &creds.owner_guid,
-                        )
-                        .await
-                    {
-                        log::error!(
-                            "extend_session: failed to connect state.nats for the new session: {}",
-                            e
-                        );
-                    }
-                }
-                None => log::error!(
-                    "extend_session: stored NATS creds malformed — listener will fail"
-                ),
-            }
-        }
-
-        listener_conn_id = Some(creds.connection_id.clone());
-        *state.credentials.write().await = Some(creds);
+    let result = link.request_access(requested, || overtaken_by_reset(&state, mark)).await;
+    if link.unlinked() {
+        let link = slot.take().expect("checked above");
+        return Ok(RegisterResponse::failed(erase_unlinked(&state, link).await));
     }
-
-    // #30: as in `register`.
-    if store::wipe_epoch() != since {
-        clear_logged_out_memory(&state).await;
-        return Ok(RegisterResponse {
-            success: false,
-            error: Some(store::LOGGED_OUT_MEANWHILE_NOTICE.to_string()),
-            connection_id: None,
-            session_id: None,
-            expires_at: None,
-            key_protection: None,
-            paired_without_session: false,
-        });
+    let now = chrono::Utc::now();
+    let snap = link.snapshot(now);
+    // A reset that started meanwhile has cleared what the UI shows, and
+    // shows its own result.
+    if !overtaken_by_reset(&state, mark) {
+        state.publish(snap.clone());
+        if link.keep_refreshing(now) {
+            state.start_refresh(false);
+        }
     }
-
-    // Restart the response listener for the rotated session keys.
-    // Existing pending request channels are dropped by the previous
-    // listener's exit path; new requests register against the fresh
-    // listener.
-    if let Some(conn_id) = listener_conn_id {
-        crate::nats::listener::spawn_listener(app.clone(), conn_id).await;
+    match result {
+        Ok(()) if snap.active_at(now) => Ok(RegisterResponse::live(&snap)),
+        Ok(()) => Ok(RegisterResponse::failed(link::ACCESS_NOT_CONFIRMED_NOTICE)),
+        Err(f) => {
+            log::info!("extend_session: no session: {:?}", f);
+            let failure = link.store.take_failure();
+            Ok(RegisterResponse::failed(link::request_notice(&f, failure.as_ref())))
+        }
     }
-
-    Ok(RegisterResponse {
-        success: true,
-        error: None,
-        connection_id: Some(outcome.connection_id),
-        session_id: Some(outcome.session_id),
-        expires_at: Some(outcome.expires_at),
-        key_protection: Some(outcome.binding.as_str().to_string()),
-        paired_without_session: false,
-    })
 }
 
 /// What the person is told when logout could not send the revoke.
@@ -799,9 +555,8 @@ const NOT_WIPED_NOR_SENT_NOTICE: &str = "This desktop's saved pairing could not 
 /// Result of [`logout`].
 #[derive(Debug, Serialize)]
 pub struct LogoutResponse {
-    /// The revoke was written to the message server connection. The vault
-    /// does not acknowledge it, so this does not confirm the device was
-    /// removed.
+    /// Whether the vault was told. Always false in this build: the device
+    /// engine has no message yet for a device to remove itself.
     pub revoke_sent: bool,
     /// The saved pairing is gone from this computer.
     pub local_wiped: bool,
@@ -857,98 +612,96 @@ fn wipe_local_pairing_with(
     }
 }
 
-/// Log out: tell the vault to revoke this device, then wipe the on-disk
-/// credential store and reset AppState. The local wipe happens even if the
-/// revoke can't be sent; the response says whether it was, so the UI never
-/// implies the vault was told when it wasn't.
+/// Log out: wipe the saved pairing (folder and keyring key) and drop the
+/// link. The vault is not told (see [`LogoutResponse::revoke_sent`]), and
+/// the response says so, so the UI never implies it was.
 #[tauri::command]
 pub async fn logout(state: State<'_, AppState>) -> Result<LogoutResponse, String> {
-    use crate::credential::store;
-    use crate::registration::pairing;
-
-    // With no known folder there is nothing to revoke from or wipe, and
-    // neither can be confirmed: both are reported as not done.
+    // With no known folder there is nothing to wipe, and that can't be
+    // confirmed: reported as not done.
     let config_dir = store::default_config_dir();
     if let Err(e) = &config_dir {
         log::warn!("logout: {}", e);
     }
-
-    // The vault may be unreachable or the creds may be unreadable: the
-    // local wipe still has to happen, and the response reports it.
-    let revoke_sent = match &config_dir {
-        Ok(dir) => match pairing::publish_revoke(dir).await {
-            Ok(()) => true,
-            Err(e) => {
-                log::warn!("device.revoke not sent (continuing with local wipe): {}", e);
-                false
-            }
-        },
-        Err(_) => false,
-    };
-
-    clear_logged_out_memory(&state).await;
-
-    // Wipe the config directory entirely — nothing left on disk — and the
-    // master key from the keyring too. A future pairing on this machine
-    // will mint a fresh key — a leaked disk image from an earlier install
-    // can't be decrypted under the new key.
-    let local_wiped = wipe_local_pairing(config_dir.as_deref().ok());
-
-    // #30: a pairing or Start New Session whose save ran just before the
-    // wipe may have set memory since the clear above. Clear it again; one
-    // that sets it after this sees the wipe and clears it itself.
-    clear_logged_out_memory(&state).await;
-
-    Ok(LogoutResponse {
-        revoke_sent,
-        local_wiped,
-        notice: logout_notice(revoke_sent, local_wiped).map(str::to_string),
-    })
+    Ok(log_out(&state, config_dir.as_deref().ok(), wipe_local_pairing).await)
 }
 
-/// End the current vault session immediately, server-side AND locally.
-///
-/// Unlike `logout` (which wipes the on-disk credential store and ends the
-/// desktop's pairing entirely), this preserves the pairing so the user can
-/// start a new session under the same connection without re-pairing on the
-/// phone. The flow is:
-///   1. Publish device.end-session to the vault — wipes the session key
-///      server-side, flips DeviceSession.Status to "expired", notifies the
-///      desktop via forApp.device.{conn}.ended.
-///   2. Locally expire the session: zero the connection key, clear
-///      credentials from memory, flip the local session state to expired
-///      so the UI routes to SessionExpired (where "Start New Session"
-///      restarts the session without re-pair).
+/// [`logout`]'s work, with the wipe passed in (tests keep the real key).
+async fn log_out(state: &AppState, config_dir: Option<&std::path::Path>, wipe: impl FnOnce(Option<&std::path::Path>) -> bool) -> LogoutResponse {
+    begin_reset(state);
+    state.publish(Snapshot::default());
+    // The link is dropped below, so stopping its refresh mid-operation
+    // leaves nothing in memory half done.
+    state.stop_refresh();
+    // The wipe first: from here, no save of a pairing or session started
+    // before can write (#30), even while the link is still held.
+    let local_wiped = wipe(config_dir);
+    drop(state.link.lock().await.take());
+    *state.is_registered.write().await = false;
+    state.publish(Snapshot::default());
+    finish_reset(state);
+    LogoutResponse { revoke_sent: false, local_wiped, notice: logout_notice(false, local_wiped).map(str::to_string) }
+}
+
+/// End this desktop's access session (§6.8, "End access": all of it, no
+/// session named), keeping the pairing so Start New Session needs no
+/// re-pair. The session stops being shown as live at once. `notice` says
+/// when the vault didn't confirm the end, or ended it only in part: the
+/// frontend shows "Session ended." only without one.
 #[tauri::command]
 pub async fn end_session(state: State<'_, AppState>) -> Result<EndSessionResponse, String> {
-    use crate::credential::store;
+    Ok(end_access(&state).await)
+}
 
-    // #30: first. If a log-out wipes the pairing from here on, the saved
-    // pairing isn't updated, even if a new one has been made since.
-    let since = store::wipe_epoch();
-
-    // The in-memory session ends at once, so nothing reports it as live
-    // while this waits for the lock or tells the vault.
-    clear_in_memory_session(&state).await;
-
-    // #33: no Start New Session runs while this does, and one started
-    // meanwhile waits until the end is done on disk and at the vault. A
-    // Start New Session that was running holds the lock until it
-    // finishes (up to its activation timeout), so memory is cleared again
-    // once the lock is ours: anything it put back is ended too.
-    let _session_op = state.session_op.lock().await;
-    clear_in_memory_session(&state).await;
-
-    // With no known folder there is no stored pairing to end or update.
-    let notice = match store::default_config_dir() {
-        Ok(config_dir) => end_session_on_disk(&config_dir, since).await,
-        Err(e) => {
-            log::warn!("end_session: {}; local reset only", e);
-            None
+async fn end_access(state: &AppState) -> EndSessionResponse {
+    begin_reset(state);
+    // Not live from here on, whatever the vault answers.
+    state.publish(state.snapshot().without_session());
+    let notice = {
+        // #33: no Start New Session runs while this does; one under way
+        // stops waiting (the reset above) and releases these.
+        let _session_op = state.session_op.lock().await;
+        let mut slot = state.link.lock().await;
+        // With the link locked, the refresh isn't mid-operation.
+        state.stop_refresh();
+        // A refresh that finished meanwhile may have shown it again.
+        state.publish(state.snapshot().without_session());
+        match slot.as_mut() {
+            None => Some(link::END_UNCONFIRMED_NOTICE.to_string()),
+            Some(l) => {
+                let result = l.end().await;
+                let notice = match &result {
+                    Ok(EndOutcome::Ended) => None,
+                    Ok(EndOutcome::Unconfirmed) => Some(link::END_UNCONFIRMED_NOTICE.to_string()),
+                    Ok(EndOutcome::Replaced) => Some(link::END_REPLACED_NOTICE.to_string()),
+                    Err(vettid_device::access::AccessError::EndUnconfirmed) => Some(link::END_UNCONFIRMED_NOTICE.to_string()),
+                    Err(e) => {
+                        log::warn!("end_session: not confirmed: {}", e);
+                        if l.session.access_end().is_some() {
+                            Some(link::END_NOT_SENT_NOTICE.to_string())
+                        } else {
+                            let failure = l.store.take_failure();
+                            Some(link::access_notice(e, failure.as_ref()))
+                        }
+                    }
+                };
+                if l.unlinked() {
+                    let l = slot.take().expect("checked above");
+                    Some(erase_unlinked(state, l).await)
+                } else {
+                    let now = chrono::Utc::now();
+                    state.publish(l.snapshot(now));
+                    // An end still waiting for its answer is sent again.
+                    if l.keep_refreshing(now) {
+                        state.start_refresh(false);
+                    }
+                    notice
+                }
+            }
         }
     };
-
-    Ok(EndSessionResponse { notice })
+    finish_reset(state);
+    EndSessionResponse { notice }
 }
 
 /// #43: a memory reset is starting; see [`AppState::resets_started`].
@@ -984,244 +737,16 @@ fn overtaken_by_reset(state: &AppState, mark: ResetMark) -> bool {
     mark.under_way || state.resets_started.load(std::sync::atomic::Ordering::SeqCst) != mark.started
 }
 
-/// #43: the vault ended this session (`session_update` expired or
-/// revoked), or its time ran out: the same reset as End session, so the
-/// key, the credentials, the listener and the connection go too, not only
-/// the session state. `revoked` keeps the session marked revoked rather
-/// than expired. Nothing on disk changes here; the vault-end path removes
-/// the session's live marker first (`end_session_from_vault_if_current`,
-/// #45).
-///
-/// It stops the listener and waits for it to end, so the listener's own
-/// handler must not await this: spawn it ([`end_session_from_vault_later`]).
-pub(crate) async fn end_session_from_vault(state: &AppState, revoked: bool) {
-    clear_in_memory_session(state).await;
-    if revoked {
-        state.session.write().await.revoke();
-    }
-}
-
-/// The session the credentials in memory are for, if any.
-pub(crate) async fn current_session_id(state: &AppState) -> Option<String> {
-    state.credentials.read().await.as_ref().map(|c| c.session_id.clone()).filter(|id| !id.is_empty())
-}
-
-/// [`end_session_from_vault`] for a message that named `session_id`: only
-/// if that is still the session in memory, checked while holding
-/// `session_op`, so End session and Start New Session can't swap it in
-/// between. A message about another session (an old one, after Start New
-/// Session) says nothing about the current one and changes nothing (#43).
-///
-/// #45: the session's live marker on disk goes too, if it still names
-/// that session, so the next unlock or launch doesn't treat it as live.
-pub(crate) async fn end_session_from_vault_if_current(state: &AppState, revoked: bool, session_id: &str) {
-    let config_dir = crate::credential::store::default_config_dir().ok();
-    end_session_from_vault_if_current_in(state, revoked, session_id, config_dir.as_deref()).await;
-}
-
-/// [`end_session_from_vault_if_current`] with the pairing's folder passed
-/// in (tests use a temporary one; never this machine's real folder).
-async fn end_session_from_vault_if_current_in(
-    state: &AppState,
-    revoked: bool,
-    session_id: &str,
-    config_dir: Option<&std::path::Path>,
-) {
-    let _session_op = state.session_op.lock().await;
-    if current_session_id(state).await.as_deref() != Some(session_id) {
-        log::info!("session_update for a session that isn't the current one; ignored");
-        return;
-    }
-    // #45: disk first, as End session does (#26), and only that session's
-    // marker: a new session's or pairing's stays. Never the pairing.
-    if let Some(dir) = config_dir {
-        // If the marker can't be removed, the session is still never live
-        // again in this run (the store records it as ended).
-        if let Err(e) = crate::credential::store::end_saved_session_if(dir, session_id) {
-            log::error!("vault ended the session, but its live marker couldn't be removed: {}", e);
-        }
-    }
-    end_session_from_vault(state, revoked).await;
-}
-
-/// [`end_session_from_vault_if_current`] on its own task, for callers that
-/// run inside the listener.
-pub(crate) fn end_session_from_vault_later(app: AppHandle, revoked: bool, session_id: String) {
-    tokio::spawn(async move {
-        let state = app.state::<AppState>();
-        end_session_from_vault_if_current(state.inner(), revoked, &session_id).await;
-    });
-}
-
-/// #40: stop the background listener, then disconnect, holding the NATS
-/// lock across both. A listener subscribes under that lock, so one spawned
-/// meanwhile either subscribed before (and is stopped here) or subscribes
-/// after, on a client that is no longer connected, and ends.
-async fn stop_listener_and_disconnect(state: &AppState) {
-    let mut nats = state.nats.lock().await;
-    crate::nats::listener::stop_listener(state).await;
-    nats.disconnect().await;
-}
-
-/// Log-out's memory reset: NATS, the connection key (zeroized), the
-/// credentials, unlocked and registered, and the session (revoked).
-async fn clear_logged_out_memory(state: &AppState) {
-    use zeroize::Zeroize;
-    begin_reset(state);
-    stop_listener_and_disconnect(state).await;
-    {
-        let mut key_guard = state.connection_key.write().await;
-        if let Some(ref mut key) = *key_guard {
-            key.zeroize();
-        }
-        *key_guard = None;
-    }
-    *state.credentials.write().await = None;
-    *state.is_unlocked.write().await = false;
-    *state.is_registered.write().await = false;
-    state.session.write().await.revoke();
-    finish_reset(state);
-}
-
-/// Drop the in-memory session: NATS, the connection key (zeroized), the
-/// credentials and the session state.
-async fn clear_in_memory_session(state: &AppState) {
-    use zeroize::Zeroize;
-    begin_reset(state);
-    stop_listener_and_disconnect(state).await;
-    {
-        let mut key_guard = state.connection_key.write().await;
-        if let Some(ref mut key) = *key_guard {
-            key.zeroize();
-        }
-        *key_guard = None;
-    }
-    *state.credentials.write().await = None;
-    *state.is_unlocked.write().await = false;
-    state.session.write().await.expire();
-    finish_reset(state);
-}
-
-/// What [`end_session`] tells the person. The session always ends in this
-/// run; `notice` is set when that couldn't be recorded on this computer,
-/// so the frontend shows it instead of "Session ended." (#26).
+/// What [`end_session`] tells the person: `notice` is set when the end
+/// isn't confirmed, or this desktop still has access, so the frontend
+/// shows it instead of "Session ended." (#26).
 #[derive(Debug, Serialize)]
 pub struct EndSessionResponse {
     pub notice: Option<String>,
 }
 
-/// The stored-pairing half of [`end_session`]: record on disk that the
-/// session ended, tell the vault, then clear the session fields in the
-/// saved pairing. Returns a notice if ending it couldn't be recorded.
-async fn end_session_on_disk(
-    config_dir: &std::path::Path,
-    since: crate::credential::store::WipeEpoch,
-) -> Option<String> {
-    use crate::credential::store;
-    use crate::registration::pairing;
-
-    let config_dir = config_dir.to_path_buf();
-
-    // #26: first, and needing no key: without the live marker the next
-    // launch treats the session as ended, even if the save below is
-    // refused (a folder that isn't private, an unreachable keyring).
-    // #30: if a log-out has wiped the pairing since this started, the
-    // pairing that ended is gone, and what is there now (if anything) was
-    // made after it: leave it, and its session at the vault, alone.
-    let marker_removed = match store::end_saved_session_since(&config_dir, since) {
-        Ok(()) => true,
-        Err(store::CredentialError::LoggedOutMeanwhile) => {
-            log::warn!("end_session: logged out meanwhile; nothing more to end");
-            // A pairing still there may be one the log-out failed to
-            // remove, with this session's marker: then the next launch
-            // could show it as open, so say so. It can't be told from a
-            // new pairing, so the notice errs that way.
-            return store::exists(&config_dir)
-                .then(|| store::SESSION_END_NOT_RECORDED_NOTICE.to_string());
-        }
-        Err(e) => {
-            log::error!("end_session: could not remove the live marker: {}", e);
-            false
-        }
-    };
-    let mut cleared_saved = false;
-
-    // Tell the vault to end the session. publish_end_session flushes
-    // before returning, within a deadline: on a clean return the
-    // end-session frame was written to the connection. That is not a
-    // confirmation from the vault. On error we still reset locally.
-    // #30: checked again: a log-out (and a new pairing) may have run
-    // since the marker was removed.
-    if store::wipe_epoch() != since {
-        log::warn!("end_session: logged out meanwhile; not telling the vault");
-        return None;
-    }
-    // #15: if loading it found a pairing that can't be opened (an earlier
-    // build's, now deleted and revoked), the person is told that, not
-    // only that the session ended.
-    let mut pairing_notice = None;
-    if let Err(e) = pairing::publish_end_session(&config_dir, "user_locked").await {
-        log::warn!("device.end-session publish failed (continuing with local reset): {}", e);
-        if matches!(
-            e,
-            crate::registration::flow::RegistrationError::OldBuildRevoked
-                | crate::registration::flow::RegistrationError::PairingUnreadable
-        ) {
-            pairing_notice = Some(e.to_string());
-        }
-    }
-
-    // Persist the session-end to disk. The device stays PAIRED — the
-    // device keypair, connection_key and NATS creds are untouched, so
-    // "Start New Session" needs no re-pair — but the session fields
-    // MUST be cleared here. get_session_info derives is_active purely
-    // from the on-disk session_expires_at, so leaving it set meant a
-    // relaunch reloaded a dead session: the desktop routed straight to
-    // the vault and every op hung because the vault no longer had it.
-    // #15: not if loading it above found a pairing that can't be opened:
-    // there is nothing to clear, and an earlier build's file that couldn't
-    // be deleted would only be revoked again.
-    if pairing_notice.is_some() {
-        return end_session_notice(pairing_notice, marker_removed, cleared_saved);
-    }
-    match pairing::load_saved(&config_dir).await {
-        Ok((mut creds, _)) => {
-            creds.session_id.clear();
-            creds.session_expires_at = 0;
-            creds.session_duration_seconds = 0;
-            // Update only: if a log-out wiped the pairing since it was
-            // loaded, nothing is written back (#28), and not over a new
-            // pairing made after that log-out either (#30).
-            if let Err(e) = store::save_existing(&config_dir, &creds, since) {
-                log::error!("end_session: failed to persist cleared session state: {}", e);
-            } else {
-                cleared_saved = true;
-                log::info!("end_session: on-disk session fields cleared (pairing preserved)");
-            }
-        }
-        Err(e) => log::warn!(
-            "end_session: could not load creds to clear on-disk session fields: {}", e
-        ),
-    }
-    end_session_notice(pairing_notice, marker_removed, cleared_saved)
-}
-
-/// What End session tells the person: a notice about the pairing itself
-/// first (#15), else whether the end was recorded (#26).
-fn end_session_notice(pairing_notice: Option<String>, marker_removed: bool, cleared_saved: bool) -> Option<String> {
-    if pairing_notice.is_some() {
-        return pairing_notice;
-    }
-    // The old session comes back at the next launch only if both failed.
-    if marker_removed || cleared_saved {
-        None
-    } else {
-        Some(crate::credential::store::SESSION_END_NOT_RECORDED_NOTICE.to_string())
-    }
-}
-
-/// Lock the session — clear credentials from memory.
-/// SECURITY: Zeroizes key material before dropping.
+/// Lock: drop the link from memory (its keys wipe themselves). The
+/// pairing stays saved; the next unlock opens it again.
 #[tauri::command]
 pub async fn lock(state: State<'_, AppState>) -> Result<bool, String> {
     lock_memory(&state).await;
@@ -1230,65 +755,38 @@ pub async fn lock(state: State<'_, AppState>) -> Result<bool, String> {
 
 /// [`lock`]'s work.
 async fn lock_memory(state: &AppState) {
-    use zeroize::Zeroize;
     begin_reset(state);
-
-    // #40: the listener, then NATS, under one lock; first, as in the other
-    // resets (#43), so nothing reconnects with what is cleared below.
-    stop_listener_and_disconnect(state).await;
-
-    // SECURITY: Zeroize connection key before clearing
-    {
-        let mut key_guard = state.connection_key.write().await;
-        if let Some(ref mut key) = *key_guard {
-            key.zeroize();
-        }
-        *key_guard = None;
-    }
-
-    // Clear credentials (ConnectionCredentials implements Zeroize on drop)
-    *state.credentials.write().await = None;
-    *state.is_unlocked.write().await = false;
-
-    // Reset session
-    state.session.write().await.expire();
+    state.publish(Snapshot::default());
+    // The link is dropped below: stopping its refresh mid-operation leaves
+    // nothing half done in memory (what is stored is as after a crash).
+    state.stop_refresh();
+    drop(state.link.lock().await.take());
+    state.publish(Snapshot::default());
     finish_reset(state);
 }
 
 /// Get current authentication/registration status.
 #[tauri::command]
 pub async fn get_status(state: State<'_, AppState>) -> Result<AuthStatus, String> {
-    let is_registered = *state.is_registered.read().await;
-    let is_unlocked = *state.is_unlocked.read().await;
-    let has_active_session = state.session.read().await.is_active();
+    let snap = state.snapshot();
+    let is_registered = *state.is_registered.read().await || snap.unlocked;
+    let config_dir = store::default_config_dir().ok();
 
-    // Also check on disk if not yet known
-    let is_registered = if !is_registered {
-        use crate::credential::store;
-        store::default_config_dir()
-            .map(|dir| store::exists(&dir))
-            .unwrap_or(false)
-    } else {
-        is_registered
-    };
+    // Also check on disk if not yet known: this build's pairing, or an
+    // earlier build's, which unlock removes with a notice.
+    let is_registered = is_registered
+        || config_dir.as_deref().is_some_and(|dir| device_store::exists(dir) || store::exists(dir));
 
     let fp = collect_device_fingerprint();
 
-    let key_protection = {
-        use crate::credential::store;
-        match store::default_config_dir() {
-            Ok(dir) => store::stored_key_protection(&dir),
-            // With no known folder nothing can have been saved.
-            Err(_) => "none",
-        }
-    }
-    .to_string();
+    // With no known folder nothing can have been saved.
+    let key_protection = config_dir.as_deref().map_or("none", device_store::stored_key_protection).to_string();
 
     Ok(AuthStatus {
         key_protection,
         is_registered,
-        is_unlocked,
-        has_active_session,
+        is_unlocked: snap.unlocked,
+        has_active_session: snap.active_at(chrono::Utc::now()),
         hostname: fp.hostname,
         platform: fp.platform,
         os_name: fp.os_name,
@@ -1348,63 +846,6 @@ mod tests {
         assert_eq!(machine_fingerprint_hex(), compute_machine_fingerprint_hex(&attrs));
     }
 
-    /// #15: End session passes on a notice about the pairing; otherwise it
-    /// speaks up only if the end couldn't be recorded at all.
-    #[test]
-    fn end_session_notice_prefers_the_pairing_notice() {
-        use crate::credential::store::{OLD_BUILD_REVOKED_NOTICE, SESSION_END_NOT_RECORDED_NOTICE};
-        let old = Some(OLD_BUILD_REVOKED_NOTICE.to_string());
-        assert_eq!(end_session_notice(old.clone(), true, true), old);
-        assert_eq!(end_session_notice(None, true, false), None);
-        assert_eq!(end_session_notice(None, false, true), None);
-        assert_eq!(end_session_notice(None, false, false), Some(SESSION_END_NOT_RECORDED_NOTICE.to_string()));
-    }
-
-    /// #40: logout's and End session's memory resets and lock each stop the
-    /// background listener: its task ends and the slot is empty.
-    #[tokio::test]
-    async fn logout_end_session_and_lock_stop_the_listener() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-        struct Held(Arc<AtomicBool>);
-        impl Drop for Held {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-        for which in ["logout", "end session", "lock"] {
-            let state = AppState::new();
-            let dropped = Arc::new(AtomicBool::new(false));
-            let held = Held(dropped.clone());
-            *state.listener_handle.lock().await = Some(tokio::spawn(async move {
-                let _held = held;
-                std::future::pending::<()>().await;
-            }));
-            match which {
-                "logout" => clear_logged_out_memory(&state).await,
-                "end session" => clear_in_memory_session(&state).await,
-                _ => lock_memory(&state).await,
-            }
-            assert!(dropped.load(Ordering::SeqCst), "{which}: the listener task ended");
-            assert!(state.listener_handle.lock().await.is_none(), "{which}: the slot is empty");
-        }
-    }
-
-    /// #43: every memory reset is counted as started and finished, so an
-    /// unlock that one overtook can tell.
-    #[tokio::test]
-    async fn every_reset_is_counted() {
-        use std::sync::atomic::Ordering::SeqCst;
-        let state = AppState::new();
-        clear_logged_out_memory(&state).await;
-        clear_in_memory_session(&state).await;
-        lock_memory(&state).await;
-        end_session_from_vault(&state, false).await;
-        assert_eq!(state.resets_started.load(SeqCst), 4);
-        assert_eq!(state.resets_finished.load(SeqCst), 4);
-        assert!(state.credentials.read().await.is_none());
-    }
-
     /// #43, M1: an unlock is overtaken by a reset that started after it
     /// did, and by one already under way when it started, but not by one
     /// that had finished before.
@@ -1425,134 +866,8 @@ mod tests {
         assert!(!overtaken_by_reset(&state, after), "one that finished before doesn't count");
     }
 
-    /// #43, M2: a session_update about another session (the old one, after
-    /// Start New Session) leaves the current session alone; one about the
-    /// current session ends it.
-    #[tokio::test]
-    async fn a_vault_end_for_another_session_changes_nothing() {
-        let state = AppState::new();
-        let creds = |id: &str| crate::credential::store::ConnectionCredentials {
-            connection_id: "conn".into(),
-            connection_key: vec![7u8; 32],
-            key_id: "key".into(),
-            device_private_key: vec![1u8; 32],
-            device_public_key: vec![2u8; 32],
-            vault_public_key: vec![3u8; 32],
-            message_space_token: "token".into(),
-            message_space_url: "tls://example.invalid:443".into(),
-            owner_guid: "owner".into(),
-            owner_name: String::new(),
-            session_id: id.into(),
-            session_expires_at: 1_900_000_000,
-            session_duration_seconds: 3600,
-        };
-        *state.credentials.write().await = Some(creds("new"));
-        *state.connection_key.write().await = Some([7u8; 32]);
-        end_session_from_vault_if_current_in(&state, false, "old", None).await;
-        assert_eq!(current_session_id(&state).await.as_deref(), Some("new"));
-        assert!(state.connection_key.read().await.is_some());
-
-        end_session_from_vault_if_current_in(&state, true, "new", None).await;
-        assert!(state.credentials.read().await.is_none());
-        assert!(state.connection_key.read().await.is_none());
-    }
-
-    /// #45: a vault end for the current session removes its live marker
-    /// from disk, and leaves the pairing; one for another session leaves
-    /// the marker.
-    #[tokio::test]
-    async fn a_vault_end_removes_only_that_sessions_marker() {
-        use crate::credential::store;
-        let base = tempfile::tempdir().unwrap();
-        let config_dir = base.path().join("vettid-desktop");
-        store::tests::save_pairing_with_live_session(&config_dir, "vs-c");
-        let state = AppState::new();
-        *state.credentials.write().await = Some(test_creds("vs-c"));
-
-        end_session_from_vault_if_current_in(&state, false, "other", Some(&config_dir)).await;
-        assert!(store::session_is_recorded(&config_dir, "vs-c"), "another session's end leaves it");
-
-        end_session_from_vault_if_current_in(&state, false, "vs-c", Some(&config_dir)).await;
-        assert!(!store::session_is_recorded(&config_dir, "vs-c"), "the marker is gone");
-        assert!(store::exists(&config_dir), "the pairing stays");
-        assert!(state.credentials.read().await.is_none());
-    }
-
-    /// #45: memory holds s1 but the marker on disk names a newer session
-    /// (s2): the vault end for s1 clears memory and leaves s2's marker.
-    #[tokio::test]
-    async fn a_vault_end_leaves_a_newer_sessions_marker() {
-        use crate::credential::store;
-        let base = tempfile::tempdir().unwrap();
-        let config_dir = base.path().join("vettid-desktop");
-        store::tests::save_pairing_with_live_session(&config_dir, "s2-newer");
-        let state = AppState::new();
-        *state.credentials.write().await = Some(test_creds("s1-older"));
-        end_session_from_vault_if_current_in(&state, false, "s1-older", Some(&config_dir)).await;
-        assert!(state.credentials.read().await.is_none());
-        assert!(store::session_is_recorded(&config_dir, "s2-newer"));
-    }
-
-    fn test_creds(session_id: &str) -> crate::credential::store::ConnectionCredentials {
-        crate::credential::store::ConnectionCredentials {
-            connection_id: "conn".into(),
-            connection_key: vec![7u8; 32],
-            key_id: "key".into(),
-            device_private_key: vec![1u8; 32],
-            device_public_key: vec![2u8; 32],
-            vault_public_key: vec![3u8; 32],
-            message_space_token: "token".into(),
-            message_space_url: "tls://example.invalid:443".into(),
-            owner_guid: "owner".into(),
-            owner_name: String::new(),
-            session_id: session_id.into(),
-            session_expires_at: 1_900_000_000,
-            session_duration_seconds: 3600,
-        }
-    }
-
-    /// #43, M2 race: the vault end waits for `session_op` (held here, as
-    /// Start New Session does); meanwhile a new session is installed. When
-    /// the end gets the lock, its session is gone, and it changes nothing.
-    #[tokio::test]
-    async fn a_vault_end_overtaken_by_a_new_session_changes_nothing() {
-        use std::sync::Arc;
-        let state = Arc::new(AppState::new());
-        let creds = |id: &str| crate::credential::store::ConnectionCredentials {
-            connection_id: "conn".into(),
-            connection_key: vec![7u8; 32],
-            key_id: "key".into(),
-            device_private_key: vec![1u8; 32],
-            device_public_key: vec![2u8; 32],
-            vault_public_key: vec![3u8; 32],
-            message_space_token: "token".into(),
-            message_space_url: "tls://example.invalid:443".into(),
-            owner_guid: "owner".into(),
-            owner_name: String::new(),
-            session_id: id.into(),
-            session_expires_at: 1_900_000_000,
-            session_duration_seconds: 3600,
-        };
-        *state.credentials.write().await = Some(creds("old"));
-        let session_op = state.session_op.lock().await;
-        let end = {
-            let state = state.clone();
-            tokio::spawn(async move { end_session_from_vault_if_current_in(&state, false, "old", None).await })
-        };
-        tokio::task::yield_now().await;
-        *state.credentials.write().await = Some(creds("new"));
-        *state.connection_key.write().await = Some([7u8; 32]);
-        drop(session_op);
-        end.await.unwrap();
-        assert_eq!(current_session_id(&state).await.as_deref(), Some("new"));
-        assert!(state.connection_key.read().await.is_some(), "the new session is untouched");
-    }
-
-    /// #43: a session the vault ended takes the key, the credentials and
-    /// the listener with it; a revoked one stays marked revoked.
-    #[tokio::test]
-    async fn a_session_the_vault_ended_is_cleared_from_memory() {
-        use crate::session::manager::SessionState;
+    /// A refresh task that records being dropped.
+    fn tracked_task(state: &AppState) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         struct Held(Arc<AtomicBool>);
@@ -1561,83 +876,119 @@ mod tests {
                 self.0.store(true, Ordering::SeqCst);
             }
         }
-        for revoked in [false, true] {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let held = Held(dropped.clone());
+        *state.refresh_task.lock().unwrap() = Some(tokio::spawn(async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        }));
+        dropped
+    }
+
+    /// Every session-ending path stops the background refresh: lock,
+    /// log-out and End session each end its task and empty the slot, and
+    /// nothing is shown as live or unlocked afterwards.
+    #[tokio::test]
+    async fn lock_logout_and_end_session_stop_the_refresh() {
+        use std::sync::atomic::Ordering;
+        for which in ["lock", "logout", "end session"] {
             let state = AppState::new();
-            *state.connection_key.write().await = Some([9u8; 32]);
-            *state.is_unlocked.write().await = true;
-            let dropped = Arc::new(AtomicBool::new(false));
-            let held = Held(dropped.clone());
-            *state.listener_handle.lock().await = Some(tokio::spawn(async move {
-                let _held = held;
-                std::future::pending::<()>().await;
-            }));
-            end_session_from_vault(&state, revoked).await;
-            assert!(state.connection_key.read().await.is_none());
-            assert!(!*state.is_unlocked.read().await);
-            assert!(dropped.load(Ordering::SeqCst), "the listener ended");
-            let want = if revoked { SessionState::Revoked } else { SessionState::Expired };
-            assert_eq!(state.session.read().await.state(), want);
+            let live = Snapshot {
+                unlocked: true,
+                session_id: Some("s".into()),
+                live_until: Some(chrono::Utc::now() + chrono::TimeDelta::hours(1)),
+                ..Default::default()
+            };
+            state.publish(live);
+            let dropped = tracked_task(&state);
+            match which {
+                "lock" => lock_memory(&state).await,
+                "logout" => {
+                    let r = log_out(&state, None, |_| false).await;
+                    assert!(!r.revoke_sent && !r.local_wiped);
+                    assert_eq!(r.notice.as_deref(), Some(NOT_WIPED_NOR_SENT_NOTICE));
+                }
+                _ => {
+                    // No link: the end can't be confirmed, and says so.
+                    let r = end_access(&state).await;
+                    assert_eq!(r.notice.as_deref(), Some(link::END_UNCONFIRMED_NOTICE));
+                }
+            }
+            tokio::task::yield_now().await;
+            assert!(dropped.load(Ordering::SeqCst), "{which}: the refresh task ended");
+            assert!(state.refresh_task.lock().unwrap().is_none(), "{which}: the slot is empty");
+            assert!(!state.snapshot().active_at(chrono::Utc::now()), "{which}: nothing live");
+            assert!(state.link.lock().await.is_none());
         }
     }
 
-    /// #43: the listener's handler can't await the reset (it would wait
-    /// for itself). A reset spawned from inside the listener, as the
-    /// handler does, stops it without hanging.
+    /// Log-out always says the vault wasn't told, and says the pairing is
+    /// gone only when the wipe confirms it.
     #[tokio::test]
-    async fn a_reset_spawned_from_inside_the_listener_stops_it() {
-        use std::sync::Arc;
-        let state = Arc::new(AppState::new());
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let state2 = state.clone();
-        let slot = state.listener_handle.clone();
-        let mut guard = slot.lock().await;
-        *guard = Some(tokio::spawn(async move {
-            let state3 = state2.clone();
-            tokio::spawn(async move {
-                end_session_from_vault(&state3, true).await;
-                let _ = done_tx.send(());
-            });
-            std::future::pending::<()>().await;
-        }));
-        drop(guard);
-        tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
-            .await
-            .expect("the reset finished")
-            .unwrap();
-        assert!(state.listener_handle.lock().await.is_none());
+    async fn logout_reports_what_happened() {
+        let state = AppState::new();
+        *state.is_registered.write().await = true;
+        let r = log_out(&state, None, |_| true).await;
+        assert!(!r.revoke_sent);
+        assert!(r.local_wiped);
+        assert_eq!(r.notice.as_deref(), Some(REVOKE_NOT_SENT_NOTICE));
+        assert!(!*state.is_registered.read().await);
+        assert_eq!(state.snapshot(), Snapshot::default());
     }
 
-    /// #40: a listener spawned while a reset is under way (an unlock
-    /// racing lock) never subscribes on the live client. The reset holds
-    /// the NATS lock from before its stop until after its disconnect, so a
-    /// listener tracked meanwhile is stopped while it waits for that lock.
-    /// With the stop outside the lock, the stop would find no listener and
-    /// this one would subscribe before the disconnect.
+    /// #43: every memory reset is counted as started and finished, so an
+    /// unlock that one overtook can tell.
     #[tokio::test]
-    async fn a_listener_spawned_during_a_reset_never_subscribes() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-        let state = Arc::new(AppState::new());
-        let subscribed = Arc::new(AtomicBool::new(false));
-        // Something else holds the NATS lock, so the reset queues for it.
-        let busy = state.nats.lock().await;
-        let reset = {
-            let state = state.clone();
-            tokio::spawn(async move { stop_listener_and_disconnect(&state).await })
+    async fn every_reset_is_counted() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let state = AppState::new();
+        lock_memory(&state).await;
+        log_out(&state, None, |_| false).await;
+        end_access(&state).await;
+        assert_eq!(state.resets_started.load(SeqCst), 3);
+        assert_eq!(state.resets_finished.load(SeqCst), 3);
+    }
+
+    /// The session info comes from the snapshot: live up to `live_until`
+    /// only, and "not unlocked" without a link.
+    #[test]
+    fn session_info_is_live_only_until_live_until() {
+        let now = chrono::Utc::now();
+        assert!(session_info(&Snapshot::default(), now).is_err());
+        let until = now + chrono::TimeDelta::seconds(90);
+        let snap = Snapshot {
+            unlocked: true,
+            device_id: Some("dev".into()),
+            session_id: Some("s1".into()),
+            expires_at: Some(until + chrono::TimeDelta::seconds(60)),
+            live_until: Some(until),
+            reachable: true,
         };
-        tokio::task::yield_now().await;
-        // A listener is spawned and tracked, and queues to subscribe.
-        let (state2, subscribed2) = (state.clone(), subscribed.clone());
-        *state.listener_handle.lock().await = Some(tokio::spawn(async move {
-            let _nats = state2.nats.lock().await;
-            subscribed2.store(true, Ordering::SeqCst);
-        }));
-        tokio::task::yield_now().await;
-        drop(busy);
-        reset.await.unwrap();
-        tokio::task::yield_now().await;
-        assert!(!subscribed.load(Ordering::SeqCst), "it never subscribed");
-        assert!(state.listener_handle.lock().await.is_none());
+        let info = session_info(&snap, now).unwrap();
+        assert!(info.is_active);
+        assert_eq!(info.expires_at, until.timestamp());
+        assert_eq!(info.seconds_remaining, 90);
+        assert_eq!(info.session_id, "s1");
+        let later = session_info(&snap, until + chrono::TimeDelta::seconds(1)).unwrap();
+        assert!(!later.is_active);
+        assert_eq!((later.expires_at, later.seconds_remaining, later.session_id.as_str()), (0, 0, ""));
+    }
+
+    /// A failed pairing claims nothing: the engine's own texts for a
+    /// rejection or a timeout, and plain ones otherwise.
+    #[test]
+    fn pairing_failures_have_plain_notices() {
+        use vettid_device::store::StoreError;
+        assert_eq!(pair_notice(&PairError::Rejected, None), vettid_device::display::REJECTED_ON_PHONE);
+        assert_eq!(pair_notice(&PairError::TimedOut, None), vettid_device::display::NOT_CONFIRMED);
+        assert_eq!(pair_notice(&PairError::Expired, None), link::PAIR_CODE_NOTICE);
+        assert_eq!(pair_notice(&PairError::AlreadyPaired, None), link::PAIR_ALREADY_NOTICE);
+        assert_eq!(pair_notice(&PairError::BadAnswer, None), link::PAIR_FAILED_NOTICE);
+        let store = PairError::Store(StoreError::Io);
+        assert_eq!(pair_notice(&store, Some(&CredentialError::KeyringUnavailable)), store::KEYRING_UNAVAILABLE_NOTICE);
+        assert_eq!(pair_notice(&store, Some(&CredentialError::LoggedOutMeanwhile)), store::LOGGED_OUT_MEANWHILE_NOTICE);
+        assert_eq!(pair_notice(&store, None), link::PAIR_FAILED_NOTICE);
+        assert_eq!(pair_notice(&PairError::NotCleared(Box::new(PairError::Rejected)), None), vettid_device::display::REJECTED_ON_PHONE);
     }
 
     /// The store step of log-out, without deleting the real keyring key.

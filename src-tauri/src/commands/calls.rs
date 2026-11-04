@@ -30,8 +30,11 @@ use serde::Serialize;
 use serde_json::json;
 use tauri::{AppHandle, State};
 
-use crate::nats::messages::DeviceOpResponse;
-use crate::nats::operations;
+// Every vault operation answers one plain "not available" error in this
+// build (see `unavailable`), so no call is placed, answered or ended at the
+// vault.
+use crate::commands::unavailable::OpResponse as DeviceOpResponse;
+use crate::commands::unavailable as operations;
 use crate::state::AppState;
 
 #[cfg(feature = "webrtc")]

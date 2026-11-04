@@ -1,9 +1,11 @@
 //! Master-key store for the on-disk credential blob.
 //!
-//! The desktop persists a small set of long-lived NATS credentials
-//! (`connection.enc`) so the user can resume their pairing on the next
-//! launch without re-pairing on the phone. That blob is encrypted with
-//! a 32-byte master key fetched from this module.
+//! The desktop persists its device state (`device.enc`, see
+//! `credential::device_store`) so the user can resume their pairing on the
+//! next launch without re-pairing on the phone. That blob is encrypted
+//! with a 32-byte master key fetched from this module, from the keyring
+//! only. (The earlier builds' `connection.enc` used the same key, with the
+//! machine-bound fallback below.)
 //!
 //! ## Key sources, in order
 //!
