@@ -20,9 +20,9 @@ use std::sync::{Arc, RwLock};
 use chrono::{DateTime, TimeDelta, Utc};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use vettid_device::access::{parse_request_answer, Access, AccessError, AccessEvent, EndOutcome, RequestOutcome, TYPE_REQUEST};
+use vettid_device::access::{Access, AccessError, AccessEvent, EndOutcome, RequestOutcome};
 use vettid_device::pairing::{Clock, SystemClock};
-use vettid_device::session::{Session, SessionError, REQUEST_TIMEOUT};
+use vettid_device::session::{Session, SessionError};
 use vettid_device::store::Persist;
 use vettid_device::transport::{Http, Transport};
 
@@ -393,15 +393,11 @@ impl<T: Transport, C: Clock> Link<T, C> {
         if self.refused() {
             return Err(RequestFailed::Access(AccessError::Session(SessionError::Refused)));
         }
-        // As Access::request (the vault's default length: nothing to check;
-        // the ordering rule settled first), keeping the answer's ts: a
-        // denial the vault sent before it is about an earlier request.
-        let answer = match self.access.settle(&mut self.session, &mut self.store).await {
-            Ok(_) => self.session.request(&mut self.store, TYPE_REQUEST, "{}", REQUEST_TIMEOUT).await.map_err(AccessError::from),
-            Err(e) => Err(e),
-        };
-        let (answered_at, outcome) = match answer {
-            Ok(a) => (a.ts, parse_request_answer(&a)),
+        // Access::request (the vault's default length: nothing to check; the
+        // ordering rule settled first), with the answer's ts: a denial the
+        // vault sent before it is about an earlier request.
+        let (answered_at, outcome) = match self.access.request_answered(&mut self.session, &mut self.store, None).await {
+            Ok((outcome, ts)) => (ts, Ok(outcome)),
             Err(e) => (Utc::now(), Err(e)),
         };
         let exp = match outcome {
