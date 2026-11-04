@@ -134,6 +134,26 @@ impl Wiping {
         Wiping { sealed_by: Some("legacy".into()), legacy: true }
     }
 
+    /// No device file, and no earlier format's pairing: nothing of a
+    /// pairing can be in any protector (a key left without its file is an
+    /// orphan, see `secret_service`).
+    pub(crate) fn nothing() -> Self {
+        Wiping { sealed_by: Some("none".into()), legacy: false }
+    }
+
+    /// Both together (a pending wipe's marker and what is on disk now):
+    /// the same protector, or one side with no file, keeps it; two
+    /// different ones are unknown. Legacy if either is.
+    pub(crate) fn and(self, other: Wiping) -> Wiping {
+        let sealed_by = match (self.sealed_by, other.sealed_by) {
+            (Some(a), Some(b)) if a == b => Some(a),
+            (Some(a), Some(b)) if b == "none" => Some(a),
+            (Some(a), Some(b)) if a == "none" => Some(b),
+            _ => None,
+        };
+        Wiping { sealed_by, legacy: self.legacy || other.legacy }
+    }
+
     /// Whether a file sealed by one of `ids` may be involved.
     pub(crate) fn may_be_sealed_by(&self, ids: &[&str]) -> bool {
         self.sealed_by.as_deref().is_none_or(|id| ids.contains(&id))
@@ -508,6 +528,12 @@ pub(crate) mod testing {
         assert!(!tpm.may_be_sealed_by(&["secret-service", "keyring"]));
         assert!(tpm.may_be_sealed_by(&["tpm"]));
         assert!(Wiping::legacy_file().legacy);
+        assert!(!Wiping::nothing().may_be_sealed_by(&["secret-service"]) && !Wiping::nothing().legacy);
+        let ss = Wiping { sealed_by: Some("secret-service".into()), legacy: false };
+        assert_eq!(ss.clone().and(Wiping::nothing()), ss);
+        assert_eq!(Wiping::nothing().and(ss.clone()), ss);
+        assert_eq!(ss.clone().and(tpm.clone()).sealed_by, None);
+        assert!(tpm.and(Wiping::legacy_file()).legacy);
     }
 
     #[test]

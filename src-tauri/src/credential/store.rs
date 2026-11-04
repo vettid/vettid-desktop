@@ -596,7 +596,19 @@ fn wipe_then(
 ) -> Result<(), CredentialError> {
     let _one_at_a_time = writer_lock();
     WIPES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let wiping = config_dir.map_or_else(super::protector::Wiping::unknown, super::device_store::what_is_sealed);
+    let on_disk = config_dir.map_or_else(super::protector::Wiping::unknown, super::device_store::what_is_sealed);
+    // A retry of a wipe that didn't finish knows what the first attempt
+    // removed from its marker; the marker is written before anything is
+    // removed.
+    let wiping = match config_dir.and_then(wipe_marker::read) {
+        Some(pending) => pending.and(on_disk),
+        None => on_disk,
+    };
+    if let Some(dir) = config_dir {
+        if let Err(e) = wipe_marker::write(dir, &wiping) {
+            log::warn!("Credential store: the wipe's marker wasn't written: {}", e);
+        }
+    }
     let wiped = match config_dir {
         Some(dir) => wipe_locked(dir),
         None => Err(CredentialError::NoConfigDir),
@@ -605,7 +617,126 @@ fn wipe_then(
     if let Err(e) = &keys {
         log::error!("Credential store: a key was not removed: {}", e);
     }
-    wiped.and(keys)
+    let done = wiped.and(keys);
+    // Last, only once every other part is confirmed gone.
+    if let (Ok(()), Some(dir)) = (&done, config_dir) {
+        if let Err(e) = wipe_marker::remove(dir) {
+            log::warn!("Credential store: the wipe's marker wasn't removed: {}", e);
+        }
+    }
+    done
+}
+
+/// The marker of a log-out's wipe that hasn't finished
+/// (`vettid-desktop.wipe-pending`, next to the pairing folder, which the
+/// wipe removes): what the device file's header said before it, so a retry
+/// after the file is gone still knows which protector kept a key. Holds no
+/// secret (a protector id and a flag), written `0600` and synced. It is not
+/// a pairing: nothing else reads it. Unix only: Windows' and macOS's
+/// protectors don't depend on it.
+mod wipe_marker {
+    use super::super::protector::Wiping;
+    use std::path::{Path, PathBuf};
+
+    const SUFFIX: &str = ".wipe-pending";
+    const TAG: &str = "vettid-desktop-wipe-v1";
+
+    pub(super) fn path(config_dir: &Path) -> Option<PathBuf> {
+        let mut name = config_dir.file_name()?.to_os_string();
+        name.push(SUFFIX);
+        Some(config_dir.with_file_name(name))
+    }
+
+    fn encode(w: &Wiping) -> String {
+        let id = match w.sealed_by.as_deref() {
+            Some(id) if !id.is_empty() && id != "?" && !id.contains(['\n', '\r']) => id,
+            _ => "?",
+        };
+        format!("{TAG}\n{id}\n{}\n", u8::from(w.legacy))
+    }
+
+    fn decode(text: &str) -> Wiping {
+        let mut lines = text.lines();
+        match (lines.next(), lines.next(), lines.next(), lines.next()) {
+            (Some(TAG), Some(id), Some(legacy @ ("0" | "1")), None) => {
+                Wiping { sealed_by: (id != "?").then(|| id.to_string()), legacy: legacy == "1" }
+            }
+            _ => Wiping::unknown(),
+        }
+    }
+
+    /// The pending wipe, if a marker is there; one that can't be read or
+    /// parsed is "nothing known".
+    #[cfg(unix)]
+    pub(super) fn read(config_dir: &Path) -> Option<Wiping> {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = path(config_dir)?;
+        match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path) {
+            Ok(f) => {
+                let mut text = String::new();
+                Some(match f.take(256).read_to_string(&mut text) {
+                    Ok(_) => decode(&text),
+                    Err(_) => Wiping::unknown(),
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => Some(Wiping::unknown()),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn write(config_dir: &Path, w: &Wiping) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = path(config_dir).ok_or_else(|| std::io::Error::other("no folder name"))?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        f.write_all(encode(w).as_bytes())?;
+        f.sync_all()?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(super) fn remove(config_dir: &Path) -> std::io::Result<()> {
+        let Some(path) = path(config_dir) else { return Ok(()) };
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn read(_: &Path) -> Option<Wiping> {
+        None
+    }
+    #[cfg(not(unix))]
+    pub(super) fn write(_: &Path, _: &Wiping) -> std::io::Result<()> {
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    pub(super) fn remove(_: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn the_marker_round_trips() {
+        for w in [Wiping::unknown(), Wiping::nothing(), Wiping::legacy_file(), Wiping { sealed_by: Some("secret-service".into()), legacy: false }] {
+            assert_eq!(decode(&encode(&w)), w);
+        }
+        assert_eq!(decode(&encode(&Wiping { sealed_by: Some("a\nb".into()), legacy: false })).sealed_by, None);
+        assert_eq!(decode("garbage"), Wiping::unknown());
+        assert_eq!(path(Path::new("/x/vettid-desktop")).unwrap(), Path::new("/x/vettid-desktop.wipe-pending"));
+    }
 }
 
 /// [`wipe`]'s work; the caller holds the writer lock.
@@ -1326,6 +1457,100 @@ pub(crate) mod tests {
         let keyring = CredentialError::NotProtected { by: "your computer's keyring" }.to_string();
         assert!(keyring.contains("sign out of your computer and back in"), "{keyring}");
         assert!(CredentialError::NoProtector.to_string().to_lowercase().contains("nothing was saved"));
+    }
+
+    /// A device file whose header names `protector` (nothing else of it is
+    /// read by a wipe).
+    #[cfg(target_os = "linux")]
+    fn sealed_by(dir: &Path, protector: &str) {
+        ensure_config_dir(dir).unwrap();
+        let header = format!(
+            r#"{{"header":{{"v":2,"protector":"{protector}","wrapped_key":"","nonce":"","created_at":0,"notice_shown":false}},"ciphertext":""}}"#
+        );
+        fs::write(dir.join(DEVICE_FILE), header).unwrap();
+    }
+
+    /// The real Linux protectors' removal, with the Secret Service
+    /// unreachable (no bus; nothing is connected to).
+    #[cfg(target_os = "linux")]
+    fn remove_unreachable(w: &super::super::protector::Wiping) -> Result<(), CredentialError> {
+        let (ss, legacy) = super::super::secret_service::unreachable_for_tests();
+        super::super::protector::Protectors::new(vec![Box::new(ss)], Box::new(legacy)).remove_external_keys(w).map_err(CredentialError::from)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn marker(dir: &Path) -> PathBuf {
+        wipe_marker::path(dir).unwrap()
+    }
+
+    /// A wipe that removed the file but not a key, retried: the marker says
+    /// what the file was (TPM), so the retry with the Secret Service
+    /// unreachable is Ok, and the marker goes last.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_partial_wipe_retried_is_ok() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        sealed_by(&dir, "tpm");
+        let first = wipe_then(Some(&dir), |_| Err(CredentialError::IoError("a key, this time".into())));
+        assert!(first.is_err());
+        assert!(!dir.exists(), "the file went");
+        assert!(marker(&dir).exists(), "the marker stays for the retry");
+        wipe_then(Some(&dir), |w| {
+            assert_eq!(w.sealed_by.as_deref(), Some("tpm"));
+            remove_unreachable(w)
+        })
+        .unwrap();
+        assert!(!marker(&dir).exists(), "removed once everything is gone");
+    }
+
+    /// No device file and no marker: nothing of a pairing; Ok with the
+    /// Secret Service unreachable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_file_and_no_marker_is_ok() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        wipe_then(Some(&dir), remove_unreachable).unwrap();
+        ensure_config_dir(&dir).unwrap();
+        wipe_then(Some(&dir), remove_unreachable).unwrap();
+        assert!(!marker(&dir).exists());
+    }
+
+    /// A file sealed by the Secret Service, with it unreachable: "not
+    /// removed", and still so on the retry (from the marker).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_secret_service_file_unreachable_is_not_removed_on_retry_too() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        sealed_by(&dir, "secret-service");
+        assert!(wipe_then(Some(&dir), remove_unreachable).is_err());
+        assert!(!dir.exists());
+        assert!(marker(&dir).exists());
+        assert!(wipe_then(Some(&dir), remove_unreachable).is_err(), "the marker remembers");
+        assert!(marker(&dir).exists());
+        // The marker isn't a pairing.
+        assert!(!exists(&dir));
+        assert!(!super::super::device_store::exists(&dir));
+    }
+
+    /// An earlier format's file on a computer with no Secret Service: its
+    /// retirement can't confirm the legacy key (LEGACY_NOT_REMOVED), and
+    /// the log-out that notice asks for, with nothing legacy left, is Ok.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_retirement_without_a_secret_service_then_log_out() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        ensure_config_dir(&dir).unwrap();
+        fs::write(dir.join(DEVICE_FILE), br#"{"version":1,"binding":"keyring","nonce":[7,7],"ciphertext":[9]}"#).unwrap();
+        let (ss, legacy) = super::super::secret_service::unreachable_for_tests();
+        let p = super::super::protector::Protectors::new(vec![Box::new(ss)], Box::new(legacy));
+        let retired = super::super::device_store::retire_legacy_with(&dir, &p);
+        assert!(matches!(retired, Err(CredentialError::LegacyNotRemoved)));
+        assert!(!dir.join(DEVICE_FILE).exists(), "the file itself went");
+        wipe_then(Some(&dir), remove_unreachable).unwrap();
     }
 
     /// No known folder, or a relative one, is refused: never the current

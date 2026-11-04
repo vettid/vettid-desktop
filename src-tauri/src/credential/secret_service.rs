@@ -25,16 +25,30 @@
 //! default store is the Secret Service (keyutils was only compiled in), so
 //! that entry can only ever have been written there.
 //!
-//! Before searching, every locked collection is unlocked (a prompt may
-//! appear); one that stays locked makes removal "not removed" and a load
-//! failing, never "no entry".
+//! Before searching, every locked collection is unlocked: one Unlock call
+//! for all of them, so one prompt, waited for at most `PROMPT_TIMEOUT_S`
+//! (120 s) in all, while log-out holds the store's writer lock. One that
+//! stays locked makes removal "not removed" and a load failing, never "no
+//! entry".
 //!
 //! When the Secret Service is absent (as far as this process can see: it
 //! may only be unreachable from here), removal succeeds only when nothing
 //! being wiped could have an item there: the device file's header, read
 //! before the wipe, names another protector, and no earlier format's
-//! pairing is involved. Otherwise it is "not removed". Only GNOME Keyring
-//! has been tried; KWallet is untested.
+//! pairing is involved; with no device file, and no marker of an
+//! interrupted wipe (`store`), there is nothing of a pairing. Otherwise it
+//! is "not removed". Only GNOME Keyring has been tried; KWallet is
+//! untested.
+//!
+//! What that leaves, disclosed: with the Secret Service unreachable, an
+//! item orphaned by a crash between `wrap` and the file's save, or a
+//! `master-key-v1` an earlier build failed to remove after deleting its
+//! file, stays in the keyring, and log-out reports nothing to remove. The
+//! header is read unauthenticated, so a forged one (`"protector":"tpm"`
+//! over a file the Secret Service sealed) makes log-out skip that item
+//! while the Secret Service is unreachable: a false "removed". Forging it
+//! needs write access to the `0700` folder, so this user or root, who can
+//! already read the unlocked keyring.
 //!
 //! Tests never reach this computer's Secret Service: a test that gets as
 //! far as connecting to it panics.
@@ -234,11 +248,22 @@ fn any_locked(ss: &Service) -> bool {
     }
 }
 
-/// Unlock every locked collection (the Secret Service may prompt), so that
-/// a search sees every item. Err if one stays locked.
+/// Unlock every locked collection, so that a search sees every item: one
+/// Unlock call for all of them, so one prompt wait, bounded by the
+/// connection's prompt timeout (`PROMPT_TIMEOUT_S` in all). Err if one
+/// stays locked.
 fn unlock_all_collections(ss: &Service) -> Result<(), dbus_secret_service::Error> {
+    let mut locked = Vec::new();
     for c in ss.get_all_collections()? {
-        c.ensure_unlocked()?;
+        if c.is_locked()? {
+            locked.push(Item::new(ss, c.path.clone()));
+        }
+    }
+    if !locked.is_empty() {
+        ss.unlock_all(&locked.iter().collect::<Vec<_>>())?;
+    }
+    if any_locked(ss) {
+        return Err(dbus_secret_service::Error::Locked);
     }
     Ok(())
 }
@@ -392,6 +417,13 @@ impl LegacyKey for LegacyEntry {
     fn remove_for(&self, wiping: &Wiping) -> Result<(), ProtectorError> {
         sweep(&self.bus, LEGACY_ENTRIES, "the earlier version's keyring key", wiping.legacy)
     }
+}
+
+/// The Secret Service protector and legacy entry with no session bus
+/// (absent; nothing is connected to), for other modules' tests.
+#[cfg(test)]
+pub(super) fn unreachable_for_tests() -> (SecretService, LegacyEntry) {
+    (SecretService { bus: BusSource::Fixed(Bus::None) }, LegacyEntry { bus: BusSource::Fixed(Bus::None) })
 }
 
 #[cfg(test)]

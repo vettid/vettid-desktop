@@ -374,7 +374,7 @@ impl Persist for DeviceStore {
 /// format's `master-key-v1` entry. `Ok(false)`: there is no such file
 /// (nothing else is touched, whatever is there). `Ok(true)`: both are
 /// confirmed gone. An error: something may be left, and the person is told.
-fn retire_legacy_with(dir: &Path, protectors: &Protectors) -> Result<bool, CredentialError> {
+pub(super) fn retire_legacy_with(dir: &Path, protectors: &Protectors) -> Result<bool, CredentialError> {
     let _one_at_a_time = store::writer_lock();
     // A file that can't be read isn't known to be the earlier format: the
     // load reports it.
@@ -423,16 +423,19 @@ pub fn exists(config_dir: &Path) -> bool {
 }
 
 /// What a wipe of `config_dir` removes, from the device file's header
-/// read unauthenticated (nothing is decrypted). No file, or one that can't
-/// be read or parsed: nothing is known ([`Wiping::unknown`]). An earlier
-/// format's file, or a `connection.enc` that may be there, involves the
-/// legacy entry.
+/// read unauthenticated (nothing is decrypted). A file that can't be read
+/// or parsed: nothing is known ([`Wiping::unknown`]). No file: nothing of
+/// a pairing ([`Wiping::nothing`]), unless a `connection.enc` may be there.
+/// An earlier format's file, or a `connection.enc`, involves the legacy
+/// entry. A wipe that was interrupted is known from its marker
+/// (`store::wipe_for_logout`), not from this.
 pub(crate) fn what_is_sealed(config_dir: &Path) -> Wiping {
+    let legacy_pairing = store::exists(config_dir);
     let raw = match read_file(config_dir) {
         Ok(Some(raw)) => raw,
-        _ => return Wiping::unknown(),
+        Ok(None) => return Wiping { legacy: legacy_pairing, ..Wiping::nothing() },
+        Err(_) => return Wiping::unknown(),
     };
-    let legacy_pairing = store::exists(config_dir);
     match serde_json::from_slice::<SealedFile>(&raw) {
         Ok(f) if f.header.v == FORMAT_VERSION => Wiping { sealed_by: Some(f.header.protector), legacy: legacy_pairing },
         Err(_) if is_legacy(&raw) => Wiping::legacy_file(),
@@ -853,7 +856,11 @@ pub(crate) mod tests {
     fn a_wipe_reads_what_the_file_was_sealed_with() {
         let base = tempfile::tempdir().unwrap();
         let dir = base.path().join("vettid-desktop");
-        assert_eq!(what_is_sealed(&dir), Wiping::unknown(), "no file: nothing known");
+        assert_eq!(what_is_sealed(&dir), Wiping::nothing(), "no file: nothing of a pairing");
+        store::ensure_config_dir(&dir).unwrap();
+        fs::write(dir.join("connection.enc"), b"old").unwrap();
+        assert_eq!(what_is_sealed(&dir), Wiping { legacy: true, ..Wiping::nothing() });
+        fs::remove_file(dir.join("connection.enc")).unwrap();
         store_in(&dir).save(STATE).unwrap();
         assert_eq!(what_is_sealed(&dir), Wiping { sealed_by: Some("test".into()), legacy: false });
         fs::write(dir.join("connection.enc"), b"old").unwrap();
