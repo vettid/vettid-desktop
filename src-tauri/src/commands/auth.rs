@@ -611,6 +611,10 @@ pub async fn extend_session(app: AppHandle, state: State<'_, AppState>) -> Resul
     let _session_op = state.session_op.lock().await;
     let mark = reset_mark(&state);
     // As in end_access: a refused device's mailbox rechecks aren't waited for.
+    // This reads the snapshot before taking the link, so a collect that has
+    // just begun (or a refusal found since) can still be waited out once.
+    // That doesn't fail open: the link is checked again under its lock, and
+    // a refused one sends nothing.
     if state.snapshot().refused {
         state.stop_refresh();
     }
@@ -869,7 +873,10 @@ async fn end_access(state: &AppState) -> EndSessionResponse {
     begin_reset(state);
     // A refused device's refresh is only collecting its mailbox, which can
     // hold the link for a poll (25 s): stop it first, so this doesn't wait.
-    // It is restarted below if still needed.
+    // It is restarted below if still needed. The snapshot is read before the
+    // link is taken, so this can still wait out one collect if the refusal
+    // was found after it; that doesn't fail open (the link is checked again
+    // under its lock, and a refused one sends nothing).
     if state.snapshot().refused {
         state.stop_refresh();
     }
