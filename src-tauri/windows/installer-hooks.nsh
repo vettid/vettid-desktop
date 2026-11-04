@@ -116,9 +116,17 @@ Var VettidWipe
 
 !macro NSIS_HOOK_POSTUNINSTALL
   ${If} $VettidWipe != ""
-    ; $2 = 1 if a pairing file is there now, or that can't be checked.
+    ; $2 = 1 if a pairing file is seen there now. An extra check, not the
+    ; confirmation (that is the wipe's own 10 or 11): FileExists reads a
+    ; folder it can't list as empty.
+    ;
+    ; The current user's local app data, from the known folder as the app
+    ; finds it (not the LOCALAPPDATA environment variable, which may be stale
+    ; or overridden). This is the end of Section Uninstall, so changing the
+    ; context here affects nothing after it.
     StrCpy $2 0
-    ReadEnvStr $1 LOCALAPPDATA
+    SetShellVarContext current
+    StrCpy $1 $LOCALAPPDATA
     ${If} $1 == ""
       StrCpy $2 1
       StrCpy $1 "%LOCALAPPDATA%"

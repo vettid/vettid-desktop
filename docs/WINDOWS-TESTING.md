@@ -167,8 +167,10 @@ also open its window) exits 0.
 2. The template: its own running-app check (which closes the app or stops the uninstall), then removes the
    program, shortcuts and registry entries.
 3. `NSIS_HOOK_POSTUNINSTALL`, unless the wipe was skipped. It looks for `device.enc`, `connection.enc` and any
-   `*.tmp-*` in `%LOCALAPPDATA%\vettid-desktop`, and for `vettid-desktop.exe` still in the install folder (the
-   app may still be running, and save again).
+   `*.tmp-*` in the current user's local app data folder (the known folder, as the app finds it, not the
+   `LOCALAPPDATA` variable), under `vettid-desktop`, and for `vettid-desktop.exe` still in the install folder
+   (the app may still be running, and save again). This is an extra check, not the confirmation: NSIS's
+   `FileExists` reads a folder it can't list as empty. The confirmation is the wipe's own 10 or 11.
    - Code 10 and nothing there: "This desktop was paired. Remove it on your phone too."
    - Code 11 and nothing there: nothing is shown.
    - Anything else (code 20, 0, any other code, the program not starting, or a file there): the uninstaller's
@@ -182,8 +184,9 @@ also open its window) exits 0.
 - The "paired" message can show when the folder couldn't be read before the wipe (counted as "may be
   paired"), but the wipe then removed it cleanly. That errs on the safe side: the person is told to check the
   phone.
-- If the uninstall stops at the template's own app check (step 2), the wipe has already run, but nothing is
-  shown about it.
+- If the template's own app check (step 2) is cancelled or fails (the app was started again after the
+  wipe), the uninstall stops there and step 3 doesn't run. The wipe has already run, but the person sees
+  neither message, only the template's "is running" one; the exit code is non-zero.
 - If NSIS ever ran a real uninstall in place (say, if it couldn't copy itself to `%TEMP%`), the hook would
   keep the pairing and say nothing. Not found: the manual doesn't say what NSIS does then, and the NSIS
   download here has no source for the uninstaller's start-up.
