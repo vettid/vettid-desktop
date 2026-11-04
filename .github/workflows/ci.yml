@@ -40,7 +40,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config libssl-dev \
             libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
-            libxdo-dev libdbus-1-dev
+            libxdo-dev libdbus-1-dev libtss2-dev
       - name: rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
@@ -54,6 +54,24 @@ jobs:
           npm run build
       - name: cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      # The Linux protectors (#13) against a software TPM and a session bus
+      # with no Secret Service. These tests are #[ignore]d (they need swtpm
+      # and dbus-daemon), so they are named here and run explicitly; the
+      # count check fails the step if any of them is renamed or skipped.
+      - name: TPM and Secret Service tests (swtpm, dbus-daemon)
+        shell: bash
+        run: |
+          sudo apt-get install -y --no-install-recommends swtpm dbus-daemon
+          tests=(
+            credential::tpm::tests::tpm_round_trip_against_swtpm
+            credential::tpm::tests::tpm_uses_the_persistent_srk_when_there
+            credential::tpm::tests::tpm_a_blob_from_another_tpm_wont_open
+            credential::tpm::tests::tpm_an_owner_auth_value_is_failing
+            credential::device_store::tests::linux_round_trip_through_the_tpm
+            credential::secret_service::tests::a_bus_without_a_secret_service_is_absent
+          )
+          cargo test --manifest-path src-tauri/Cargo.toml --locked -p vettid-desktop --lib -- --ignored --exact "${tests[@]}" | tee ignored.log
+          grep -q "test result: ok. ${#tests[@]} passed" ignored.log
       # The messaging crate's clippy.toml disallows the HPKE functions that
       # take caller randomness outside its tests; -D warnings makes a use
       # an error.

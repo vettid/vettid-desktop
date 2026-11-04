@@ -877,6 +877,45 @@ pub(crate) mod tests {
         assert_eq!(format!("{s:?}"), "DeviceStore(..)", "nor with a data key in memory");
     }
 
+    /// Linux: the whole store through the real TPM protector, against a
+    /// software TPM (the legacy entry is the test one, so no Secret Service
+    /// is touched). Needs swtpm; CI runs it by name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs swtpm; CI runs it"]
+    fn linux_round_trip_through_the_tpm() {
+        use super::super::tpm::tests::Swtpm;
+        let swtpm = Swtpm::start();
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("vettid-desktop");
+        let b = Arc::new(Behaviour::default());
+        let tpm = || Protectors::new(vec![Box::new(swtpm.protector())], Box::new(testing::TestLegacy(b.clone())));
+        DeviceStore::with_protectors(&dir, None, tpm()).save(STATE).unwrap();
+        assert_eq!(stored_key_protection(&dir), KeyProtection { protector: "tpm", bound: true });
+        let good = read_sealed(&dir);
+        assert!(!good.header.wrapped_key.is_empty());
+        assert_eq!(DeviceStore::with_protectors(&dir, None, tpm()).load().unwrap().as_deref().map(|v| &v[..]), Some(STATE));
+        // A changed sealed object: the TPM refuses it, the file is kept.
+        let mut f = SealedFile { header: good.header.clone(), ciphertext: good.ciphertext.clone() };
+        let mut w = B64.decode(&f.header.wrapped_key).unwrap();
+        let last = w.len() - 1;
+        w[last] ^= 1;
+        f.header.wrapped_key = B64.encode(w);
+        write_sealed(&dir, &f);
+        let mut s = DeviceStore::with_protectors(&dir, None, tpm());
+        assert_eq!(s.load(), Err(StoreError::Corrupt));
+        assert!(matches!(s.take_failure(), Some(CredentialError::Unreadable)));
+        assert!(exists(&dir));
+        // The clear: the file, and the (test) legacy entry; the TPM keeps
+        // nothing outside the file.
+        write_sealed(&dir, &good);
+        let mut s = DeviceStore::with_protectors(&dir, None, tpm());
+        assert!(s.load().unwrap().is_some());
+        s.clear().unwrap();
+        assert!(!exists(&dir));
+        assert_eq!(Behaviour::count(&b.legacy_removes), 1);
+    }
+
     /// Windows: the whole store through the real DPAPI protector (DPAPI
     /// keeps no state; the legacy entry is the test one, so the real
     /// Credential Manager is not touched).
