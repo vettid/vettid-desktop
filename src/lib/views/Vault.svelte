@@ -28,6 +28,10 @@
   let secretsCount = $state<number | null>(null);
   let walletsCount = $state<number | null>(null);
   let dataCount = $state<number | null>(null);
+  // Why a tab's count could not be loaded (the backend's text), shown at
+  // the tab. '' : no error. The count itself stays hidden, never 0.
+  let secretsCountError = $state('');
+  let walletsCountError = $state('');
   // Header-load flag — flips true once profile.get has come back so
   // the tab content (and especially PersonalData's own fetch) stays
   // un-mounted until the header is rendered. Profile-first was the
@@ -53,6 +57,8 @@
   async function loadProfile() {
     if (session.state !== 'active') return;
     errorMessage = '';
+    secretsCountError = '';
+    walletsCountError = '';
     try {
       const snap: any = await invoke('get_vault_snapshot');
       if (snap?.success && snap?.data) {
@@ -104,10 +110,9 @@
         invoke<any>('list_wallets').catch((e) => ({ success: false, error: String(e) })),
       ]).then(([secretsResp, walletsResp]) => {
         // A count that could not be loaded stays hidden (never 0); the
-        // backend's text is shown with the other load errors.
-        for (const r of [secretsResp, walletsResp]) {
-          if (!r?.success && !errorMessage) errorMessage = r?.error ?? 'Failed to load vault';
-        }
+        // backend's text is shown at its tab.
+        secretsCountError = secretsResp?.success ? '' : String(secretsResp?.error ?? '');
+        walletsCountError = walletsResp?.success ? '' : String(walletsResp?.error ?? '');
         // Vault returns the list as `data.secrets`, not `data.items` —
         // the older key was a stale guess.
         if (secretsResp?.success && secretsResp?.data?.secrets) {
@@ -199,6 +204,10 @@
           <span class="tab-count">{secretsCount}</span>
         {:else if tab.id === 'wallets' && walletsCount !== null}
           <span class="tab-count">{walletsCount}</span>
+        {:else if tab.id === 'secrets' && secretsCountError}
+          <span class="tab-count tab-count-error" title={secretsCountError}>!</span>
+        {:else if tab.id === 'wallets' && walletsCountError}
+          <span class="tab-count tab-count-error" title={walletsCountError}>!</span>
         {/if}
       </button>
     {/each}
@@ -307,6 +316,9 @@
     border-radius: 999px;
     background: rgba(255, 255, 255, 0.06);
     color: var(--text-muted);
+  }
+  .tab-count-error {
+    color: var(--error);
   }
   .tab.active .tab-count {
     background: var(--accent-muted);
