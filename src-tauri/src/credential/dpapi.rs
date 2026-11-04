@@ -173,7 +173,7 @@ pub(crate) const DOMAIN_NOTICE: &str =
 
 /// NEW TEXT (owner approval needed): Settings, when the profile roams.
 pub(crate) const ROAMING_NOTICE: &str =
-    "Your Windows profile roams. With a copy of the saved pairing file, a copy of your profile and your password can open it on another computer.";
+    "Your Windows profile roams. Someone with a copy of the saved pairing file, a copy of your profile and your password could open it on another computer.";
 
 impl Reach {
     /// This account's reach. SECURITY: a check that fails counts as false
