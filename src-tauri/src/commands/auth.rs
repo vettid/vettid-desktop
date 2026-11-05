@@ -733,9 +733,10 @@ fn extend_response(
         _ if overtaken => RegisterResponse::failed(link::REQUEST_STOPPED_NOTICE),
         Ok(()) if snap.active_at(now) => RegisterResponse::live(snap),
         Ok(()) => RegisterResponse::failed(link::ACCESS_NOT_CONFIRMED_NOTICE),
-        Err(link::RequestFailed::TooSoon(at)) => RegisterResponse {
-            retry_at: link::too_soon_retry_at(at, now).map(|t| t.timestamp()),
-            ..RegisterResponse::failed(link::request_notice(&link::RequestFailed::TooSoon(at), failure))
+        // One `now` for both, so the time and the text agree (#83).
+        Err(link::RequestFailed::TooSoon(at)) => match link::too_soon_retry_at(at, now) {
+            Some(t) => RegisterResponse { retry_at: Some(t.timestamp()), ..RegisterResponse::failed(link::REQUEST_TOO_SOON_NOTICE) },
+            None => RegisterResponse::failed(link::REQUEST_TOO_SOON_NOW_NOTICE),
         },
         Err(f) => RegisterResponse::failed(link::request_notice(&f, failure)),
     }
