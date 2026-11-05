@@ -8,6 +8,13 @@ import type { Connection } from '../types';
  */
 export const selectedConnectionStore: Writable<Connection | null> = writable(null);
 
+/**
+ * True while the pairing view holds a pairing under way: from Connect until
+ * the person leaves its result (Continue or Try Again). Routing leaves the
+ * pairing view alone meanwhile (#79). Set only by the pairing view.
+ */
+export const pairingHeld: Writable<boolean> = writable(false);
+
 export function clearSelectedConnection(): void {
     selectedConnectionStore.set(null);
 }

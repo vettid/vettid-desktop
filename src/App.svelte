@@ -9,6 +9,8 @@
   import { initVaultListeners } from './lib/stores/vault';
   import { initNotifications } from './lib/notifications';
   import { resetSecretsUnlock } from './lib/stores/secrets';
+  import { pairingHeld } from './lib/stores/navigation';
+  import { nextView } from './lib/routing.js';
 
   import Pairing from './lib/views/Pairing.svelte';
   import SessionExpired from './lib/views/SessionExpired.svelte';
@@ -125,30 +127,15 @@
     // pre-query 'inactive' placeholder and flash the pairing screen.
     if (!stateResolved) return;
 
-    if (sessionState.state === 'active') {
-      // Transition out of pre-session takeovers (loading / pairing /
-      // expired) → land on Connections, the default destination.
-      // Already on a real destination → stay.
-      if (currentView === 'loading' || currentView === 'pairing' || currentView === 'expired') {
-        currentView = 'connections';
-      }
-    } else if (sessionState.state === 'expired' || sessionState.state === 'suspended') {
-      // Session ran out (or got revoked from another device). Route
-      // to the Start-New-Session takeover. Don't yank the user out
-      // of Settings — they might be reading hostname info.
-      if (currentView !== 'settings') currentView = 'expired';
-    } else if (sessionState.state === 'revoked') {
-      // Hard revoke — credentials no longer valid; user has to
-      // re-pair. Settings stays accessible so the user can
-      // logout + restart cleanly.
-      if (currentView !== 'settings') currentView = 'pairing';
-    } else if (sessionState.state === 'inactive') {
-      if (isRegistered) {
-        if (currentView !== 'settings') currentView = 'expired';
-      } else {
-        currentView = 'pairing';
-      }
-    }
+    // The rule is in lib/routing.js (tested there). A pairing under way
+    // keeps the pairing view (#79).
+    const next = nextView({
+      current: currentView,
+      session: sessionState.state,
+      isRegistered,
+      pairingHeld: $pairingHeld,
+    });
+    if (next !== currentView) currentView = next;
 
     // Any non-active state means the prior unlock grant (if any) is
     // meaningless — clear the local mirror so the chip doesn't show
@@ -161,6 +148,8 @@
 
   /** Session pill click — routes per the state. See plan §1 table. */
   function onSessionPillClick() {
+    // #79: a pairing under way isn't left by the top bar either.
+    if ($pairingHeld) return;
     switch (sessionState.state) {
       case 'active':
         currentView = 'session-detail';
@@ -182,6 +171,7 @@
   }
 
   function onSettingsClick() {
+    if ($pairingHeld) return;
     currentView = currentView === 'settings' ? defaultDestination() : 'settings';
   }
 
@@ -199,7 +189,7 @@
    * active session — the same rule the rail itself follows.
    */
   function handleKeydown(e: KeyboardEvent) {
-    if (!stateResolved) return;
+    if (!stateResolved || $pairingHeld) return;
     if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey) return;
     switch (e.key) {
       case '1':
@@ -224,7 +214,8 @@
   // The rail is only useful when there's an active session — the
   // pre-session takeovers hide it to keep the user's attention on
   // the single thing they need to do.
-  let railVisible = $derived(sessionState.state === 'active');
+  // Hidden too while a pairing is held (#79): nothing leaves it.
+  let railVisible = $derived(sessionState.state === 'active' && !$pairingHeld);
 
 </script>
 

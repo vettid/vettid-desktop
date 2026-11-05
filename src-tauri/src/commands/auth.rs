@@ -13,6 +13,9 @@ use vettid_device::transport::Http;
 #[derive(Debug, Serialize)]
 pub struct AuthStatus {
     pub is_registered: bool,
+    /// A pairing is waiting for the phone (#79): a pairing view that
+    /// didn't start it (after a reload) says so instead of the code form.
+    pub pairing_under_way: bool,
     pub is_unlocked: bool,
     pub has_active_session: bool,
     // Device-identity fields surfaced in the Settings view so the
@@ -103,6 +106,10 @@ pub struct PairingSasEvent {
 /// owner's phone is being asked.
 pub const ACCESS_REQUESTED_EVENT: &str = "session:requested";
 
+/// A second Connect while a pairing still waits for the phone (#79).
+const PAIR_UNDER_WAY_NOTICE: &str =
+    "This desktop is still waiting for your phone to approve a pairing. Approve or reject it on your phone first.";
+
 /// What a failed pairing tells the person. The SAS mismatch and the
 /// timeout keep the engine's own texts (`vettid_device::display`).
 fn pair_notice(e: &PairError, store: Option<&CredentialError>) -> String {
@@ -137,7 +144,11 @@ pub async fn register(
     let since = store::wipe_epoch();
     let mark = reset_mark(&state);
     // Review MEDIUM 3: an unlock meanwhile leaves the device store alone.
-    let _pairing = PairingUnderWay::new(&state.pairing);
+    // #79: and a second pairing waits for this one to end.
+    let Some(_pairing) = PairingUnderWay::only(&state.pairing) else {
+        log::warn!("register: refused, a pairing is already under way");
+        return Ok(RegisterResponse::failed(PAIR_UNDER_WAY_NOTICE));
+    };
     let config_dir = store::default_config_dir().map_err(|e| e.to_string())?;
     // Checked before pairing starts, so a folder another account can open,
     // or a protector that fails or isn't there (#13), is refused before the
@@ -500,6 +511,15 @@ impl<'a> PairingUnderWay<'a> {
     fn new(n: &'a std::sync::atomic::AtomicUsize) -> Self {
         n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         PairingUnderWay(n)
+    }
+
+    /// Counted only if no other pairing is under way (#79): two at once
+    /// would race over the pending state on disk (`pairing::start`
+    /// removes an earlier pending one).
+    fn only(n: &'a std::sync::atomic::AtomicUsize) -> Option<Self> {
+        use std::sync::atomic::Ordering::SeqCst;
+        // From 0 to 1 only: a refused call never touches the count.
+        n.compare_exchange(0, 1, SeqCst, SeqCst).ok().map(|_| PairingUnderWay(n))
     }
 }
 
@@ -1020,17 +1040,27 @@ async fn lock_memory(state: &AppState) {
     finish_reset(state);
 }
 
+/// Whether `get_status` reports this desktop as paired: known in memory
+/// (`register` confirmed it, or unlock opened it), or else a pairing on
+/// disk: this build's or an earlier build's, which unlock removes with a
+/// notice. Not while a pairing is under way (`pairings` > 0, #79): its
+/// pending `device.enc` is not a pairing until the vault's `device.paired`,
+/// and `register` itself reports the outcome.
+fn registered(known: bool, pairings: usize, on_disk: impl FnOnce() -> bool) -> bool {
+    known || (pairings == 0 && on_disk())
+}
+
 /// Get current authentication/registration status.
 #[tauri::command]
 pub async fn get_status(state: State<'_, AppState>) -> Result<AuthStatus, String> {
     let snap = state.snapshot();
-    let is_registered = *state.is_registered.read().await || snap.unlocked;
     let config_dir = store::default_config_dir().ok();
-
-    // Also check on disk if not yet known: this build's pairing, or an
-    // earlier build's, which unlock removes with a notice.
-    let is_registered = is_registered
-        || config_dir.as_deref().is_some_and(|dir| device_store::exists(dir) || store::exists(dir));
+    let pairings = state.pairing.load(std::sync::atomic::Ordering::SeqCst);
+    let is_registered = registered(
+        *state.is_registered.read().await || snap.unlocked,
+        pairings,
+        || config_dir.as_deref().is_some_and(|dir| device_store::exists(dir) || store::exists(dir)),
+    );
 
     let fp = collect_device_fingerprint();
 
@@ -1044,6 +1074,7 @@ pub async fn get_status(state: State<'_, AppState>) -> Result<AuthStatus, String
         key_bound: protection.bound,
         key_notices: device_store::protection_notices(protection).into_iter().map(str::to_string).collect(),
         is_registered,
+        pairing_under_way: pairings > 0,
         is_unlocked: snap.unlocked,
         has_active_session: snap.active_at(chrono::Utc::now()),
         hostname: fp.hostname,
@@ -1327,6 +1358,37 @@ mod tests {
         let r = tokio::time::timeout(std::time::Duration::from_secs(1), begin_opening(&pairing, &opening)).await;
         assert!(r.expect("not waited").is_none());
         drop(counted);
+    }
+
+    /// #79: a second pairing is refused while one is under way, and the
+    /// first's count is untouched by the refusal.
+    #[test]
+    fn only_one_pairing_at_a_time() {
+        let n = std::sync::atomic::AtomicUsize::new(0);
+        let first = PairingUnderWay::only(&n).expect("the first is counted");
+        assert!(PairingUnderWay::only(&n).is_none(), "a second is refused");
+        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 1, "the refusal left no count");
+        drop(first);
+        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(PairingUnderWay::only(&n).is_some(), "after it, a new one may start");
+    }
+
+    /// #79: while a pairing is under way, its pending `device.enc` doesn't
+    /// count as a pairing (the disk isn't even read); a confirmed one
+    /// always does.
+    #[test]
+    fn a_pairing_under_way_is_not_reported_as_paired() {
+        let read = std::cell::Cell::new(false);
+        let on_disk = || {
+            read.set(true);
+            true
+        };
+        assert!(!registered(false, 1, on_disk), "pending, not paired");
+        assert!(!read.get(), "the disk isn't read while pairing");
+        assert!(!registered(false, 2, || true));
+        assert!(registered(false, 0, || true), "a saved pairing, no pairing under way");
+        assert!(!registered(false, 0, || false));
+        assert!(registered(true, 1, || false), "register confirmed it, still finishing");
     }
 
     /// LOW 11: an earlier build's pairing goes whenever it is there; the
