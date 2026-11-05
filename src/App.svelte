@@ -214,7 +214,8 @@
   // The rail is only useful when there's an active session — the
   // pre-session takeovers hide it to keep the user's attention on
   // the single thing they need to do.
-  let railVisible = $derived(sessionState.state === 'active');
+  // Hidden too while a pairing is held (#79): nothing leaves it.
+  let railVisible = $derived(sessionState.state === 'active' && !$pairingHeld);
 
 </script>
 
