@@ -56,6 +56,13 @@ pub fn run() {
                     let _ = handle.emit(link::NOTICE_EVENT, notice);
                 });
                 *app.state::<AppState>().notify.write().unwrap_or_else(|p| p.into_inner()) = Some(tell);
+                // #77: a change of the vault's state, or of whether a session
+                // is live, reaches the window at once as `vault:changed`.
+                let handle = app.handle().clone();
+                let changed: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+                    let _ = handle.emit(link::CHANGED_EVENT, ());
+                });
+                *app.state::<AppState>().changed.write().unwrap_or_else(|p| p.into_inner()) = Some(changed);
             }
             // Compute the device fingerprint now, on a background
             // thread. Hashing the executable is slow on a debug build;
@@ -83,6 +90,7 @@ pub fn run() {
             auth::extend_session,
             auth::end_session,
             auth::get_session_info,
+            auth::check_vault,
             auth::get_status,
             // Vault commands — independent
             vault::list_connections,

@@ -631,6 +631,13 @@ pub struct SessionInfoResponse {
     /// The refresh settled a stored end without that confirmation: what to
     /// tell the person instead.
     pub end_notice: Option<String>,
+    /// The vault's lock and hold as of now (VAULT-LOCK-PLAN §3.1, §3.3):
+    /// always [`Snapshot::vault_at`], so a stored Open past its
+    /// confirmation is Unknown.
+    pub vault: link::VaultView,
+    /// The snapshot's publish counter ([`Snapshot::seq`]): the frontend
+    /// applies a read only if this isn't older than the last it applied.
+    pub seq: u64,
 }
 
 /// What the frontend polls (cheap, no network) to drive the expiry UI:
@@ -666,7 +673,44 @@ fn session_info(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> Result<S
             // No outcome seen here: not confirmed, if there was an end at all.
             None => snap.end_seen.then(|| link::END_UNCONFIRMED_NOTICE.to_string()),
         },
+        vault: snap.vault_at(now),
+        seq: snap.seq,
     })
+}
+
+/// The window gained focus (VAULT-LOCK-PLAN §3.1, "reads `vault.status` on
+/// wake and when the window gains focus"): the frontend calls this, then
+/// reads `get_session_info`. True if it read the status.
+#[tauri::command]
+pub async fn check_vault(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(check_vault_now(&state).await)
+}
+
+/// [`check_vault`]: a sleep the refresh loop's marks show is taken as a
+/// resume ([`Link::focused`]), and if the vault's word is old (or a read
+/// is asked for) the link refreshes: `vault.status`, and a stored
+/// unanswered end settled (#80), as the background refresh does. Then the
+/// snapshot is published. The refresh loop is left as it is: its schedule
+/// and its backoff stay (lead review). Not while an operation holds the
+/// link (a request waiting for the phone reads the vault itself), nor for
+/// a refused device.
+pub(crate) async fn check_vault_now(state: &AppState) -> bool {
+    let mark = reset_mark(state);
+    let Ok(mut slot) = state.link.try_lock() else { return false };
+    let Some(link) = slot.as_mut() else { return false };
+    if !link.focus_read().await {
+        return false;
+    }
+    if link.unlinked() {
+        let link = slot.take().expect("checked above");
+        let notice = erase_unlinked(state, link).await;
+        state.shared().tell(&notice);
+        return true;
+    }
+    if !overtaken_by_reset(state, mark) {
+        state.publish(link.snapshot(chrono::Utc::now()));
+    }
+    true
 }
 
 /// Start New Session: ask the owner's phone for an access session
@@ -1275,7 +1319,8 @@ mod tests {
         assert!(r.local_wiped);
         assert_eq!(r.notice.as_deref(), Some(REVOKE_NOT_SENT_NOTICE));
         assert!(!*state.is_registered.read().await);
-        assert_eq!(state.snapshot(), Snapshot::default());
+        // Cleared (the publish counter aside, which every publish moves).
+        assert_eq!(Snapshot { seq: 0, ..state.snapshot() }, Snapshot::default());
     }
 
     /// Logout's end of access: "ended" only for the vault's confirmed end;
@@ -1611,6 +1656,7 @@ mod tests {
             end_seen: false,
             // Confirmed a minute past the session's cap.
             vault: link::VaultView::open(until + chrono::TimeDelta::seconds(60)),
+            seq: 0,
         };
         let info = session_info(&snap, now).unwrap();
         assert!(info.is_active);
@@ -1645,10 +1691,26 @@ mod tests {
         let late = session_info(&snap, until + chrono::TimeDelta::seconds(61)).unwrap();
         assert!(!late.is_active);
         assert_eq!(late.notice.as_deref(), Some(link::STALE_NOTICE));
-        let stale = Snapshot { live_until: None, stale: true, ..snap };
+        let stale = Snapshot { live_until: None, stale: true, ..snap.clone() };
         let info = session_info(&stale, now).unwrap();
         assert!(!info.is_active);
         assert_eq!(info.notice.as_deref(), Some(link::STALE_NOTICE));
+        // #77: the vault is passed on as of now, never the stored state.
+        assert_eq!(session_info(&snap, now).unwrap().vault.state, link::VaultShown::Open);
+        assert_eq!(session_info(&snap, until + chrono::TimeDelta::seconds(61)).unwrap().vault.state, link::VaultShown::Unknown);
+        let held = Snapshot { vault: link::VaultView { state: link::VaultShown::Held, ..Default::default() }, ..snap };
+        assert_eq!(session_info(&held, now).unwrap().vault.state, link::VaultShown::Held);
+    }
+
+    /// #77: a focus with no link open reads nothing, and says so.
+    #[tokio::test]
+    async fn check_vault_without_a_link_reads_nothing() {
+        let state = AppState::new();
+        assert!(!check_vault_now(&state).await);
+        // While an operation holds the link, it isn't waited for.
+        let held = state.link.clone();
+        let _guard = held.lock().await;
+        assert!(!check_vault_now(&state).await);
     }
 
     /// A failed pairing claims nothing: the engine's own texts for a

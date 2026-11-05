@@ -1,9 +1,21 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { get } from 'svelte/store';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
+  import { getCurrentWindow } from '@tauri-apps/api/window';
 
-  import { sessionStore, type SessionState, refreshSessionFromBackend } from './lib/stores/session';
+  import {
+    sessionStore,
+    type SessionState,
+    refreshSessionFromBackend,
+    endConfirm,
+    answerEnd,
+    endBusy,
+    checkVaultOnFocus,
+    listenForVaultChanges,
+  } from './lib/stores/session';
+  import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
   import { themeStore } from './lib/stores/theme';
   import { initCallListener } from './lib/stores/calls';
   import { initVaultListeners } from './lib/stores/vault';
@@ -51,6 +63,20 @@
   // or it opened but another account can open it too (#24).
   let pairingNotice = $state('');
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let unlistenFocus: (() => void) | null = null;
+  let unlistenChanges: (() => void) | null = null;
+
+  // #77 (§3.2): End session's confirmation is held here, above the views,
+  // so a screen swap (the vault held, locked or unknown) neither closes it
+  // nor re-points it. The dialog's own open flag follows the store; a
+  // cancel there answers no.
+  let endOpen = $state(false);
+  $effect(() => {
+    endOpen = $endConfirm.open;
+  });
+  $effect(() => {
+    if (!endOpen && get(endConfirm).open) answerEnd(false);
+  });
 
   async function refreshRegistration() {
     try {
@@ -106,10 +132,28 @@
       await refreshRegistration();
       await refreshSessionFromBackend();
     }, 30_000);
+    // #77: the backend says at once when the vault's state, or whether a
+    // session is live, changes.
+    try {
+      unlistenChanges = await listenForVaultChanges();
+    } catch (e) {
+      console.warn('No vault change events:', e);
+    }
+    // #77 (§3.1): when the window gains focus, the backend reads the
+    // vault's status if its word is old (and a sleep it saw is a resume).
+    try {
+      unlistenFocus = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+        if (focused) checkVaultOnFocus();
+      });
+    } catch (e) {
+      console.warn('No focus events:', e);
+    }
   });
 
   onDestroy(() => {
     if (pollTimer) clearInterval(pollTimer);
+    unlistenFocus?.();
+    unlistenChanges?.();
   });
 
   // Auto-routing on state transitions. The user can navigate around
@@ -221,6 +265,25 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
+<ConfirmDialog
+  bind:open={endOpen}
+  title="End session?"
+  message="You'll start a fresh session from the lock screen — no re-pairing needed on your phone."
+  confirmLabel="End session"
+  tone="danger"
+  onConfirm={() => answerEnd(true)}
+/>
+
+{#if $endBusy}
+  <!-- End session under way, over every view: the round trip with the
+       vault (through the relay) can take a beat, and a screen swap
+       meanwhile must not hide it. -->
+  <div class="busy-overlay" role="status">
+    <div class="loading-spinner"></div>
+    <p>Ending your session…</p>
+  </div>
+{/if}
+
 {#if currentView === 'loading'}
   <!-- Launch-time takeover while we query the backend for registration
        + session state. Replaces the old pairing-screen flash. -->
@@ -331,6 +394,19 @@
   }
   @keyframes app-spin {
     to { transform: rotate(360deg); }
+  }
+  .busy-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    background: var(--bg, #0e0e12);
+    color: var(--text, #e8e8ea);
+    font-size: 0.95rem;
   }
   .pairing-notice {
     display: flex;

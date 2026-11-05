@@ -141,6 +141,10 @@ pub const REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(60
 /// is how late it can be to see one (lead review).
 pub const LOCKED_REFRESH_MAX: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
+/// A window focus reads `vault.status` only when the vault hasn't confirmed
+/// its state for this long ([`Link::focused`]).
+pub const FOCUS_RECHECK_AFTER: TimeDelta = TimeDelta::seconds(15);
+
 /// After a refusal (`token_revoked`): how long between collecting the
 /// mailbox again, for a `device.unlinked` that arrives later (§8.6: a
 /// refused device keeps collecting its own mailbox). It goes on for as long
@@ -211,6 +215,10 @@ pub struct Snapshot {
     /// The vault's lock and hold, as far as this desktop knows
     /// (VAULT-LOCK-PLAN §3.1).
     pub vault: VaultView,
+    /// The publish counter (#77): set by [`Shared::publish`], one more than
+    /// the snapshot it replaces, so the frontend can drop a read that
+    /// returns an older snapshot than one it has already applied.
+    pub seq: u64,
 }
 
 /// The vault's state as the UI shows it (VAULT-LOCK-PLAN §3.1, §3.3): what
@@ -491,6 +499,9 @@ pub struct Link<T: Transport = Http, C: Clock = SystemClock> {
     marks: Arc<std::sync::Mutex<LoopMarks>>,
     /// How many times [`Link::resumed`] ran (for the logs and the tests).
     resumes: u32,
+    /// When this link last sent a `vault.status` of its own (answered or
+    /// not): what a focus read is throttled on ([`Link::focused`]).
+    last_attempt: Option<DateTime<Utc>>,
 }
 
 /// What the refresh loop records of its own rounds, by the wall clock.
@@ -560,6 +571,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
             read_now: false,
             marks: Arc::default(),
             resumes: 0,
+            last_attempt: None,
         }
     }
 
@@ -665,10 +677,51 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// ([`LoopMarks::slept`]), [`Link::resumed`]. Never from time a
     /// command held the lock: the old loop recorded its waking before it
     /// waited for it. The backoff starts again from [`REFRESH_EVERY`].
-    pub fn refresh_started(&mut self, now: DateTime<Utc>, first: std::time::Duration) {
+    /// Returns the loop's first wait: `first`, or none at all when a read
+    /// is asked for at once (a vault notice, a resume, a focus): a restart
+    /// doesn't drop it.
+    pub fn refresh_started(&mut self, now: DateTime<Utc>, first: std::time::Duration) -> std::time::Duration {
         self.check_gap(now);
         self.backoff = None;
+        let first = if std::mem::take(&mut self.read_now) { std::time::Duration::ZERO } else { first };
         *self.marks() = LoopMarks { due: due_after(now, first), woke: None };
+        first
+    }
+
+    /// The window gained focus: [`Link::focused`], and if a read is due, a
+    /// [`Link::refresh`] (`vault.status`, and a stored unanswered end
+    /// settled, #80). The refresh loop's schedule, marks and backoff are
+    /// left to it (lead review): a focus doesn't push its rounds back.
+    /// True if it read.
+    pub async fn focus_read(&mut self) -> bool {
+        if self.refused() || !self.focused(Utc::now()) {
+            return false;
+        }
+        if let Err(e) = self.refresh().await {
+            log::info!("link: focus read: {}", e);
+        }
+        true
+    }
+
+    /// The window gained focus (VAULT-LOCK-PLAN §3.1): a sleep the marks
+    /// show is a resume ([`Link::resumed`]); and whether `vault.status`
+    /// should be read now. Yes when a read is asked for at once (a resume,
+    /// a notice). Otherwise it is throttled on the last status *sent*,
+    /// answered or not (lead review): while Open or Held, one at most every
+    /// [`FOCUS_RECHECK_AFTER`] (focus comes with every switch of window);
+    /// while Locked or Unknown, not before the refresh loop's backoff since
+    /// then, so that switching windows neither adds reads that wait at the
+    /// relay of a locked vault nor holds the link meanwhile.
+    pub fn focused(&mut self, now: DateTime<Utc>) -> bool {
+        self.check_gap(now);
+        if std::mem::take(&mut self.read_now) {
+            return true;
+        }
+        let wait = match self.vault_now(now) {
+            VaultState::Open { .. } | VaultState::Held { .. } => FOCUS_RECHECK_AFTER,
+            VaultState::Locked { .. } | VaultState::Unknown => TimeDelta::from_std(self.backoff.unwrap_or(REFRESH_EVERY)).unwrap_or(TimeDelta::MAX),
+        };
+        self.last_attempt.is_none_or(|a| a.checked_add_signed(wait).is_some_and(|due| now >= due))
     }
 
     /// The refresh loop has the lock for a round: [`Link::resumed`] if its
@@ -705,6 +758,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// outbox held after a 429 or a 5xx) it is shown "as of" (lead review
     /// M4).
     async fn status_once(&mut self) -> Result<StatusRead, AccessError> {
+        self.last_attempt = Some(Utc::now());
         let r = self.access.read_status(&mut self.session, &mut self.store).await;
         let now = Utc::now();
         match &r {
@@ -959,6 +1013,8 @@ impl<T: Transport, C: Clock> Link<T, C> {
             end_seen: self.end_seen,
             // A refused device knows nothing of the vault.
             vault,
+            // Set when published (Shared::publish).
+            seq: 0,
         }
     }
 
@@ -1140,6 +1196,24 @@ pub type Notify = Arc<RwLock<Option<Arc<dyn Fn(String) + Send + Sync>>>>;
 /// The Tauri event that carries a [`Notify`] notice to the frontend.
 pub const NOTICE_EVENT: &str = "vault:notice";
 
+/// Called when a published snapshot changes what the UI shows of the
+/// vault's state or whether a session is live (#77): the frontend reads the
+/// session again at once ([`CHANGED_EVENT`]) instead of on its next poll.
+pub type Changed = Arc<RwLock<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
+/// The Tauri event a [`Changed`] call emits (no payload).
+pub const CHANGED_EVENT: &str = "vault:changed";
+
+/// What a change of which [`Shared::publish`] tells the UI at once:
+/// everything the screen shows of the vault at `now` (its state, Locked
+/// "as of" or not, the reason, the counts, the deadline, `idle_lock_at`,
+/// `due`), and whether a session is live. Not `open_until`, which every
+/// confirmation moves and the screen doesn't show (an Open past it is
+/// Unknown here already).
+fn shown(s: &Snapshot, now: DateTime<Utc>) -> (VaultView, bool) {
+    (VaultView { open_until: None, ..s.vault_at(now) }, s.active_at(now))
+}
+
 /// The handles the background refresh needs (clones of `AppState`'s).
 #[derive(Clone)]
 pub struct Shared {
@@ -1147,11 +1221,27 @@ pub struct Shared {
     pub snapshot: Arc<RwLock<Snapshot>>,
     pub is_registered: Arc<tokio::sync::RwLock<bool>>,
     pub notify: Notify,
+    pub changed: Changed,
 }
 
 impl Shared {
+    /// Store `s` as what the UI may know, with the next publish counter
+    /// ([`Snapshot::seq`]); if that changes what the screen shows of the
+    /// vault or whether a session is live, call [`Changed`] (#77).
     pub fn publish(&self, s: Snapshot) {
-        *self.snapshot.write().unwrap_or_else(|p| p.into_inner()) = s;
+        let now = Utc::now();
+        let (before, after) = {
+            let mut g = self.snapshot.write().unwrap_or_else(|p| p.into_inner());
+            let before = shown(&g, now);
+            let seq = g.seq + 1;
+            *g = Snapshot { seq, ..s };
+            (before, shown(&g, now))
+        };
+        if before != after {
+            if let Some(f) = self.changed.read().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                f();
+            }
+        }
     }
 
     pub fn read(&self) -> Snapshot {
@@ -1271,7 +1361,7 @@ pub async fn refresh_loop<T: Transport, C: Clock>(
     // sleep that came before it: the old loop's marks are kept in the link.
     let marks = match link.lock().await.as_mut() {
         Some(l) => {
-            l.refresh_started(Utc::now(), first);
+            wait = l.refresh_started(Utc::now(), first);
             l.loop_marks()
         }
         None => Arc::default(),
@@ -2252,13 +2342,19 @@ mod tests {
 
     /// Lead review (M1 gap): a loop restarted by a command after a sleep
     /// still sees the gap, from the round the old loop expected, kept in
-    /// the link: Open becomes Unknown at its start. Without a gap, nothing
-    /// changes.
+    /// the link: it resumes at its start (Open becomes Unknown), and reads
+    /// the status at once (the read the resume asks for survives the
+    /// restart); a vault that answers is Open again, one that doesn't
+    /// stays Unknown. Without a gap, nothing changes and nothing is read.
     #[tokio::test(start_paused = true)]
     async fn a_restarted_loop_sees_a_sleep_before_it() {
-        for gap in [true, false] {
+        for (gap, answers) in [(true, true), (true, false), (false, true)] {
             let dir = tempfile::tempdir().unwrap();
-            let (_vault, mut link) = live(dir.path()).await;
+            let (vault, mut link) = live(dir.path()).await;
+            if !answers {
+                vault.lock_silently();
+            }
+            let before = statuses(&vault);
             if gap {
                 // The old loop set its round 8 hours ago and never woke for
                 // it (its timer didn't count the suspend).
@@ -2274,15 +2370,16 @@ mod tests {
                 let g = slot.lock().await;
                 let l = g.as_ref().unwrap();
                 let snap = l.snapshot(Utc::now());
-                if gap {
-                    assert_eq!(snap.vault.state, VaultShown::Unknown, "resumed at the loop's start");
+                assert_eq!(l.resumes, u32::from(gap));
+                assert_eq!(statuses(&vault) > before, gap, "a read at once only after the resume");
+                if gap && !answers {
+                    assert_eq!(snap.vault.state, VaultShown::Unknown, "resumed, and the vault didn't answer");
                     assert!(!snap.active_at(Utc::now()));
                 } else {
                     assert_eq!(snap.vault.state, VaultShown::Open);
                     assert!(snap.active_at(Utc::now()));
                 }
                 assert!(l.marks().due.is_some_and(|d| d > Utc::now()), "the new loop's round is set");
-                assert_eq!(l.resumes, u32::from(gap));
             }
             task.abort();
             let _ = task.await;
@@ -2445,6 +2542,169 @@ mod tests {
         link.request_access(|| {}, || false).await.expect("granted");
         assert_eq!(requests(&vault), 1);
         assert!(link.snapshot(Utc::now()).active_at(Utc::now()));
+    }
+
+    /// #77: a published snapshot that changes the vault's state or whether
+    /// a session is live calls `changed`; one that changes neither doesn't.
+    #[test]
+    fn publish_tells_the_ui_of_a_change_at_once() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = calls.clone();
+        let changed: Changed = Arc::new(RwLock::new(Some(Arc::new(move || {
+            c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }))));
+        let shared = Shared {
+            link: Arc::new(Mutex::new(None)),
+            snapshot: Arc::default(),
+            is_registered: Arc::default(),
+            notify: Arc::default(),
+            changed,
+        };
+        let count = || calls.load(std::sync::atomic::Ordering::SeqCst);
+        let now = Utc::now();
+        let open = VaultView::open(now + TimeDelta::minutes(2));
+        let live = Snapshot { link_open: true, live_until: Some(now + TimeDelta::minutes(2)), vault: open.clone(), ..Default::default() };
+        shared.publish(live.clone());
+        assert_eq!(count(), 1, "unknown to open and live");
+        shared.publish(Snapshot { reachable: true, ..live.clone() });
+        assert_eq!(count(), 1, "nothing shown changed");
+        shared.publish(Snapshot { vault: VaultView { state: VaultShown::Held, ..Default::default() }, live_until: None, ..live.clone() });
+        assert_eq!(count(), 2, "held");
+        shared.publish(Snapshot { vault: VaultView { state: VaultShown::Locked, ..Default::default() }, live_until: None, ..live.clone() });
+        assert_eq!(count(), 3, "locked");
+        shared.publish(Snapshot { live_until: None, ..live.clone() });
+        assert_eq!(count(), 4, "open, not live");
+        // Everything else the screen shows of the vault (lead review).
+        let locked = VaultView { state: VaultShown::Locked, locked_since: Some(now), ..Default::default() };
+        let mut n = 4;
+        for v in [
+            locked.clone(),
+            VaultView { as_of: Some(now), ..locked.clone() },
+            locked.clone(),
+            VaultView { reason: Some("idle"), ..locked.clone() },
+            VaultView { state: VaultShown::Held, ..Default::default() },
+            VaultView { state: VaultShown::Held, waiting: Some(Counts { messages: 1, ..Default::default() }), ..Default::default() },
+            VaultView { state: VaultShown::Held, waiting: Some(Counts { messages: 2, ..Default::default() }), ..Default::default() },
+            VaultView { state: VaultShown::Held, waiting: Some(Counts { messages: 2, ..Default::default() }), idle_lock_at: Some(now), ..Default::default() },
+            VaultView { due: true, ..open.clone() },
+        ] {
+            shared.publish(Snapshot { vault: v.clone(), live_until: None, ..live.clone() });
+            n += 1;
+            assert_eq!(count(), n, "{v:?}");
+        }
+        // A new confirmation only moves open_until: nothing shown changes.
+        shared.publish(Snapshot { vault: VaultView { due: true, ..VaultView::open(now + TimeDelta::minutes(3)) }, live_until: None, ..live.clone() });
+        assert_eq!(count(), n, "open_until alone");
+        // Each publish takes the next counter.
+        let before = shared.read().seq;
+        shared.publish(live);
+        assert_eq!(shared.read().seq, before + 1);
+    }
+
+    /// Lead review: focus reads are throttled on the last status sent, not
+    /// the last confirmation. While Unknown (a status unanswered), two
+    /// focuses 20 s apart read once: not again before the loop's backoff.
+    /// While Open, a focus more than FOCUS_RECHECK_AFTER after the last
+    /// read still reads.
+    #[tokio::test]
+    async fn focus_reads_are_throttled_on_the_last_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = live(dir.path()).await;
+        vault.lock_silently();
+        let _ = link.refresh().await;
+        assert_eq!(link.snapshot(Utc::now()).vault.state, VaultShown::Unknown);
+        let backoff = link.next_wait(Utc::now());
+        assert_eq!(backoff, REFRESH_EVERY);
+        // The last attempt a backoff ago: the first focus reads.
+        link.last_attempt = Some(Utc::now() - TimeDelta::seconds(61));
+        let before = statuses(&vault);
+        assert!(link.focus_read().await, "due: read");
+        assert_eq!(statuses(&vault), before + 1);
+        // A second focus 20 s later: not before the backoff, though that
+        // read wasn't answered either.
+        assert!(!link.focused(Utc::now() + TimeDelta::seconds(20)));
+        assert!(!link.focus_read().await);
+        assert_eq!(statuses(&vault), before + 1, "one read for the two focuses");
+        // The backoff later (grown by that unanswered read), it reads
+        // again; and a resume always does.
+        let wait = TimeDelta::from_std(link.backoff.expect("backing off")).unwrap();
+        assert!(!link.focused(Utc::now() + wait - TimeDelta::seconds(5)));
+        assert!(link.focused(Utc::now() + wait + TimeDelta::seconds(1)));
+        link.resumed();
+        assert!(link.focused(Utc::now()), "a read asked for at once");
+
+        // Open: a focus 16 s after the last read reads.
+        let dir = tempfile::tempdir().unwrap();
+        let (_vault, mut link) = live(dir.path()).await;
+        assert!(!link.focused(Utc::now()), "just read");
+        assert!(link.focused(Utc::now() + TimeDelta::seconds(16)));
+    }
+
+    /// Lead review M2: a focus read settles a stored end (#80) and leaves
+    /// the refresh loop's marks as they are; a fresh focus reads nothing.
+    #[tokio::test]
+    async fn a_focus_read_settles_a_stored_end_and_keeps_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired_with(dir.path(), true);
+        let marks = LoopMarks { due: Some(Utc::now() + TimeDelta::seconds(40)), woke: None };
+        *link.marks() = marks;
+        assert!(link.focus_read().await, "nothing confirmed yet: read");
+        assert!(link.session.access_end().is_none(), "the stored end is settled");
+        assert_eq!(link.snapshot(Utc::now()).end_settled, Some(EndSettled::Confirmed));
+        assert!(vault.deposited().iter().any(|k| k == "device.session.end"));
+        let after = *link.marks();
+        assert_eq!(after.woke, None);
+        assert!(after.due >= marks.due, "the loop's round isn't moved earlier, nor reset: {after:?}");
+        let before = statuses(&vault);
+        assert!(!link.focus_read().await, "just confirmed: nothing read");
+        assert_eq!(statuses(&vault), before);
+    }
+
+    /// A read asked for at once (here by a resume) survives a refresh
+    /// restart: the restarted loop reads at once, not after `first`.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_asked_for_survives_a_restart() {
+        for asked in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (vault, mut link) = live(dir.path()).await;
+            if asked {
+                link.resumed();
+            }
+            let before = statuses(&vault);
+            let slot = Arc::new(Mutex::new(Some(link)));
+            let s2 = slot.clone();
+            let task = tokio::spawn(async move { refresh_loop(&s2, REFRESH_EVERY, REFUSED_RECHECK_EVERY, |_| {}, |_| {}).await });
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            // No time has passed: only a read asked for at once has run.
+            let _ = slot.lock().await;
+            assert_eq!(statuses(&vault) > before, asked, "asked: {asked}");
+            if asked {
+                assert!(slot.lock().await.as_ref().unwrap().snapshot(Utc::now()).active_at(Utc::now()), "read again: live");
+            }
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    /// A focus reads the status only when the vault's word is older than
+    /// FOCUS_RECHECK_AFTER, or a read is asked for, and it takes a sleep
+    /// the marks show as a resume.
+    #[tokio::test]
+    async fn a_focus_reads_the_status_only_when_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_vault, mut link) = live(dir.path()).await;
+        let now = Utc::now();
+        assert!(!link.focused(now), "just confirmed");
+        assert!(link.focused(now + FOCUS_RECHECK_AFTER + TimeDelta::seconds(1)), "older: read");
+        link.read_now = true;
+        assert!(link.focused(now), "asked for");
+        assert!(!link.focused(now), "taken");
+        *link.marks() = LoopMarks { due: Some(now - TimeDelta::hours(3)), woke: None };
+        assert!(link.focused(now), "a sleep: resumed, and read");
+        assert_eq!(link.resumes, 1);
+        assert_eq!(link.snapshot(now).vault.state, VaultShown::Unknown);
     }
 
     /// Lead review M1: the refresh loop takes a wall-clock jump of more

@@ -1,17 +1,19 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
-  import { sessionStore, sessionNotice, refreshSessionFromBackend, endReturned, markEndStarted } from '../stores/session';
+  import { sessionStore, refreshSessionFromBackend, vaultStore, askToEnd, endBusy, endStatus } from '../stores/session';
+  import { vaultScreen, endOffered, unreachableAlertShown } from '../vaultState.js';
   import SessionTimer from '../components/SessionTimer.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
 
   let session = $derived($sessionStore);
+  // #77: the vault's state (the hold-off line while `due`).
+  let screen = $derived(vaultScreen($vaultStore));
 
   let busy = $state(false);
   let busyLabel = $state('');
   let statusMessage = $state('');
 
   let lockDialogOpen = $state(false);
-  let endDialogOpen = $state(false);
 
   // Identity for the "Session for {name} ({email})" line. Pulled
   // from profile.get on mount — the same op the Vault view uses for
@@ -55,35 +57,9 @@
     }
   }
 
-  async function doEnd() {
-    if (busy) return;
-    busy = true;
-    busyLabel = 'Ending your session…';
-    statusMessage = '';
-    sessionNotice.set(null);
-    markEndStarted();
-    try {
-      // The session stops being shown as live at once; `notice` says when
-      // the vault didn't confirm the end (or a newer session runs on).
-      const result = await invoke<{ notice: string | null; end_pending?: boolean }>('end_session');
-      statusMessage = result.notice ?? 'Session ended.';
-      // This view is usually replaced by now (routing follows the poll);
-      // the notice is shown on the next.
-      sessionNotice.set(result.notice);
-      // #80: before any read. Still pending: kept as the end's own notice,
-      // to go on a later confirmation; otherwise the outcome is final.
-      endReturned(result.notice, !!result.end_pending);
-      // Refresh the Svelte store immediately so the StatusBar pill +
-      // App.svelte routing pick up the expired state right away
-      // instead of waiting on the 30s poll. Without this the user
-      // sees "nothing happened" until the timer fires.
-      await refreshSessionFromBackend();
-    } catch (e) {
-      statusMessage = `Failed to end session: ${e}`;
-    } finally {
-      busy = false;
-    }
-  }
+  // End session, its confirmation and its "Ending your session…" overlay
+  // live above the views (stores/session.ts, App.svelte, #77): a screen
+  // swap while it is open or under way loses nothing.
 </script>
 
 <ConfirmDialog
@@ -92,15 +68,6 @@
   message="Your vault stays paired — the next launch auto-unlocks."
   confirmLabel="Lock"
   onConfirm={doLock}
-/>
-
-<ConfirmDialog
-  bind:open={endDialogOpen}
-  title="End session?"
-  message="You'll start a fresh session from the lock screen — no re-pairing needed on your phone."
-  confirmLabel="End session"
-  tone="danger"
-  onConfirm={doEnd}
 />
 
 {#if busy}
@@ -135,12 +102,14 @@
             disabled={busy || session.state !== 'active'}>
       Lock now
     </button>
-    <button class="action-btn danger" onclick={() => endDialogOpen = true}
-            disabled={busy || session.state !== 'active'}>
-      End session
-    </button>
-    {#if statusMessage}
-      <span class="status-msg">{statusMessage}</span>
+    {#if endOffered(screen.kind)}
+      <button class="action-btn danger" onclick={askToEnd}
+              disabled={busy || $endBusy}>
+        End session
+      </button>
+    {/if}
+    {#if statusMessage || $endStatus}
+      <span class="status-msg">{statusMessage || $endStatus}</span>
     {/if}
   </div>
 
@@ -176,7 +145,12 @@
     </div>
   </div>
 
-  {#if session.state === 'suspended'}
+  {#if screen.holdOff}
+    <!-- #77: past the deadline with the hold off: the session continues. -->
+    <div class="alert warning" role="status">{screen.holdOff}</div>
+  {/if}
+
+  {#if unreachableAlertShown(session)}
     <div class="alert warning">
       Your phone is unreachable. All vault operations are paused.
       Make sure your phone is connected to the internet and the VettID app is running.

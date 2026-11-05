@@ -483,7 +483,8 @@ pub(super) fn write_private(config_dir: &Path, name: &str, data: &[u8]) -> Resul
 #[cfg(not(windows))]
 fn write_atomically(config_dir: &Path, name: &str, data: &[u8]) -> Result<(), CredentialError> {
     let path = config_dir.join(name);
-    let io = |what: &str, e: std::io::Error| CredentialError::IoError(format!("{} {}: {}", what, path.display(), e));
+    // The error's text (with the OS error code) and its kind, for the logs.
+    let io = |what: &str, e: std::io::Error| CredentialError::IoError(format!("{} {}: {} (kind {:?})", what, path.display(), e, e.kind()));
 
     // Temporary files a crashed earlier save left behind.
     let prefix = format!("{name}{TEMP_INFIX}");
