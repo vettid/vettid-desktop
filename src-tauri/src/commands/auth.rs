@@ -612,6 +612,9 @@ pub struct SessionInfoResponse {
     /// Why a session this desktop knows of isn't shown as active: the vault
     /// hasn't confirmed it lately (`link::STALE_NOTICE`).
     pub notice: Option<String>,
+    /// An End session the vault hasn't answered yet (#80): the UI shows
+    /// "Ending your session…" until it is false.
+    pub end_pending: bool,
 }
 
 /// What the frontend polls (cheap, no network) to drive the expiry UI:
@@ -634,6 +637,7 @@ fn session_info(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> Result<S
         seconds_remaining: until.map_or(0, |t| (t - now).num_seconds().max(0)),
         is_active: active,
         notice: (snap.stale && !active).then(|| link::STALE_NOTICE.to_string()),
+        end_pending: snap.end_pending,
     })
 }
 
@@ -1548,9 +1552,14 @@ mod tests {
             reachable: true,
             refused: false,
             stale: false,
+            end_pending: false,
         };
         let info = session_info(&snap, now).unwrap();
         assert!(info.is_active);
+        assert!(!info.end_pending);
+        // #80: an end under way is passed on, with no session live.
+        let ending = session_info(&snap.without_session(), now).unwrap();
+        assert!(ending.end_pending && !ending.is_active);
         assert_eq!(info.expires_at, until.timestamp());
         assert_eq!(info.seconds_remaining, 90);
         assert_eq!(info.session_id, "s1");

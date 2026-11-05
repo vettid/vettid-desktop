@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
-  import { sessionStore, sessionNotice, refreshSessionFromBackend } from '../stores/session';
+  import { sessionStore, sessionNotice, refreshSessionFromBackend, noteEndNotice, markEndStarted } from '../stores/session';
   import SessionTimer from '../components/SessionTimer.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
 
@@ -61,18 +61,23 @@
     busyLabel = 'Ending your session…';
     statusMessage = '';
     sessionNotice.set(null);
+    markEndStarted();
     try {
       // The session stops being shown as live at once; `notice` says when
       // the vault didn't confirm the end (or a newer session runs on).
       const result = await invoke<{ notice: string | null }>('end_session');
       statusMessage = result.notice ?? 'Session ended.';
-      // This view is replaced at once; the notice is shown on the next.
+      // This view is usually replaced by now (routing follows the poll);
+      // the notice is shown on the next.
       sessionNotice.set(result.notice);
       // Refresh the Svelte store immediately so the StatusBar pill +
       // App.svelte routing pick up the expired state right away
       // instead of waiting on the 30s poll. Without this the user
       // sees "nothing happened" until the timer fires.
       await refreshSessionFromBackend();
+      // #80: if the end is still pending, its notice goes once the vault
+      // answers it.
+      noteEndNotice(result.notice);
     } catch (e) {
       statusMessage = `Failed to end session: ${e}`;
     } finally {

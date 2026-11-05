@@ -140,6 +140,10 @@ pub struct Snapshot {
     /// The access session is current as far as this desktop knows, but the
     /// vault hasn't confirmed it for [`STALE_AFTER`]: not shown as live.
     pub stale: bool,
+    /// An End session the vault hasn't answered yet (#80): one under way,
+    /// or a stored unanswered end that the refresh keeps sending. Shown as
+    /// "Ending your session…", never as ended.
+    pub end_pending: bool,
 }
 
 impl Snapshot {
@@ -149,9 +153,10 @@ impl Snapshot {
     }
 
     /// The same, without the session: what an operation that is ending it
-    /// shows meanwhile.
+    /// shows meanwhile (the end pending until the link's own snapshot says
+    /// how it went).
     pub fn without_session(&self) -> Snapshot {
-        Snapshot { session_id: None, expires_at: None, live_until: None, ..self.clone() }
+        Snapshot { session_id: None, expires_at: None, live_until: None, end_pending: true, ..self.clone() }
     }
 }
 
@@ -397,6 +402,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
             reachable: self.reachable,
             refused,
             stale,
+            end_pending: self.session.access_end().is_some(),
         }
     }
 
@@ -1037,6 +1043,25 @@ mod tests {
         assert_eq!(link.end().await, Err(AccessError::EndUnconfirmed));
         assert!(link.session.access_end().is_some());
         assert!(link.keep_refreshing(Utc::now()), "settled later by the refresh");
+        // #80: the UI sees the end as pending, not as done.
+        let snap = link.snapshot(Utc::now());
+        assert!(snap.end_pending && !snap.active_at(Utc::now()));
+    }
+
+    /// #80: a confirmed end isn't pending; what an end under way shows
+    /// meanwhile is.
+    #[tokio::test]
+    async fn a_confirmed_end_isnt_pending_and_one_under_way_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.set_session(Some(("s-1", Utc::now() + TimeDelta::hours(1))));
+        link.read_status().await.unwrap();
+        let before = link.snapshot(Utc::now());
+        assert!(!before.end_pending);
+        let meanwhile = before.without_session();
+        assert!(meanwhile.end_pending && !meanwhile.active_at(Utc::now()));
+        assert_eq!(link.end().await, Ok(EndOutcome::Ended));
+        assert!(!link.snapshot(Utc::now()).end_pending, "the vault answered");
     }
 
     /// Item 4: no answer, and the session the resend named was replaced by
@@ -1062,9 +1087,11 @@ mod tests {
         let (_vault, mut link) = FakeVault::paired_with(dir.path(), true);
         assert!(link.session.access_end().is_some());
         assert!(link.keep_refreshing(Utc::now()));
+        assert!(link.snapshot(Utc::now()).end_pending, "#80: shown as pending after a restart");
         link.refresh().await.unwrap();
         assert!(link.session.access_end().is_none(), "answered");
         assert!(!link.keep_refreshing(Utc::now()));
+        assert!(!link.snapshot(Utc::now()).end_pending, "#80: and no longer once answered");
     }
 
     /// A request from a refused device isn't sent, and says why.
