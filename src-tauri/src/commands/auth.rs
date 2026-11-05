@@ -946,6 +946,9 @@ async fn end_access(state: &AppState) -> EndSessionResponse {
     }
     // Not live from here on, whatever the vault answers.
     state.publish(state.snapshot().without_session());
+    // #80 (review L1): whether this end still waits, read from the link
+    // while it is held, not from a later snapshot a lock may have reset.
+    let mut end_pending = false;
     let notice = {
         // #33: no Start New Session runs while this does; one under way
         // stops waiting (the reset above) and releases these.
@@ -970,7 +973,9 @@ async fn end_access(state: &AppState) -> EndSessionResponse {
                     Some(erase_unlinked(state, l).await)
                 } else {
                     let now = chrono::Utc::now();
-                    state.publish(l.snapshot(now));
+                    let snap = l.snapshot(now);
+                    end_pending = snap.end_pending;
+                    state.publish(snap);
                     // An end still waiting for its answer is sent again.
                     if l.keep_refreshing(now) {
                         state.start_refresh(false);
@@ -981,7 +986,6 @@ async fn end_access(state: &AppState) -> EndSessionResponse {
         }
     };
     finish_reset(state);
-    let end_pending = state.snapshot().end_pending;
     EndSessionResponse { notice, end_pending }
 }
 
