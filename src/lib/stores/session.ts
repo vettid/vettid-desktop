@@ -1,5 +1,5 @@
 import { get, writable } from 'svelte/store';
-import { afterRead } from '../endState.js';
+import { afterRead, afterEnd, readIsStale } from '../endState.js';
 
 export interface SessionState {
   state: 'inactive' | 'active' | 'suspended' | 'expired' | 'revoked';
@@ -45,22 +45,29 @@ export const endPending = writable<boolean>(false);
  *  pending: cleared once the vault answers that end (see endState.js). */
 let endNotice: string | null = null;
 
+/** Counts End session presses: a read that began before the latest one is
+ *  dropped (see readIsStale). */
+let endSeq = 0;
+
 /** End session was pressed: pending at once, before any read, since
  *  routing may leave the Session view before the next one. */
 export function markEndStarted(): void {
+  endSeq += 1;
   endNotice = null;
   endPending.set(true);
+}
+
+/** End session returned: `pending` is whether its end still waits. */
+export function endReturned(notice: string | null, pending: boolean): void {
+  const r = afterEnd({ notice, pending });
+  endNotice = r.endNotice;
+  endPending.set(r.pending);
 }
 
 /** A new session or a new pairing: an earlier end no longer applies (#80). */
 export function resetEndState(): void {
   endNotice = null;
   endPending.set(false);
-}
-
-/** End session's notice, kept as the end's own if the end is still pending. */
-export function noteEndNotice(notice: string | null): void {
-  endNotice = notice !== null && get(endPending) ? notice : null;
 }
 
 function applyEndState(nowPending: boolean | null, confirmed = false, settledNotice: string | null = null): void {
@@ -123,6 +130,7 @@ export function resetSession() {
  */
 export async function refreshSessionFromBackend(): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
+  const seq = endSeq;
   try {
     const info = await invoke<{
       connection_id: string;
@@ -135,6 +143,8 @@ export async function refreshSessionFromBackend(): Promise<void> {
       end_confirmed?: boolean;
       end_notice?: string | null;
     }>('get_session_info');
+    // #80: from before an End session press: it would undo it.
+    if (readIsStale(seq, endSeq)) return;
 
     // #80: an End session still waiting for the vault, and its notice.
     // A live session makes an earlier end's "not confirmed" moot (#80, L1).
@@ -168,6 +178,7 @@ export async function refreshSessionFromBackend(): Promise<void> {
       sessionStore.update(s => ({ ...s, state: 'expired', secondsRemaining: 0 }));
     }
   } catch {
+    if (readIsStale(seq, endSeq)) return;
     // No link: nothing is known of an end; its notice isn't touched.
     applyEndState(null);
     // `get_session_info` throws "not unlocked" when AppState has no

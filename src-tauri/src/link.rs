@@ -148,6 +148,9 @@ pub struct Snapshot {
     /// if it hasn't, or a new End session has started since. A stored end
     /// going away is not on its own a confirmation.
     pub end_settled: Option<EndSettled>,
+    /// This link has had an End session, or opened with a stored one: an
+    /// end that went away without an outcome here is then "not confirmed".
+    pub end_seen: bool,
 }
 
 /// How the refresh settled a stored unanswered end (#80).
@@ -182,7 +185,7 @@ impl Snapshot {
     /// shows meanwhile (the end pending until the link's own snapshot says
     /// how it went).
     pub fn without_session(&self) -> Snapshot {
-        Snapshot { session_id: None, expires_at: None, live_until: None, end_pending: true, end_settled: None, ..self.clone() }
+        Snapshot { session_id: None, expires_at: None, live_until: None, end_pending: true, end_settled: None, end_seen: true, ..self.clone() }
     }
 }
 
@@ -269,6 +272,8 @@ pub struct Link<T: Transport = Http, C: Clock = SystemClock> {
     refusal_polled: bool,
     /// How the refresh last settled a stored end (#80; see [`Snapshot`]).
     end_settled: Option<EndSettled>,
+    /// See [`Snapshot::end_seen`].
+    end_seen: bool,
     /// When the vault last confirmed what this link knows of the session:
     /// a `vault.status` read, or an answered end. `None`: never in this
     /// run (no baseline).
@@ -300,7 +305,8 @@ impl<T: Transport, C: Clock> Link<T, C> {
         if session.access_end_unreadable() {
             log::warn!("link: the stored unanswered end didn't read; it is settled through vault.status");
         }
-        Link { session, store, access: Access::new(), reachable: false, refusal_polled: false, confirmed: None, end_settled: None }
+        let end_seen = session.access_end().is_some() || session.access_end_unreadable();
+        Link { session, store, access: Access::new(), reachable: false, refusal_polled: false, confirmed: None, end_settled: None, end_seen }
     }
 
     /// The vault's mailbox refused this device (`token_revoked`, §8.6), or
@@ -458,6 +464,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
             stale,
             end_pending: self.session.access_end().is_some(),
             end_settled: self.end_settled.clone(),
+            end_seen: self.end_seen,
         }
     }
 
@@ -568,6 +575,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
     pub async fn end(&mut self) -> Result<EndOutcome, AccessError> {
         // A new end: an earlier one's settling no longer applies (#80).
         self.end_settled = None;
+        self.end_seen = true;
         let r = self.access.end(&mut self.session, &mut self.store, None).await;
         self.reachable = r.as_ref().err().is_none_or(answered);
         if r.is_ok() {

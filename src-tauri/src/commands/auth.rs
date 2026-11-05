@@ -645,7 +645,8 @@ fn session_info(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> Result<S
         expires_at: until.map_or(0, |t| t.timestamp()),
         seconds_remaining: until.map_or(0, |t| (t - now).num_seconds().max(0)),
         is_active: active,
-        notice: (snap.stale && !active).then(|| link::STALE_NOTICE.to_string()),
+        // Not while an end is pending: that one's state is shown (#80, L3).
+        notice: (snap.stale && !active && !snap.end_pending).then(|| link::STALE_NOTICE.to_string()),
         end_pending: snap.end_pending,
         end_confirmed: snap.end_settled == Some(link::EndSettled::Confirmed),
         // With no end pending: what to say unless the end was confirmed. An
@@ -655,7 +656,8 @@ fn session_info(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> Result<S
             _ if snap.end_pending => None,
             Some(link::EndSettled::Confirmed) => None,
             Some(link::EndSettled::NotConfirmed(n)) => Some(n.to_string()),
-            None => Some(link::END_UNCONFIRMED_NOTICE.to_string()),
+            // No outcome seen here: not confirmed, if there was an end at all.
+            None => snap.end_seen.then(|| link::END_UNCONFIRMED_NOTICE.to_string()),
         },
     })
 }
@@ -979,7 +981,8 @@ async fn end_access(state: &AppState) -> EndSessionResponse {
         }
     };
     finish_reset(state);
-    EndSessionResponse { notice }
+    let end_pending = state.snapshot().end_pending;
+    EndSessionResponse { notice, end_pending }
 }
 
 /// What End session tells the person about `result`: nothing for a
@@ -1046,6 +1049,9 @@ fn overtaken_by_reset(state: &AppState, mark: ResetMark) -> bool {
 #[derive(Debug, Serialize)]
 pub struct EndSessionResponse {
     pub notice: Option<String>,
+    /// The end is still waiting for the vault (#80): the UI keeps showing it
+    /// as pending. False when nothing stays pending (answered, or no link).
+    pub end_pending: bool,
 }
 
 /// Lock: drop the link from memory (its keys wipe themselves). The
@@ -1578,6 +1584,7 @@ mod tests {
             stale: false,
             end_pending: false,
             end_settled: None,
+            end_seen: false,
         };
         let info = session_info(&snap, now).unwrap();
         assert!(info.is_active);
@@ -1586,8 +1593,10 @@ mod tests {
         let ending = session_info(&snap.without_session(), now).unwrap();
         assert!(ending.end_pending && !ending.is_active);
         assert!(!ending.end_confirmed && ending.end_notice.is_none(), "nothing settled yet");
-        // Not pending, no outcome: not confirmed.
-        let gone = session_info(&snap, now).unwrap();
+        // No end at all: nothing to say.
+        assert_eq!(session_info(&snap, now).unwrap().end_notice, None);
+        // Not pending, no outcome, after an end: not confirmed.
+        let gone = session_info(&Snapshot { end_seen: true, ..snap.clone() }, now).unwrap();
         assert!(!gone.end_confirmed);
         assert_eq!(gone.end_notice.as_deref(), Some(link::END_UNCONFIRMED_NOTICE));
         let confirmed = Snapshot { end_settled: Some(link::EndSettled::Confirmed), ..snap.clone() };

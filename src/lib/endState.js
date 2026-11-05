@@ -30,3 +30,29 @@ export function afterRead({ wasPending, nowPending, notice, endNotice, confirmed
   }
   return { notice, endNotice, pending: nowPending };
 }
+
+/**
+ * What End session's own return leaves (#80): `pending` is the backend's
+ * `end_pending` after it. Still pending: its notice is kept as the end's own,
+ * to go only on a later confirmation. Not pending: the outcome is final,
+ * and nothing is left to clear later.
+ *
+ * @param {{ notice: string | null, pending: boolean }} s
+ * @returns {{ endNotice: string | null, pending: boolean }}
+ */
+export function afterEnd({ notice, pending }) {
+  return pending ? { endNotice: notice, pending: true } : { endNotice: null, pending: false };
+}
+
+/**
+ * A read of the backend that started before the latest End session press
+ * (`startSeq` older than `nowSeq`) describes the session before it: dropped
+ * whole, so it can't undo the press (#80, lead review L4).
+ *
+ * @param {number} startSeq
+ * @param {number} nowSeq
+ * @returns {boolean}
+ */
+export function readIsStale(startSeq, nowSeq) {
+  return startSeq !== nowSeq;
+}

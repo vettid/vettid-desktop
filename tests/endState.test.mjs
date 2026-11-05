@@ -45,3 +45,17 @@ test('#80: a confirmation with no notice of ours clears nothing; pending follows
   assert.deepEqual(ended({ notice: null, endNotice: null, confirmed: true }), { notice: null, endNotice: null, pending: false });
   assert.deepEqual(afterRead({ wasPending: false, nowPending: true, notice: null, endNotice: null }), { notice: null, endNotice: null, pending: true });
 });
+
+test('#80: End session returning still pending keeps its notice as its own; otherwise final', async () => {
+  const { afterEnd } = await import('../src/lib/endState.js');
+  assert.deepEqual(afterEnd({ notice: NOT_SENT, pending: true }), { endNotice: NOT_SENT, pending: true });
+  // Answered, or no link (lead review L5): nothing left pending or to clear.
+  assert.deepEqual(afterEnd({ notice: UNCONFIRMED, pending: false }), { endNotice: null, pending: false });
+  assert.deepEqual(afterEnd({ notice: null, pending: false }), { endNotice: null, pending: false });
+});
+
+test('#80 (lead review L4): a read begun before an End press is dropped', async () => {
+  const { readIsStale } = await import('../src/lib/endState.js');
+  assert.equal(readIsStale(3, 4), true);
+  assert.equal(readIsStale(4, 4), false);
+});
