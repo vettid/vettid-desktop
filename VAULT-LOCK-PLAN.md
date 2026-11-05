@@ -20,7 +20,7 @@
 | R6 | While held (with the hold on), a desktop's access session is suspended: still current, but anything other than `vault.status`, `vault.lock`, `device.session.end{}`, `call.end`, `call.ice` of an answered call and `location.share.stop` is answered `owner_check_required`. Entering the hold drops pending session requests. With the hold off, desktops' sessions continue. | §3.6.3 (what is allowed while held), §3.6.7 |
 | R7 | A locked vault collects nothing: requests wait at the relay and get no answer. Sessions resume after an unlock **and a check**: an idle-locked vault comes back held. | §12.1, VAULT-LOCK §4.5 |
 | R8 | Messages arrive in no order. A status answered before a lock can arrive after the lock's confirmation. | §8.4 |
-| R9 | As built, the vault sends `vault.locking` best effort, deposited directly. It skips a device with deposits still queued, and the notice's `exp` is `ts` + 60 s, so a device that collects later drops it as expired. A desktop must not depend on receiving it. | vettid-vault `vault/outbox.go` |
+| R9 | As built, the vault sends `vault.locking` best effort, deposited directly. It skips a device with deposits still queued, and the notice's `exp` is `ts` + 60 s, so a device that collects later drops it as expired. A desktop must not depend on receiving it. | vettid-vault `main` `0ee0078`, `vault/outbox.go` (read: the skip when `outboxPending`, and `Exp: now.Add(time.Minute)`) |
 
 ## 2. What the desktop does today (`main` `67b2ea0`)
 
@@ -144,15 +144,47 @@
        request with a new 60 s `exp` (R2, question 2). Then say plainly
        that the lock isn't confirmed and the vault may still be open.
   3. The `unlock_id` sent is the last valid one read, whatever the state
-     (`Unknown` included), so a lock is never downgraded. Only when no
-     valid `unlock_id` was ever read (the last status had none, a vault
-     before release L, or no status read at all): `vault.lock {}` once,
-     never resent (R2). Its `{}` confirms the lock, as for a bound one.
+     (`Unknown` included), so a lock is never downgraded. When no valid
+     `unlock_id` was ever read (no status read yet, as right after a
+     restart): an unconditional `vault.lock {}` isn't bound to an
+     unlock. It can wait at the relay up to its 60 s `exp` (plus clock
+     skew) and lock a vault the member has just unlocked. So
+     (question 8) the desktop first reads `vault.status` with a short
+     timeout (10 s). If it answers, the lock is sent bound, with the
+     `unlock_id` it gives. If it gives none (a vault before release L),
+     or doesn't answer, `vault.lock {}` goes once, never resent (R2). Its
+     `{}` confirms the lock, as for a bound one.
+  4. **No silent failure.** A lock left unconfirmed when the person
+     leaves the screen (the resend stops with the screen) shows a banner
+     wherever they are: the "Not confirmed" text, until the state is
+     known.
 - **After a confirmed lock** the desktop keeps its link, so it notices
   the unlock (above). When a status answers with a new `unlock_id`, the
   vault is open again. The session shows as live only if that status
   names it and the vault is not held (R7).
-- **"Lock this desktop"** (today's Lock, #76) stays as it is.
+- **"Lock this desktop"** (today's Lock, #76) stays as it is, renamed
+  (NEW). "Lock vault" does not end this desktop's access session, as
+  planned: the session resumes after the next unlock and check (R7).
+  Whether it should also end it is question 9.
+
+### 3.2a Access-session actions through a lock or hold
+
+- **End session** stays offered on the Held, Locked and Unknown screens.
+  `device.session.end` is allowed while held (R6), and a stored end
+  keeps retrying (§3.1).
+- The pending-end notice (#80, #85) and `endState.js`'s `readIsStale`
+  survive a change of the vault state. A screen swap does not clear
+  them.
+- An open End or Lock confirmation isn't lost or re-pointed when the
+  screen swaps: it stays on the action the person opened it for, and
+  is answered or cancelled by them.
+- **Start New Session** is hidden while Held, Locked or Unknown. The
+  vault would refuse it or not answer, and the desktop asks only for
+  what can be used now.
+- **Accepted, said plainly:** after a lock made on the phone, with the
+  `vault.locking` missed (R9), a desktop can show the session as live
+  for up to about 2 minutes (`STALE_AFTER`). To narrow that, the desktop
+  also reads `vault.status` on wake and when its window gains focus.
 
 ### 3.3 The hold
 
@@ -176,36 +208,45 @@
   `vault.locking` with `reason: "idle"` uses the "locked by inactivity"
   text.
 
-### 3.4 Texts (all NEW, for the owner's approval, question 6)
+### 3.4 Texts (each NEW, for the owner's approval, question 6)
 
-- **Lock vault** (the button), and its confirmation: "Lock your vault? It
-  stays locked until you unlock it on your phone."
-- **Locking**: "Locking your vault…"
-- **Locked** (confirmed): "Your vault is locked. Unlock it on your phone
+- **Lock vault** (the button, NEW), and its confirmation (NEW): "Lock
+  your vault? It stays locked until you unlock it on your phone."
+- **Lock this desktop** (today's "Lock" renamed, NEW).
+- **Locked after failed checks** (`reason: "owner_check"`, ten failed
+  checks, §3.6.4), NEW: "Your vault locked itself after too many failed
+  daily checks. Unlock it on your phone."
+- **Locked by a recovery** (`reason: "recovery"`), NEW: "Your vault was
+  locked because a recovery started. Use your phone to continue."
+- **`stale_lock`, then no answer**: the "Unknown" text below.
+- **Locking** (NEW): "Locking your vault…"
+- **Locked** (confirmed, NEW): "Your vault is locked. Unlock it on your phone
   to continue."
-- **Locked from elsewhere** (a matching `vault.locking` for a lock this
+- **Locked from elsewhere** (NEW; a matching `vault.locking` for a lock this
   desktop didn't send): "Your vault was locked. Unlock it
   on your phone to continue."
-- **Locked by inactivity** (`reason: "idle"`): "Your vault locked itself
+- **Locked by inactivity** (NEW; `reason: "idle"`): "Your vault locked itself
   because your daily check wasn't done. Unlock it on your phone."
-- **Locked, can't check now**: "Your vault was locked at <time>. This
+- **Locked, can't check now** (NEW): "Your vault was locked at <time>. This
   desktop can't reach it now to check."
-- **Not confirmed**: "Your vault hasn't confirmed the lock. It may still
-  be open. This desktop tried 3 times; try again, or lock it on your
-  phone."
-- **Unlocked since** (`stale_lock`, then an answering status): "Your
+- **Not confirmed** (NEW): "Your vault hasn't confirmed the lock. It may still
+  be open. Try again, or lock it on your phone." ("This desktop tried 3
+  times" is added if question 2 is a.) The same text is the banner of
+  §3.2.
+- **Unlocked since** (NEW; `stale_lock`, then an answering status): "Your
   vault has been unlocked since this desktop last checked. It is open
   now. Lock again if you want it locked."
-- **Unknown**: "This desktop can't tell whether your vault is locked.
+- **Unknown** (NEW): "This desktop can't tell whether your vault is locked.
   It keeps checking."
-- **Held**: "Your vault is waiting for your daily check. Open VettID on
+- **Held** (NEW): "Your vault is waiting for your daily check. Open VettID on
   your phone to continue."
   - With counts: "Waiting: <n> messages, <n> requests, <n> missed calls,
-    <n> other."
+    <n> other.", each with its singular for 1 ("1 message", "1 request",
+    "1 missed call") and a count of 0 left out.
   - Without counts: "Something may be waiting for you."
   - The line "Your vault locks itself at <time> unless you do your daily
     check."
-- **Hold off** (a line on the session): "Your daily check is overdue.
+- **Hold off** (a line on the session, NEW): "Your daily check is overdue.
   Your vault's hold is off, so this desktop keeps working."
 
 ## 4. Tests
@@ -228,8 +269,17 @@
   - `Locked` with the relay unreachable becomes "as of";
   - a pending session request dropped on `Held` and on `Locked`;
   - a stored end that keeps retrying through a lock;
-  - `vault.lock` never in the outbox (the engine's existing test).
-- **UI:** the routing and state tests (`npm test`) for each state.
+  - `vault.lock` never in the outbox (the engine's existing test);
+  - Lock pressed with no `unlock_id`: the status read first, then bound,
+    `{}` only without an answer or a value;
+  - each reason text (`idle`, `owner_check`, `recovery`);
+  - `due` to `held` to `ok`;
+  - "as of" back to `Locked` once the relay returns.
+- **UI:** the routing and state tests (`npm test`) for each state:
+  - End pending through Held and Locked, with its confirmation open
+    during a swap;
+  - Start New Session hidden in Held, Locked and Unknown;
+  - leaving the screen mid-resend shows the banner.
 - **Staging, on Windows here, with the phone:**
   - a lock from the desktop, confirmed;
   - a lock from the phone, then the desktop's refresh;
@@ -266,6 +316,23 @@
 7. **The idle-lock time on the hold screen.**
    - a (recommended): show it.
    - b: leave it out for now.
+8. **A lock with no `unlock_id` known** (right after a restart).
+   - a (recommended): read `vault.status` first, with a 10 s timeout, and
+     send the lock bound if it answers. Send `{}` only without an answer
+     or a value. This trades a few seconds for a lock bound to the
+     current unlock.
+   - b: send `{}` at once, which is faster but can lock a vault the
+     member has just unlocked.
+9. **Does "Lock vault" also end this desktop's session?**
+   - a: no. The session resumes after the next unlock and check (R7), as
+     planned.
+   - b (recommended): yes. Lock vault also ends this desktop's session,
+     through the stored end of #80, so the member returns to a desktop
+     that asks for a new session. That is less surprising after "lock".
+
+Questions 3 and 4 are deviations from VAULT-MESSAGING. If the owner
+approves them, they go in as a VAULT-MESSAGING erratum, or are recorded
+as owner decisions for desktops.
 
 ## 6. Order
 
