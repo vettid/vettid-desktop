@@ -363,8 +363,12 @@ saved pairing works as above.
   A management tool must count 2 as a failure, which Intune's default return codes do.
 - **A 2 is a failure to retry, not always with an event.** An uninstall started within a second or two of
   the install returned 2 in 4 of 5 runs here, removed nothing and wrote no event; the next run gave 0. This
-  is the row "Uninstall within about a second of the install" above, not explained yet (possibly Defender
-  scanning the new files). Every run started 10 s or more after the install gave the expected result.
+  is the row "Uninstall within about a second of the install" above. It isn't explained yet. Every path in
+  the hooks that sets 2 also writes an event, so this 2 comes from elsewhere. A candidate (a hypothesis) is
+  NSIS's own "aborted" code from the template's app-running check (`CheckIfAppIsRunning`, run before the
+  wipe), if the Restart Manager finds `vettid-desktop.exe` in use and can't close what holds it. But polling
+  the Restart Manager every 250 ms for 8 s after an install showed nothing holding the file. Every run started
+  10 s or more after the install gave the expected result.
 - **If the script can't run** (an execution policy set by Group Policy, Constrained Language Mode, AppLocker
   or WDAC), the result is a failure exit code or "detected", never a false "uninstalled".
 - **Don't build the command yourself.** A plain `uninstall.exe /S` (Windows' `UninstallString`) returns 0 at
