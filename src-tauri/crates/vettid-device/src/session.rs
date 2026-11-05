@@ -855,6 +855,9 @@ impl<T: Transport, C: Clock> Session<T, C> {
                         RelayError::Relay { retry_after: Some(s), .. } => std::time::Duration::from_secs(*s),
                         _ => std::time::Duration::ZERO,
                     };
+                    // A retry_after longer than this budget is cut to it:
+                    // the next poll may come sooner than the relay asked,
+                    // which it then answers again (accepted; review L2).
                     let budget = std::time::Duration::from_secs(wait_secs.max(1));
                     let cap = self.collect_backoff.max(asked).min(budget);
                     self.collect_backoff = (self.collect_backoff * 2).min(COLLECT_MAX_BACKOFF);
