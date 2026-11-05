@@ -517,8 +517,9 @@ impl<'a> PairingUnderWay<'a> {
     /// would race over the pending state on disk (`pairing::start`
     /// removes an earlier pending one).
     fn only(n: &'a std::sync::atomic::AtomicUsize) -> Option<Self> {
-        let counted = PairingUnderWay::new(n);
-        (n.load(std::sync::atomic::Ordering::SeqCst) == 1).then_some(counted)
+        use std::sync::atomic::Ordering::SeqCst;
+        // From 0 to 1 only: a refused call never touches the count.
+        n.compare_exchange(0, 1, SeqCst, SeqCst).ok().map(|_| PairingUnderWay(n))
     }
 }
 

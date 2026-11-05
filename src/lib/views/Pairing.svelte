@@ -33,23 +33,30 @@
 
   // #79: after a reload mid-pairing, the backend may still be waiting for
   // the phone. Say so, rather than offer a second Connect, and look again
-  // every 2 s; once it has ended, routing takes over (paired or not).
+  // every 2 s; once it has ended, reload, so the app starts from what the
+  // backend knows (paired or not).
   onMount(async () => {
-    if (step === 'code' && (await pairingUnderWay())) {
+    const busy = await pairingUnderWay();
+    // Checked after the wait: a Connect pressed meanwhile is this view's own.
+    if (busy && step === 'code') {
       step = 'elsewhere';
       elsewhereTimer = setInterval(async () => {
         if (!(await pairingUnderWay())) {
-          if (elsewhereTimer) clearInterval(elsewhereTimer);
-          elsewhereTimer = null;
-          step = 'code';
+          stopElsewhere();
+          window.location.reload();
         }
       }, 2000);
     }
   });
 
+  function stopElsewhere() {
+    if (elsewhereTimer) clearInterval(elsewhereTimer);
+    elsewhereTimer = null;
+  }
+
   onDestroy(() => {
     unlistenSas?.();
-    if (elsewhereTimer) clearInterval(elsewhereTimer);
+    stopElsewhere();
     pairingHeld.set(false);
   });
 
@@ -65,6 +72,7 @@
     // it (only surrounding whitespace is dropped).
     inviteCode = inviteCode.trim();
     if (!inviteCode) return;
+    stopElsewhere();
     errorMessage = '';
     step = 'awaiting-qr';
 
