@@ -268,9 +268,11 @@ pub struct Session<T: Transport, C: Clock> {
     /// The outbox isn't tried before this (a backoff, or the relay's
     /// `retry_after`, §8.6): no send or poll moves it earlier.
     hold_until: DateTime<Utc>,
-    /// The hold was asked for by the relay (`retry_after`): kept even once
-    /// the relay answers again (#86).
-    hold_by_relay: bool,
+    /// The hold came only from failing to reach the relay (a connect or
+    /// transport error, no `retry_after`): released once a collect gets
+    /// through (#86). A hold from the relay's own answer (a 5xx, a 429) is
+    /// kept, so the outbox backoff still spaces those out.
+    hold_releasable: bool,
     /// See [`COLLECT_BACKOFF`].
     collect_backoff: std::time::Duration,
     outbox_backoff: TimeDelta,
@@ -342,7 +344,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
             maybe_sent: Vec::new(),
             dirty: false,
             hold_until: now,
-            hold_by_relay: false,
+            hold_releasable: false,
             collect_backoff: COLLECT_BACKOFF,
             outbox_backoff: OUTBOX_BACKOFF,
             refresh_sent: None,
@@ -772,11 +774,12 @@ impl<T: Transport, C: Clock> Session<T, C> {
                     }
                     RelayError::Relay { status: 429, retry_after, .. } => {
                         let wait = retry_after.map(|s| TimeDelta::seconds(s.min(3600) as i64));
-                        temporary = Some((d.error.clone(), wait));
+                        temporary = Some((d.error.clone(), wait, false));
                         break;
                     }
                     err if err.retryable() => {
-                        temporary = Some((err.clone(), None));
+                        let unreachable = matches!(err, RelayError::Connect | RelayError::Transport);
+                        temporary = Some((err.clone(), None, unreachable));
                         break;
                     }
                     _ if d.possibly_delivered => {
@@ -801,15 +804,15 @@ impl<T: Transport, C: Clock> Session<T, C> {
             self.save(store)?;
         }
         match temporary {
-            Some((err, wait)) => {
+            Some((err, wait, unreachable)) => {
                 self.hold_until = now + wait.unwrap_or(self.outbox_backoff).max(self.outbox_backoff);
-                self.hold_by_relay = wait.is_some();
+                self.hold_releasable = unreachable;
                 self.outbox_backoff = (self.outbox_backoff * 2).min(OUTBOX_MAX_BACKOFF);
                 Err(SessionError::Relay(err))
             }
             None => {
                 self.outbox_backoff = OUTBOX_BACKOFF;
-                self.hold_by_relay = false;
+                self.hold_releasable = false;
                 Ok(())
             }
         }
@@ -836,19 +839,27 @@ impl<T: Transport, C: Clock> Session<T, C> {
             Ok(()) | Err(SessionError::Relay(_)) | Err(SessionError::Refused) => {}
             Err(e) => return Err(e),
         }
+        let started = tokio::time::Instant::now();
         let msgs = match self.transport.collect(&self.state.relay_url, wait_secs, POLL_MAX).await {
             Ok(m) => m,
             Err(e) => {
-                // #81: wait before the caller polls again (full jitter),
-                // within the long-poll time it allowed anyway.
-                if e.retryable() {
-                    let cap = self.collect_backoff.min(std::time::Duration::from_secs(wait_secs.max(1)));
-                    self.collect_backoff = (self.collect_backoff * 2).min(COLLECT_MAX_BACKOFF);
-                    tokio::time::sleep(jitter(cap)).await;
-                }
                 // The inbox is local and stored: what wasn't returned yet
                 // is returned now, even with the relay out of reach.
                 let pending = self.unreturned();
+                // #81: before the caller polls again, a wait (full jitter),
+                // less the time this collect already took, so it stays
+                // within the long-poll time the caller allowed (and a
+                // request's deadline). Not when there is something to return.
+                if e.retryable() && pending.is_empty() {
+                    let asked = match &e {
+                        RelayError::Relay { retry_after: Some(s), .. } => std::time::Duration::from_secs(*s),
+                        _ => std::time::Duration::ZERO,
+                    };
+                    let budget = std::time::Duration::from_secs(wait_secs.max(1));
+                    let cap = self.collect_backoff.max(asked).min(budget);
+                    self.collect_backoff = (self.collect_backoff * 2).min(COLLECT_MAX_BACKOFF);
+                    tokio::time::sleep(collect_wait(cap, asked.min(budget), started.elapsed())).await;
+                }
                 return if pending.is_empty() { Err(e.into()) } else { Ok(pending) };
             }
         };
@@ -857,9 +868,10 @@ impl<T: Transport, C: Clock> Session<T, C> {
         // after transport failures goes out now, not minutes later. A hold
         // the relay asked for (`retry_after`) stays.
         self.collect_backoff = COLLECT_BACKOFF;
-        if !self.hold_by_relay {
+        if self.hold_releasable {
             self.hold_until = self.clock.now().min(self.hold_until);
             self.outbox_backoff = OUTBOX_BACKOFF;
+            self.hold_releasable = false;
         }
         let cp = self.checkpoint();
         let mut events = Vec::new();
@@ -1191,6 +1203,13 @@ fn jitter(cap: std::time::Duration) -> std::time::Duration {
     use rand::Rng;
     let ms = cap.as_millis() as u64;
     std::time::Duration::from_millis(if ms == 0 { 0 } else { rand::thread_rng().gen_range(0..=ms) })
+}
+
+/// The wait after a failed collect (#81): at least what the relay asked
+/// for (`floor`), otherwise a full-jitter wait up to `cap`; less the time
+/// the collect itself already took.
+fn collect_wait(cap: std::time::Duration, floor: std::time::Duration, spent: std::time::Duration) -> std::time::Duration {
+    jitter(cap).max(floor).min(cap).saturating_sub(spent)
 }
 
 #[cfg(test)]

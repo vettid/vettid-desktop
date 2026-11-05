@@ -57,6 +57,10 @@ pub(crate) struct Faults {
     pub(crate) revoked: bool,
     /// Answer this many deposits 429 quota_exceeded.
     pub(crate) quota: usize,
+    /// Answer this many deposits 503 (the relay's own failure).
+    pub(crate) server_errors: usize,
+    /// Answer this many deposits 429 rate_limited, without retry_after.
+    pub(crate) rate_limited: usize,
     pub(crate) deposits_seen: usize,
 }
 
@@ -100,6 +104,16 @@ impl Transport for Mem {
             if f.temporary > 0 {
                 f.temporary -= 1;
                 return Err(DepositError { error: RelayError::Connect, possibly_delivered: false });
+            }
+            if f.server_errors > 0 {
+                f.server_errors -= 1;
+                let error = RelayError::Relay { status: 503, code: "unavailable".into(), retry_after: None, quota: None };
+                return Err(DepositError { error, possibly_delivered: false });
+            }
+            if f.rate_limited > 0 {
+                f.rate_limited -= 1;
+                let error = RelayError::Relay { status: 429, code: "rate_limited".into(), retry_after: None, quota: None };
+                return Err(DepositError { error, possibly_delivered: false });
             }
         }
         let id = new_ulid(Utc::now()).unwrap();
