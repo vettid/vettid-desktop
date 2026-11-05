@@ -1,5 +1,7 @@
 import { get, writable } from 'svelte/store';
 import { afterRead, afterEnd, readIsStale } from '../endState.js';
+import { notLiveState, type VaultView } from '../vaultState.js';
+import { CLOSED, openEnd, answer, type Confirm } from '../endConfirm.js';
 
 export interface SessionState {
   state: 'inactive' | 'active' | 'suspended' | 'expired' | 'revoked';
@@ -36,6 +38,85 @@ export const sessionNotice = writable<string | null>(null);
  * so an unconfirmed end never looks like a confirmed one.
  */
 export const endPending = writable<boolean>(false);
+
+/**
+ * The vault's lock and hold as of the last read (#77): `get_session_info`'s
+ * `vault`, which the backend takes at the time of the read. `null` while no
+ * link is open (nothing known).
+ */
+export const vaultStore = writable<VaultView | null>(null);
+
+/**
+ * End session's confirmation (#77, §3.2), above the views: a screen swap
+ * neither closes it nor re-points it (see endConfirm.js). App.svelte shows
+ * it.
+ */
+export const endConfirm = writable<Confirm>(CLOSED);
+
+/** End session is under way (App.svelte shows it over every view). */
+export const endBusy = writable<boolean>(false);
+
+/** What the last End session said, for the Session view. */
+export const endStatus = writable<string>('');
+
+/** Open End session's confirmation. */
+export function askToEnd(): void {
+  endConfirm.set(openEnd());
+}
+
+/** The person answered End session's confirmation. */
+export async function answerEnd(yes: boolean): Promise<void> {
+  const r = answer(get(endConfirm), yes);
+  endConfirm.set(r.confirm);
+  if (r.run === 'end') await endSessionNow();
+}
+
+/**
+ * End session (§6.8, all of this desktop's access): offered in every
+ * vault state (§3.2). Run from above the views, so a screen swap while it
+ * waits doesn't lose its outcome.
+ */
+export async function endSessionNow(): Promise<void> {
+  if (get(endBusy)) return;
+  const { invoke } = await import('@tauri-apps/api/core');
+  endBusy.set(true);
+  endStatus.set('');
+  sessionNotice.set(null);
+  markEndStarted();
+  try {
+    // The session stops being shown as live at once; `notice` says when
+    // the vault didn't confirm the end (or a newer session runs on).
+    const result = await invoke<{ notice: string | null; end_pending?: boolean }>('end_session');
+    endStatus.set(result.notice ?? 'Session ended.');
+    // The view is usually replaced by now (routing follows the poll); the
+    // notice is shown on the next.
+    sessionNotice.set(result.notice);
+    // #80: before any read. Still pending: kept as the end's own notice,
+    // to go on a later confirmation; otherwise the outcome is final.
+    endReturned(result.notice, !!result.end_pending);
+    // Refresh the store at once so the pill and routing follow.
+    await refreshSessionFromBackend();
+  } catch (e) {
+    endStatus.set(`Failed to end session: ${e}`);
+  } finally {
+    endBusy.set(false);
+  }
+}
+
+/**
+ * The window gained focus (#77, §3.1): the backend reads `vault.status` if
+ * its word is old (and takes a sleep its refresh saw as a resume), then
+ * the store is read again.
+ */
+export async function checkVaultOnFocus(): Promise<void> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  try {
+    const read = await invoke<boolean>('check_vault');
+    if (read) await refreshSessionFromBackend();
+  } catch {
+    // Nothing to check (no link): the poll goes on as before.
+  }
+}
 
 /** The not-confirmed notice End session showed while its end stayed
  *  pending: cleared once the vault answers that end (see endState.js). */
@@ -136,9 +217,14 @@ export async function refreshSessionFromBackend(): Promise<void> {
       end_pending?: boolean;
       end_confirmed?: boolean;
       end_notice?: string | null;
+      vault?: VaultView | null;
     }>('get_session_info');
     // #80: from before an End session press: it would undo it.
     if (readIsStale(seq, endSeq)) return;
+
+    // #77: the vault's state, as of this read. It changes nothing of the
+    // end's state below (a pending end and its notice survive a swap).
+    vaultStore.set(info.vault ?? null);
 
     // #80: an End session still waiting for the vault, and its notice.
     // A live session makes an earlier end's "not confirmed" moot (#80, L1).
@@ -167,10 +253,13 @@ export async function refreshSessionFromBackend(): Promise<void> {
         sessionNotice.set(info.notice);
         staleNoticeShown = info.notice;
       }
-      sessionStore.update(s => ({ ...s, state: 'expired', secondsRemaining: 0 }));
+      // #77: held or locked is the vault's word ("suspended"), not an
+      // expiry.
+      sessionStore.update(s => ({ ...s, state: notLiveState(info.vault), secondsRemaining: 0 }));
     }
   } catch {
     if (readIsStale(seq, endSeq)) return;
+    vaultStore.set(null);
     // No link: nothing is known of an end; its notice isn't touched.
     applyEndState(null);
     // `get_session_info` throws "not unlocked" when AppState has no
