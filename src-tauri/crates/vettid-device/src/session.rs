@@ -275,6 +275,10 @@ pub struct Session<T: Transport, C: Clock> {
     hold_releasable: bool,
     /// See [`COLLECT_BACKOFF`].
     collect_backoff: std::time::Duration,
+    /// The last collect failed: the next one doesn't long-poll (`wait`
+    /// 0), so a held outbox goes out as soon as the relay is back, not a
+    /// long-poll later (#86, lead review).
+    probe_next: bool,
     outbox_backoff: TimeDelta,
     refresh_sent: Option<DateTime<Utc>>,
 }
@@ -346,6 +350,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
             hold_until: now,
             hold_releasable: false,
             collect_backoff: COLLECT_BACKOFF,
+            probe_next: false,
             outbox_backoff: OUTBOX_BACKOFF,
             refresh_sent: None,
         };
@@ -805,7 +810,10 @@ impl<T: Transport, C: Clock> Session<T, C> {
         }
         match temporary {
             Some((err, wait, unreachable)) => {
-                self.hold_until = now + wait.unwrap_or(self.outbox_backoff).max(self.outbox_backoff);
+                // The backoff part with jitter (half fixed, half random), so
+                // desktops that failed together don't retry together (§7.2).
+                let own = TimeDelta::from_std(equal_jitter(self.outbox_backoff.to_std().unwrap_or_default())).unwrap_or(self.outbox_backoff);
+                self.hold_until = now + wait.map_or(own, |w| w.max(own));
                 self.hold_releasable = unreachable;
                 self.outbox_backoff = (self.outbox_backoff * 2).min(OUTBOX_MAX_BACKOFF);
                 Err(SessionError::Relay(err))
@@ -840,9 +848,11 @@ impl<T: Transport, C: Clock> Session<T, C> {
             Err(e) => return Err(e),
         }
         let started = tokio::time::Instant::now();
-        let msgs = match self.transport.collect(&self.state.relay_url, wait_secs, POLL_MAX).await {
+        let wait = if self.probe_next { 0 } else { wait_secs };
+        let msgs = match self.transport.collect(&self.state.relay_url, wait, POLL_MAX).await {
             Ok(m) => m,
             Err(e) => {
+                self.probe_next = true;
                 // The inbox is local and stored: what wasn't returned yet
                 // is returned now, even with the relay out of reach.
                 let pending = self.unreturned();
@@ -871,6 +881,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
         // after transport failures goes out now, not minutes later. A hold
         // the relay asked for (`retry_after`) stays.
         self.collect_backoff = COLLECT_BACKOFF;
+        self.probe_next = false;
         if self.hold_releasable {
             self.hold_until = self.clock.now().min(self.hold_until);
             self.outbox_backoff = OUTBOX_BACKOFF;
@@ -1206,6 +1217,11 @@ fn jitter(cap: std::time::Duration) -> std::time::Duration {
     use rand::Rng;
     let ms = cap.as_millis() as u64;
     std::time::Duration::from_millis(if ms == 0 { 0 } else { rand::thread_rng().gen_range(0..=ms) })
+}
+
+/// Half of `d` fixed and half random: never shorter than `d / 2`.
+fn equal_jitter(d: std::time::Duration) -> std::time::Duration {
+    d / 2 + jitter(d / 2)
 }
 
 /// The wait after a failed collect (#81): at least what the relay asked

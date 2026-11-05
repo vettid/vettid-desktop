@@ -57,6 +57,9 @@ pub(crate) struct Faults {
     pub(crate) revoked: bool,
     /// Answer this many deposits 429 quota_exceeded.
     pub(crate) quota: usize,
+    /// An empty collect waits its full `wait` (tokio time), as the relay's
+    /// long-poll does; off by default, so other tests don't wait.
+    pub(crate) long_poll: bool,
     /// Answer this many deposits 503 (the relay's own failure).
     pub(crate) server_errors: usize,
     /// Answer this many deposits 429 rate_limited, without retry_after.
@@ -130,13 +133,17 @@ impl Transport for Mem {
     /// relay there is no lease, so an unacked message comes back on the
     /// next collect (and `max` or more unacked messages would hide the
     /// rest).
-    async fn collect(&self, _base: &str, _wait: u64, max: u32) -> Result<Vec<Message>, RelayError> {
-        {
+    async fn collect(&self, _base: &str, wait: u64, max: u32) -> Result<Vec<Message>, RelayError> {
+        let long_poll = {
             let mut f = self.faults.lock().unwrap();
             if f.collects > 0 {
                 f.collects -= 1;
                 return Err(RelayError::Transport);
             }
+            f.long_poll
+        };
+        if long_poll && self.relay.lock().unwrap().mailboxes.get(&self.mailbox()).is_none_or(|m| m.is_empty()) {
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
         }
         let msgs: Vec<Message> = self.relay.lock().unwrap().mailboxes.get(&self.mailbox()).map(|m| m.iter().take(max as usize).cloned().collect()).unwrap_or_default();
         if msgs.is_empty() {
