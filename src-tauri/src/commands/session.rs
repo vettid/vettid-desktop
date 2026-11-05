@@ -46,9 +46,9 @@ fn status_of(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> SessionStat
             session_id: snap.session_id.clone(),
             expires_at: Some(until.timestamp()),
             seconds_remaining: Some((until - now).num_seconds().max(0)),
-            // The vault doesn't count extensions; reported as 0.
-            extended_count: Some(0),
-            max_extensions: Some(3),
+            // The vault doesn't count extensions (#82): not reported.
+            extended_count: None,
+            max_extensions: None,
             phone_reachable: snap.reachable,
         },
         None if snap.unlocked => none("expired", snap.reachable),
@@ -102,11 +102,13 @@ mod tests {
             unlocked: true,
             session_id: Some("s".into()),
             expires_at: Some(now + chrono::TimeDelta::hours(1)),
+            ends_at: Some(now + chrono::TimeDelta::minutes(59)),
             live_until: Some(now + chrono::TimeDelta::seconds(120)),
             ..Default::default()
         };
         let s = status_of(&snap, now);
-        assert_eq!((s.state.as_str(), s.seconds_remaining), ("active", Some(3600)));
+        // The desktop's own end, a margin before the vault's hour.
+        assert_eq!((s.state.as_str(), s.seconds_remaining), ("active", Some(59 * 60)));
         // Past the freshness window: not live, so no time at all.
         let later = status_of(&snap, now + chrono::TimeDelta::seconds(121));
         assert_eq!((later.state.as_str(), later.seconds_remaining), ("expired", None));

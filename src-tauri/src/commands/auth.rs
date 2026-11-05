@@ -54,8 +54,8 @@ pub struct RegisterResponse {
     pub connection_id: Option<String>,
     /// The access session (§6.8), when one is live.
     pub session_id: Option<String>,
-    /// Unix seconds: when this desktop stops treating the session as live
-    /// (a margin before the vault's `expires_at`).
+    /// Unix seconds: when this desktop stops treating the session as live,
+    /// a margin before the vault's `expires_at` (#82: not the freshness cap).
     pub expires_at: Option<i64>,
     /// Not a success, but the pairing is saved: there is no access session
     /// (yet). The pairing screen shows `error` and continues to Start New
@@ -606,9 +606,10 @@ pub struct SessionInfoResponse {
     /// The id the vault gave this device.
     pub connection_id: String,
     pub session_id: String,
-    /// Unix seconds at which the live session ends: the vault's own
-    /// `expires_at` (#82). 0 when not live. Whether it is live is
-    /// `is_active` (which also stops once the vault goes quiet).
+    /// Unix seconds at which this desktop stops treating the live session
+    /// as live, a margin before the vault's `expires_at` (#82). 0 when not
+    /// live. Whether it is live now is `is_active` (which also stops once
+    /// the vault goes quiet).
     pub expires_at: i64,
     pub seconds_remaining: i64,
     pub is_active: bool,
@@ -1583,6 +1584,7 @@ mod tests {
             device_id: Some("dev".into()),
             session_id: Some("s1".into()),
             expires_at: Some(until + chrono::TimeDelta::seconds(60)),
+            ends_at: Some(until + chrono::TimeDelta::seconds(30)),
             live_until: Some(until),
             reachable: true,
             refused: false,
@@ -1611,9 +1613,9 @@ mod tests {
         let info = session_info(&not, now).unwrap();
         assert!(!info.end_confirmed);
         assert_eq!(info.end_notice.as_deref(), Some(link::END_UNCONFIRMED_NOTICE));
-        // #82: the vault's expires_at (60 s past live_until here), not live_until.
-        assert_eq!(info.expires_at, (until + chrono::TimeDelta::seconds(60)).timestamp());
-        assert_eq!(info.seconds_remaining, 150);
+        // #82: the desktop's own end (ends_at, 30 s past live_until here), not live_until.
+        assert_eq!(info.expires_at, (until + chrono::TimeDelta::seconds(30)).timestamp());
+        assert_eq!(info.seconds_remaining, 120);
         assert_eq!(info.session_id, "s1");
         let later = session_info(&snap, until + chrono::TimeDelta::seconds(1)).unwrap();
         assert!(!later.is_active);
