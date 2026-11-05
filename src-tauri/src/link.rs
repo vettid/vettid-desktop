@@ -538,6 +538,14 @@ impl<T: Transport, C: Clock> Link<T, C> {
         if r.is_ok() {
             self.confirmed = Some(Utc::now());
         }
+        // #80: this end's own outcome; a stored end still pending has none yet.
+        self.end_settled = match &r {
+            Ok(EndOutcome::Ended) => Some(EndSettled::Confirmed),
+            Ok(EndOutcome::Unconfirmed) => Some(EndSettled::NotConfirmed(END_UNCONFIRMED_NOTICE)),
+            Ok(EndOutcome::Replaced) => Some(EndSettled::NotConfirmed(END_REPLACED_NOTICE)),
+            Err(_) if self.session.access_end().is_none() => Some(EndSettled::NotConfirmed(END_UNCONFIRMED_NOTICE)),
+            Err(_) => None,
+        };
         self.note_refused().await;
         r
     }
@@ -1098,7 +1106,9 @@ mod tests {
         let meanwhile = before.without_session();
         assert!(meanwhile.end_pending && !meanwhile.active_at(Utc::now()));
         assert_eq!(link.end().await, Ok(EndOutcome::Ended));
-        assert!(!link.snapshot(Utc::now()).end_pending, "the vault answered");
+        let after = link.snapshot(Utc::now());
+        assert!(!after.end_pending, "the vault answered");
+        assert_eq!(after.end_settled, Some(EndSettled::Confirmed), "#80: and that is a confirmation");
     }
 
     /// Item 4: no answer, and the session the resend named was replaced by

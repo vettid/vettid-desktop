@@ -646,9 +646,14 @@ fn session_info(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> Result<S
         notice: (snap.stale && !active).then(|| link::STALE_NOTICE.to_string()),
         end_pending: snap.end_pending,
         end_confirmed: snap.end_settled == Some(link::EndSettled::Confirmed),
+        // With no end pending: what to say unless the end was confirmed. An
+        // end that went away without an outcome here (settled inside a
+        // request, or by a late answer) was not confirmed (#80).
         end_notice: match &snap.end_settled {
+            _ if snap.end_pending => None,
+            Some(link::EndSettled::Confirmed) => None,
             Some(link::EndSettled::NotConfirmed(n)) => Some(n.to_string()),
-            _ => None,
+            None => Some(link::END_UNCONFIRMED_NOTICE.to_string()),
         },
     })
 }
@@ -1574,6 +1579,10 @@ mod tests {
         let ending = session_info(&snap.without_session(), now).unwrap();
         assert!(ending.end_pending && !ending.is_active);
         assert!(!ending.end_confirmed && ending.end_notice.is_none(), "nothing settled yet");
+        // Not pending, no outcome: not confirmed.
+        let gone = session_info(&snap, now).unwrap();
+        assert!(!gone.end_confirmed);
+        assert_eq!(gone.end_notice.as_deref(), Some(link::END_UNCONFIRMED_NOTICE));
         let confirmed = Snapshot { end_settled: Some(link::EndSettled::Confirmed), ..snap.clone() };
         let info = session_info(&confirmed, now).unwrap();
         assert!(info.end_confirmed && info.end_notice.is_none());

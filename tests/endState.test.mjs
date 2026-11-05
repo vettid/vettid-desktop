@@ -19,6 +19,12 @@ test('#80 (review H1): an end that stops being pending without a confirmation is
   assert.deepEqual(ended({}), { notice: NOT_SENT, endNotice: null, pending: false });
 });
 
+test('#80 (re-review M1): an end gone with nothing on screen and no confirmation says so', () => {
+  // After a restart only the spinner showed; the backend says "not confirmed".
+  const r = afterRead({ wasPending: true, nowPending: false, notice: null, endNotice: null, settledNotice: UNCONFIRMED });
+  assert.deepEqual(r, { notice: UNCONFIRMED, endNotice: null, pending: false });
+});
+
 test('#80: it stays while the end is still pending', () => {
   const r = afterRead({ wasPending: true, nowPending: true, notice: NOT_SENT, endNotice: NOT_SENT, confirmed: true });
   assert.deepEqual(r, { notice: NOT_SENT, endNotice: NOT_SENT, pending: true });
