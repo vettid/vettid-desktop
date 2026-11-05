@@ -1076,7 +1076,9 @@ async fn failed_collects_back_off_and_a_good_one_resets() {
     assert!(start.elapsed() <= std::time::Duration::from_secs(1 + 2 + 4 + 8 + 16 + 25), "each wait within its cap");
     assert!(start.elapsed() > std::time::Duration::ZERO, "the polls did wait");
     s.poll(&mut store).await.unwrap();
-    assert_eq!(s.collect_backoff, COLLECT_BACKOFF, "the relay answers again");
+    assert_eq!(s.collect_backoff, COLLECT_MAX_BACKOFF, "a good probe alone doesn't reset it");
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.collect_backoff, COLLECT_BACKOFF, "a good long-poll does");
 }
 
 /// #86: deposits held only by this session's own backoff after transport

@@ -880,7 +880,11 @@ impl<T: Transport, C: Clock> Session<T, C> {
         // collects, and an outbox held only by this session's own backoff
         // after transport failures goes out now, not minutes later. A hold
         // the relay asked for (`retry_after`) stays.
-        self.collect_backoff = COLLECT_BACKOFF;
+        // Reset only after a good long-poll: a relay that answers the probe
+        // but fails again keeps backing off (review L1).
+        if wait > 0 {
+            self.collect_backoff = COLLECT_BACKOFF;
+        }
         self.probe_next = false;
         if self.hold_releasable {
             self.hold_until = self.clock.now().min(self.hold_until);
