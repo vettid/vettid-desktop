@@ -1,6 +1,6 @@
 # Desktop: the vault's lock and hold (design note, #77)
 
-*Draft, 2026-11-05, for the owner's approval before code.*
+*2026-11-05. Approved by the owner (§5); the code follows it.*
 
 *Read against:*
 - *VAULT-MESSAGING 0.85.0 (vettid.org master): §3.6.3, §3.6.5, §3.6.7, §8.4, §10.2 ("Locks", `vault.status`, `vault.held`, `vault.locking`), §11.4, §12.1;*
@@ -91,7 +91,7 @@ about its lock and hold, and how the desktop shows it honestly.
     read at once.
   - A `vault.locking` when no `unlock_id` is held (no status read yet,
     or a vault before release L): the desktop has no unlock result for
-    the §11.4 time rule (question 1). Proposed: the state becomes
+    the §11.4 time rule (owner decision 1, §5): the state becomes
     `Unknown`, the session not live, and a status is read at once. The
     notice never makes the desktop show "locked", only less.
   - `vault.held` (newest by `ts`) sets `Held` with its counts.
@@ -109,7 +109,7 @@ about its lock and hold, and how the desktop shows it honestly.
     each refresh reaches the relay (the collect answers) and the status
     gets no answer. If the relay can't be reached, the state shows
     "locked as of <time>": the last time it was confirmed, and that
-    this desktop can't check now (question 2). It turns back to `Locked`
+    this desktop can't check now (owner decision 2). It turns back to `Locked`
     once the relay answers again and the status still doesn't.
 - **Pending requests and ends.**
   - A pending `device.session.request` is dropped when the state becomes
@@ -155,9 +155,9 @@ about its lock and hold, and how the desktop shows it honestly.
 - The hold ends when a `vault.status` says `ok` or `due` (newer than the
   hold statement). A `vault.held` delivered late shows the hold until
   that status, which the continued refresh reads within 60 s.
-- `idle_lock_at` is shown on the hold screen (question 4).
+- `idle_lock_at` is shown on the hold screen (owner decision 4).
 
-### 3.4 Texts (each NEW, for the owner's approval, question 3)
+### 3.4 Texts (each NEW; approved by the owner, decision 3)
 
 - **Locked** (NEW; a matching `vault.locking`, no reason): "Your vault
   was locked. Unlock it on your phone to continue."
@@ -218,23 +218,19 @@ about its lock and hold, and how the desktop shows it honestly.
   - the relay cut while locked ("as of");
   - sleep and resume while locked.
 
-## 5. Questions for the owner
+## 5. Owner decisions (2026-11-05)
 
-1. **A `vault.locking` with no `unlock_id` held.** §10.2 and §11.4 give
-   the time rule, against an unlock result, which a desktop never has.
-   - a (recommended): treat it as `Unknown`: the session not live, a
-     status read, and "locked" never shown on it alone. This deviates
-     from the spec, so it is recorded as an owner decision for desktops
-     (or an erratum).
-   - b: a spec erratum that defines the rule for desktops (for example,
-     `ts` later than its latest status answer).
-2. **Locked when the vault can't be checked** (offline, after resume).
-   - a (recommended): "locked as of <time>", with "can't check now".
-   - b: `Unknown`.
-3. **The texts of §3.4.** Approve them as written, or change them.
-4. **The idle-lock time on the hold screen.**
-   - a (recommended): show it.
-   - b: leave it out for now.
+The owner chose the recommended answer to each question (thread
+01M6PJ5AMK6YXG58NYA4PGTW2T, "rec"):
+
+1. **A `vault.locking` with no `unlock_id` held** shows `Unknown` and
+   re-reads the status; "locked" is never shown on it alone. This is the
+   owner's decision for desktops, in place of the §11.4 time rule. The
+   spec erratum is the lead's.
+2. **Locked when the vault can't be checked** (offline, after resume):
+   "locked as of <time>", with "can't check now".
+3. **The texts of §3.4** are approved as written.
+4. **The hold screen** shows the idle-lock time.
 
 ## 6. Order
 
