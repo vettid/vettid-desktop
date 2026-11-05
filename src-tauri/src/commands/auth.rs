@@ -61,6 +61,9 @@ pub struct RegisterResponse {
     /// (yet). The pairing screen shows `error` and continues to Start New
     /// Session instead of offering to pair again.
     pub paired_without_session: bool,
+    /// Unix seconds: when the person may ask again after `too_soon` (#83),
+    /// for the frontend to show in the computer's own locale.
+    pub retry_at: Option<i64>,
 }
 
 impl RegisterResponse {
@@ -72,6 +75,7 @@ impl RegisterResponse {
             session_id: None,
             expires_at: None,
             paired_without_session: false,
+            retry_at: None,
         }
     }
 
@@ -88,6 +92,7 @@ impl RegisterResponse {
             session_id: snap.session_id.clone(),
             expires_at: snap.shown_expiry(chrono::Utc::now()).map(|t| t.timestamp()),
             paired_without_session: false,
+            retry_at: None,
         }
     }
 }
@@ -728,6 +733,10 @@ fn extend_response(
         _ if overtaken => RegisterResponse::failed(link::REQUEST_STOPPED_NOTICE),
         Ok(()) if snap.active_at(now) => RegisterResponse::live(snap),
         Ok(()) => RegisterResponse::failed(link::ACCESS_NOT_CONFIRMED_NOTICE),
+        Err(link::RequestFailed::TooSoon(at)) => RegisterResponse {
+            retry_at: link::too_soon_retry_at(at, now).map(|t| t.timestamp()),
+            ..RegisterResponse::failed(link::request_notice(&link::RequestFailed::TooSoon(at), failure))
+        },
         Err(f) => RegisterResponse::failed(link::request_notice(&f, failure)),
     }
 }
