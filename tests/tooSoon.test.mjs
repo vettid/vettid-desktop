@@ -20,3 +20,10 @@ test('#83: German and British English are 24-hour', () => {
   const pm = Math.floor(new Date(2026, 10, 5, 13, 5, 0).getTime() / 1000);
   assert.equal(plain(tooSoonNotice(pm, 'en-GB')), `${lead} 13:05.`);
 });
+
+test('#83: both screens take the same notice from a response', async () => {
+  const { noticeOf } = await import('../src/lib/tooSoon.js');
+  assert.equal(plain(noticeOf({ retry_at: at, error: 'x' }, '', 'en-US')), `${lead} 10:48 AM.`);
+  assert.equal(noticeOf({ retry_at: null, error: 'The error.' }), 'The error.');
+  assert.equal(noticeOf({ error: '' }, 'Pairing failed'), 'Pairing failed');
+});

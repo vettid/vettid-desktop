@@ -2,7 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { onDestroy } from 'svelte';
-  import { tooSoonNotice } from '../tooSoon.js';
+  import { noticeOf } from '../tooSoon.js';
   import { activateSession, sessionNotice, endPending } from '../stores/session';
 
   let step = $state<'idle' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error' | 'removed-unconfirmed'>('idle');
@@ -44,7 +44,7 @@
       } else {
         step = 'error';
         // #83: the time in this computer's own locale.
-        errorMessage = result.retry_at ? tooSoonNotice(result.retry_at) : (result.error || 'Extension failed');
+        errorMessage = noticeOf(result, 'Extension failed');
       }
     } catch (e: any) {
       step = 'error';
