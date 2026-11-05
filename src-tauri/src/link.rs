@@ -181,6 +181,17 @@ impl Snapshot {
         self.live_until.is_some_and(|u| t <= u)
     }
 
+    /// When the live session ends, for "Time remaining" (#82): the vault's
+    /// own `expires_at` for it, not [`Snapshot::live_until`] (which is
+    /// capped at [`STALE_AFTER`] past the last confirmation, and decides
+    /// only whether the session is shown as live). `None` unless live at `t`.
+    pub fn shown_expiry(&self, t: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if !self.active_at(t) {
+            return None;
+        }
+        self.expires_at.or(self.live_until)
+    }
+
     /// The same, without the session: what an operation that is ending it
     /// shows meanwhile (the end pending until the link's own snapshot says
     /// how it went).

@@ -167,10 +167,6 @@
       </div>
     {/if}
     <div class="row">
-      <span class="label">Extensions used</span>
-      <span class="value">{session.extendedCount} / {session.maxExtensions}</span>
-    </div>
-    <div class="row">
       <span class="label">Phone</span>
       <span class="value"
             class:reachable={session.phoneReachable}

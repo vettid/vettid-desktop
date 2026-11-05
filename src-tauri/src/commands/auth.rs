@@ -86,7 +86,7 @@ impl RegisterResponse {
             error: None,
             connection_id: snap.device_id.clone(),
             session_id: snap.session_id.clone(),
-            expires_at: snap.live_until.map(|t| t.timestamp()),
+            expires_at: snap.shown_expiry(chrono::Utc::now()).map(|t| t.timestamp()),
             paired_without_session: false,
         }
     }
@@ -606,8 +606,9 @@ pub struct SessionInfoResponse {
     /// The id the vault gave this device.
     pub connection_id: String,
     pub session_id: String,
-    /// Unix seconds at which this desktop stops treating the session as
-    /// live (a margin before the vault's `expires_at`). 0 when inactive.
+    /// Unix seconds at which the live session ends: the vault's own
+    /// `expires_at` (#82). 0 when not live. Whether it is live is
+    /// `is_active` (which also stops once the vault goes quiet).
     pub expires_at: i64,
     pub seconds_remaining: i64,
     pub is_active: bool,
@@ -638,7 +639,7 @@ fn session_info(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> Result<S
         return Err("not unlocked".to_string());
     }
     let active = snap.active_at(now);
-    let until = snap.live_until.filter(|_| active);
+    let until = snap.shown_expiry(now);
     Ok(SessionInfoResponse {
         connection_id: snap.device_id.clone().unwrap_or_default(),
         session_id: snap.session_id.clone().filter(|_| active).unwrap_or_default(),
@@ -1610,8 +1611,9 @@ mod tests {
         let info = session_info(&not, now).unwrap();
         assert!(!info.end_confirmed);
         assert_eq!(info.end_notice.as_deref(), Some(link::END_UNCONFIRMED_NOTICE));
-        assert_eq!(info.expires_at, until.timestamp());
-        assert_eq!(info.seconds_remaining, 90);
+        // #82: the vault's expires_at (60 s past live_until here), not live_until.
+        assert_eq!(info.expires_at, (until + chrono::TimeDelta::seconds(60)).timestamp());
+        assert_eq!(info.seconds_remaining, 150);
         assert_eq!(info.session_id, "s1");
         let later = session_info(&snap, until + chrono::TimeDelta::seconds(1)).unwrap();
         assert!(!later.is_active);
