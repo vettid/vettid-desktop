@@ -615,6 +615,13 @@ pub struct SessionInfoResponse {
     /// An End session the vault hasn't answered yet (#80): the UI shows
     /// "Ending your session…" until it is false.
     pub end_pending: bool,
+    /// The refresh settled a stored end and the vault confirmed it (#80):
+    /// End session's not-confirmed notice may go. Not set by a stored end
+    /// merely going away.
+    pub end_confirmed: bool,
+    /// The refresh settled a stored end without that confirmation: what to
+    /// tell the person instead.
+    pub end_notice: Option<String>,
 }
 
 /// What the frontend polls (cheap, no network) to drive the expiry UI:
@@ -638,6 +645,11 @@ fn session_info(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> Result<S
         is_active: active,
         notice: (snap.stale && !active).then(|| link::STALE_NOTICE.to_string()),
         end_pending: snap.end_pending,
+        end_confirmed: snap.end_settled == Some(link::EndSettled::Confirmed),
+        end_notice: match &snap.end_settled {
+            Some(link::EndSettled::NotConfirmed(n)) => Some(n.to_string()),
+            _ => None,
+        },
     })
 }
 
@@ -1553,6 +1565,7 @@ mod tests {
             refused: false,
             stale: false,
             end_pending: false,
+            end_settled: None,
         };
         let info = session_info(&snap, now).unwrap();
         assert!(info.is_active);
@@ -1560,6 +1573,14 @@ mod tests {
         // #80: an end under way is passed on, with no session live.
         let ending = session_info(&snap.without_session(), now).unwrap();
         assert!(ending.end_pending && !ending.is_active);
+        assert!(!ending.end_confirmed && ending.end_notice.is_none(), "nothing settled yet");
+        let confirmed = Snapshot { end_settled: Some(link::EndSettled::Confirmed), ..snap.clone() };
+        let info = session_info(&confirmed, now).unwrap();
+        assert!(info.end_confirmed && info.end_notice.is_none());
+        let not = Snapshot { end_settled: Some(link::EndSettled::NotConfirmed(link::END_UNCONFIRMED_NOTICE)), ..snap.clone() };
+        let info = session_info(&not, now).unwrap();
+        assert!(!info.end_confirmed);
+        assert_eq!(info.end_notice.as_deref(), Some(link::END_UNCONFIRMED_NOTICE));
         assert_eq!(info.expires_at, until.timestamp());
         assert_eq!(info.seconds_remaining, 90);
         assert_eq!(info.session_id, "s1");

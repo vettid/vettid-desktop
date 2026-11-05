@@ -70,14 +70,14 @@
       // This view is usually replaced by now (routing follows the poll);
       // the notice is shown on the next.
       sessionNotice.set(result.notice);
+      // #80: kept as the end's own notice before any read, so a read that
+      // finds the end settled meanwhile handles it.
+      noteEndNotice(result.notice);
       // Refresh the Svelte store immediately so the StatusBar pill +
       // App.svelte routing pick up the expired state right away
       // instead of waiting on the 30s poll. Without this the user
       // sees "nothing happened" until the timer fires.
       await refreshSessionFromBackend();
-      // #80: if the end is still pending, its notice goes once the vault
-      // answers it.
-      noteEndNotice(result.notice);
     } catch (e) {
       statusMessage = `Failed to end session: ${e}`;
     } finally {

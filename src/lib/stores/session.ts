@@ -57,8 +57,8 @@ export function noteEndNotice(notice: string | null): void {
   endNotice = notice !== null && get(endPending) ? notice : null;
 }
 
-function applyEndState(nowPending: boolean | null): void {
-  const r = afterRead({ wasPending: get(endPending), nowPending, notice: get(sessionNotice), endNotice });
+function applyEndState(nowPending: boolean | null, confirmed = false, settledNotice: string | null = null): void {
+  const r = afterRead({ wasPending: get(endPending), nowPending, notice: get(sessionNotice), endNotice, confirmed, settledNotice });
   endNotice = r.endNotice;
   if (r.notice !== get(sessionNotice)) sessionNotice.set(r.notice);
   endPending.set(r.pending);
@@ -125,10 +125,12 @@ export async function refreshSessionFromBackend(): Promise<void> {
       is_active: boolean;
       notice?: string | null;
       end_pending?: boolean;
+      end_confirmed?: boolean;
+      end_notice?: string | null;
     }>('get_session_info');
 
     // #80: an End session still waiting for the vault, and its notice.
-    applyEndState(!!info.end_pending);
+    applyEndState(!!info.end_pending, !!info.end_confirmed, info.end_notice ?? null);
 
     if (info.is_active) {
       // Confirmed again: the stale-session notice no longer applies.

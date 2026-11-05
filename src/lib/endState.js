@@ -2,21 +2,31 @@
 // of the backend (#80), kept free of Svelte and Tauri for `npm test`.
 
 /**
- * After a read: `wasPending` and `nowPending` are whether an End session
- * was waiting for the vault before and after it; `notice` is the notice on
- * screen; `endNotice` is the not-confirmed notice End session showed (null
- * if none). Once a pending end is no longer pending, the vault has answered
- * it, so that notice ("may still be open") no longer applies and goes.
- * Any other notice stays. A read that couldn't tell (`nowPending` null, the
- * link is gone) changes nothing: the notice is never cleared on a guess.
+ * After a read.
+ * - `wasPending`, `nowPending`: whether an End session was waiting for the
+ *   vault before and after it (`nowPending` null: the read couldn't tell,
+ *   for example no link while locked).
+ * - `notice`: the notice on screen. `endNotice`: the not-confirmed notice
+ *   End session showed (null if none).
+ * - `confirmed`: the backend settled the stored end and the vault confirmed
+ *   it. `settledNotice`: it settled without that confirmation, and says
+ *   what to show instead.
  *
- * @param {{ wasPending: boolean, nowPending: boolean | null, notice: string | null, endNotice: string | null }} s
+ * A pending end that stops being pending is cleared only when confirmed:
+ * a stored end going away is not, on its own, a confirmation. With no
+ * confirmation the person is told what the backend says, or the notice
+ * stays. A read that couldn't tell changes nothing.
+ *
+ * @param {{ wasPending: boolean, nowPending: boolean | null, notice: string | null, endNotice: string | null, confirmed?: boolean, settledNotice?: string | null }} s
  * @returns {{ notice: string | null, endNotice: string | null, pending: boolean }}
  */
-export function afterRead({ wasPending, nowPending, notice, endNotice }) {
-  if (nowPending === null) return { notice, endNotice, pending: false };
-  if (wasPending && !nowPending && endNotice !== null) {
-    return { notice: notice === endNotice ? null : notice, endNotice: null, pending: false };
+export function afterRead({ wasPending, nowPending, notice, endNotice, confirmed = false, settledNotice = null }) {
+  if (nowPending === null) return { notice, endNotice, pending: wasPending };
+  if (wasPending && !nowPending) {
+    const ours = notice === null || notice === endNotice;
+    if (confirmed) return { notice: ours && endNotice !== null ? null : notice, endNotice: null, pending: false };
+    if (settledNotice !== null) return { notice: ours ? settledNotice : notice, endNotice: null, pending: false };
+    return { notice, endNotice: null, pending: false };
   }
   return { notice, endNotice, pending: nowPending };
 }

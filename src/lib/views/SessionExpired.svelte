@@ -91,7 +91,7 @@
 
     {#if $sessionNotice}
       <p class="error-text" role="status">{$sessionNotice}</p>
-    {:else if $endPending}
+    {:else if $endPending && step === 'idle'}
       <!-- #80: an end the vault hasn't answered never looks like a confirmed one. -->
       <div class="waiting" role="status">
         <div class="spinner"></div>

@@ -3,31 +3,39 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { afterRead } from '../src/lib/endState.js';
 
-const NOT_CONFIRMED = "This desktop couldn't reach your vault to end the session, so it may still be open.";
+const NOT_SENT = "This desktop couldn't reach your vault to end the session, so it may still be open.";
+const UNCONFIRMED = "Your vault didn't confirm that the session ended.";
 const OTHER = 'Some other notice.';
+const ended = (over) => afterRead({ wasPending: true, nowPending: false, notice: NOT_SENT, endNotice: NOT_SENT, ...over });
 
-test('#80: the not-confirmed notice goes once the vault answers the end', () => {
-  const r = afterRead({ wasPending: true, nowPending: false, notice: NOT_CONFIRMED, endNotice: NOT_CONFIRMED });
-  assert.deepEqual(r, { notice: null, endNotice: null, pending: false });
+test('#80: the not-confirmed notice goes once the vault confirms the end', () => {
+  assert.deepEqual(ended({ confirmed: true }), { notice: null, endNotice: null, pending: false });
+});
+
+test('#80 (review H1): an end that stops being pending without a confirmation is never shown as ended', () => {
+  // Settled unconfirmed (an old vault, an error answer): the backend's notice replaces ours.
+  assert.deepEqual(ended({ settledNotice: UNCONFIRMED }), { notice: UNCONFIRMED, endNotice: null, pending: false });
+  // Gone with no outcome at all: our notice stays.
+  assert.deepEqual(ended({}), { notice: NOT_SENT, endNotice: null, pending: false });
 });
 
 test('#80: it stays while the end is still pending', () => {
-  const r = afterRead({ wasPending: true, nowPending: true, notice: NOT_CONFIRMED, endNotice: NOT_CONFIRMED });
-  assert.deepEqual(r, { notice: NOT_CONFIRMED, endNotice: NOT_CONFIRMED, pending: true });
+  const r = afterRead({ wasPending: true, nowPending: true, notice: NOT_SENT, endNotice: NOT_SENT, confirmed: true });
+  assert.deepEqual(r, { notice: NOT_SENT, endNotice: NOT_SENT, pending: true });
 });
 
 test('#80: another notice on screen is left alone', () => {
-  const r = afterRead({ wasPending: true, nowPending: false, notice: OTHER, endNotice: NOT_CONFIRMED });
-  assert.deepEqual(r, { notice: OTHER, endNotice: null, pending: false });
+  assert.equal(ended({ notice: OTHER, confirmed: true }).notice, OTHER);
+  assert.equal(ended({ notice: OTHER, settledNotice: UNCONFIRMED }).notice, OTHER);
 });
 
-test('#80: never cleared on a read that could not tell', () => {
-  const r = afterRead({ wasPending: true, nowPending: null, notice: NOT_CONFIRMED, endNotice: NOT_CONFIRMED });
-  assert.equal(r.notice, NOT_CONFIRMED);
-  assert.equal(r.endNotice, NOT_CONFIRMED);
+test('#80 (review M1): a read that could not tell changes nothing, pending included', () => {
+  const r = afterRead({ wasPending: true, nowPending: null, notice: NOT_SENT, endNotice: NOT_SENT, confirmed: true });
+  assert.deepEqual(r, { notice: NOT_SENT, endNotice: NOT_SENT, pending: true });
+  assert.equal(afterRead({ wasPending: false, nowPending: null, notice: null, endNotice: null }).pending, false);
 });
 
-test('#80: nothing to clear without an end notice; pending follows the read', () => {
+test('#80: a confirmation with no notice of ours clears nothing; pending follows the read', () => {
+  assert.deepEqual(ended({ notice: null, endNotice: null, confirmed: true }), { notice: null, endNotice: null, pending: false });
   assert.deepEqual(afterRead({ wasPending: false, nowPending: true, notice: null, endNotice: null }), { notice: null, endNotice: null, pending: true });
-  assert.deepEqual(afterRead({ wasPending: true, nowPending: false, notice: null, endNotice: null }), { notice: null, endNotice: null, pending: false });
 });
