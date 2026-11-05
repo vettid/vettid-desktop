@@ -441,6 +441,7 @@ after the install:
 | `uninstall.exe` replaced by a stand-in that exits 0 and wipes nothing (an older build, a regression) | 2 | fixture kept, still detected; with the real one back, 0 |
 | The product key and `InstallLocation` name different folders | 2 | fixture and program kept, detected; once they agree (other case, trailing `\`), 0 |
 | Program gone, a leftover `uninstall.exe` that isn't VettID's (a copy of `whoami.exe`) | 2 | kept; a leftover VettID `uninstall.exe` is removed (0), and the empty folder |
+| Both scripts run as SYSTEM (a one-off scheduled task, run by an administrator) | 2 | detection printed "running as a service account … counted as installed" |
 | `windo`'s own profile | – | no install folder before or after |
 
 The events go to the machine's Application log, so a management tool or an administrator can read them. A
