@@ -211,7 +211,7 @@ also open its window) exits 0.
 - The "paired" message can show when the folder couldn't be read before the wipe (counted as "may be
   paired"), but the wipe then removed it cleanly. That errs on the safe side: the person is told to check the
   phone.
-- If the template's own app check (step 2) is cancelled or fails (the app was started again after the
+- If the template's own app check (step 2) is canceled or fails (the app was started again after the
   wipe), the uninstall stops there and step 3 doesn't run. The wipe has already run, but the person sees
   neither message, only the template's "is running" one; the exit code is non-zero.
 - If NSIS ever ran a real uninstall in place (say, if it couldn't copy itself to `%TEMP%`), the hook would

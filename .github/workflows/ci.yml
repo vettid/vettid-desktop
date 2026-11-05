@@ -17,6 +17,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      # User-facing text is American English (owner decision, 2026-11-05).
+      - name: spelling (American English in user-facing text)
+        run: sh scripts/check-spelling.sh
       - name: npm ci
         run: npm ci
       - name: svelte-check
