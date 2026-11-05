@@ -61,10 +61,9 @@ try {
 
     # The program is gone, so nothing here can run the wipe: confirmed only if nothing of the pairing is left.
     if (PairingLeft) { exit 2 }
-    # The uninstall.exe an earlier in-place run leaves (only if it is VettID Desktop's), and its folder if that
-    # is then empty. Nothing else: the folder can be shared with other files (/D=).
-    if (Exists $u) {
-        if ((Get-Item -LiteralPath $u -Force).VersionInfo.ProductName -ne 'VettID Desktop') { exit 2 }
+    # The uninstall.exe an earlier in-place run leaves (only if it is VettID Desktop's; another one is left as it
+    # is), and its folder if that is then empty. Nothing else: the folder can be shared with other files (/D=).
+    if ((Exists $u) -and (Get-Item -LiteralPath $u -Force).VersionInfo.ProductName -eq 'VettID Desktop') {
         Remove-Item -LiteralPath $u -Force -Confirm:$false
     }
     if ((Exists $dir) -and @(Get-ChildItem -LiteralPath $dir -Force).Count -eq 0) { Remove-Item -LiteralPath $dir -Confirm:$false }

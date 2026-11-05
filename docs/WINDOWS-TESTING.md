@@ -362,14 +362,17 @@ saved pairing works as above.
   (`vettid-desktop/master-key-v1/local`, checked with `cmdkey`) is still there. It exits 0 when neither is.
   `cmdkey`'s output counts as "absent" only in its absent shape (no line but the header naming the target,
   and a `* … *` marker line); anything else counts as present. Only English output was seen here.
-  It deletes only the leftover `uninstall.exe`, and only if its version information says VettID Desktop,
-  then the folder if that is empty: the install folder can be shared with other files (`/D=`). It refuses a
+  It deletes only the leftover `uninstall.exe`, and only if its version information says VettID Desktop
+  (another program's is left as it is), then the folder if that is empty: the install folder can be shared
+  with other files (`/D=`). It refuses a
   folder that isn't a full path below a drive or a share. A management tool must count 2 as a failure, which
   Intune's default return codes do.
-- **A 2 without an event means the uninstall stopped before removing anything.** Retry it. Most 2s come
-  with event 1001, 1002 or 1003 (see Scripts), but not all: an uninstall started within a second or two of
-  the install returned 2 in 4 of 5 runs here, removed nothing and wrote no event, and the next run gave 0
-  (the row "Uninstall within about a second of the install" above). Every path in the hooks that sets 2 also
+- **A 2 without an event.** The script's own 2s (listed above) write no event, and some come after the
+  uninstaller removed things (its 0 with the pairing left, or the program gone with the pairing left). A 2
+  from the uninstaller itself with no event means it stopped before removing anything: retry it. The
+  uninstaller's other 2s come with event 1001, 1002 or 1003 (see Scripts). An uninstall started within a
+  second or two of the install returned 2 in 4 of 5 runs here, removed nothing and wrote no event, and the
+  next run gave 0 (the row "Uninstall within about a second of the install" above). Every path in the hooks that sets 2 also
   writes an event, so this one comes from elsewhere. The likely cause (a hypothesis) is NSIS's own "aborted"
   code from the template's app-running check (`CheckIfAppIsRunning`, run before the wipe): something holding
   `vettid-desktop.exe` couldn't be closed. Polling the Restart Manager every 250 ms for 8 s after an install
@@ -440,7 +443,7 @@ after the install:
 | `uninstall.exe` put back, fixture, `uninstall-vettid.ps1`, then again | 0, 0 | fixture gone, not detected; only the other app's file left in the folder |
 | `uninstall.exe` replaced by a stand-in that exits 0 and wipes nothing (an older build, a regression) | 2 | fixture kept, still detected; with the real one back, 0 |
 | The product key and `InstallLocation` name different folders | 2 | fixture and program kept, detected; once they agree (other case, trailing `\`), 0 |
-| Program gone, a leftover `uninstall.exe` that isn't VettID's (a copy of `whoami.exe`) | 2 | kept; a leftover VettID `uninstall.exe` is removed (0), and the empty folder |
+| Program gone, a leftover `uninstall.exe` that isn't VettID's (a copy of `whoami.exe`) | 0 | kept, and its folder; a leftover VettID `uninstall.exe` is removed (0), and the empty folder |
 | Both scripts run as SYSTEM (a one-off scheduled task, run by an administrator) | 2 | detection printed "running as a service account … counted as installed" |
 | `windo`'s own profile | – | no install folder before or after |
 
