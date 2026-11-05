@@ -38,15 +38,17 @@ fn status_of(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> SessionStat
         max_extensions: None,
         phone_reachable: reachable,
     };
-    match snap.live_until.filter(|_| snap.active_at(now)) {
+    // The time shown is the session's own expiry (#82); live or not is
+    // `active_at`, from live_until.
+    match snap.shown_expiry(now) {
         Some(until) => SessionStatus {
             state: "active".to_string(),
             session_id: snap.session_id.clone(),
             expires_at: Some(until.timestamp()),
             seconds_remaining: Some((until - now).num_seconds().max(0)),
-            // The vault doesn't count extensions; reported as 0.
-            extended_count: Some(0),
-            max_extensions: Some(3),
+            // The vault doesn't count extensions (#82): not reported.
+            extended_count: None,
+            max_extensions: None,
             phone_reachable: snap.reachable,
         },
         None if snap.unlocked => none("expired", snap.reachable),
@@ -89,5 +91,26 @@ mod tests {
         let s = status_of(&snap, now);
         assert_eq!((s.state.as_str(), s.seconds_remaining), ("active", Some(30)));
         assert_eq!(status_of(&snap, now + chrono::TimeDelta::seconds(31)).state, "expired");
+    }
+
+    /// #82: the time shown is the session's own expiry (an hour here), not
+    /// the 120 s freshness window that decides whether it is live.
+    #[test]
+    fn the_time_shown_is_the_sessions_expiry() {
+        let now = chrono::Utc::now();
+        let snap = Snapshot {
+            unlocked: true,
+            session_id: Some("s".into()),
+            expires_at: Some(now + chrono::TimeDelta::hours(1)),
+            ends_at: Some(now + chrono::TimeDelta::minutes(59)),
+            live_until: Some(now + chrono::TimeDelta::seconds(120)),
+            ..Default::default()
+        };
+        let s = status_of(&snap, now);
+        // The desktop's own end, a margin before the vault's hour.
+        assert_eq!((s.state.as_str(), s.seconds_remaining), ("active", Some(59 * 60)));
+        // Past the freshness window: not live, so no time at all.
+        let later = status_of(&snap, now + chrono::TimeDelta::seconds(121));
+        assert_eq!((later.state.as_str(), later.seconds_remaining), ("expired", None));
     }
 }

@@ -130,6 +130,11 @@ pub struct Snapshot {
     /// The access session the vault last named, if live.
     pub session_id: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
+    /// When this desktop itself stops treating the live session as live:
+    /// the last moment of [`Access::active_at`] (a margin before
+    /// `expires_at`), not capped by [`STALE_AFTER`]. `None` unless live.
+    /// What "Time remaining" counts down to (#82).
+    pub ends_at: Option<DateTime<Utc>>,
     /// The last moment at which [`Access::active_at`] was true, as of the
     /// snapshot: never later.
     pub live_until: Option<DateTime<Utc>>,
@@ -181,11 +186,23 @@ impl Snapshot {
         self.live_until.is_some_and(|u| t <= u)
     }
 
+    /// When the live session ends, for "Time remaining" (#82): this
+    /// desktop's own end of it ([`Snapshot::ends_at`]), not
+    /// [`Snapshot::live_until`] (capped at [`STALE_AFTER`] past the last
+    /// confirmation, which decides only whether it is shown as live).
+    /// `None` unless live at `t`.
+    pub fn shown_expiry(&self, t: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if !self.active_at(t) {
+            return None;
+        }
+        self.ends_at.or(self.live_until)
+    }
+
     /// The same, without the session: what an operation that is ending it
     /// shows meanwhile (the end pending until the link's own snapshot says
     /// how it went).
     pub fn without_session(&self) -> Snapshot {
-        Snapshot { session_id: None, expires_at: None, live_until: None, end_pending: true, end_settled: None, end_seen: true, ..self.clone() }
+        Snapshot { session_id: None, expires_at: None, ends_at: None, live_until: None, end_pending: true, end_settled: None, end_seen: true, ..self.clone() }
     }
 }
 
@@ -458,6 +475,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
             device_id: self.session.device_id().map(str::to_string),
             session_id: current.map(|c| c.session_id.clone()),
             expires_at: current.map(|c| c.expires_at),
+            ends_at: live_until.and(known),
             live_until,
             reachable: self.reachable,
             refused,
@@ -1134,6 +1152,23 @@ mod tests {
         // #80: the UI sees the end as pending, not as done.
         let snap = link.snapshot(Utc::now());
         assert!(snap.end_pending && !snap.active_at(Utc::now()));
+    }
+
+    /// #82: "Time remaining" runs to this desktop's own end of the session
+    /// (a margin before the vault's expires_at), not to the 120 s cap.
+    #[tokio::test]
+    async fn the_time_shown_runs_to_the_desktops_own_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        let exp = Utc::now() + TimeDelta::hours(1);
+        vault.set_session(Some(("s-1", exp)));
+        link.read_status().await.unwrap();
+        let now = Utc::now();
+        let snap = link.snapshot(now);
+        let shown = snap.shown_expiry(now).expect("live");
+        assert!(shown < exp, "a margin before the vault's expiry");
+        assert!(shown > now + TimeDelta::minutes(55), "about the hour, not the cap");
+        assert!(snap.live_until.unwrap() <= now + STALE_AFTER, "live still decided by the cap");
     }
 
     /// #80: a confirmed end isn't pending; what an end under way shows

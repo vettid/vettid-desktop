@@ -8,8 +8,6 @@ export interface SessionState {
   ownerName: string | null;
   expiresAt: number | null;
   secondsRemaining: number | null;
-  extendedCount: number;
-  maxExtensions: number;
   phoneReachable: boolean;
 }
 
@@ -20,8 +18,6 @@ const initialState: SessionState = {
   ownerName: null,
   expiresAt: null,
   secondsRemaining: null,
-  extendedCount: 0,
-  maxExtensions: 3,
   phoneReachable: false,
 };
 
@@ -96,8 +92,6 @@ export function activateSession(
     ownerName: ownerName ?? null,
     expiresAt,
     secondsRemaining: Math.floor((expiresAt * 1000 - Date.now()) / 1000),
-    extendedCount: 0,
-    maxExtensions: 3,
     phoneReachable: true,
   });
 }
@@ -164,8 +158,6 @@ export async function refreshSessionFromBackend(): Promise<void> {
         ownerName: null,
         expiresAt: info.expires_at,
         secondsRemaining: info.seconds_remaining,
-        extendedCount: 0,
-        maxExtensions: 3,
         phoneReachable: true,
       });
     } else {
@@ -203,8 +195,6 @@ export async function refreshSessionFromBackend(): Promise<void> {
           ownerName: null,
           expiresAt: 0,
           secondsRemaining: 0,
-          extendedCount: 0,
-          maxExtensions: 3,
           phoneReachable: false,
         });
       }
