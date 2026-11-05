@@ -337,7 +337,8 @@ impl<T: Transport, C: Clock> Link<T, C> {
         match self.session.poll(&mut self.store).await {
             Ok(msgs) => {
                 for m in &msgs {
-                    let _ = self.access.observe(&mut self.session, &mut self.store, m);
+                    let e = self.access.observe(&mut self.session, &mut self.store, m);
+                    self.note_end_answered(&e);
                 }
             }
             Err(e) => log::info!("link: collecting after the refusal: {}", e),
@@ -351,7 +352,8 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// `vault.status` anyway (§6.8).
     fn drain_held(&mut self) {
         for m in self.session.take_held() {
-            let _ = self.access.observe(&mut self.session, &mut self.store, &m);
+            let e = self.access.observe(&mut self.session, &mut self.store, &m);
+            self.note_end_answered(&e);
         }
     }
 
@@ -382,7 +384,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
                     // #80: kept, so the UI tells a confirmed end from one
                     // that only stopped being sent.
                     if let Some(s) = end_settled(&r, self.session.access_end().is_none()) {
-                        self.end_settled = Some(s);
+                        self.set_end_settled(s);
                     }
                     r.map(drop)
                 } else {
@@ -395,6 +397,24 @@ impl<T: Transport, C: Clock> Link<T, C> {
         self.drain_held();
         self.note_refused().await;
         r
+    }
+
+    /// Record how a stored end settled (#80), with a log line the staging
+    /// checks can see.
+    fn set_end_settled(&mut self, s: EndSettled) {
+        match &s {
+            EndSettled::Confirmed => log::info!("link: the stored end is confirmed"),
+            EndSettled::NotConfirmed(_) => log::info!("link: the stored end went without a confirmation"),
+        }
+        self.end_settled = Some(s);
+    }
+
+    /// A late `ok` to a stored end, handled on its own (`observe`): that is
+    /// the vault's confirmation (#80).
+    fn note_end_answered(&mut self, e: &Result<Option<AccessEvent>, AccessError>) {
+        if matches!(e, Ok(Some(AccessEvent::EndAnswered))) {
+            self.set_end_settled(EndSettled::Confirmed);
+        }
     }
 
     /// The vault removed this device (`device.unlinked`).
@@ -462,6 +482,19 @@ impl<T: Transport, C: Clock> Link<T, C> {
         if self.refused() {
             return Err(RequestFailed::Access(AccessError::Session(SessionError::Refused)));
         }
+        // #80 (lead review M1): a stored unanswered end is settled here
+        // first, as the ordering rule needs anyway (§6.8), so its outcome is
+        // recorded; Access::request then finds nothing to settle.
+        if self.session.access_end().is_some() {
+            let r = self.access.settle(&mut self.session, &mut self.store).await;
+            if let Some(s) = end_settled(&r, self.session.access_end().is_none()) {
+                self.set_end_settled(s);
+            }
+            if let Err(e) = r {
+                self.reachable = answered(&e);
+                return Err(RequestFailed::Access(e));
+            }
+        }
         // Access::request (the vault's default length: nothing to check; the
         // ordering rule settled first), with the answer's ts: a denial the
         // vault sent before it is about an earlier request.
@@ -494,7 +527,9 @@ impl<T: Transport, C: Clock> Link<T, C> {
                     self.reachable = true;
                     let mut granted = false;
                     for m in &msgs {
-                        match self.access.observe(&mut self.session, &mut self.store, m) {
+                        let e = self.access.observe(&mut self.session, &mut self.store, m);
+                        self.note_end_answered(&e);
+                        match e {
                             Ok(Some(AccessEvent::Granted(_))) => granted = true,
                             // A denial from before this request's answer is
                             // about an earlier one.
@@ -1156,6 +1191,22 @@ mod tests {
         let snap = link.snapshot(Utc::now());
         assert!(!snap.end_pending, "no longer sent");
         assert_eq!(snap.end_settled, Some(EndSettled::NotConfirmed(END_UNCONFIRMED_NOTICE)));
+    }
+
+    /// #80 (lead review M1): a stored end left by an offline End session is
+    /// settled by Start New Session before the refresh gets to it. The
+    /// vault's `ok` is recorded as a confirmation even though the request
+    /// is then denied.
+    #[tokio::test]
+    async fn a_stored_end_settled_by_a_request_is_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired_with(dir.path(), true);
+        assert!(link.snapshot(Utc::now()).end_pending);
+        vault.deny_on_request();
+        assert_eq!(link.request_access(|| {}, || false).await, Err(RequestFailed::Denied));
+        let snap = link.snapshot(Utc::now());
+        assert!(!snap.end_pending, "the request settled it first");
+        assert_eq!(snap.end_settled, Some(EndSettled::Confirmed));
     }
 
     /// #80: the settling outcome maps as the module says; a cleared end

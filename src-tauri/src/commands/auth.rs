@@ -508,6 +508,8 @@ pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String
 struct PairingUnderWay<'a>(&'a std::sync::atomic::AtomicUsize);
 
 impl<'a> PairingUnderWay<'a> {
+    /// Counted unconditionally: for tests (`register` uses [`Self::only`]).
+    #[cfg(test)]
     fn new(n: &'a std::sync::atomic::AtomicUsize) -> Self {
         n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         PairingUnderWay(n)
@@ -952,7 +954,12 @@ async fn end_access(state: &AppState) -> EndSessionResponse {
         // A refresh that finished meanwhile may have shown it again.
         state.publish(state.snapshot().without_session());
         match slot.as_mut() {
-            None => Some(link::END_UNCONFIRMED_NOTICE.to_string()),
+            None => {
+                // No link: nothing was sent and nothing stays pending (lead
+                // review L5); the notice says it wasn't confirmed.
+                state.publish(Snapshot { end_pending: false, ..state.snapshot() });
+                Some(link::END_UNCONFIRMED_NOTICE.to_string())
+            }
             Some(l) => {
                 let result = l.end().await;
                 let notice = end_notice(&result, l);
