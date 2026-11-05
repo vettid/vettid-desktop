@@ -52,6 +52,12 @@ export function markEndStarted(): void {
   endPending.set(true);
 }
 
+/** A new session or a new pairing: an earlier end no longer applies (#80). */
+export function resetEndState(): void {
+  endNotice = null;
+  endPending.set(false);
+}
+
 /** End session's notice, kept as the end's own if the end is still pending. */
 export function noteEndNotice(notice: string | null): void {
   endNotice = notice !== null && get(endPending) ? notice : null;
@@ -75,6 +81,7 @@ export function activateSession(
   ownerName?: string,
 ) {
   sessionNotice.set(null);
+  resetEndState();
   sessionStore.set({
     state: 'active',
     sessionId,
@@ -130,7 +137,8 @@ export async function refreshSessionFromBackend(): Promise<void> {
     }>('get_session_info');
 
     // #80: an End session still waiting for the vault, and its notice.
-    applyEndState(!!info.end_pending, !!info.end_confirmed, info.end_notice ?? null);
+    // A live session makes an earlier end's "not confirmed" moot (#80, L1).
+    applyEndState(!!info.end_pending, !!info.end_confirmed, info.is_active ? null : (info.end_notice ?? null));
 
     if (info.is_active) {
       // Confirmed again: the stale-session notice no longer applies.

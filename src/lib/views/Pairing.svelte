@@ -2,7 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { onDestroy, onMount } from 'svelte';
-  import { sessionNotice, sessionStore, refreshSessionFromBackend } from '../stores/session';
+  import { sessionNotice, sessionStore, refreshSessionFromBackend, resetEndState } from '../stores/session';
   import { pairingHeld } from '../stores/navigation';
 
   let inviteCode = $state('');
@@ -73,6 +73,8 @@
     inviteCode = inviteCode.trim();
     if (!inviteCode) return;
     stopElsewhere();
+    // #80: an end on an earlier pairing doesn't follow into this one.
+    resetEndState();
     errorMessage = '';
     step = 'awaiting-qr';
 
