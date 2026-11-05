@@ -1059,3 +1059,37 @@ async fn a_broken_inbox_entry_is_dropped_on_load() {
     s.send(&mut store, "test.after", "{}", false).await.unwrap();
     assert_eq!(vault_receive(&mut vault).await.kind, "test.after", "the keys survived");
 }
+
+/// #81: a failed collect makes the next poll wait (full jitter, doubling
+/// to the cap), and a collect that works resets it. Time is paused, so the
+/// waits pass at once.
+#[tokio::test(start_paused = true)]
+async fn failed_collects_back_off_and_a_good_one_resets() {
+    let (relay, _vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    faults.lock().unwrap().collects = 6;
+    let start = tokio::time::Instant::now();
+    for _ in 0..6 {
+        assert!(s.poll(&mut store).await.is_err());
+    }
+    assert_eq!(s.collect_backoff, COLLECT_MAX_BACKOFF, "1, 2, 4, 8, 16, then the 30 s cap");
+    assert!(start.elapsed() <= std::time::Duration::from_secs(1 + 2 + 4 + 8 + 16 + 25), "each wait within its cap");
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.collect_backoff, COLLECT_BACKOFF, "the relay answers again");
+}
+
+/// #86: deposits held only by this session's own backoff after transport
+/// failures go out as soon as a collect works again, not minutes later.
+#[tokio::test]
+async fn an_outbox_held_after_transport_failures_goes_out_when_the_relay_answers() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    s.outbox_backoff = TimeDelta::minutes(5);
+    faults.lock().unwrap().temporary = 1;
+    let id = s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+    assert_eq!(s.outbox_len(), 1, "held for minutes by the backoff");
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.outbox_len(), 0, "the relay answered: sent at once");
+    assert_eq!(s.outbox_backoff, OUTBOX_BACKOFF);
+    assert_eq!(vault_receive(&mut vault).await.id, id);
+}

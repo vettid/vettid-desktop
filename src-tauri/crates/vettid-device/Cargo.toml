@@ -28,7 +28,7 @@ dev-file-store = []
 dev-relay = ["vettid-relay/dev-relay"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
 serde_json = "1"
 sha2 = "0.10"
 # The dev stack test drives the stack's control port (tests/devstack.rs).

@@ -137,6 +137,11 @@ const POLL_MAX: u32 = 32;
 /// Backoff before the outbox is tried again after a temporary failure.
 const OUTBOX_BACKOFF: TimeDelta = TimeDelta::seconds(5);
 const OUTBOX_MAX_BACKOFF: TimeDelta = TimeDelta::minutes(5);
+/// After a failed collect, the next poll waits a random time up to this,
+/// doubling to [`COLLECT_MAX_BACKOFF`] (full jitter; #81): a relay out of
+/// reach isn't asked several times a second.
+const COLLECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+const COLLECT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The ephemeral types of §8.5: they need `exp`, have no age limit, and
 /// are deduped in memory only; every other type is durable.
@@ -263,6 +268,11 @@ pub struct Session<T: Transport, C: Clock> {
     /// The outbox isn't tried before this (a backoff, or the relay's
     /// `retry_after`, §8.6): no send or poll moves it earlier.
     hold_until: DateTime<Utc>,
+    /// The hold was asked for by the relay (`retry_after`): kept even once
+    /// the relay answers again (#86).
+    hold_by_relay: bool,
+    /// See [`COLLECT_BACKOFF`].
+    collect_backoff: std::time::Duration,
     outbox_backoff: TimeDelta,
     refresh_sent: Option<DateTime<Utc>>,
 }
@@ -332,6 +342,8 @@ impl<T: Transport, C: Clock> Session<T, C> {
             maybe_sent: Vec::new(),
             dirty: false,
             hold_until: now,
+            hold_by_relay: false,
+            collect_backoff: COLLECT_BACKOFF,
             outbox_backoff: OUTBOX_BACKOFF,
             refresh_sent: None,
         };
@@ -791,11 +803,13 @@ impl<T: Transport, C: Clock> Session<T, C> {
         match temporary {
             Some((err, wait)) => {
                 self.hold_until = now + wait.unwrap_or(self.outbox_backoff).max(self.outbox_backoff);
+                self.hold_by_relay = wait.is_some();
                 self.outbox_backoff = (self.outbox_backoff * 2).min(OUTBOX_MAX_BACKOFF);
                 Err(SessionError::Relay(err))
             }
             None => {
                 self.outbox_backoff = OUTBOX_BACKOFF;
+                self.hold_by_relay = false;
                 Ok(())
             }
         }
@@ -825,12 +839,28 @@ impl<T: Transport, C: Clock> Session<T, C> {
         let msgs = match self.transport.collect(&self.state.relay_url, wait_secs, POLL_MAX).await {
             Ok(m) => m,
             Err(e) => {
+                // #81: wait before the caller polls again (full jitter),
+                // within the long-poll time it allowed anyway.
+                if e.retryable() {
+                    let cap = self.collect_backoff.min(std::time::Duration::from_secs(wait_secs.max(1)));
+                    self.collect_backoff = (self.collect_backoff * 2).min(COLLECT_MAX_BACKOFF);
+                    tokio::time::sleep(jitter(cap)).await;
+                }
                 // The inbox is local and stored: what wasn't returned yet
                 // is returned now, even with the relay out of reach.
                 let pending = self.unreturned();
                 return if pending.is_empty() { Err(e.into()) } else { Ok(pending) };
             }
         };
+        // The relay answers again (#81, #86): no more waiting between
+        // collects, and an outbox held only by this session's own backoff
+        // after transport failures goes out now, not minutes later. A hold
+        // the relay asked for (`retry_after`) stays.
+        self.collect_backoff = COLLECT_BACKOFF;
+        if !self.hold_by_relay {
+            self.hold_until = self.clock.now().min(self.hold_until);
+            self.outbox_backoff = OUTBOX_BACKOFF;
+        }
         let cp = self.checkpoint();
         let mut events = Vec::new();
         let mut acks = Vec::with_capacity(msgs.len());
@@ -1154,6 +1184,13 @@ impl<T: Transport, C: Clock> Session<T, C> {
             }
         }
     }
+}
+
+/// A random wait from 0 up to `cap` (full jitter).
+fn jitter(cap: std::time::Duration) -> std::time::Duration {
+    use rand::Rng;
+    let ms = cap.as_millis() as u64;
+    std::time::Duration::from_millis(if ms == 0 { 0 } else { rand::thread_rng().gen_range(0..=ms) })
 }
 
 #[cfg(test)]
