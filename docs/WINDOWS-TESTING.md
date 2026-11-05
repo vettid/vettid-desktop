@@ -227,9 +227,10 @@ also open its window) exits 0.
   folder afterwards.
 - `uninstall.exe /S _?=<install folder>` without the switch **keeps the pairing**, as for an installer.
   No installer passes `/WIPEPAIRING`.
-- **The event log:** every failure, silent or not, writes a Warning, source "VettID Desktop", to the Application
+- **The event log:** every failure the hooks detect, silent or not, writes a Warning, source "VettID Desktop", to the Application
   log: event ID 1001 when the pairing couldn't be removed or confirmed, 1002 when the uninstall was refused
-  because another account ran it, 1003 when the program itself couldn't be deleted. The source isn't registered (that needs an administrator), so Event Viewer says the
+  because another account ran it, 1003 when the program itself couldn't be deleted. An uninstall that
+  stops before the hooks run (exit 2, nothing removed; see "IT-managed installs" and #74) writes none. The source isn't registered (that needs an administrator), so Event Viewer says the
   description isn't found and shows the text as the event's data. Find it with
   `Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='VettID Desktop']]]"`. Its text (for
   the owner's approval) names no person, folder or account; 1001's and 1003's give the wipe's result code.
@@ -343,13 +344,16 @@ saved pairing works as above.
 - **Install:** `<setup>.exe /S`. It installs for that user and exits 0. The folder is
   `%LOCALAPPDATA%\VettID Desktop`, unless this user installed it elsewhere before (`/D=`, or by hand): the
   installer reuses the folder in `HKCU\Software\vettid\VettID Desktop`, which an uninstall keeps. So don't
-  assume the default folder; the two scripts below read that key.
-- **Uninstall:** `powershell -NoProfile -ExecutionPolicy Bypass -File uninstall-vettid.ps1`
+  assume the default folder; the two scripts below read that key, and the Apps-list entry's `InstallLocation`.
+- **Uninstall:** `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File uninstall-vettid.ps1`
   (`scripts/windows/uninstall-vettid.ps1`). It finds the folder and runs
   `uninstall.exe /S /WIPEPAIRING _?=<folder>`, the one form that waits and wipes. It exits 0 only when the
-  saved pairing is confirmed gone, and 2 otherwise (event 1001, 1002 or 1003 in the Application log, see
-  Scripts). It also exits 2:
+  saved pairing is confirmed gone, and 2 otherwise. A 0 from the uninstaller isn't taken on trust: the script
+  then checks that the program, the pairing folder and the Credential Manager entry are gone, so an older
+  build or a regression that exits 0 without wiping gives 2. It also exits 2:
   - when the program is there but its `uninstall.exe` is missing or won't run;
+  - when the product key and the Apps-list entry name different folders;
+  - when it runs as SYSTEM, LocalService or NetworkService (see "Not system context");
   - on any error of its own (fail secure).
 
   If the program is already gone, nothing can run the wipe. The script then exits 2, without a new event,
@@ -358,26 +362,32 @@ saved pairing works as above.
   (`vettid-desktop/master-key-v1/local`, checked with `cmdkey`) is still there. It exits 0 when neither is.
   `cmdkey`'s output counts as "absent" only in its absent shape (no line but the header naming the target,
   and a `* … *` marker line); anything else counts as present. Only English output was seen here.
-  It deletes only the leftover `uninstall.exe`, and then the folder if that is empty: the install folder can
-  be shared with other files (`/D=`). It refuses a folder that isn't a full path below a drive or a share.
-  A management tool must count 2 as a failure, which Intune's default return codes do.
-- **A 2 is a failure to retry, not always with an event.** An uninstall started within a second or two of
-  the install returned 2 in 4 of 5 runs here, removed nothing and wrote no event; the next run gave 0. This
-  is the row "Uninstall within about a second of the install" above. It isn't explained yet. Every path in
-  the hooks that sets 2 also writes an event, so this 2 comes from elsewhere. A candidate (a hypothesis) is
-  NSIS's own "aborted" code from the template's app-running check (`CheckIfAppIsRunning`, run before the
-  wipe), if the Restart Manager finds `vettid-desktop.exe` in use and can't close what holds it. But polling
-  the Restart Manager every 250 ms for 8 s after an install showed nothing holding the file. Every run started
-  10 s or more after the install gave the expected result.
-- **If the script can't run** (an execution policy set by Group Policy, Constrained Language Mode, AppLocker
-  or WDAC), the result is a failure exit code or "detected", never a false "uninstalled".
+  It deletes only the leftover `uninstall.exe`, and only if its version information says VettID Desktop,
+  then the folder if that is empty: the install folder can be shared with other files (`/D=`). It refuses a
+  folder that isn't a full path below a drive or a share. A management tool must count 2 as a failure, which
+  Intune's default return codes do.
+- **A 2 without an event means the uninstall stopped before removing anything.** Retry it. Most 2s come
+  with event 1001, 1002 or 1003 (see Scripts), but not all: an uninstall started within a second or two of
+  the install returned 2 in 4 of 5 runs here, removed nothing and wrote no event, and the next run gave 0
+  (the row "Uninstall within about a second of the install" above). Every path in the hooks that sets 2 also
+  writes an event, so this one comes from elsewhere. The likely cause (a hypothesis) is NSIS's own "aborted"
+  code from the template's app-running check (`CheckIfAppIsRunning`, run before the wipe): something holding
+  `vettid-desktop.exe` couldn't be closed. Polling the Restart Manager every 250 ms for 8 s after an install
+  showed nothing holding the file, though. Every run started 10 s or more after the install gave the expected
+  result. An event for this case is #74.
+- **Script signing.** The scripts aren't signed. With Intune's "Enforce script signature check: Yes", a
+  detection script that can't run counts as **not installed**, and the failure would drop off the dashboard.
+  Set it to No, or sign the scripts with your own certificate. An uninstall script that can't run (that
+  setting, an execution policy set by Group Policy, Constrained Language Mode, AppLocker or WDAC) gives a
+  non-zero exit code, never a false 0.
 - **Don't build the command yourself.** A plain `uninstall.exe /S` (Windows' `UninstallString`) returns 0 at
   once, before the wipe has run. `uninstall.exe /S _?=<folder>` without `/WIPEPAIRING` waits but **keeps the
   pairing**, and exits 0 with no event: it is the form an installer uses to update.
 - **Detection:** `scripts/windows/detect-vettid.ps1`, as a script detection rule run as the user. It always
   exits 0, and prints a line when detected (Intune's rule for a detection script, from its documentation, not
   checked against a live tenant). It reports the app while the program is there, **or anything of a saved
-  pairing is left** (the same checks as the uninstall script), and when it can't check.
+  pairing is left** (the same checks as the uninstall script), when it can't check, and when it runs as a
+  service account. It looks for the program in the default folder, the product key's and `InstallLocation`.
   - A failed wipe can still have removed the program (see the table below). A rule on `vettid-desktop.exe`
     alone would then show "not installed" while the pairing is still on the disk, and the failure would drop
     off the dashboard.
@@ -388,10 +398,11 @@ saved pairing works as above.
 - **After the uninstall:** run in place, the uninstaller can't delete itself, so `uninstall.exe` and its
   folder stay. The Apps-list entry and the program are gone. The script's next run removes `uninstall.exe`,
   and the folder if it is then empty.
-- **Not system context.** Neither the installer nor the scripts reach a person's install when run as SYSTEM:
+- **Not system context.** Nothing here reaches a person's install when run as SYSTEM:
   - the installer run as SYSTEM installs into SYSTEM's own profile;
-  - the scripts run as SYSTEM look in SYSTEM's profile (`%LOCALAPPDATA%` and `HKCU` are SYSTEM's). They find
-    nothing, or remove SYSTEM's own copy and exit 0, and leave every person's pairing as it is;
+  - the scripts refuse to run as SYSTEM, LocalService or NetworkService: the uninstall script exits 2 and
+    the detection script reports "installed". Run that way, they would see only that account's own profile
+    (`%LOCALAPPDATA%` and `HKCU`), and would say "uninstalled" while every person's pairing stays;
   - `uninstall.exe` run by SYSTEM, or by any account but the installing one, on the person's folder is
     refused (exit 2, event 1002), as above.
 - **The person must be signed in** for either to run. An IT department that needs system-context deployment
@@ -427,6 +438,9 @@ after the install:
 | Program there, `uninstall.exe` not a program | 2 | program kept |
 | Program there, `uninstall.exe` missing | 2 | program kept |
 | `uninstall.exe` put back, fixture, `uninstall-vettid.ps1`, then again | 0, 0 | fixture gone, not detected; only the other app's file left in the folder |
+| `uninstall.exe` replaced by a stand-in that exits 0 and wipes nothing (an older build, a regression) | 2 | fixture kept, still detected; with the real one back, 0 |
+| The product key and `InstallLocation` name different folders | 2 | fixture and program kept, detected; once they agree (other case, trailing `\`), 0 |
+| Program gone, a leftover `uninstall.exe` that isn't VettID's (a copy of `whoami.exe`) | 2 | kept; a leftover VettID `uninstall.exe` is removed (0), and the empty folder |
 | `windo`'s own profile | – | no install folder before or after |
 
 The events go to the machine's Application log, so a management tool or an administrator can read them. A
