@@ -31,9 +31,11 @@ lock, and a lock made on the phone. Every vault operation other than the session
 - **Start it with a log**, in its own PowerShell window. A debug build is a console program, and its log goes to
   standard error:
   ```powershell
+  Remove-Item Env:RUST_LOG -ErrorAction SilentlyContinue
   Start-Process -NoNewWindow -FilePath "$env:LOCALAPPDATA\VettID Desktop\vettid-desktop.exe" `
-    -RedirectStandardError "$env:TEMP\vettid-staging.log"
+    -RedirectStandardError "$env:TEMP\vettid-staging-$(Get-Date -Format HHmmss).log"
   ```
+  Each launch gets its own log file, so a relaunch doesn't overwrite the last one.
   Leave `RUST_LOG` unset (the built-in level is `info`, with this app at `debug` and `reqwest` at `warn`). Never
   set it to `debug` or `trace` for other crates. Run the checks below from a second window.
   The app's own log lines hold no codes, keys or email addresses. A file-system error can include a path with
@@ -60,23 +62,24 @@ Record each step in the table below: pass or fail, the time where asked, and wha
    - Expected: the Session view shows a live session with its timer, and the phone lists this desktop as
      active. The desktop shows a session as live only after its own `vault.status` this run.
    - **Fail-secure, no network at start:** turn the network off, relaunch. Expected: "Start a new session",
-     with no session shown live. Turn the network on: within about a minute, the session may be shown live
-     again with no approval, because the vault still names it. Record what happens.
+     with no session shown live. The launch may sit on the loading view for up to 30 s while it waits for
+     `vault.status`: that isn't a hang. Turn the network on: within about 2 minutes, the session may be shown
+     live again with no approval, because the vault still names it. Record what happens.
 3. **End session.**
    1. In the Session view, choose End session and confirm. Expected: "Ending your session…" until the vault
       answers, then "Start a new session" with no notice. Any notice there means the end was **not**
       confirmed. The phone no longer lists the desktop as active.
    2. **Fail-secure, no network:** choose Start New Session and approve it on the phone. Turn the network off,
-      and **within a minute** choose End session (after that the desktop stops showing the session as live,
+      and **at once** choose End session (after that the desktop stops showing the session as live,
       and End session is disabled). Expected: "This desktop couldn't reach your vault to end the session, so it
-      may still be open. This desktop keeps trying while it runs; …". It may take up to about 90 s. It must
-      never say the session ended. Turn the network on and keep the app running (don't Quit): within about a
-      minute, the phone no longer lists the session as active. The notice stays on the desktop; the phone is
+      may still be open. This desktop keeps trying while it runs; …", after up to about 2 minutes behind
+      "Ending your session…". It must never say the session ended. Turn the network on and keep the app
+      running (don't Quit): within about 2 minutes, the phone no longer lists the session as active. The notice stays on the desktop; the phone is
       the check.
 4. **Lock.**
    1. **The desktop's own lock:** in a live session, choose Lock now, and confirm with **Lock**.
-      - Expected: "Locked. The next launch auto-unlocks." The session isn't shown, and the app shows "Start a
-        new session".
+      - Expected: "Locking…", then "Start a new session" with no notice. The line "Locked. The next launch
+        auto-unlocks." may only flash before the screen changes.
       - This lock is the desktop's alone: it sends nothing to the vault. Record what the phone shows; it is
         expected to still list the desktop as active.
       - Don't choose Start New Session now, and don't follow a notice that points to Log out. Record any notice
@@ -84,8 +87,9 @@ Record each step in the table below: pass or fail, the time where asked, and wha
       - Relaunch. Expected: if the session hasn't expired, it is shown live again with no approval, after the
         desktop's `vault.status`. Record it.
    2. **The vault locked on the phone:** in a live session, lock the vault on the phone, and note the time.
-      - Expected: within about 3 minutes, the desktop stops showing the session as live, and shows "Start a new
-        session" with "This desktop hasn't heard from your vault for a few minutes…". Record how long it took.
+      - Expected: within about 3 minutes, the desktop stops showing the session as live and shows "Start a new
+        session". The notice "This desktop hasn't heard from your vault for a few minutes…" may follow up to a
+        minute later. Record both times.
       - Unlock on the phone, and record what the desktop does: whether the old session comes back by itself,
         or Start New Session (approved on the phone) is needed.
 5. **Log out.** Settings → Danger zone → Log out, then confirm.
@@ -94,7 +98,7 @@ Record each step in the table below: pass or fail, the time where asked, and wha
    - `%LOCALAPPDATA%\vettid-desktop` is gone. No Credential Manager entry `vettid-desktop/master-key-v1/local`
      is left (`cmdkey /list:vettid-desktop/master-key-v1/local` shows `* NONE *`).
    - Then remove the desktop on the phone. Log out doesn't tell the phone.
-6. **Uninstall with a pairing** (pair again first, steps 1.1–1.4):
+6. **Uninstall with a pairing** (pair again first, steps 1.1–1.4, then Quit from the tray):
    `(Start-Process -Wait -PassThru -FilePath "$env:LOCALAPPDATA\VettID Desktop\uninstall.exe" -ArgumentList
    "/S /WIPEPAIRING _?=$env:LOCALAPPDATA\VettID Desktop").ExitCode`.
    - Expected: 0. `%LOCALAPPDATA%\vettid-desktop` is gone, the Credential Manager entry is absent, and there is
