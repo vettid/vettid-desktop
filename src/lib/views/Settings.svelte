@@ -170,7 +170,7 @@
                   The key that opens this desktop's saved pairing is locked by Windows to your
                   account. A copy of the file alone doesn't open elsewhere, but a copy of your
                   Windows profile with your password can open it. Programs you run, and an
-                  administrator of this computer or of your organisation's domain, may still be
+                  administrator of this computer or of your organization's domain, may still be
                   able to open it.
                 </p>
                 {#each deviceInfo.keyNotices as notice}

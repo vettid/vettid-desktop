@@ -169,7 +169,7 @@ pub struct Reach {
 /// NEW TEXT (owner approval needed): Settings, when this computer is
 /// joined to a domain.
 pub(crate) const DOMAIN_NOTICE: &str =
-    "This computer is joined to your organisation's domain. An administrator of that domain may be able to open this desktop's saved pairing.";
+    "This computer is joined to your organization's domain. An administrator of that domain may be able to open this desktop's saved pairing.";
 
 /// NEW TEXT (owner approval needed): Settings, when the profile roams.
 pub(crate) const ROAMING_NOTICE: &str =
