@@ -1,12 +1,15 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import { onDestroy } from 'svelte';
-  import { sessionNotice } from '../stores/session';
+  import { onDestroy, onMount } from 'svelte';
+  import { sessionNotice, sessionStore, refreshSessionFromBackend } from '../stores/session';
   import { pairingHeld } from '../stores/navigation';
 
   let inviteCode = $state('');
-  let step = $state<'code' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error' | 'paired-no-session'>('code');
+  // 'elsewhere': a pairing this view didn't start (before a reload) still
+  // waits for the phone; its result isn't known here.
+  let step = $state<'code' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error' | 'paired-no-session' | 'elsewhere'>('code');
+  let elsewhereTimer: ReturnType<typeof setInterval> | null = null;
   let errorMessage = $state('');
   // The six-digit code the member compares with their phone (§6.7).
   let sas = $state('');
@@ -19,8 +22,34 @@
     pairingHeld.set(step !== 'code');
   });
 
+  async function pairingUnderWay(): Promise<boolean> {
+    try {
+      const status: any = await invoke('get_status');
+      return !!status?.pairing_under_way;
+    } catch {
+      return false;
+    }
+  }
+
+  // #79: after a reload mid-pairing, the backend may still be waiting for
+  // the phone. Say so, rather than offer a second Connect, and look again
+  // every 2 s; once it has ended, routing takes over (paired or not).
+  onMount(async () => {
+    if (step === 'code' && (await pairingUnderWay())) {
+      step = 'elsewhere';
+      elsewhereTimer = setInterval(async () => {
+        if (!(await pairingUnderWay())) {
+          if (elsewhereTimer) clearInterval(elsewhereTimer);
+          elsewhereTimer = null;
+          step = 'code';
+        }
+      }, 2000);
+    }
+  });
+
   onDestroy(() => {
     unlistenSas?.();
+    if (elsewhereTimer) clearInterval(elsewhereTimer);
     pairingHeld.set(false);
   });
 
@@ -53,13 +82,15 @@
 
       if (result.success) {
         sessionNotice.set(null);
+        // So "Session active." below follows the session from here on.
+        await refreshSessionFromBackend();
         step = 'success';
       } else if (result.paired_without_session) {
         // #33: the pairing is saved, only the session isn't: continue to
         // Start New Session, don't offer to pair again.
         step = 'paired-no-session';
         errorMessage = result.error || '';
-        // Shown on Start New Session too, if routing gets there first.
+        // Shown on Start New Session too, after Continue.
         sessionNotice.set(result.error || null);
       } else {
         step = 'error';
@@ -136,8 +167,17 @@
       <button class="btn primary" onclick={() => window.location.reload()}>Continue</button>
 
     {:else if step === 'success'}
-      <div class="success-msg">Desktop paired! Session active.</div>
+      <!-- "Session active." only while it is (the poll keeps the store current). -->
+      <div class="success-msg">
+        {$sessionStore.state === 'active' ? 'Desktop paired! Session active.' : 'Desktop paired.'}
+      </div>
       <button class="btn primary" onclick={() => window.location.reload()}>Continue</button>
+
+    {:else if step === 'elsewhere'}
+      <div class="waiting">
+        <div class="spinner"></div>
+        <p>This desktop is still waiting for your phone to approve a pairing. Approve or reject it on your phone.</p>
+      </div>
 
     {:else if step === 'error'}
       <p class="error-text">{errorMessage}</p>

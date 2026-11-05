@@ -148,6 +148,8 @@
 
   /** Session pill click — routes per the state. See plan §1 table. */
   function onSessionPillClick() {
+    // #79: a pairing under way isn't left by the top bar either.
+    if ($pairingHeld) return;
     switch (sessionState.state) {
       case 'active':
         currentView = 'session-detail';
@@ -169,6 +171,7 @@
   }
 
   function onSettingsClick() {
+    if ($pairingHeld) return;
     currentView = currentView === 'settings' ? defaultDestination() : 'settings';
   }
 
@@ -186,7 +189,7 @@
    * active session — the same rule the rail itself follows.
    */
   function handleKeydown(e: KeyboardEvent) {
-    if (!stateResolved) return;
+    if (!stateResolved || $pairingHeld) return;
     if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey) return;
     switch (e.key) {
       case '1':
