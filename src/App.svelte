@@ -9,6 +9,8 @@
   import { initVaultListeners } from './lib/stores/vault';
   import { initNotifications } from './lib/notifications';
   import { resetSecretsUnlock } from './lib/stores/secrets';
+  import { pairingHeld } from './lib/stores/navigation';
+  import { nextView } from './lib/routing.js';
 
   import Pairing from './lib/views/Pairing.svelte';
   import SessionExpired from './lib/views/SessionExpired.svelte';
@@ -125,30 +127,15 @@
     // pre-query 'inactive' placeholder and flash the pairing screen.
     if (!stateResolved) return;
 
-    if (sessionState.state === 'active') {
-      // Transition out of pre-session takeovers (loading / pairing /
-      // expired) → land on Connections, the default destination.
-      // Already on a real destination → stay.
-      if (currentView === 'loading' || currentView === 'pairing' || currentView === 'expired') {
-        currentView = 'connections';
-      }
-    } else if (sessionState.state === 'expired' || sessionState.state === 'suspended') {
-      // Session ran out (or got revoked from another device). Route
-      // to the Start-New-Session takeover. Don't yank the user out
-      // of Settings — they might be reading hostname info.
-      if (currentView !== 'settings') currentView = 'expired';
-    } else if (sessionState.state === 'revoked') {
-      // Hard revoke — credentials no longer valid; user has to
-      // re-pair. Settings stays accessible so the user can
-      // logout + restart cleanly.
-      if (currentView !== 'settings') currentView = 'pairing';
-    } else if (sessionState.state === 'inactive') {
-      if (isRegistered) {
-        if (currentView !== 'settings') currentView = 'expired';
-      } else {
-        currentView = 'pairing';
-      }
-    }
+    // The rule is in lib/routing.js (tested there). A pairing under way
+    // keeps the pairing view (#79).
+    const next = nextView({
+      current: currentView,
+      session: sessionState.state,
+      isRegistered,
+      pairingHeld: $pairingHeld,
+    });
+    if (next !== currentView) currentView = next;
 
     // Any non-active state means the prior unlock grant (if any) is
     // meaningless — clear the local mirror so the chip doesn't show

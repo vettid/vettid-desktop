@@ -24,6 +24,8 @@ jobs:
         run: npm ci
       - name: svelte-check
         run: npm run check
+      - name: frontend tests (node --test)
+        run: npm test
       - name: vite build
         run: npm run build
 

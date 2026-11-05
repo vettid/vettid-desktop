@@ -3,6 +3,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { onDestroy } from 'svelte';
   import { sessionNotice } from '../stores/session';
+  import { pairingHeld } from '../stores/navigation';
 
   let inviteCode = $state('');
   let step = $state<'code' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error' | 'paired-no-session'>('code');
@@ -12,8 +13,15 @@
   let sasInstruction = $state('');
   let unlistenSas: UnlistenFn | null = null;
 
+  // #79: from Connect until the person leaves the result, routing leaves
+  // this view alone, so a rejection or "Desktop paired!" is what they see.
+  $effect(() => {
+    pairingHeld.set(step !== 'code');
+  });
+
   onDestroy(() => {
     unlistenSas?.();
+    pairingHeld.set(false);
   });
 
   // Svelte action: focus the input when it mounts so the user can

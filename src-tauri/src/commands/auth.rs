@@ -1020,17 +1020,26 @@ async fn lock_memory(state: &AppState) {
     finish_reset(state);
 }
 
+/// Whether `get_status` reports this desktop as paired: known in memory
+/// (`register` confirmed it, or unlock opened it), or else a pairing on
+/// disk: this build's or an earlier build's, which unlock removes with a
+/// notice. Not while a pairing is under way (`pairings` > 0, #79): its
+/// pending `device.enc` is not a pairing until the vault's `device.paired`,
+/// and `register` itself reports the outcome.
+fn registered(known: bool, pairings: usize, on_disk: impl FnOnce() -> bool) -> bool {
+    known || (pairings == 0 && on_disk())
+}
+
 /// Get current authentication/registration status.
 #[tauri::command]
 pub async fn get_status(state: State<'_, AppState>) -> Result<AuthStatus, String> {
     let snap = state.snapshot();
-    let is_registered = *state.is_registered.read().await || snap.unlocked;
     let config_dir = store::default_config_dir().ok();
-
-    // Also check on disk if not yet known: this build's pairing, or an
-    // earlier build's, which unlock removes with a notice.
-    let is_registered = is_registered
-        || config_dir.as_deref().is_some_and(|dir| device_store::exists(dir) || store::exists(dir));
+    let is_registered = registered(
+        *state.is_registered.read().await || snap.unlocked,
+        state.pairing.load(std::sync::atomic::Ordering::SeqCst),
+        || config_dir.as_deref().is_some_and(|dir| device_store::exists(dir) || store::exists(dir)),
+    );
 
     let fp = collect_device_fingerprint();
 
@@ -1327,6 +1336,24 @@ mod tests {
         let r = tokio::time::timeout(std::time::Duration::from_secs(1), begin_opening(&pairing, &opening)).await;
         assert!(r.expect("not waited").is_none());
         drop(counted);
+    }
+
+    /// #79: while a pairing is under way, its pending `device.enc` doesn't
+    /// count as a pairing (the disk isn't even read); a confirmed one
+    /// always does.
+    #[test]
+    fn a_pairing_under_way_is_not_reported_as_paired() {
+        let read = std::cell::Cell::new(false);
+        let on_disk = || {
+            read.set(true);
+            true
+        };
+        assert!(!registered(false, 1, on_disk), "pending, not paired");
+        assert!(!read.get(), "the disk isn't read while pairing");
+        assert!(!registered(false, 2, || true));
+        assert!(registered(false, 0, || true), "a saved pairing, no pairing under way");
+        assert!(!registered(false, 0, || false));
+        assert!(registered(true, 1, || false), "register confirmed it, still finishing");
     }
 
     /// LOW 11: an earlier build's pairing goes whenever it is there; the
