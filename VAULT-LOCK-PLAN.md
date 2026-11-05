@@ -59,14 +59,20 @@
 ### 3.1 The vault state, in the engine (`crates/vettid-device`)
 
 - **The state.** `Access` keeps a vault state beside the session:
-  - `Unknown`: at start, after a restart, after sleep or resume, and
-    whenever nothing below has said otherwise;
-  - `Open { unlock_id? }`;
-  - `Held { deadline, waiting? }`;
+  - `Unknown`: at start, after a restart, and whenever nothing below
+    has said otherwise. `Open` also becomes `Unknown` after sleep or
+    resume, and when a status goes unanswered or `STALE_AFTER` passes
+    without a confirmation, so a lock missed on the phone's side never
+    leaves "open" on the screen. `Locked` after resume becomes "locked
+    as of <time>" (below) until a status answers;
+  - `Open { unlock_id?, due }`: `due` is `owner_check.state` `due`, past
+    the deadline with the hold off (§3.6.3, §10.2), and the session
+    continues;
+  - `Held { deadline, waiting? }`: `owner_check.state` `held` (the hold
+    on);
   - `Locked { since, by_this_desktop }`.
 
-  Only `Open`, or `Held` with the hold off, with a current session,
-  shows the session as live. `STALE_AFTER` stays as the cap on top.
+  Only `Open` with a current session shows the session as live. `STALE_AFTER` stays as the cap on top.
   `Snapshot` gains this state, as `vault`. Its field `unlocked` (the
   link in memory) is renamed `link_open`, so it can't be confused with
   the vault's lock.
@@ -109,7 +115,10 @@
 - **Pending requests and ends.**
   - A pending `device.session.request` is dropped when the state becomes
     `Held` (the vault drops it, R6) or `Locked`. Its waiting screen
-    gives way to the hold or locked screen.
+    gives way to the hold or locked screen. A locked vault does not
+    drop it, and may grant it after an unlock: such a grant is a fresh
+    session, shown as live only after a `vault.status` names it and the
+    state is `Open`.
   - A stored `device.session.end` keeps retrying through a lock, since
     sessions resume after an unlock (R7, #80).
 
@@ -134,11 +143,11 @@
        screen open, send again, at most 3 sends in all, each a new
        request with a new 60 s `exp` (R2, question 2). Then say plainly
        that the lock isn't confirmed and the vault may still be open.
-  3. No `unlock_id` held, because the last status had none (a vault
-     before release L): `vault.lock {}` once, never resent (R2). With
-     **no status read at all**, or `Unknown`, it still sends
-     `vault.lock {}` once, and says the result can't be confirmed
-     beyond the vault's answer.
+  3. The `unlock_id` sent is the last valid one read, whatever the state
+     (`Unknown` included), so a lock is never downgraded. Only when no
+     valid `unlock_id` was ever read (the last status had none, a vault
+     before release L, or no status read at all): `vault.lock {}` once,
+     never resent (R2). Its `{}` confirms the lock, as for a bound one.
 - **After a confirmed lock** the desktop keeps its link, so it notices
   the unlock (above). When a status answers with a new `unlock_id`, the
   vault is open again. The session shows as live only if that status
@@ -157,13 +166,13 @@
     never zeros.
 - A request answered `owner_check_required` sets `Held` and shows the
   same screen; today it surfaces as a generic error.
-- `due` (before the deadline) changes nothing on the desktop. With the
-  hold off, `held` shows the session as live, and the screen shows a
-  line that the hold is off.
-- The hold ends when a `vault.status` says `ok` (newer than the hold
-  statement). A `vault.held` delivered late shows the hold until that
+- `due` (past the deadline with the hold off) keeps the session live,
+  and the screen shows the "hold off" line of §3.4. `ok` (before the
+  deadline) changes nothing.
+- The hold ends when a `vault.status` says `ok` or `due` (newer than the
+  hold statement). A `vault.held` delivered late shows the hold until that
   status, which the continued refresh reads within 60 s.
-- `idle_lock_at` is shown on the hold screen (question 2b). A
+- `idle_lock_at` is shown on the hold screen (question 7). A
   `vault.locking` with `reason: "idle"` uses the "locked by inactivity"
   text.
 
@@ -236,10 +245,10 @@
    - a (recommended): two actions, "Lock this desktop" (today) and
      "Lock vault" (new, asks first).
    - b: one "Lock" that locks the vault and this desktop.
-2. **Resend and idle lock.**
+2. **The resend.**
    - a (recommended): at most 3 sends of an unconfirmed lock, each with
-     a new 60 s `exp`, and the idle-lock time on the hold screen.
-   - b: one send only, no idle-lock time.
+     a new 60 s `exp`, while the screen stays open.
+   - b: one send only, then the plain text.
 3. **After `stale_lock`.**
    - a (recommended): read the vault's own `vault.status`, a deviation
      from §10.2's member-API status, which a desktop doesn't use.
@@ -254,6 +263,9 @@
    - a (recommended): "locked as of <time>", with "can't check now".
    - b: `Unknown`.
 6. **The texts of §3.4.** Approve them as written, or change them.
+7. **The idle-lock time on the hold screen.**
+   - a (recommended): show it.
+   - b: leave it out for now.
 
 ## 6. Order
 
