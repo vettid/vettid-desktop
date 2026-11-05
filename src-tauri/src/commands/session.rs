@@ -51,7 +51,7 @@ fn status_of(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> SessionStat
             max_extensions: None,
             phone_reachable: snap.reachable,
         },
-        None if snap.unlocked => none("expired", snap.reachable),
+        None if snap.link_open => none("expired", snap.reachable),
         None => none("inactive", false),
     }
 }
@@ -84,7 +84,7 @@ mod tests {
     fn active_only_while_the_snapshot_is_live() {
         let now = chrono::Utc::now();
         assert_eq!(status_of(&Snapshot::default(), now).state, "inactive");
-        let mut snap = Snapshot { unlocked: true, reachable: true, ..Default::default() };
+        let mut snap = Snapshot { link_open: true, reachable: true, ..Default::default() };
         assert_eq!(status_of(&snap, now).state, "expired");
         snap.live_until = Some(now + chrono::TimeDelta::seconds(30));
         snap.session_id = Some("s".into());
@@ -99,7 +99,7 @@ mod tests {
     fn the_time_shown_is_the_sessions_expiry() {
         let now = chrono::Utc::now();
         let snap = Snapshot {
-            unlocked: true,
+            link_open: true,
             session_id: Some("s".into()),
             expires_at: Some(now + chrono::TimeDelta::hours(1)),
             ends_at: Some(now + chrono::TimeDelta::minutes(59)),

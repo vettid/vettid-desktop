@@ -45,6 +45,32 @@
 //! Missed events are recovered by reading `vault.status`, as §6.8 says:
 //! they are not stored in the inbox.
 //!
+//! **The vault's lock and hold** (VAULT-LOCK-PLAN §3.1; VAULT-MESSAGING
+//! §3.6.3, §3.6.5, §10.2 "Locks"). Beside the session, [`Access`] keeps
+//! what the vault last said of itself ([`VaultState`]): `Unknown` at
+//! start and whenever nothing below says otherwise; `Open` (with its
+//! `unlock_id`, and `due` past the deadline with the hold off) or `Held`
+//! from a `vault.status` answer; `Held` from `vault.held` or an
+//! `owner_check_required` answer; `Locked` from a `vault.locking` naming
+//! the current `unlock_id`. Only `Open` lets a session be active
+//! ([`Access::active_at`]): while held the vault suspends desktops'
+//! sessions (§3.6.3), and a locked vault answers nothing (§12.1).
+//! - These statements are ordered by the vault's `ts` (and `seq`), as the
+//!   session's are, in their own order: an older one never replaces a
+//!   newer one (§8.4).
+//! - A `vault.locking` naming another `unlock_id` changes nothing (§10.2
+//!   "Locks"), and one when no `unlock_id` is held (or one without the
+//!   member) makes the state `Unknown`, never `Locked` (owner decision 1,
+//!   2026-11-05): either way the event says to read `vault.status` now
+//!   ([`AccessEvent::ReadStatus`]). A status never sets `Open` with an
+//!   `unlock_id` a lock notice has ended.
+//! - `device.session.granted` and `.ended` never change it (§3.6.3).
+//! - Its decay (`Open` to `Unknown` when a status goes unanswered, when
+//!   the vault hasn't confirmed it for a while, or on resume) is the
+//!   app's: see [`Access::vault_unconfirmed`].
+//! - The desktop never sends `vault.lock` (owner decision, 2026-11-05):
+//!   nothing here does.
+//!
 //! Not here yet: approvals (`approval.waiting`) and step-up types.
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -86,6 +112,76 @@ pub const TYPE_END: &str = "device.session.end";
 pub const TYPE_GRANTED: &str = "device.session.granted";
 pub const TYPE_ENDED: &str = "device.session.ended";
 pub const TYPE_STATUS: &str = "vault.status";
+pub const TYPE_LOCKING: &str = "vault.locking";
+pub const TYPE_HELD: &str = "vault.held";
+/// The code the vault answers a request with while it is held (§3.6.3).
+pub const OWNER_CHECK_REQUIRED: &str = "owner_check_required";
+/// How many `unlock_id`s that lock notices ended are remembered.
+const ENDED_KEEP: usize = 16;
+
+/// Whether `id` is an `unlock_id`: exactly 32 lowercase hex characters
+/// (§10.2 "Locks").
+pub fn valid_unlock_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// What is waiting while the vault is held: the counts of `vault.held`
+/// and of `vault.status`'s `owner_check.waiting` (§3.6.3). Counts only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Waiting {
+    pub messages: u64,
+    pub requests: u64,
+    pub calls: u64,
+    pub other: u64,
+}
+
+/// Why the vault locked: `vault.locking`'s `reason` (§10.2). Another
+/// value, or none, is a lock without a known reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockReason {
+    /// `"idle"`: the idle lock (§3.6.8).
+    Idle,
+    /// `"owner_check"`: ten failed owner checks (§3.6.4).
+    OwnerCheck,
+    /// `"recovery"`: a recovery request (§11.11.1).
+    Recovery,
+}
+
+/// What this desktop knows of the vault's lock and hold (VAULT-LOCK-PLAN
+/// §3.1). Only `Open` lets a session be live.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum VaultState {
+    /// Nothing current says otherwise: at start, after a malformed
+    /// statement or a lock notice this desktop can't place, and (the
+    /// app's decay) after an unanswered status or a resume.
+    #[default]
+    Unknown,
+    /// A `vault.status` answer: open, under `unlock_id` (none from a vault
+    /// before release L). `due`: past the deadline with the hold off; the
+    /// session continues (§3.6.3, §3.6.7).
+    Open { unlock_id: Option<String>, due: bool },
+    /// Held (§3.6.3): `deadline`, the counts and `idle_lock_at` when a
+    /// statement gave them (none from an `owner_check_required` answer).
+    Held { deadline: Option<DateTime<Utc>>, waiting: Option<Waiting>, idle_lock_at: Option<DateTime<Utc>> },
+    /// A `vault.locking` naming the current `unlock_id`, sent at `since`.
+    Locked { since: DateTime<Utc>, reason: Option<LockReason> },
+}
+
+/// What a `vault.status` body says of the vault ([`parse_vault_status`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultStatus {
+    /// `Open` or `Held`.
+    pub state: VaultState,
+    pub unlock_id: Option<String>,
+}
+
+/// A `vault.locking` body ([`parse_locking`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Locking {
+    /// The unlock the lock ends (none from a vault before release L).
+    pub unlock_id: Option<String>,
+    pub reason: Option<LockReason>,
+}
 
 /// An access session the vault named. `Debug` shows only the start of
 /// its id.
@@ -190,6 +286,15 @@ pub enum AccessEvent {
     EndAnswered,
     /// A late answer to `vault.status`.
     Status(StatusSession),
+    /// `vault.locking` naming the current `unlock_id`, newer than what was
+    /// applied: the vault is [`VaultState::Locked`].
+    Locked,
+    /// `vault.held` (applied only if newest by `ts`).
+    Held,
+    /// A `vault.locking` this desktop can't apply (another `unlock_id`,
+    /// none held, none named, or older than what was applied): read
+    /// `vault.status` now.
+    ReadStatus,
 }
 
 /// Why an access operation failed. Carries no secret; `Debug` filters
@@ -317,6 +422,116 @@ pub fn parse_request_answer(answer: &Inner) -> Result<RequestOutcome, AccessErro
     }
 }
 
+/// An optional timestamp member.
+fn opt_ts(o: &Object<'_>, name: &str) -> Result<Option<DateTime<Utc>>, AccessError> {
+    match o.get(name) {
+        None => Ok(None),
+        Some(_) => ts(o, name).map(Some),
+    }
+}
+
+/// An optional `waiting` member of `o` (at nesting `level`): `{messages,
+/// requests, calls, other}`, each required. Other members are ignored.
+fn opt_waiting(o: &Object<'_>, level: usize) -> Result<Option<Waiting>, AccessError> {
+    if o.get("waiting").is_none() {
+        return Ok(None);
+    }
+    let w = o.object("waiting", level).map_err(malformed)?;
+    let n = |name: &str| w.uint(name, 0, u64::MAX).map_err(malformed);
+    Ok(Some(Waiting { messages: n("messages")?, requests: n("requests")?, calls: n("calls")?, other: n("other")? }))
+}
+
+/// An optional `unlock_id` member: absent is `None`; present, it must be
+/// 32 lowercase hex characters ([`valid_unlock_id`]).
+fn opt_unlock_id(o: &Object<'_>) -> Result<Option<String>, AccessError> {
+    match o.get("unlock_id") {
+        None => Ok(None),
+        Some(_) => {
+            let id = o.string("unlock_id").map_err(malformed)?;
+            if valid_unlock_id(&id) {
+                Ok(Some(id))
+            } else {
+                Err(AccessError::Malformed)
+            }
+        }
+    }
+}
+
+/// What a `vault.status` body says of the vault's lock and hold (§10.2):
+/// its `unlock_id` and `owner_check` (`state`, `hold`, `deadline`, and
+/// `waiting` and `idle_lock_at` if present). Other members are ignored,
+/// as in [`parse_status`], which this doesn't replace.
+/// - `ok`: `Open`; `due` (with the hold off): `Open` with `due`; `held`
+///   (with the hold on): `Held`. A `state` and `hold` that disagree don't
+///   check out.
+/// - A vault that answers is not locked (§12.1): without `owner_check` (a
+///   vault before 0.13.0) it is `Open`, and without `unlock_id` (before
+///   release L) `Open` with none.
+/// - `Malformed` when either member is present and doesn't check out (an
+///   `unlock_id` that isn't 32 lowercase hex characters included): the
+///   state is then `Unknown`, never taken as absent.
+pub fn parse_vault_status(body: &str) -> Result<VaultStatus, AccessError> {
+    let o = strict_json::parse_object(body.as_bytes()).map_err(malformed)?;
+    let unlock_id = opt_unlock_id(&o)?;
+    if o.get("owner_check").is_none() {
+        return Ok(VaultStatus { state: VaultState::Open { unlock_id: unlock_id.clone(), due: false }, unlock_id });
+    }
+    let oc = o.object("owner_check", 1).map_err(malformed)?;
+    let deadline = ts(&oc, "deadline")?;
+    let hold = oc.bool("hold").map_err(malformed)?;
+    let waiting = opt_waiting(&oc, 2)?;
+    let idle_lock_at = opt_ts(&oc, "idle_lock_at")?;
+    let state = match (oc.string("state").map_err(malformed)?.as_str(), hold) {
+        ("ok", _) => VaultState::Open { unlock_id: unlock_id.clone(), due: false },
+        ("due", false) => VaultState::Open { unlock_id: unlock_id.clone(), due: true },
+        ("held", true) => VaultState::Held { deadline: Some(deadline), waiting, idle_lock_at },
+        _ => return Err(AccessError::Malformed),
+    };
+    Ok(VaultStatus { state, unlock_id })
+}
+
+/// A `vault.held` body (§3.6.3, §10.2): `{deadline, waiting?,
+/// idle_lock_at?}` as [`VaultState::Held`]. Without `waiting` the counts
+/// are not known. Other members are ignored.
+pub fn parse_held(body: &str) -> Result<VaultState, AccessError> {
+    let o = strict_json::parse_object(body.as_bytes()).map_err(malformed)?;
+    Ok(VaultState::Held { deadline: Some(ts(&o, "deadline")?), waiting: opt_waiting(&o, 1)?, idle_lock_at: opt_ts(&o, "idle_lock_at")? })
+}
+
+/// A `vault.locking` body (§10.2): `{unlock_id?, reason?}`. A `reason`
+/// this desktop doesn't know is a lock without a known reason. Other
+/// members are ignored.
+pub fn parse_locking(body: &str) -> Result<Locking, AccessError> {
+    let o = strict_json::parse_object(body.as_bytes()).map_err(malformed)?;
+    let reason = match o.opt_string("reason").map_err(malformed)?.as_deref() {
+        Some("idle") => Some(LockReason::Idle),
+        Some("owner_check") => Some(LockReason::OwnerCheck),
+        Some("recovery") => Some(LockReason::Recovery),
+        _ => None,
+    };
+    Ok(Locking { unlock_id: opt_unlock_id(&o)?, reason })
+}
+
+/// Whether `answer` is the vault's `owner_check_required` (§3.6.3).
+fn hold_answer(answer: &Inner) -> bool {
+    matches!(answer.response.as_ref().map(|r| &r.status), Some(Status::Error { code, .. }) if code == OWNER_CHECK_REQUIRED)
+}
+
+/// Whether what the vault said at `at` with `seq` is not older than what
+/// was applied last at `learned` with `learned_seq`: at the same `ts`, the
+/// lower `seq` is the older; without a `seq` on both, the later to arrive
+/// stands.
+fn not_older(learned: Option<DateTime<Utc>>, learned_seq: Option<u64>, at: DateTime<Utc>, seq: Option<u64>) -> bool {
+    match learned {
+        None => true,
+        Some(l) if at != l => at > l,
+        Some(_) => match (learned_seq, seq) {
+            (Some(prev), Some(n)) => n >= prev,
+            _ => true,
+        },
+    }
+}
+
 /// A session event from the vault (not a response): `None` if `m` isn't
 /// one.
 pub fn parse_event(m: &Inner) -> Option<Result<AccessEvent, AccessError>> {
@@ -383,6 +598,21 @@ pub struct Access {
     baseline: bool,
     /// How long each attempt waits for its answer.
     timeout: TimeDelta,
+    /// What the vault last said of its lock and hold.
+    vault: VaultState,
+    /// The vault's `ts` and `seq` of the last statement applied to
+    /// `vault` (their own order, apart from the session's).
+    vault_learned: Option<DateTime<Utc>>,
+    vault_learned_seq: Option<u64>,
+    /// The current `unlock_id`, from the newest status applied; dropped
+    /// once a lock notice names it.
+    unlock_id: Option<String>,
+    /// `unlock_id`s that lock notices ended, newest last (at most
+    /// [`ENDED_KEEP`]): a status naming one never sets `Open`.
+    ended: Vec<String>,
+    /// A lock or hold notice asked for `vault.status` to be read now
+    /// ([`Access::take_status_wanted`]).
+    status_wanted: bool,
 }
 
 impl Default for Access {
@@ -394,7 +624,20 @@ impl Default for Access {
 impl Access {
     /// No session known (as after a start: read `vault.status`).
     pub fn new() -> Self {
-        Access { current: None, margin: EXPIRY_MARGIN, learned: None, learned_seq: None, baseline: false, timeout: REQUEST_TIMEOUT }
+        Access {
+            current: None,
+            margin: EXPIRY_MARGIN,
+            learned: None,
+            learned_seq: None,
+            baseline: false,
+            timeout: REQUEST_TIMEOUT,
+            vault: VaultState::Unknown,
+            vault_learned: None,
+            vault_learned_seq: None,
+            unlock_id: None,
+            ended: Vec::new(),
+            status_wanted: false,
+        }
     }
 
     /// The same, waiting `timeout` for each answer.
@@ -409,9 +652,131 @@ impl Access {
 
     /// Whether this desktop has an access session at `t`: one the vault
     /// named, more than its margin ([`margin_for`]) from its end, and known
-    /// since this `Access`'s own `vault.status` (or an end) answered.
+    /// since this `Access`'s own `vault.status` (or an end) answered; and
+    /// the vault is [`VaultState::Open`] (`due` included). Held, locked or
+    /// unknown, no session is live (VAULT-LOCK-PLAN §3.1).
     pub fn active_at(&self, t: DateTime<Utc>) -> bool {
-        self.baseline && self.current.as_ref().is_some_and(|s| s.active_at(t, self.margin))
+        self.baseline && matches!(self.vault, VaultState::Open { .. }) && self.current.as_ref().is_some_and(|s| s.active_at(t, self.margin))
+    }
+
+    /// What the vault last said of its lock and hold.
+    pub fn vault(&self) -> &VaultState {
+        &self.vault
+    }
+
+    /// The current `unlock_id`, if a status named one and no lock notice
+    /// has ended it since.
+    pub fn unlock_id(&self) -> Option<&str> {
+        self.unlock_id.as_deref()
+    }
+
+    /// The vault's word that it is open is no longer current (a status
+    /// went unanswered, the vault hasn't confirmed it for a while, or the
+    /// computer slept): `Open` becomes `Unknown` until a status answers.
+    /// `Held` and `Locked` stay (neither is live). The `unlock_id` is kept,
+    /// so a lock notice naming it still applies. The app calls it
+    /// (VAULT-LOCK-PLAN §3.1).
+    pub fn vault_unconfirmed(&mut self) {
+        if matches!(self.vault, VaultState::Open { .. }) {
+            self.vault = VaultState::Unknown;
+        }
+    }
+
+    /// Whether a lock or hold notice observed since the last call asked
+    /// for `vault.status` to be read now ([`AccessEvent::ReadStatus`], or
+    /// a notice that didn't check out); cleared by the call.
+    pub fn take_status_wanted(&mut self) -> bool {
+        std::mem::take(&mut self.status_wanted)
+    }
+
+    /// The vault's `ts` of the last statement applied to [`Access::vault`]
+    /// (`None`: none yet). An `Unknown` from a statement that didn't check
+    /// out, or from the app's decay, doesn't move it.
+    pub fn vault_learned_at(&self) -> Option<DateTime<Utc>> {
+        self.vault_learned
+    }
+
+    fn vault_not_older(&self, at: DateTime<Utc>, seq: Option<u64>) -> bool {
+        not_older(self.vault_learned, self.vault_learned_seq, at, seq)
+    }
+
+    fn vault_mark(&mut self, at: DateTime<Utc>, seq: Option<u64>) {
+        self.vault_learned = Some(at);
+        self.vault_learned_seq = seq;
+    }
+
+    /// Apply a status's word on the vault, said at `at` with `seq`: older
+    /// than what is applied, or naming an `unlock_id` a lock notice ended
+    /// (a status from before that lock), it is ignored.
+    fn learn_vault(&mut self, at: DateTime<Utc>, seq: Option<u64>, st: VaultStatus) {
+        if !self.vault_not_older(at, seq) || st.unlock_id.as_ref().is_some_and(|id| self.ended.contains(id)) {
+            return;
+        }
+        self.vault_mark(at, seq);
+        self.unlock_id = st.unlock_id;
+        self.vault = st.state;
+    }
+
+    /// The vault answered `owner_check_required` at `at`: it is held
+    /// (§3.6.3). A hold already known keeps its deadline and counts.
+    fn learn_held_answer(&mut self, answer: &Inner) {
+        if !hold_answer(answer) || !self.vault_not_older(answer.ts, answer.seq) {
+            return;
+        }
+        self.vault_mark(answer.ts, answer.seq);
+        if !matches!(self.vault, VaultState::Held { .. }) {
+            self.vault = VaultState::Held { deadline: None, waiting: None, idle_lock_at: None };
+        }
+    }
+
+    /// Remember that a lock notice ended `id`.
+    fn end_unlock(&mut self, id: &str) {
+        if !self.ended.iter().any(|e| e == id) {
+            self.ended.push(id.to_string());
+            if self.ended.len() > ENDED_KEEP {
+                self.ended.remove(0);
+            }
+        }
+    }
+
+    /// A `vault.locking` said at `at` with `seq` (§10.2 "Locks").
+    fn learn_locking(&mut self, at: DateTime<Utc>, seq: Option<u64>, l: Locking) -> AccessEvent {
+        let Some(named) = l.unlock_id else {
+            // A notice without `unlock_id` (a vault before release L): the
+            // §11.4 time rule needs an unlock result, which a desktop
+            // doesn't have. As with none held (owner decision 1,
+            // 2026-11-05): Unknown, never Locked, and read the status.
+            self.vault = VaultState::Unknown;
+            return AccessEvent::ReadStatus;
+        };
+        let known = self.ended.contains(&named);
+        self.end_unlock(&named);
+        match self.unlock_id.as_deref() {
+            Some(cur) if cur == named => {
+                self.unlock_id = None;
+                if self.vault_not_older(at, seq) {
+                    self.vault_mark(at, seq);
+                    self.vault = VaultState::Locked { since: at, reason: l.reason };
+                    AccessEvent::Locked
+                } else {
+                    // Its unlock is over, but something newer was applied
+                    // (the vault opened again and came back held): that
+                    // stands, and the status says which unlock is current.
+                    AccessEvent::ReadStatus
+                }
+            }
+            // Another unlock's (R1: ignored), but the unlock_id held may
+            // be out of date: read the status.
+            Some(_) => AccessEvent::ReadStatus,
+            // The lock already applied, again: nothing new.
+            None if known => AccessEvent::ReadStatus,
+            // None held (no status read yet, or a vault before release L):
+            // owner decision 1 (2026-11-05): Unknown, never Locked.
+            None => {
+                self.vault = VaultState::Unknown;
+                AccessEvent::ReadStatus
+            }
+        }
     }
 
     /// Apply what the vault said at `at` (its `ts`) with `seq`: `Some` a
@@ -447,14 +812,7 @@ impl Access {
     /// Whether what the vault said at `at` with `seq` is not older than what
     /// was applied last.
     fn newer(&self, at: DateTime<Utc>, seq: Option<u64>) -> bool {
-        match self.learned {
-            None => true,
-            Some(l) if at != l => at > l,
-            Some(_) => match (self.learned_seq, seq) {
-                (Some(prev), Some(n)) => n >= prev,
-                _ => true,
-            },
-        }
+        not_older(self.learned, self.learned_seq, at, seq)
     }
 
     /// Drop the current session if `named` (or any, if `None`) is it.
@@ -475,6 +833,7 @@ impl Access {
 
     fn status_answer<T: Transport, C: Clock>(&mut self, s: &Session<T, C>, answer: &Inner) -> Result<StatusSession, AccessError> {
         if let Some(Status::Error { code, .. }) = answer.response.as_ref().map(|r| &r.status) {
+            self.learn_held_answer(answer);
             return Err(AccessError::Vault(code.clone()));
         }
         let status = match parse_status(&answer.body) {
@@ -482,9 +841,17 @@ impl Access {
             Err(e) => {
                 // Unreadable: nothing known.
                 self.current = None;
+                self.vault = VaultState::Unknown;
                 return Err(e);
             }
         };
+        match parse_vault_status(&answer.body) {
+            Ok(v) => self.learn_vault(answer.ts, answer.seq, v),
+            // An unlock_id or owner_check that doesn't check out: the
+            // vault's state is not known (never "absent"). The session
+            // part stands on its own.
+            Err(_) => self.vault = VaultState::Unknown,
+        }
         match &status {
             StatusSession::Session(x) => self.learn(answer.ts, answer.seq, Some(x.clone()), s.access_end()),
             StatusSession::None => self.learn(answer.ts, answer.seq, None, s.access_end()),
@@ -527,6 +894,8 @@ impl Access {
             None => "{}".into(),
         };
         let answer = s.request(store, TYPE_REQUEST, &body, self.timeout).await?;
+        // Refused while held (§3.6.3): the vault is held.
+        self.learn_held_answer(&answer);
         Ok((parse_request_answer(&answer)?, answer.ts))
     }
 
@@ -631,6 +1000,7 @@ impl Access {
         answer: &Inner,
     ) -> Result<(), AccessError> {
         s.set_access_end(store, None)?;
+        self.learn_held_answer(answer);
         let ok = empty_ok(answer);
         if ok.is_ok() || ok == Err(AccessError::Malformed) {
             // Ended (or never current): from the vault's ts of the answer,
@@ -654,6 +1024,9 @@ impl Access {
         m: &Inner,
     ) -> Result<Option<AccessEvent>, AccessError> {
         if let Some(r) = &m.response {
+            // `owner_check_required` to any request: the vault is held
+            // (§3.6.3).
+            self.learn_held_answer(m);
             return match m.kind.as_str() {
                 TYPE_END => match s.access_end().cloned() {
                     Some(p) if p.id == r.re => self.end_answered(s, store, &p, m).map(|()| Some(AccessEvent::EndAnswered)),
@@ -664,6 +1037,43 @@ impl Access {
                 _ => Ok(None),
             };
         }
+        // The vault's lock and hold (§10.2). One that doesn't check out
+        // leaves the state unknown (fail secure): read the status.
+        match m.kind.as_str() {
+            TYPE_LOCKING => {
+                let r = match parse_locking(&m.body) {
+                    Ok(l) => Ok(Some(self.learn_locking(m.ts, m.seq, l))),
+                    Err(e) => {
+                        self.vault = VaultState::Unknown;
+                        Err(e)
+                    }
+                };
+                if !matches!(r, Ok(Some(AccessEvent::Locked))) {
+                    self.status_wanted = true;
+                }
+                return r;
+            }
+            TYPE_HELD => {
+                return match parse_held(&m.body) {
+                    Ok(held) => {
+                        // The newest by ts (§3.6.3 "A device keeps the
+                        // newest by ts").
+                        if self.vault_not_older(m.ts, m.seq) {
+                            self.vault_mark(m.ts, m.seq);
+                            self.vault = held;
+                        }
+                        Ok(Some(AccessEvent::Held))
+                    }
+                    Err(e) => {
+                        self.vault = VaultState::Unknown;
+                        self.status_wanted = true;
+                        Err(e)
+                    }
+                };
+            }
+            _ => {}
+        }
+        // Session events below never change the vault's state (§3.6.3).
         let Some(event) = parse_event(m) else { return Ok(None) };
         match &event {
             Ok(AccessEvent::Granted(g)) => self.learn(m.ts, m.seq, Some(g.clone()), s.access_end()),

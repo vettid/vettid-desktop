@@ -751,9 +751,16 @@ async fn a_grant_before_a_baseline_is_not_active() {
     assert!(st.is_ok());
     assert!(a.active_at(Utc::now()));
 
-    // An answered end is a baseline too.
+    // An answered end is a baseline too. (VAULT-LOCK-PLAN §3.1: it doesn't
+    // say the vault is open, a held vault answers ends too, so the vault's
+    // word comes first from a status answer collected by a poll, which is
+    // no baseline, and without a `session` member, so it names none.)
     let mut b = access();
+    let late = response(&event(TYPE_STATUS, "{}"), Status::Ok, &status_body(None));
+    assert_eq!(b.observe(&mut s, &mut store, &late), Ok(Some(AccessEvent::Status(StatusSession::Absent))));
+    assert!(matches!(b.vault(), VaultState::Open { .. }));
     b.observe(&mut s, &mut store, &event(TYPE_GRANTED, &session_body("s-2", exp))).unwrap();
+    assert!(!b.active_at(Utc::now()), "no baseline yet");
     let (got, _) = tokio::join!(b.end(&mut s, &mut store, Some("s-1")), answer(&mut vault, TYPE_END, Status::Ok, "{}"));
     assert_eq!(got, Ok(EndOutcome::Ended));
     assert!(b.active_at(Utc::now()), "s-2 is not the session ended, and the end's answer is a baseline");
@@ -917,6 +924,402 @@ async fn a_grant_while_an_end_waits() {
     record_end(&mut s, &mut store, None, END_ATTEMPTS);
     a.observe(&mut s, &mut store, &event(TYPE_GRANTED, &session_body("s-1", Utc::now() + TimeDelta::hours(1)))).unwrap();
     assert!(!a.active_at(Utc::now()));
+}
+
+// ---------------------------------------------------------------------------
+// The vault's lock and hold (VAULT-LOCK-PLAN §3.1, §4).
+// ---------------------------------------------------------------------------
+
+const UNLOCK_A: &str = "0123456789abcdef0123456789abcdef";
+const UNLOCK_B: &str = "fedcba9876543210fedcba9876543210";
+
+/// An `owner_check` member.
+fn owner_check(state: &str, hold: bool, extra: &str) -> String {
+    let comma = if extra.is_empty() { "" } else { "," };
+    format!(r#"{{"state":"{state}","deadline":"2026-11-05T09:00:00.000Z","interval_seconds":86400,"failures":0,"hold":{hold}{comma}{extra}}}"#)
+}
+
+/// A `vault.status` body naming `unlock` and `session` (none: `null`),
+/// with `owner_check` if given.
+fn vault_status_body(unlock: Option<&str>, oc: Option<&str>, session: Option<&str>) -> String {
+    let mut parts = Vec::new();
+    if let Some(u) = unlock {
+        parts.push(format!(r#""unlock_id":"{u}""#));
+    }
+    if let Some(oc) = oc {
+        parts.push(format!(r#""owner_check":{oc}"#));
+    }
+    match session {
+        Some(id) => parts.push(format!(r#""session":{}"#, session_body(id, Utc::now() + TimeDelta::hours(1)))),
+        None => parts.push(r#""session":null"#.into()),
+    }
+    format!("{{\"vault_id\":\"vault-1\",{}}}", parts.join(","))
+}
+
+/// A status answer (collected by a poll) with `body`, stamped `ts`.
+fn status_at(body: &str, ts: DateTime<Utc>) -> Inner {
+    let mut r = response(&event(TYPE_STATUS, "{}"), Status::Ok, body);
+    r.ts = ts;
+    r
+}
+
+/// A vault event stamped `ts`, with `exp` (an ephemeral type needs one).
+fn event_at(kind: &str, body: &str, ts: DateTime<Utc>) -> Inner {
+    let mut m = event(kind, body);
+    m.ts = ts;
+    m.exp = Some(ts + TimeDelta::seconds(60));
+    m
+}
+
+fn locking(unlock: Option<&str>, reason: Option<&str>) -> String {
+    let mut parts = Vec::new();
+    if let Some(u) = unlock {
+        parts.push(format!(r#""unlock_id":"{u}""#));
+    }
+    if let Some(r) = reason {
+        parts.push(format!(r#""reason":"{r}""#));
+    }
+    format!("{{{}}}", parts.join(","))
+}
+
+/// `read_status` answered with `body`, stamped a minute ago (so that what
+/// the test says next is newer).
+async fn status_read(a: &mut Access, s: &mut S, store: &mut MemStore, vault: &mut Vault, body: String) -> Result<StatusRead, AccessError> {
+    let vault_side = async {
+        let req = receive(vault).await;
+        assert_eq!(req.kind, TYPE_STATUS);
+        let mut r = response(&req, Status::Ok, &body);
+        r.ts = Utc::now() - TimeDelta::minutes(1);
+        deposit(vault, r).await;
+    };
+    let (st, ()) = tokio::join!(a.read_status(s, store), vault_side);
+    st
+}
+
+/// `unlock_id` and `owner_check` are read from `vault.status`; other
+/// members are ignored, and `parse_status` reads the same bodies as
+/// before.
+#[test]
+fn vault_status_is_parsed() {
+    let open = |unlock_id: Option<&str>, due| VaultState::Open { unlock_id: unlock_id.map(str::to_string), due };
+    let read = |body: &str| parse_vault_status(body).map(|v| v.state);
+    // A vault before 0.13.0 / release L: it answered, so it is open.
+    assert_eq!(read(r#"{"vault_id":"v"}"#), Ok(open(None, false)));
+    assert_eq!(read(&format!(r#"{{"unlock_id":"{UNLOCK_A}","later":{{"x":1}}}}"#)), Ok(open(Some(UNLOCK_A), false)));
+    assert_eq!(parse_vault_status(&format!(r#"{{"unlock_id":"{UNLOCK_A}"}}"#)).unwrap().unlock_id.as_deref(), Some(UNLOCK_A));
+    assert_eq!(read(&format!(r#"{{"owner_check":{}}}"#, owner_check("ok", true, ""))), Ok(open(None, false)));
+    let counts = r#""waiting":{"messages":3,"requests":1,"calls":0,"other":2,"new":9}"#;
+    assert_eq!(read(&format!(r#"{{"unlock_id":"{UNLOCK_A}","owner_check":{}}}"#, owner_check("due", false, counts))), Ok(open(Some(UNLOCK_A), true)));
+    let deadline = parse_ts("2026-11-05T09:00:00.000Z");
+    let idle = parse_ts("2026-11-06T09:00:00.000Z");
+    let held = format!(r#"{{"owner_check":{}}}"#, owner_check("held", true, &format!(r#"{counts},"idle_lock_at":"2026-11-06T09:00:00.000Z","hold_off_until":"x""#)));
+    assert_eq!(
+        read(&held),
+        Ok(VaultState::Held { deadline, waiting: Some(Waiting { messages: 3, requests: 1, calls: 0, other: 2 }), idle_lock_at: idle })
+    );
+    assert_eq!(read(&format!(r#"{{"owner_check":{}}}"#, owner_check("held", true, ""))), Ok(VaultState::Held { deadline, waiting: None, idle_lock_at: None }));
+    // parse_status is unchanged by the new members.
+    assert_eq!(parse_status(&held), Ok(StatusSession::Absent));
+    // An unlock_id that isn't 32 lowercase hex characters: malformed,
+    // never taken as absent.
+    for bad in [
+        r#"{"unlock_id":"0123456789ABCDEF0123456789ABCDEF"}"#.to_string(),
+        r#"{"unlock_id":"0123456789abcdef0123456789abcde"}"#.into(),
+        r#"{"unlock_id":"0123456789abcdef0123456789abcdef0"}"#.into(),
+        r#"{"unlock_id":"0123456789abcdef0123456789abcdeg"}"#.into(),
+        r#"{"unlock_id":""}"#.into(),
+        r#"{"unlock_id":null}"#.into(),
+        r#"{"unlock_id":7}"#.into(),
+        // owner_check that doesn't check out.
+        r#"{"owner_check":null}"#.into(),
+        r#"{"owner_check":{"state":"ok"}}"#.into(),
+        format!(r#"{{"owner_check":{}}}"#, owner_check("paused", false, "")),
+        format!(r#"{{"owner_check":{}}}"#, owner_check("held", false, "")),
+        format!(r#"{{"owner_check":{}}}"#, owner_check("due", true, "")),
+        format!(r#"{{"owner_check":{}}}"#, owner_check("held", true, r#""waiting":{"messages":1}"#)),
+        format!(r#"{{"owner_check":{}}}"#, owner_check("held", true, r#""waiting":{"messages":-1,"requests":0,"calls":0,"other":0}"#)),
+        format!(r#"{{"owner_check":{}}}"#, owner_check("held", true, r#""idle_lock_at":"tomorrow""#)),
+    ] {
+        assert_eq!(parse_vault_status(&bad), Err(AccessError::Malformed), "{bad}");
+    }
+}
+
+/// `vault.held` and `vault.locking` bodies.
+#[test]
+fn held_and_locking_bodies_are_parsed() {
+    let deadline = parse_ts("2026-11-05T09:00:00.000Z");
+    assert_eq!(
+        parse_held(r#"{"deadline":"2026-11-05T09:00:00.000Z","waiting":{"messages":0,"requests":2,"calls":1,"other":0}}"#),
+        Ok(VaultState::Held { deadline, waiting: Some(Waiting { messages: 0, requests: 2, calls: 1, other: 0 }), idle_lock_at: None })
+    );
+    assert_eq!(parse_held(r#"{"deadline":"2026-11-05T09:00:00.000Z"}"#), Ok(VaultState::Held { deadline, waiting: None, idle_lock_at: None }));
+    for bad in [r#"{}"#, r#"{"deadline":"soon"}"#, r#"{"deadline":"2026-11-05T09:00:00.000Z","waiting":[]}"#] {
+        assert_eq!(parse_held(bad), Err(AccessError::Malformed), "{bad}");
+    }
+    for (reason, want) in [
+        (Some("idle"), Some(LockReason::Idle)),
+        (Some("owner_check"), Some(LockReason::OwnerCheck)),
+        (Some("recovery"), Some(LockReason::Recovery)),
+        (Some("later"), None),
+        (None, None),
+    ] {
+        assert_eq!(parse_locking(&locking(Some(UNLOCK_A), reason)), Ok(Locking { unlock_id: Some(UNLOCK_A.into()), reason: want }));
+    }
+    assert_eq!(parse_locking("{}"), Ok(Locking { unlock_id: None, reason: None }));
+    assert_eq!(parse_locking(r#"{"unlock_id":"A"}"#), Err(AccessError::Malformed));
+    assert_eq!(parse_locking(r#"{"reason":7}"#), Err(AccessError::Malformed));
+}
+
+/// At start the vault's state is Unknown, and no session is active until a
+/// status says the vault is open.
+#[tokio::test]
+async fn the_vault_is_unknown_until_a_status_answers() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    assert_eq!(a.vault(), &VaultState::Unknown);
+    let st = status_read(&mut a, &mut s, &mut store, &mut vault, vault_status_body(Some(UNLOCK_A), Some(&owner_check("ok", false, "")), Some("s-1"))).await;
+    assert!(st.is_ok());
+    assert_eq!(a.vault(), &VaultState::Open { unlock_id: Some(UNLOCK_A.into()), due: false });
+    assert_eq!(a.unlock_id(), Some(UNLOCK_A));
+    assert!(a.active_at(Utc::now()));
+}
+
+/// A `vault.locking` naming the current unlock locks, with each reason;
+/// nothing is live, and session events change nothing of it.
+#[tokio::test]
+async fn a_matching_lock_notice_locks() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    for (reason, want) in [(None, None), (Some("idle"), Some(LockReason::Idle)), (Some("owner_check"), Some(LockReason::OwnerCheck)), (Some("recovery"), Some(LockReason::Recovery))] {
+        let mut a = access();
+        status_read(&mut a, &mut s, &mut store, &mut vault, vault_status_body(Some(UNLOCK_A), None, Some("s-1"))).await.unwrap();
+        assert!(a.active_at(Utc::now()));
+        let t = Utc::now();
+        assert_eq!(a.observe(&mut s, &mut store, &event_at(TYPE_LOCKING, &locking(Some(UNLOCK_A), reason), t)), Ok(Some(AccessEvent::Locked)));
+        assert_eq!(a.vault(), &VaultState::Locked { since: t, reason: want }, "{reason:?}");
+        assert!(!a.active_at(Utc::now()), "nothing is live while locked");
+        assert!(!a.take_status_wanted(), "nothing to read: the notice placed itself");
+        // §3.6.3: session events never change the vault's state.
+        let mut g = event(TYPE_GRANTED, &session_body("s-2", Utc::now() + TimeDelta::hours(1)));
+        g.ts = t + TimeDelta::seconds(1);
+        a.observe(&mut s, &mut store, &g).unwrap();
+        let mut ended = event(TYPE_ENDED, r#"{"reason":"ended"}"#);
+        ended.ts = t + TimeDelta::seconds(2);
+        a.observe(&mut s, &mut store, &ended).unwrap();
+        assert!(matches!(a.vault(), VaultState::Locked { .. }));
+    }
+}
+
+/// A `vault.locking` naming another unlock changes nothing, and asks for a
+/// status read now.
+#[tokio::test]
+async fn a_lock_notice_for_another_unlock_reads_the_status() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    status_read(&mut a, &mut s, &mut store, &mut vault, vault_status_body(Some(UNLOCK_A), None, Some("s-1"))).await.unwrap();
+    let before = a.vault().clone();
+    assert_eq!(a.observe(&mut s, &mut store, &event_at(TYPE_LOCKING, &locking(Some(UNLOCK_B), None), Utc::now())), Ok(Some(AccessEvent::ReadStatus)));
+    assert_eq!(a.vault(), &before, "no change");
+    assert!(a.active_at(Utc::now()));
+    assert!(a.take_status_wanted());
+    assert!(!a.take_status_wanted(), "taken");
+    // B is over, so a later status naming B doesn't open.
+    a.observe(&mut s, &mut store, &status_at(&vault_status_body(Some(UNLOCK_B), None, Some("s-1")), Utc::now() + TimeDelta::seconds(1))).unwrap();
+    assert_eq!(a.unlock_id(), Some(UNLOCK_A), "a status naming an ended unlock is ignored");
+}
+
+/// Owner decision 1 (2026-11-05): a `vault.locking` when no unlock_id is
+/// held (no status read yet, or a vault before release L), or one that
+/// names none, makes the state Unknown, never Locked, and asks for a status.
+#[tokio::test]
+async fn a_lock_notice_with_no_unlock_id_held_is_unknown() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    // No status read yet.
+    let mut a = access();
+    assert_eq!(a.observe(&mut s, &mut store, &event_at(TYPE_LOCKING, &locking(Some(UNLOCK_A), Some("idle")), Utc::now())), Ok(Some(AccessEvent::ReadStatus)));
+    assert_eq!(a.vault(), &VaultState::Unknown);
+    assert!(a.take_status_wanted());
+    // A vault without unlock_id in its status.
+    let mut a = access();
+    status_read(&mut a, &mut s, &mut store, &mut vault, vault_status_body(None, None, Some("s-1"))).await.unwrap();
+    assert!(a.active_at(Utc::now()));
+    assert_eq!(a.observe(&mut s, &mut store, &event_at(TYPE_LOCKING, &locking(Some(UNLOCK_A), None), Utc::now())), Ok(Some(AccessEvent::ReadStatus)));
+    assert_eq!(a.vault(), &VaultState::Unknown);
+    assert!(!a.active_at(Utc::now()), "not live, and not shown locked either");
+    // A notice that names no unlock (before release L), with one held.
+    let mut a = access();
+    status_read(&mut a, &mut s, &mut store, &mut vault, vault_status_body(Some(UNLOCK_A), None, Some("s-1"))).await.unwrap();
+    assert_eq!(a.observe(&mut s, &mut store, &event_at(TYPE_LOCKING, "{}", Utc::now())), Ok(Some(AccessEvent::ReadStatus)));
+    assert_eq!(a.vault(), &VaultState::Unknown);
+    // A notice that doesn't check out: Unknown too, and a status is read.
+    let mut a = access();
+    status_read(&mut a, &mut s, &mut store, &mut vault, vault_status_body(Some(UNLOCK_A), None, Some("s-1"))).await.unwrap();
+    assert_eq!(a.observe(&mut s, &mut store, &event_at(TYPE_LOCKING, r#"{"unlock_id":"x"}"#, Utc::now())), Err(AccessError::Malformed));
+    assert_eq!(a.vault(), &VaultState::Unknown);
+    assert!(a.take_status_wanted());
+}
+
+/// A `vault.locking` past its `exp` is dropped by the engine (§8.5): it
+/// changes nothing. So is one without an `exp`.
+#[tokio::test]
+async fn an_expired_lock_notice_changes_nothing() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    status_read(&mut a, &mut s, &mut store, &mut vault, vault_status_body(Some(UNLOCK_A), None, Some("s-1"))).await.unwrap();
+    let mut expired = event(TYPE_LOCKING, &locking(Some(UNLOCK_A), None));
+    expired.ts = Utc::now() - TimeDelta::minutes(2);
+    expired.exp = Some(Utc::now() - TimeDelta::minutes(1));
+    deposit(&mut vault, expired).await;
+    deposit(&mut vault, event(TYPE_LOCKING, &locking(Some(UNLOCK_A), None))).await;
+    let msgs = s.poll(&mut store).await.unwrap();
+    assert!(msgs.is_empty(), "dropped: {msgs:?}");
+    assert!(matches!(a.vault(), VaultState::Open { .. }));
+    assert!(a.active_at(Utc::now()));
+}
+
+/// A malformed unlock_id in a status gives Unknown (never "absent"): no
+/// session is live, though the status's session is still read.
+#[tokio::test]
+async fn a_malformed_unlock_id_gives_unknown() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    status_read(&mut a, &mut s, &mut store, &mut vault, vault_status_body(Some(UNLOCK_A), None, Some("s-1"))).await.unwrap();
+    assert!(a.active_at(Utc::now()));
+    let st = status_read(&mut a, &mut s, &mut store, &mut vault, vault_status_body(Some("0123456789ABCDEF0123456789ABCDEF"), None, Some("s-1"))).await;
+    assert!(matches!(st, Ok(StatusRead { session: StatusSession::Session(_), .. })));
+    assert_eq!(a.vault(), &VaultState::Unknown);
+    assert!(!a.active_at(Utc::now()));
+}
+
+/// Ordered by ts (§8.4): a status from before a lock notice, arriving
+/// after it, doesn't reopen; a newer one naming a new unlock does. A
+/// notice older than a newer statement doesn't lock (the vault opened
+/// again since), and says to read the status.
+#[tokio::test]
+async fn the_vaults_order_wins_for_the_lock() {
+    let (relay, _vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    let t = Utc::now();
+    a.observe(&mut s, &mut store, &status_at(&vault_status_body(Some(UNLOCK_A), None, Some("s-1")), t)).unwrap();
+    baseline_only(&mut a);
+    a.observe(&mut s, &mut store, &event_at(TYPE_LOCKING, &locking(Some(UNLOCK_A), None), t + TimeDelta::seconds(2))).unwrap();
+    assert!(matches!(a.vault(), VaultState::Locked { .. }));
+    // Answered before the lock, arriving after it.
+    a.observe(&mut s, &mut store, &status_at(&vault_status_body(Some(UNLOCK_A), None, Some("s-1")), t + TimeDelta::seconds(1))).unwrap();
+    assert!(matches!(a.vault(), VaultState::Locked { .. }), "an older status doesn't reopen");
+    // Newer, but naming the unlock the lock ended (only as a guard).
+    a.observe(&mut s, &mut store, &status_at(&vault_status_body(Some(UNLOCK_A), None, Some("s-1")), t + TimeDelta::seconds(3))).unwrap();
+    assert!(matches!(a.vault(), VaultState::Locked { .. }), "never Open under an ended unlock_id");
+    // A new unlock.
+    a.observe(&mut s, &mut store, &status_at(&vault_status_body(Some(UNLOCK_B), None, Some("s-1")), t + TimeDelta::seconds(4))).unwrap();
+    assert_eq!(a.vault(), &VaultState::Open { unlock_id: Some(UNLOCK_B.into()), due: false });
+    // The vault came back held after an idle lock (§12.1, VAULT-LOCK §4.5):
+    // a lock notice of B sent before that hold arrives after it.
+    a.observe(&mut s, &mut store, &event_at(TYPE_HELD, r#"{"deadline":"2026-11-05T09:00:00.000Z"}"#, t + TimeDelta::seconds(6))).unwrap();
+    assert_eq!(a.observe(&mut s, &mut store, &event_at(TYPE_LOCKING, &locking(Some(UNLOCK_B), None), t + TimeDelta::seconds(5))), Ok(Some(AccessEvent::ReadStatus)));
+    assert!(matches!(a.vault(), VaultState::Held { .. }), "the newer hold stands");
+    assert_eq!(a.unlock_id(), None, "B is over");
+}
+
+/// Sets the baseline as a status read would (for tests that apply status
+/// answers through `observe`, which isn't one).
+fn baseline_only(a: &mut Access) {
+    a.baseline = true;
+}
+
+/// `vault.held` keeps the newest by ts, with and without counts; a status
+/// from before the hold doesn't end it, a newer `ok` one does.
+#[tokio::test]
+async fn the_hold_is_the_newest_by_ts() {
+    let (relay, _vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    let t = Utc::now();
+    a.observe(&mut s, &mut store, &status_at(&vault_status_body(Some(UNLOCK_A), None, Some("s-1")), t)).unwrap();
+    baseline_only(&mut a);
+    assert!(a.active_at(Utc::now()));
+    let counts = r#"{"deadline":"2026-11-05T09:00:00.000Z","waiting":{"messages":3,"requests":1,"calls":0,"other":2},"idle_lock_at":"2026-11-06T09:00:00.000Z"}"#;
+    assert_eq!(a.observe(&mut s, &mut store, &event_at(TYPE_HELD, counts, t + TimeDelta::seconds(2))), Ok(Some(AccessEvent::Held)));
+    let three = Some(Waiting { messages: 3, requests: 1, calls: 0, other: 2 });
+    assert!(matches!(a.vault(), VaultState::Held { waiting, idle_lock_at: Some(_), .. } if *waiting == three));
+    assert!(!a.active_at(Utc::now()), "a held vault suspends the session (§3.6.3)");
+    // An older notice without counts: the newer stands.
+    a.observe(&mut s, &mut store, &event_at(TYPE_HELD, r#"{"deadline":"2026-11-05T09:00:00.000Z"}"#, t + TimeDelta::seconds(1))).unwrap();
+    assert!(matches!(a.vault(), VaultState::Held { waiting, .. } if *waiting == three));
+    // A status from before the deadline arriving late doesn't end the hold.
+    a.observe(&mut s, &mut store, &status_at(&vault_status_body(Some(UNLOCK_A), Some(&owner_check("ok", false, "")), Some("s-1")), t + TimeDelta::seconds(1))).unwrap();
+    assert!(matches!(a.vault(), VaultState::Held { .. }));
+    // A newer notice without counts: counts not known.
+    a.observe(&mut s, &mut store, &event_at(TYPE_HELD, r#"{"deadline":"2026-11-05T09:00:00.000Z"}"#, t + TimeDelta::seconds(3))).unwrap();
+    assert!(matches!(a.vault(), VaultState::Held { waiting: None, .. }));
+    // A newer status, ok: the hold is over.
+    a.observe(&mut s, &mut store, &status_at(&vault_status_body(Some(UNLOCK_A), Some(&owner_check("ok", false, "")), Some("s-1")), t + TimeDelta::seconds(4))).unwrap();
+    assert!(matches!(a.vault(), VaultState::Open { due: false, .. }));
+    assert!(a.active_at(Utc::now()));
+}
+
+/// `due` to `held` to `ok`: a due status is live (the hold is off), a
+/// held one isn't.
+#[tokio::test]
+async fn due_then_held_then_ok() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    let body = |oc: String| vault_status_body(Some(UNLOCK_A), Some(&oc), Some("s-1"));
+    status_read(&mut a, &mut s, &mut store, &mut vault, body(owner_check("due", false, r#""waiting":{"messages":1,"requests":0,"calls":0,"other":0}"#))).await.unwrap();
+    assert_eq!(a.vault(), &VaultState::Open { unlock_id: Some(UNLOCK_A.into()), due: true });
+    assert!(a.active_at(Utc::now()), "due: the session continues");
+    status_read(&mut a, &mut s, &mut store, &mut vault, body(owner_check("held", true, ""))).await.unwrap();
+    assert!(matches!(a.vault(), VaultState::Held { waiting: None, .. }));
+    assert!(!a.active_at(Utc::now()), "held: suspended");
+    status_read(&mut a, &mut s, &mut store, &mut vault, body(owner_check("ok", false, ""))).await.unwrap();
+    assert_eq!(a.vault(), &VaultState::Open { unlock_id: Some(UNLOCK_A.into()), due: false });
+    assert!(a.active_at(Utc::now()));
+}
+
+/// An `owner_check_required` answer sets Held: to a request, and to any
+/// other request collected later. A hold already known keeps its counts.
+#[tokio::test]
+async fn owner_check_required_sets_held() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    status_read(&mut a, &mut s, &mut store, &mut vault, vault_status_body(Some(UNLOCK_A), None, Some("s-1"))).await.unwrap();
+    let (got, _) = tokio::join!(a.request(&mut s, &mut store, None), answer(&mut vault, TYPE_REQUEST, error(OWNER_CHECK_REQUIRED), "{}"));
+    assert_eq!(got, Err(AccessError::Vault(OWNER_CHECK_REQUIRED.into())));
+    assert_eq!(a.vault(), &VaultState::Held { deadline: None, waiting: None, idle_lock_at: None });
+    assert!(!a.active_at(Utc::now()));
+
+    let mut a = access();
+    status_read(&mut a, &mut s, &mut store, &mut vault, vault_status_body(Some(UNLOCK_A), None, Some("s-1"))).await.unwrap();
+    let held = r#"{"deadline":"2026-11-05T09:00:00.000Z","waiting":{"messages":1,"requests":0,"calls":0,"other":0}}"#;
+    a.observe(&mut s, &mut store, &event_at(TYPE_HELD, held, Utc::now())).unwrap();
+    let mut late = response(&event("message.list", "{}"), error(OWNER_CHECK_REQUIRED), "{}");
+    late.ts = Utc::now() + TimeDelta::seconds(1);
+    assert_eq!(a.observe(&mut s, &mut store, &late), Ok(None));
+    assert!(matches!(a.vault(), VaultState::Held { waiting: Some(_), deadline: Some(_), .. }), "kept: {:?}", a.vault());
+}
+
+/// The app's decay: Open becomes Unknown; Held and Locked stay, and the
+/// unlock_id is kept, so a lock notice naming it still applies.
+#[tokio::test]
+async fn vault_unconfirmed_turns_open_to_unknown() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    status_read(&mut a, &mut s, &mut store, &mut vault, vault_status_body(Some(UNLOCK_A), None, Some("s-1"))).await.unwrap();
+    a.vault_unconfirmed();
+    assert_eq!(a.vault(), &VaultState::Unknown);
+    assert!(!a.active_at(Utc::now()));
+    assert_eq!(a.observe(&mut s, &mut store, &event_at(TYPE_LOCKING, &locking(Some(UNLOCK_A), None), Utc::now())), Ok(Some(AccessEvent::Locked)));
+    a.vault_unconfirmed();
+    assert!(matches!(a.vault(), VaultState::Locked { .. }), "Locked stays");
 }
 
 /// `Debug` shows only the start of ids, and the vault's code filtered.

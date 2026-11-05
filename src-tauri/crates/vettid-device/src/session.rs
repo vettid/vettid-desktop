@@ -474,6 +474,15 @@ impl<T: Transport, C: Clock> Session<T, C> {
         std::mem::take(&mut self.held)
     }
 
+    /// The last collect from the relay failed (it couldn't be reached, or
+    /// answered with an error); false once one gets through, and before
+    /// any. A request that timed out with this false reached the relay,
+    /// and its answer didn't come: a locked vault collects nothing
+    /// (§12.1), so that is not the relay's failure (VAULT-LOCK-PLAN §3.1).
+    pub fn relay_failed(&self) -> bool {
+        self.probe_next
+    }
+
     fn own_pk(&self) -> VerifyingKey {
         self.relay_key.verifying_key()
     }
