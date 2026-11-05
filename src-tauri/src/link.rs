@@ -47,8 +47,27 @@ pub const PAIR_ALREADY_NOTICE: &str = "This desktop is already paired. To pair i
 pub const PAIR_FAILED_NOTICE: &str = "Not paired: this desktop couldn't finish pairing with your vault. Start again from your phone.";
 /// NEW TEXT (owner approval needed): paired, but no access session.
 pub const PAIRED_NO_ACCESS_NOTICE: &str = "This desktop is paired, but your vault hasn't given it access yet. Choose Start New Session to ask your phone.";
-/// NEW TEXT (owner approval needed): `too_soon` (§10.3).
+/// `too_soon` (§10.3) with a time to name: the frontend says "You can ask
+/// again at {time}." in the computer's own locale (#83). This text stays
+/// for any other caller.
 pub const REQUEST_TOO_SOON_NOTICE: &str = "Your vault asks this desktop to wait before asking again. Try again in a few minutes.";
+/// NEW TEXT (owner approval needed, #83): `too_soon` when the time is
+/// within a minute, or already past (the clocks differ).
+pub const REQUEST_TOO_SOON_NOW_NOTICE: &str = "Your vault asks this desktop to wait before asking again. Try again in a minute.";
+
+/// When the person may ask again (#83), for the frontend to show in its
+/// own locale: the vault's `allowed_after`, rounded up to the next whole
+/// minute so it is never too early. `None` within a minute of `now`, or if
+/// already past (the clocks differ): then the notice says "in a minute".
+pub fn too_soon_retry_at(at: DateTime<Utc>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if at <= now + TimeDelta::minutes(1) {
+        return None;
+    }
+    let secs = at.timestamp();
+    let whole = secs.rem_euclid(60) == 0 && at.timestamp_subsec_nanos() == 0;
+    let up = if whole { secs } else { (secs.div_euclid(60) + 1) * 60 };
+    DateTime::<Utc>::from_timestamp(up, 0)
+}
 /// NEW TEXT (owner approval needed): the owner declined the request.
 pub const REQUEST_DENIED_NOTICE: &str = "Your phone declined the request. This desktop has no access.";
 /// NEW TEXT (owner approval needed): the owner declined a renewal while a
@@ -233,7 +252,8 @@ fn live_until(access: &Access, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
 /// Why an access request ended without a live session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestFailed {
-    TooSoon,
+    /// Too soon after the last request; the vault's `allowed_after`.
+    TooSoon(DateTime<Utc>),
     Denied,
     /// Declined while a session is live: that one runs on (0.77.0).
     DeniedWhileLive,
@@ -264,7 +284,10 @@ pub fn access_notice(e: &AccessError, store: Option<&CredentialError>) -> String
 /// The plain notice for a failed request.
 pub fn request_notice(f: &RequestFailed, store: Option<&CredentialError>) -> String {
     match f {
-        RequestFailed::TooSoon => REQUEST_TOO_SOON_NOTICE.into(),
+        RequestFailed::TooSoon(at) => match too_soon_retry_at(*at, Utc::now()) {
+            Some(_) => REQUEST_TOO_SOON_NOTICE.into(),
+            None => REQUEST_TOO_SOON_NOW_NOTICE.into(),
+        },
         RequestFailed::Denied => REQUEST_DENIED_NOTICE.into(),
         RequestFailed::DeniedWhileLive => RENEWAL_DENIED_NOTICE.into(),
         RequestFailed::Lapsed => REQUEST_LAPSED_NOTICE.into(),
@@ -529,9 +552,9 @@ impl<T: Transport, C: Clock> Link<T, C> {
         };
         let exp = match outcome {
             Ok(RequestOutcome::Requested { exp, .. }) => exp,
-            Ok(RequestOutcome::TooSoon { .. }) => {
+            Ok(RequestOutcome::TooSoon { allowed_after }) => {
                 self.reachable = true;
-                return Err(RequestFailed::TooSoon);
+                return Err(RequestFailed::TooSoon(allowed_after));
             }
             Err(e) => {
                 self.reachable = answered(&e);
@@ -804,6 +827,22 @@ mod tests {
     #[test]
     fn no_session_is_live_without_the_vaults_word() {
         assert_eq!(live_until(&Access::new(), Utc::now()), None);
+    }
+
+    /// #83: the time to name is rounded up to the minute (never early),
+    /// and there is none within a minute or once past (clock skew).
+    #[test]
+    fn too_soon_retry_at_rounds_up_and_drops_near_times() {
+        use chrono::TimeZone;
+        let t = |h, m, s| Utc.with_ymd_and_hms(2026, 11, 5, h, m, s).unwrap();
+        let now = t(9, 0, 0);
+        assert_eq!(too_soon_retry_at(t(9, 5, 30), now), Some(t(9, 6, 0)));
+        assert_eq!(too_soon_retry_at(t(9, 6, 0), now), Some(t(9, 6, 0)));
+        assert_eq!(too_soon_retry_at(t(9, 0, 50), now), None);
+        assert_eq!(too_soon_retry_at(t(8, 58, 0), now), None);
+        // The notices: the frontend names the time; "in a minute" when near.
+        assert_eq!(request_notice(&RequestFailed::TooSoon(Utc::now() + TimeDelta::minutes(7)), None), REQUEST_TOO_SOON_NOTICE);
+        assert_eq!(request_notice(&RequestFailed::TooSoon(Utc::now()), None), REQUEST_TOO_SOON_NOW_NOTICE);
     }
 
     /// The plain notices: an end-pending refusal, a relay failure and a

@@ -4,6 +4,7 @@
   import { onDestroy, onMount } from 'svelte';
   import { sessionNotice, sessionStore, refreshSessionFromBackend, resetEndState } from '../stores/session';
   import { pairingHeld } from '../stores/navigation';
+  import { noticeOf } from '../tooSoon.js';
 
   let inviteCode = $state('');
   // 'elsewhere': a pairing this view didn't start (before a reload) still
@@ -99,12 +100,12 @@
         // #33: the pairing is saved, only the session isn't: continue to
         // Start New Session, don't offer to pair again.
         step = 'paired-no-session';
-        errorMessage = result.error || '';
+        errorMessage = noticeOf(result);
         // Shown on Start New Session too, after Continue.
-        sessionNotice.set(result.error || null);
+        sessionNotice.set(noticeOf(result) || null);
       } else {
         step = 'error';
-        errorMessage = result.error || 'Pairing failed';
+        errorMessage = noticeOf(result, 'Pairing failed');
       }
     } catch (e: any) {
       step = 'error';
@@ -125,13 +126,13 @@
 
 <div class="pairing">
   <div class="card">
-    <h1>Connect Desktop</h1>
+    <h1>Pair a desktop</h1>
     <p class="subtitle">Pair this desktop to your VettID vault.</p>
 
     {#if step === 'code'}
       <ol class="instructions">
         <li>Open VettID on your phone.</li>
-        <li>Tap <strong>Connect Desktop</strong> from the feed FAB.</li>
+        <li>Go to <strong>Devices &amp; agents</strong>, tap <strong>+</strong>, then <strong>Pair a desktop</strong>.</li>
         <li>Copy the pairing code your phone shows, and paste it below.</li>
       </ol>
 
