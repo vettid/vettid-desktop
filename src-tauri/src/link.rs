@@ -128,6 +128,13 @@ pub const VAULT_LOCKED_NOTICE: &str = "Your vault was locked. Unlock it on your 
 /// live (or an end waits for its answer, or the vault is held, locked or
 /// unknown).
 pub const REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+/// The longest wait between refreshes while the vault is locked or unknown
+/// and its status requests reach the relay unanswered (VAULT-LOCK-PLAN
+/// §3.1, lead review): from [`REFRESH_EVERY`], doubling to this. A locked
+/// vault collects nothing (§12.1), so each unanswered read waits at the
+/// relay, in the mailbox's quota, until the vault unlocks or it expires.
+pub const LOCKED_REFRESH_MAX: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 /// After a refusal (`token_revoked`): how long between collecting the
 /// mailbox again, for a `device.unlinked` that arrives later (§8.6: a
 /// refused device keeps collecting its own mailbox). It goes on for as long
@@ -421,6 +428,19 @@ pub struct Link<T: Transport = Http, C: Clock = SystemClock> {
     /// Locked, but not checked since a resume or a status read the relay
     /// couldn't take: shown "as of" `vault_checked`.
     locked_as_of: bool,
+    /// The wait before the next refresh while the vault is locked or
+    /// unknown and status reads reach the relay unanswered: `None` is
+    /// [`REFRESH_EVERY`] (see [`Link::next_wait`]).
+    backoff: Option<std::time::Duration>,
+    /// A vault notice or a resume asks for the next refresh at once.
+    read_now: bool,
+    /// When the next refresh round is due, by the wall clock: set by the
+    /// refresh loop before each wait, and moved to at least a refresh
+    /// later on every status answer (a confirmation, from a command too:
+    /// no gap before it counts). Kept in
+    /// the link, so that a loop restarted by a command after a sleep still
+    /// sees the gap ([`refresh_loop`], [`slept_through`]).
+    round_due: Option<DateTime<Utc>>,
 }
 
 impl<T: Transport, C: Clock> std::fmt::Debug for Link<T, C> {
@@ -460,6 +480,9 @@ impl<T: Transport, C: Clock> Link<T, C> {
             end_seen,
             vault_checked: None,
             locked_as_of: false,
+            backoff: None,
+            read_now: false,
+            round_due: None,
         }
     }
 
@@ -519,12 +542,58 @@ impl<T: Transport, C: Clock> Link<T, C> {
 
     /// What this link keeps of an observed message's outcome: a late `ok`
     /// to a stored end (#80), and a lock notice applied (confirmed now).
+    /// Any lock or hold notice resets the backoff and asks for the next
+    /// refresh at once.
     fn noted(&mut self, e: &Result<Option<AccessEvent>, AccessError>) {
         self.note_end_answered(e);
         if matches!(e, Ok(Some(AccessEvent::Locked))) {
             log::info!("link: the vault says it locked");
             self.vault_checked = Some(Utc::now());
             self.locked_as_of = false;
+        }
+        if matches!(e, Ok(Some(AccessEvent::Locked | AccessEvent::Held | AccessEvent::ReadStatus))) {
+            self.backoff = None;
+            self.read_now = true;
+        }
+    }
+
+    /// How long the refresh loop waits before its next round
+    /// (VAULT-LOCK-PLAN §3.1, lead review): at once after a vault notice or
+    /// a resume; [`REFRESH_EVERY`] while the vault is open or held (it
+    /// answers then, and [`STALE_AFTER`] needs it); while it is locked or
+    /// unknown, the backoff, from [`REFRESH_EVERY`] doubling to
+    /// [`LOCKED_REFRESH_MAX`], which grows only while the status requests
+    /// reach the relay and go unanswered. Takes the "at once".
+    pub fn next_wait(&mut self, now: DateTime<Utc>) -> std::time::Duration {
+        if std::mem::take(&mut self.read_now) {
+            return std::time::Duration::ZERO;
+        }
+        match self.vault_now(now) {
+            VaultState::Locked { .. } | VaultState::Unknown => self.backoff.unwrap_or(REFRESH_EVERY),
+            VaultState::Open { .. } | VaultState::Held { .. } => REFRESH_EVERY,
+        }
+    }
+
+    /// The refresh loop starts (at the app's start, or restarted by a
+    /// command): if the wall clock is well past the round the previous
+    /// loop expected, the computer slept meanwhile ([`Link::resumed`]).
+    /// The backoff starts again from [`REFRESH_EVERY`].
+    pub fn refresh_started(&mut self, now: DateTime<Utc>, first: std::time::Duration) {
+        self.check_gap(now);
+        self.backoff = None;
+        self.round_due = due_after(now, first);
+    }
+
+    /// The refresh loop woke at `now` for a round: [`Link::resumed`] if
+    /// the wall clock is well past the round it expected.
+    pub fn refresh_woke(&mut self, now: DateTime<Utc>) {
+        self.check_gap(now);
+    }
+
+    fn check_gap(&mut self, now: DateTime<Utc>) {
+        if self.round_due.is_some_and(|d| slept_through(d, now)) {
+            log::info!("link: the computer slept; the vault's state is checked again");
+            self.resumed();
         }
     }
 
@@ -548,16 +617,31 @@ impl<T: Transport, C: Clock> Link<T, C> {
                 self.confirmed = Some(now);
                 self.vault_checked = Some(now);
                 self.locked_as_of = false;
+                // Answered: the refresh goes back to its pace, and a gap is
+                // measured from here at the earliest (a round the loop has
+                // already set for later stays: its wake is no sleep).
+                self.backoff = None;
+                self.round_due = self.round_due.max(due_after(now, REFRESH_EVERY));
             }
             Err(e) if !answered(e) => {
                 self.access.status_unanswered();
+                let reached = self.session.last_request_reached() && !self.session.relay_failed();
                 if matches!(self.access.vault(), VaultState::Locked { .. }) {
-                    if self.session.last_request_reached() && !self.session.relay_failed() {
+                    if reached {
                         self.locked_as_of = false;
                         self.vault_checked = Some(now);
                     } else {
                         self.locked_as_of = true;
                     }
+                }
+                // Locked or unknown, and the read waits at the relay: the
+                // next one waits longer, so that an overnight lock doesn't
+                // fill the mailbox with reads (lead review).
+                if reached && matches!(self.access.vault(), VaultState::Locked { .. } | VaultState::Unknown) {
+                    self.backoff = Some(match self.backoff {
+                        None => REFRESH_EVERY,
+                        Some(b) => (b * 2).min(LOCKED_REFRESH_MAX),
+                    });
                 }
             }
             Err(_) => {}
@@ -598,6 +682,8 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// was confirmed, until a status answers (or the relay does, and the
     /// status still doesn't). The app then reads `vault.status`.
     pub fn resumed(&mut self) {
+        self.backoff = None;
+        self.read_now = true;
         self.access.vault_unconfirmed();
         if matches!(self.access.vault(), VaultState::Locked { .. }) {
             self.locked_as_of = true;
@@ -1018,6 +1104,11 @@ pub fn slept_through(due: DateTime<Utc>, woke: DateTime<Utc>) -> bool {
     due.checked_add_signed(TimeDelta::seconds(2 * REFRESH_EVERY.as_secs() as i64)).is_some_and(|late| woke > late)
 }
 
+/// `now` plus `wait`, if that is a time.
+fn due_after(now: DateTime<Utc>, wait: std::time::Duration) -> Option<DateTime<Utc>> {
+    TimeDelta::from_std(wait).ok().and_then(|w| now.checked_add_signed(w))
+}
+
 /// The background refresh's loop over `link`: after `first`, a
 /// [`refresh_round`] every [`REFRESH_EVERY`] until there is nothing left to
 /// keep up ([`Link::keep_refreshing`], which since #77 holds while the link
@@ -1037,18 +1128,20 @@ pub async fn refresh_loop<T: Transport, C: Clock>(
     tell: impl Fn(&'static str),
 ) -> Option<bool> {
     let mut wait = first;
+    // A loop restarted by a command (the old task aborted mid-wait) still
+    // sees a sleep that came before it: the round the old loop expected is
+    // kept in the link.
+    if let Some(l) = link.lock().await.as_mut() {
+        l.refresh_started(Utc::now(), first);
+    }
     loop {
-        let due = TimeDelta::from_std(wait).ok().and_then(|w| Utc::now().checked_add_signed(w));
         tokio::time::sleep(wait).await;
         // Read before taking the lock: an operation holding it (a request
         // waiting for the phone) is not a sleep.
         let woke = Utc::now();
         let mut slot = link.lock().await;
-        if due.is_some_and(|d| slept_through(d, woke)) {
-            if let Some(l) = slot.as_mut() {
-                log::info!("link: the computer slept; the vault's state is checked again");
-                l.resumed();
-            }
+        if let Some(l) = slot.as_mut() {
+            l.refresh_woke(woke);
         }
         if slot.as_ref().is_some_and(|l| l.refused()) {
             // Already found refused (by this task, or by an operation that
@@ -1059,10 +1152,24 @@ pub async fn refresh_loop<T: Transport, C: Clock>(
                 Round::Unlinked { erased } => return Some(erased),
                 Round::Continue(snap) | Round::Stop(snap, _) => show(snap),
             }
+            if let Some(l) = slot.as_mut() {
+                l.round_due = due_after(Utc::now(), wait);
+            }
             continue;
         }
-        wait = REFRESH_EVERY;
-        match refresh_round(&mut slot).await {
+        let round = refresh_round(&mut slot).await;
+        // The pace of the next round (the backoff while locked or unknown),
+        // and when it is due, by the wall clock.
+        wait = match slot.as_mut() {
+            Some(l) => {
+                let now = Utc::now();
+                let w = if l.refused() { refused_every } else { l.next_wait(now) };
+                l.round_due = due_after(now, w);
+                w
+            }
+            None => REFRESH_EVERY,
+        };
+        match round {
             Round::Gone => return None,
             Round::Continue(snap) => show(snap),
             Round::Stop(snap, notice) => {
@@ -1942,6 +2049,100 @@ mod tests {
         never_sent_a_lock(&vault);
     }
 
+    /// Lead review: while locked, status reads that reach the relay
+    /// unanswered back off, from REFRESH_EVERY doubling to
+    /// LOCKED_REFRESH_MAX; a vault notice brings the next read forward and
+    /// starts the backoff again; an answer resets it.
+    #[tokio::test]
+    async fn the_refresh_backs_off_while_locked_and_resets_on_an_answer() {
+        let secs = std::time::Duration::from_secs;
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = live(dir.path()).await;
+        assert_eq!(link.next_wait(Utc::now()), REFRESH_EVERY, "open: the usual pace");
+        vault.lock_vault(None);
+        let _ = link.refresh().await;
+        assert!(matches!(link.vault_now(Utc::now()), VaultState::Locked { .. }));
+        assert_eq!(link.next_wait(Utc::now()), secs(0), "the lock notice: the next read at once");
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            let _ = link.refresh().await;
+            assert!(link.session.last_request_reached(), "each read reached the relay");
+            waits.push(link.next_wait(Utc::now()));
+        }
+        assert_eq!(waits, [secs(60), secs(120), secs(240), secs(480), secs(600), secs(600)]);
+        assert_eq!(LOCKED_REFRESH_MAX, secs(600));
+        // A notice (here one this desktop can't place) brings the read
+        // forward, and the backoff starts again.
+        vault.event_now("vault.locking", &locking_body(UNLOCK_2), Some(Utc::now() + TimeDelta::seconds(60)));
+        let _ = link.refresh().await;
+        assert_eq!(link.next_wait(Utc::now()), secs(0));
+        let _ = link.refresh().await;
+        assert!(link.next_wait(Utc::now()) < LOCKED_REFRESH_MAX, "started again");
+        // Unlocked: answered, back to the usual pace.
+        vault.unlock(UNLOCK_2);
+        link.refresh().await.unwrap();
+        assert_eq!(link.next_wait(Utc::now()), REFRESH_EVERY);
+        assert_eq!(link.backoff, None);
+        // Held: the vault answers, so the pace stays.
+        vault.hold(true, "");
+        link.refresh().await.unwrap();
+        assert_eq!(link.next_wait(Utc::now()), REFRESH_EVERY);
+        never_sent_a_lock(&vault);
+    }
+
+    /// The backoff grows only on reads that reached the relay: out of
+    /// reach, nothing waits there, and the pace stays REFRESH_EVERY.
+    #[tokio::test]
+    async fn the_backoff_doesnt_grow_while_the_relay_is_out_of_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = live(dir.path()).await;
+        vault.lock_vault(None);
+        let _ = link.refresh().await;
+        assert_eq!(link.next_wait(Utc::now()), std::time::Duration::ZERO);
+        vault.offline(true);
+        for _ in 0..2 {
+            let _ = link.refresh().await;
+            assert!(!link.session.last_request_reached());
+            assert_eq!(link.next_wait(Utc::now()), REFRESH_EVERY);
+        }
+    }
+
+    /// Lead review (M1 gap): a loop restarted by a command after a sleep
+    /// still sees the gap, from the round the old loop expected, kept in
+    /// the link: Open becomes Unknown at its start. Without a gap, nothing
+    /// changes.
+    #[tokio::test(start_paused = true)]
+    async fn a_restarted_loop_sees_a_sleep_before_it() {
+        for gap in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (_vault, mut link) = live(dir.path()).await;
+            if gap {
+                link.round_due = Some(Utc::now() - TimeDelta::hours(8));
+            }
+            let slot = Arc::new(Mutex::new(Some(link)));
+            let s2 = slot.clone();
+            let task = tokio::spawn(async move { refresh_loop(&s2, REFRESH_EVERY, REFUSED_RECHECK_EVERY, |_| {}, |_| {}).await });
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            {
+                let g = slot.lock().await;
+                let l = g.as_ref().unwrap();
+                let snap = l.snapshot(Utc::now());
+                if gap {
+                    assert_eq!(snap.vault.state, VaultShown::Unknown, "resumed at the loop's start");
+                    assert!(!snap.active_at(Utc::now()));
+                } else {
+                    assert_eq!(snap.vault.state, VaultShown::Open);
+                    assert!(snap.active_at(Utc::now()));
+                }
+                assert!(l.round_due.is_some_and(|d| d > Utc::now()), "the new loop's round is set");
+            }
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     /// Lead review M1: the refresh loop takes a wall-clock jump of more
     /// than two refreshes past the expected round as a sleep or resume.
     #[test]
@@ -2106,15 +2307,20 @@ mod tests {
         never_sent_a_lock(&vault);
     }
 
-    /// No code path sends `vault.lock` (owner decision, 2026-11-05). It
-    /// can go only through `Session::send_once` (the outbox refuses it,
-    /// §8.6). Across every crate under src-tauri (the desktop, vettid-device,
-    /// vettid-relay, vettid-vms), outside the session engine's own guard
-    /// (`crates/vettid-device/src/session.rs`) and test files:
-    /// - no call of `send_once(`;
-    /// - no string literal names the type, or builds it: one holding it
-    ///   (not `vault.locking`), one ending in `vault.`, holding `vault.{`
-    ///   (a `format!`), or starting with `.lock` (lead review L5).
+    /// A tripwire for `vault.lock` (owner decision, 2026-11-05: the desktop
+    /// never sends it), not a proof. The real guards are the engine's:
+    /// `outbox_allowed` keeps the type out of the stored outbox (§8.6), so
+    /// it can go only through `Session::send_once`, and the first check
+    /// below is that nothing outside the engine calls `send_once`. Across
+    /// every crate under src-tauri (the desktop, vettid-device,
+    /// vettid-relay, vettid-vms), outside the engine's own guard
+    /// (`crates/vettid-device/src/session.rs`) and test files, it fails on:
+    /// - a call of `send_once(`;
+    /// - a string literal that holds the type (not `vault.locking`), or an
+    ///   obvious piece of it: one word ending in `vault.` or starting with
+    ///   `.lock`, or a `vault.{` (a `format!`) (lead review L5). A type
+    ///   put together from variables (`join`, `format!` of other strings)
+    ///   gets past this scan.
     #[test]
     fn no_code_path_sends_vault_lock() {
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

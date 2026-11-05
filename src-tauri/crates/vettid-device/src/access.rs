@@ -118,6 +118,12 @@ pub const TYPE_LOCKING: &str = "vault.locking";
 pub const TYPE_HELD: &str = "vault.held";
 /// The code the vault answers a request with while it is held (§3.6.3).
 pub const OWNER_CHECK_REQUIRED: &str = "owner_check_required";
+/// How long after its answer is no longer awaited a `vault.status` request
+/// stays good (its `exp` is the wait plus this). The vault reads `exp` by
+/// its own clock and accepts a `ts` up to 5 minutes ahead (§8.4): with
+/// that much margin, a desktop whose clock is up to 5 minutes behind the
+/// vault's still gets its answers, and a copy queued longer is dropped.
+pub const STATUS_EXP_MARGIN: TimeDelta = vettid_vms::envelope::MAX_CLOCK_SKEW_FUTURE;
 /// How many `unlock_id`s that lock notices ended are remembered.
 const ENDED_KEEP: usize = 16;
 
@@ -859,7 +865,11 @@ impl Access {
     /// Ask `vault.status` and apply its `session`. Its answer (to this
     /// request, sent now) is the baseline [`Access::active_at`] needs.
     pub async fn read_status<T: Transport, C: Clock>(&mut self, s: &mut Session<T, C>, store: &mut impl Persist) -> Result<StatusRead, AccessError> {
-        let answer = s.request(store, TYPE_STATUS, "{}", self.timeout).await?;
+        // With an `exp` (VAULT-LOCK-PLAN §3.1, lead review): a locked vault
+        // collects nothing (§12.1), so unanswered reads wait at the relay;
+        // after an unlock the vault drops the stale ones instead of
+        // answering them all.
+        let answer = s.request_expiring(store, TYPE_STATUS, "{}", self.timeout, self.timeout + STATUS_EXP_MARGIN).await?;
         let session = self.status_answer(s, &answer)?;
         self.baseline = true;
         Ok(StatusRead { session, end_pending: s.access_end().is_some() })

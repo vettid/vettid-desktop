@@ -757,6 +757,29 @@ impl<T: Transport, C: Clock> Session<T, C> {
         self.wait_for(store, id, timeout).await
     }
 
+    /// [`Session::request`] with an `exp` `ttl` after now, by this
+    /// session's clock (§5.3: "discard the message if it is still
+    /// unprocessed after this time"). A copy that waits longer, in this
+    /// outbox or at the relay while the vault is locked, is dropped here
+    /// unsent, and by the vault unanswered, instead of being acted on late.
+    /// The answer is awaited `timeout`, as for [`Session::request`]; a late
+    /// one is accepted until `exp` plus the clock skew.
+    pub async fn request_expiring(
+        &mut self,
+        store: &mut impl Persist,
+        kind: &str,
+        body: &str,
+        timeout: TimeDelta,
+        ttl: TimeDelta,
+    ) -> Result<Inner, SessionError> {
+        self.last_request = None;
+        let exp = self.clock.now() + ttl;
+        let inner = self.inner(None, kind, body.to_string(), None, Some(exp))?;
+        let id = self.send_inner(store, inner, true).await?;
+        self.last_request = Some(id.clone());
+        self.wait_for(store, id, timeout).await
+    }
+
     /// [`Session::request`] again under the same inner `id` (an
     /// application retry, §8.6): the vault answers it from its cache
     /// instead of acting twice.

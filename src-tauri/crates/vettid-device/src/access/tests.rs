@@ -1373,6 +1373,27 @@ async fn vault_unconfirmed_turns_open_to_unknown() {
     assert!(matches!(a.vault(), VaultState::Locked { .. }), "Locked stays");
 }
 
+/// A `vault.status` request carries a short `exp` (the wait plus
+/// STATUS_EXP_MARGIN), so the vault drops copies that waited at the relay
+/// through a lock instead of answering them all (lead review).
+#[tokio::test]
+async fn a_status_request_carries_a_short_exp() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    let vault_side = async {
+        let req = receive(&mut vault).await;
+        assert_eq!(req.kind, TYPE_STATUS);
+        let ttl = req.exp.expect("an exp") - req.ts;
+        let want = REQUEST_TIMEOUT + STATUS_EXP_MARGIN;
+        // The test clock ticks a second at every reading.
+        assert!(ttl <= want && ttl >= want - TimeDelta::seconds(5), "{ttl}");
+        deposit(&mut vault, response(&req, Status::Ok, &status_body(Some(None)))).await;
+    };
+    let (st, ()) = tokio::join!(a.read_status(&mut s, &mut store), vault_side);
+    assert!(st.is_ok());
+}
+
 /// `Debug` shows only the start of ids, and the vault's code filtered.
 #[test]
 fn debug_hides_ids_and_filters_vault_text() {
