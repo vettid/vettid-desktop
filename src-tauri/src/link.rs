@@ -133,7 +133,9 @@ pub const REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(60
 /// §3.1, lead review): from [`REFRESH_EVERY`], doubling to this. A locked
 /// vault collects nothing (§12.1), so each unanswered read waits at the
 /// relay, in the mailbox's quota, until the vault unlocks or it expires.
-pub const LOCKED_REFRESH_MAX: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// Five minutes, not more: a desktop gets no notice of an unlock, so this
+/// is how late it can be to see one (lead review).
+pub const LOCKED_REFRESH_MAX: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// After a refusal (`token_revoked`): how long between collecting the
 /// mailbox again, for a `device.unlinked` that arrives later (§8.6: a
@@ -434,13 +436,39 @@ pub struct Link<T: Transport = Http, C: Clock = SystemClock> {
     backoff: Option<std::time::Duration>,
     /// A vault notice or a resume asks for the next refresh at once.
     read_now: bool,
-    /// When the next refresh round is due, by the wall clock: set by the
-    /// refresh loop before each wait, and moved to at least a refresh
-    /// later on every status answer (a confirmation, from a command too:
-    /// no gap before it counts). Kept in
-    /// the link, so that a loop restarted by a command after a sleep still
-    /// sees the gap ([`refresh_loop`], [`slept_through`]).
-    round_due: Option<DateTime<Utc>>,
+    /// What the refresh loop records of its own rounds ([`LoopMarks`]).
+    /// Shared with the loop, which writes to it without the link's lock,
+    /// and kept in the link, so that a loop restarted by a command after a
+    /// sleep still sees the gap ([`refresh_loop`], [`slept_through`]).
+    marks: Arc<std::sync::Mutex<LoopMarks>>,
+    /// How many times [`Link::resumed`] ran (for the logs and the tests).
+    resumes: u32,
+}
+
+/// What the refresh loop records of its own rounds, by the wall clock.
+/// Written without the link's lock, so that time a command spends holding
+/// the lock (a request waiting minutes for the phone) never reads as a
+/// sleep (lead review).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LoopMarks {
+    /// When the loop's next round is due: set before each wait, and moved
+    /// to at least a refresh later whenever the vault answers an operation
+    /// that holds the lock.
+    pub due: Option<DateTime<Utc>>,
+    /// When the loop woke for that round, recorded before it waits for the
+    /// lock; `None` while it sleeps.
+    pub woke: Option<DateTime<Utc>>,
+}
+
+impl LoopMarks {
+    /// Whether these marks show a sleep, at `now`: the loop woke well past
+    /// its round ([`slept_through`] at `woke`, whatever came after while
+    /// it waited for the lock); or, if it hasn't woken since, `now` is
+    /// well past the round, so its timer didn't run on time (a suspend
+    /// that the monotonic clock didn't count).
+    pub fn slept(&self, now: DateTime<Utc>) -> bool {
+        self.due.is_some_and(|d| slept_through(d, self.woke.unwrap_or(now)))
+    }
 }
 
 impl<T: Transport, C: Clock> std::fmt::Debug for Link<T, C> {
@@ -482,7 +510,8 @@ impl<T: Transport, C: Clock> Link<T, C> {
             locked_as_of: false,
             backoff: None,
             read_now: false,
-            round_due: None,
+            marks: Arc::default(),
+            resumes: 0,
         }
     }
 
@@ -574,27 +603,46 @@ impl<T: Transport, C: Clock> Link<T, C> {
         }
     }
 
+    /// The refresh loop's marks, shared with it.
+    pub fn loop_marks(&self) -> Arc<std::sync::Mutex<LoopMarks>> {
+        self.marks.clone()
+    }
+
+    fn marks(&self) -> std::sync::MutexGuard<'_, LoopMarks> {
+        self.marks.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// The refresh loop starts (at the app's start, or restarted by a
-    /// command): if the wall clock is well past the round the previous
-    /// loop expected, the computer slept meanwhile ([`Link::resumed`]).
-    /// The backoff starts again from [`REFRESH_EVERY`].
+    /// command): if the previous loop's marks show a sleep
+    /// ([`LoopMarks::slept`]), [`Link::resumed`]. Never from time a
+    /// command held the lock: the old loop recorded its waking before it
+    /// waited for it. The backoff starts again from [`REFRESH_EVERY`].
     pub fn refresh_started(&mut self, now: DateTime<Utc>, first: std::time::Duration) {
         self.check_gap(now);
         self.backoff = None;
-        self.round_due = due_after(now, first);
+        *self.marks() = LoopMarks { due: due_after(now, first), woke: None };
     }
 
-    /// The refresh loop woke at `now` for a round: [`Link::resumed`] if
-    /// the wall clock is well past the round it expected.
+    /// The refresh loop has the lock for a round: [`Link::resumed`] if its
+    /// marks show a sleep.
     pub fn refresh_woke(&mut self, now: DateTime<Utc>) {
         self.check_gap(now);
     }
 
     fn check_gap(&mut self, now: DateTime<Utc>) {
-        if self.round_due.is_some_and(|d| slept_through(d, now)) {
+        let slept = self.marks().slept(now);
+        if slept {
             log::info!("link: the computer slept; the vault's state is checked again");
             self.resumed();
         }
+    }
+
+    /// The vault answered an operation that holds the lock: no sleep before
+    /// now is left to find, and the loop's round counts from here at the
+    /// earliest (a round set for later stays: its wake is no sleep).
+    fn vault_answered(&self) {
+        let mut m = self.marks();
+        m.due = m.due.max(due_after(Utc::now(), REFRESH_EVERY));
     }
 
     /// `vault.status`, once, and what its outcome says of the vault
@@ -618,10 +666,9 @@ impl<T: Transport, C: Clock> Link<T, C> {
                 self.vault_checked = Some(now);
                 self.locked_as_of = false;
                 // Answered: the refresh goes back to its pace, and a gap is
-                // measured from here at the earliest (a round the loop has
-                // already set for later stays: its wake is no sleep).
+                // measured from here at the earliest.
                 self.backoff = None;
-                self.round_due = self.round_due.max(due_after(now, REFRESH_EVERY));
+                self.vault_answered();
             }
             Err(e) if !answered(e) => {
                 self.access.status_unanswered();
@@ -682,6 +729,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// was confirmed, until a status answers (or the relay does, and the
     /// status still doesn't). The app then reads `vault.status`.
     pub fn resumed(&mut self) {
+        self.resumes += 1;
         self.backoff = None;
         self.read_now = true;
         self.access.vault_unconfirmed();
@@ -878,6 +926,9 @@ impl<T: Transport, C: Clock> Link<T, C> {
             Ok((outcome, ts)) => (ts, Ok(outcome)),
             Err(e) => (Utc::now(), Err(e)),
         };
+        if outcome.as_ref().err().is_none_or(answered) {
+            self.vault_answered();
+        }
         let exp = match outcome {
             Ok(RequestOutcome::Requested { exp, .. }) => exp,
             Ok(RequestOutcome::TooSoon { allowed_after }) => {
@@ -906,6 +957,9 @@ impl<T: Transport, C: Clock> Link<T, C> {
             match self.session.poll(&mut self.store).await {
                 Ok(msgs) => {
                     self.reachable = true;
+                    if !msgs.is_empty() {
+                        self.vault_answered();
+                    }
                     let mut granted = false;
                     for m in &msgs {
                         let e = self.access.observe(&mut self.session, &mut self.store, m);
@@ -973,6 +1027,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
         self.reachable = r.as_ref().err().is_none_or(answered);
         if r.is_ok() {
             self.confirmed = Some(Utc::now());
+            self.vault_answered();
         }
         // #80: this end's own outcome; a stored end still pending has none yet.
         self.end_settled = match &r {
@@ -1128,20 +1183,23 @@ pub async fn refresh_loop<T: Transport, C: Clock>(
     tell: impl Fn(&'static str),
 ) -> Option<bool> {
     let mut wait = first;
-    // A loop restarted by a command (the old task aborted mid-wait) still
-    // sees a sleep that came before it: the round the old loop expected is
-    // kept in the link.
-    if let Some(l) = link.lock().await.as_mut() {
-        l.refresh_started(Utc::now(), first);
-    }
+    // A loop restarted by a command (the old task aborted) still sees a
+    // sleep that came before it: the old loop's marks are kept in the link.
+    let marks = match link.lock().await.as_mut() {
+        Some(l) => {
+            l.refresh_started(Utc::now(), first);
+            l.loop_marks()
+        }
+        None => Arc::default(),
+    };
     loop {
         tokio::time::sleep(wait).await;
-        // Read before taking the lock: an operation holding it (a request
-        // waiting for the phone) is not a sleep.
-        let woke = Utc::now();
+        // Recorded before waiting for the lock: an operation holding it (a
+        // request waiting for the phone) is not a sleep.
+        marks.lock().unwrap_or_else(|p| p.into_inner()).woke = Some(Utc::now());
         let mut slot = link.lock().await;
         if let Some(l) = slot.as_mut() {
-            l.refresh_woke(woke);
+            l.refresh_woke(Utc::now());
         }
         if slot.as_ref().is_some_and(|l| l.refused()) {
             // Already found refused (by this task, or by an operation that
@@ -1152,9 +1210,7 @@ pub async fn refresh_loop<T: Transport, C: Clock>(
                 Round::Unlinked { erased } => return Some(erased),
                 Round::Continue(snap) | Round::Stop(snap, _) => show(snap),
             }
-            if let Some(l) = slot.as_mut() {
-                l.round_due = due_after(Utc::now(), wait);
-            }
+            *marks.lock().unwrap_or_else(|p| p.into_inner()) = LoopMarks { due: due_after(Utc::now(), wait), woke: None };
             continue;
         }
         let round = refresh_round(&mut slot).await;
@@ -1164,7 +1220,7 @@ pub async fn refresh_loop<T: Transport, C: Clock>(
             Some(l) => {
                 let now = Utc::now();
                 let w = if l.refused() { refused_every } else { l.next_wait(now) };
-                l.round_due = due_after(now, w);
+                *l.marks() = LoopMarks { due: due_after(now, w), woke: None };
                 w
             }
             None => REFRESH_EVERY,
@@ -2069,8 +2125,8 @@ mod tests {
             assert!(link.session.last_request_reached(), "each read reached the relay");
             waits.push(link.next_wait(Utc::now()));
         }
-        assert_eq!(waits, [secs(60), secs(120), secs(240), secs(480), secs(600), secs(600)]);
-        assert_eq!(LOCKED_REFRESH_MAX, secs(600));
+        assert_eq!(waits, [secs(60), secs(120), secs(240), secs(300), secs(300), secs(300)]);
+        assert_eq!(LOCKED_REFRESH_MAX, secs(300));
         // A notice (here one this desktop can't place) brings the read
         // forward, and the backoff starts again.
         vault.event_now("vault.locking", &locking_body(UNLOCK_2), Some(Utc::now() + TimeDelta::seconds(60)));
@@ -2117,7 +2173,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let (_vault, mut link) = live(dir.path()).await;
             if gap {
-                link.round_due = Some(Utc::now() - TimeDelta::hours(8));
+                // The old loop set its round 8 hours ago and never woke for
+                // it (its timer didn't count the suspend).
+                *link.marks() = LoopMarks { due: Some(Utc::now() - TimeDelta::hours(8)), woke: None };
             }
             let slot = Arc::new(Mutex::new(Some(link)));
             let s2 = slot.clone();
@@ -2136,11 +2194,68 @@ mod tests {
                     assert_eq!(snap.vault.state, VaultShown::Open);
                     assert!(snap.active_at(Utc::now()));
                 }
-                assert!(l.round_due.is_some_and(|d| d > Utc::now()), "the new loop's round is set");
+                assert!(l.marks().due.is_some_and(|d| d > Utc::now()), "the new loop's round is set");
+                assert_eq!(l.resumes, u32::from(gap));
             }
             task.abort();
             let _ = task.await;
         }
+    }
+
+    /// Lead review (false resume): a request that waits minutes for the
+    /// phone holds the lock; the old loop woke on time meanwhile and waited
+    /// for it. A grant answered after 4 minutes, then a refresh restart:
+    /// the session stays live, and `resumed()` isn't called. Without the
+    /// grant's answers (nothing moved the round), the old loop's on-time
+    /// waking still shows no sleep. The clock is the marks': the old loop's
+    /// round set 4 minutes before now.
+    #[tokio::test(start_paused = true)]
+    async fn time_spent_holding_the_lock_is_no_sleep() {
+        for answered in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (vault, mut link) = FakeVault::paired(dir.path());
+            link.read_status().await.unwrap();
+            let round = Utc::now() - TimeDelta::minutes(4) + TimeDelta::seconds(60);
+            // The old loop's round, 3 minutes ago, and its on-time waking.
+            *link.marks() = LoopMarks { due: Some(round), woke: Some(round) };
+            if answered {
+                vault.grant_on_request(("s-2", Utc::now() + TimeDelta::hours(1)));
+                link.request_access(|| {}, || false).await.expect("granted");
+                assert!(link.marks().due.is_some_and(|d| d > Utc::now()), "the belt: the vault's answers moved the round");
+            } else {
+                vault.set_session(Some(("s-2", Utc::now() + TimeDelta::hours(1))));
+                link.read_status().await.unwrap();
+                // As if nothing had moved the round: only the old loop's
+                // on-time waking keeps this from reading as a sleep.
+                *link.marks() = LoopMarks { due: Some(round), woke: Some(round) };
+            }
+            assert!(link.snapshot(Utc::now()).active_at(Utc::now()));
+            let slot = Arc::new(Mutex::new(Some(link)));
+            let s2 = slot.clone();
+            let task = tokio::spawn(async move { refresh_loop(&s2, REFRESH_EVERY, REFUSED_RECHECK_EVERY, |_| {}, |_| {}).await });
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            {
+                let g = slot.lock().await;
+                let l = g.as_ref().unwrap();
+                assert_eq!(l.resumes, 0, "no resume (answered: {answered})");
+                let snap = l.snapshot(Utc::now());
+                assert!(snap.active_at(Utc::now()), "the session stays live");
+                assert_eq!(snap.session_id.as_deref(), Some("s-2"));
+                assert_eq!(snap.vault.state, VaultShown::Open);
+            }
+            task.abort();
+            let _ = task.await;
+        }
+        // The marks themselves: an on-time waking is no sleep however late
+        // `now` is; a waking well past the round is one; no waking and
+        // `now` well past the round is one.
+        let due = Utc::now() - TimeDelta::minutes(10);
+        assert!(!LoopMarks { due: Some(due), woke: Some(due) }.slept(Utc::now()));
+        assert!(LoopMarks { due: Some(due), woke: Some(due + TimeDelta::minutes(5)) }.slept(Utc::now()));
+        assert!(LoopMarks { due: Some(due), woke: None }.slept(Utc::now()));
+        assert!(!LoopMarks::default().slept(Utc::now()));
     }
 
     /// Lead review M1: the refresh loop takes a wall-clock jump of more
