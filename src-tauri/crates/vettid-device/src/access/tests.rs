@@ -1394,6 +1394,31 @@ async fn a_status_request_carries_a_short_exp() {
     assert!(st.is_ok());
 }
 
+/// `Debug` of the vault's state, its parse results and `Access` shows
+/// only the start of each `unlock_id`, the current one and the ended ones
+/// (lead review).
+#[tokio::test]
+async fn debug_hides_unlock_ids() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    status_read(&mut a, &mut s, &mut store, &mut vault, vault_status_body(Some(UNLOCK_A), None, Some("s-1"))).await.unwrap();
+    a.observe(&mut s, &mut store, &event_at(TYPE_LOCKING, &locking(Some(UNLOCK_B), None), Utc::now() - TimeDelta::minutes(5))).unwrap();
+    assert_eq!(a.unlock_id(), Some(UNLOCK_A));
+    let shown = [
+        format!("{a:?}"),
+        format!("{:?}", a.vault()),
+        format!("{:?}", parse_vault_status(&vault_status_body(Some(UNLOCK_A), None, None)).unwrap()),
+        format!("{:?}", parse_locking(&locking(Some(UNLOCK_B), Some("idle"))).unwrap()),
+    ];
+    for d in shown {
+        for id in [UNLOCK_A, UNLOCK_B] {
+            assert!(!d.contains(id) && !d.contains(&id[..12]), "{d}");
+        }
+        assert!(d.contains(&UNLOCK_A[..6]) || d.contains(&UNLOCK_B[..6]), "the start is shown: {d}");
+    }
+}
+
 /// `Debug` shows only the start of ids, and the vault's code filtered.
 #[test]
 fn debug_hides_ids_and_filters_vault_text() {

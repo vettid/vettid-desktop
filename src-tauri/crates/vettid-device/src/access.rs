@@ -156,8 +156,9 @@ pub enum LockReason {
 }
 
 /// What this desktop knows of the vault's lock and hold (VAULT-LOCK-PLAN
-/// §3.1). Only `Open` lets a session be live.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// §3.1). Only `Open` lets a session be live. `Debug` shows only the start
+/// of an `unlock_id`.
+#[derive(Clone, PartialEq, Eq, Default)]
 pub enum VaultState {
     /// Nothing current says otherwise: at start, after a malformed
     /// statement or a lock notice this desktop can't place, and (the
@@ -176,19 +177,51 @@ pub enum VaultState {
 }
 
 /// What a `vault.status` body says of the vault ([`parse_vault_status`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Debug` shows only the start of the `unlock_id`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct VaultStatus {
     /// `Open` or `Held`.
     pub state: VaultState,
     pub unlock_id: Option<String>,
 }
 
-/// A `vault.locking` body ([`parse_locking`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A `vault.locking` body ([`parse_locking`]). `Debug` shows only the start
+/// of the `unlock_id`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Locking {
     /// The unlock the lock ends (none from a vault before release L).
     pub unlock_id: Option<String>,
     pub reason: Option<LockReason>,
+}
+
+/// An optional id, as `Debug` shows it: only its start.
+fn short_opt(id: &Option<String>) -> Option<String> {
+    id.as_deref().map(short_id)
+}
+
+impl std::fmt::Debug for VaultState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown => f.write_str("Unknown"),
+            Self::Open { unlock_id, due } => f.debug_struct("Open").field("unlock_id", &short_opt(unlock_id)).field("due", due).finish(),
+            Self::Held { deadline, waiting, idle_lock_at } => {
+                f.debug_struct("Held").field("deadline", deadline).field("waiting", waiting).field("idle_lock_at", idle_lock_at).finish()
+            }
+            Self::Locked { since, reason } => f.debug_struct("Locked").field("since", since).field("reason", reason).finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for VaultStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultStatus").field("state", &self.state).field("unlock_id", &short_opt(&self.unlock_id)).finish()
+    }
+}
+
+impl std::fmt::Debug for Locking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Locking").field("unlock_id", &short_opt(&self.unlock_id)).field("reason", &self.reason).finish()
+    }
 }
 
 /// An access session the vault named. `Debug` shows only the start of
@@ -589,7 +622,9 @@ fn empty_ok(answer: &Inner) -> Result<(), AccessError> {
 /// reported active. **Then, if it says `end_pending`, the app calls
 /// [`Access::settle`]**: an end stored before a restart is sent again only
 /// by `settle` (or `request`, `end`).
-#[derive(Debug)]
+///
+/// `Debug` shows only the start of each `unlock_id` (the current one and
+/// those lock notices ended), as [`AccessSession`]'s does of its id.
 pub struct Access {
     current: Option<AccessSession>,
     /// The current session's margin ([`margin_for`]), from when the vault
@@ -621,6 +656,25 @@ pub struct Access {
     /// A lock or hold notice asked for `vault.status` to be read now
     /// ([`Access::take_status_wanted`]).
     status_wanted: bool,
+}
+
+impl std::fmt::Debug for Access {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Access")
+            .field("current", &self.current)
+            .field("margin", &self.margin)
+            .field("learned", &self.learned)
+            .field("learned_seq", &self.learned_seq)
+            .field("baseline", &self.baseline)
+            .field("timeout", &self.timeout)
+            .field("vault", &self.vault)
+            .field("vault_learned", &self.vault_learned)
+            .field("vault_learned_seq", &self.vault_learned_seq)
+            .field("unlock_id", &short_opt(&self.unlock_id))
+            .field("ended", &self.ended.iter().map(|e| short_id(e)).collect::<Vec<_>>())
+            .field("status_wanted", &self.status_wanted)
+            .finish()
+    }
 }
 
 impl Default for Access {

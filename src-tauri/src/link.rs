@@ -123,6 +123,10 @@ pub const VAULT_HELD_NOTICE: &str = "Your vault is waiting for your daily check.
 /// The vault was locked (VAULT-LOCK-PLAN §3.4 "Locked", approved by the
 /// owner, decision 3, 2026-11-05): what a request that the lock ended says.
 pub const VAULT_LOCKED_NOTICE: &str = "Your vault was locked. Unlock it on your phone to continue.";
+/// The vault's state isn't known (VAULT-LOCK-PLAN §3.4 "Unknown", approved
+/// by the owner, decision 3, 2026-11-05): what a request refused for that
+/// says.
+pub const VAULT_UNKNOWN_NOTICE: &str = "This desktop can't tell whether your vault is open. It keeps checking.";
 
 /// How often the background task reads `vault.status` while a session is
 /// live (or an end waits for its answer, or the vault is held, locked or
@@ -214,7 +218,13 @@ pub struct Snapshot {
 /// `unlock_id`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct VaultView {
+    /// As of the snapshot: read it through [`VaultView::at`] (or
+    /// [`Snapshot::vault_at`]), which turns an `Open` past `open_until`
+    /// into `Unknown`.
     pub state: VaultShown,
+    /// Open: until when it counts as confirmed (the last confirmation plus
+    /// [`STALE_AFTER`]). Past it, [`VaultView::at`] shows `Unknown`.
+    pub open_until: Option<DateTime<Utc>>,
     /// Open, past the deadline with the hold off (§3.6.7): the session
     /// continues.
     pub due: bool,
@@ -235,6 +245,25 @@ pub struct VaultView {
     /// Locked: `"idle"`, `"owner_check"` or `"recovery"`; `None` for a lock
     /// without a known reason.
     pub reason: Option<&'static str>,
+}
+
+impl VaultView {
+    /// `Open` until `until` (a confirmation plus [`STALE_AFTER`]).
+    pub fn open(until: DateTime<Utc>) -> Self {
+        VaultView { state: VaultShown::Open, open_until: Some(until), ..Default::default() }
+    }
+
+    /// The view at `t`: an `Open` past its `open_until` (or without one)
+    /// is `Unknown`, as a session past its `live_until` is not live. A
+    /// stored snapshot read late (after a suspend, or while a command holds
+    /// the link) never shows an old `Open` (lead review).
+    pub fn at(&self, t: DateTime<Utc>) -> VaultView {
+        if self.state == VaultShown::Open && self.open_until.is_none_or(|u| t > u) {
+            VaultView::default()
+        } else {
+            self.clone()
+        }
+    }
 }
 
 /// Which state [`VaultView`] shows.
@@ -296,9 +325,23 @@ fn end_settled(r: &Result<Settled, AccessError>, cleared: bool) -> Option<EndSet
 }
 
 impl Snapshot {
-    /// Whether the access session is live at `t`.
+    /// Whether the access session is live at `t`: up to `live_until`, and
+    /// while the vault view at `t` is Open ([`Snapshot::vault_at`]).
     pub fn active_at(&self, t: DateTime<Utc>) -> bool {
-        self.live_until.is_some_and(|u| t <= u)
+        self.live_until.is_some_and(|u| t <= u) && self.vault_at(t).state == VaultShown::Open
+    }
+
+    /// The vault's state at `t` ([`VaultView::at`]): what every reader of a
+    /// stored snapshot shows.
+    pub fn vault_at(&self, t: DateTime<Utc>) -> VaultView {
+        self.vault.at(t)
+    }
+
+    /// Whether the session is current as far as this desktop knows but not
+    /// shown live for lack of the vault's word, at `t`: `stale` as of the
+    /// snapshot, or a session shown then whose Open has since run out.
+    pub fn stale_at(&self, t: DateTime<Utc>) -> bool {
+        self.stale || (self.session_id.is_some() && self.vault.state == VaultShown::Open && self.vault_at(t).state == VaultShown::Unknown)
     }
 
     /// When the live session ends, for "Time remaining" (#82): this
@@ -361,9 +404,13 @@ pub enum RequestFailed {
     /// `owner_check_required`: the vault drops pending requests (§3.6.3).
     Held,
     /// The vault was locked while the request waited (VAULT-LOCK-PLAN
-    /// §3.1). It may still grant it after an unlock: that session is shown
-    /// live only once a `vault.status` names it.
+    /// §3.1), or before it was sent (then it isn't sent). It may still
+    /// grant one that waited after an unlock: that session is shown live
+    /// only once a `vault.status` names it.
     Locked,
+    /// Not sent: this desktop doesn't know that the vault is open, even
+    /// after reading its status (lead review).
+    Unknown,
     Access(AccessError),
 }
 
@@ -399,6 +446,7 @@ pub fn request_notice(f: &RequestFailed, store: Option<&CredentialError>) -> Str
         RequestFailed::Unlinked => UNLINKED_NOT_ERASED_NOTICE.into(),
         RequestFailed::Held => VAULT_HELD_NOTICE.into(),
         RequestFailed::Locked => VAULT_LOCKED_NOTICE.into(),
+        RequestFailed::Unknown => VAULT_UNKNOWN_NOTICE.into(),
         RequestFailed::Access(e) => access_notice(e, store),
     }
 }
@@ -742,7 +790,11 @@ impl<T: Transport, C: Clock> Link<T, C> {
     fn vault_view(&self, now: DateTime<Utc>) -> VaultView {
         match self.vault_now(now) {
             VaultState::Unknown => VaultView::default(),
-            VaultState::Open { due, .. } => VaultView { state: VaultShown::Open, due, ..Default::default() },
+            VaultState::Open { due, .. } => match self.vault_checked.map(|c| c + STALE_AFTER) {
+                Some(until) => VaultView { due, ..VaultView::open(until) },
+                // Not reached: vault_now shows an unconfirmed Open as Unknown.
+                None => VaultView::default(),
+            },
             VaultState::Held { deadline, waiting, idle_lock_at } => {
                 VaultView { state: VaultShown::Held, waiting: waiting.map(Counts::from), deadline, idle_lock_at, ..Default::default() }
             }
@@ -754,6 +806,27 @@ impl<T: Transport, C: Clock> Link<T, C> {
                 ..Default::default()
             },
         }
+    }
+
+    /// Why a session request may not go now, if it may not: the vault is
+    /// held or locked, or (after a status read, here and now) still not
+    /// known to be open.
+    async fn not_open_for_a_request(&mut self) -> Option<RequestFailed> {
+        let refusal = |v: VaultState| match v {
+            VaultState::Open { .. } => None,
+            VaultState::Held { .. } => Some(RequestFailed::Held),
+            VaultState::Locked { .. } => Some(RequestFailed::Locked),
+            VaultState::Unknown => Some(RequestFailed::Unknown),
+        };
+        if let VaultState::Unknown = self.vault_now(Utc::now()) {
+            if self.vault_stale(Utc::now()) {
+                self.access.vault_unconfirmed();
+            }
+            let r = self.status_once().await;
+            self.reachable = r.as_ref().err().is_none_or(answered);
+            self.drain_held();
+        }
+        refusal(self.vault_now(Utc::now()))
     }
 
     /// Held or locked by a statement the vault made at or after `since`
@@ -865,7 +938,11 @@ impl<T: Transport, C: Clock> Link<T, C> {
         // (`confirmed`, which an answered end also sets) and the vault's
         // (`vault_checked`) can't disagree (lead review L3).
         let live_until = known.zip(cap).map(|(u, c)| u.min(c)).filter(|u| *u >= now).filter(|_| vault.state == VaultShown::Open);
-        let stale = known.is_some() && live_until.is_none();
+        // A session this desktop holds that isn't shown live for lack of
+        // the vault's word: only while the vault view is Unknown. Held and
+        // Locked are the vault's word, not a lack of it (lead review).
+        let held_session = self.access.current().is_some_and(|c| c.expires_at > now);
+        let stale = !refused && vault.state == VaultShown::Unknown && held_session && live_until.is_none();
         let current = live_until.and(self.access.current());
         Snapshot {
             link_open: true,
@@ -918,6 +995,13 @@ impl<T: Transport, C: Clock> Link<T, C> {
                 self.reachable = answered(&e);
                 return Err(RequestFailed::Access(e));
             }
+        }
+        // Defense in depth (lead review): no request while the vault isn't
+        // Open, so none waits at the relay through a lock or a hold and is
+        // granted after an unlock nobody expected. Unknown: the status is
+        // read first; the request goes only if it says Open.
+        if let Some(f) = self.not_open_for_a_request().await {
+            return Err(f);
         }
         // Access::request (the vault's default length: nothing to check; the
         // ordering rule settled first), with the answer's ts: a denial the
@@ -1268,7 +1352,7 @@ mod tests {
     #[test]
     fn a_snapshot_is_live_only_up_to_live_until() {
         let now = Utc::now();
-        let s = Snapshot { link_open: true, live_until: Some(now), ..Default::default() };
+        let s = Snapshot { link_open: true, live_until: Some(now), vault: VaultView::open(now), ..Default::default() };
         assert!(s.active_at(now));
         assert!(!s.active_at(now + TimeDelta::seconds(1)));
         assert!(!Snapshot::default().active_at(now));
@@ -1529,7 +1613,10 @@ mod tests {
         let snap = link.snapshot(now);
         assert!(snap.active_at(now) && !snap.stale);
         assert!(snap.live_until.unwrap() <= now + STALE_AFTER, "capped at the confirmation");
+        // Both confirmations age together, as they do when status reads
+        // stop (the stale notice is for an Unknown vault only, #77).
         link.confirmed = Some(now - STALE_AFTER - TimeDelta::seconds(1));
+        link.vault_checked = link.confirmed;
         let snap = link.snapshot(now);
         assert!(!snap.active_at(now), "not shown as live");
         assert!(snap.stale);
@@ -1810,7 +1897,7 @@ mod tests {
         link.read_status().await.unwrap();
         let snap = link.snapshot(Utc::now());
         assert!(snap.active_at(Utc::now()));
-        assert_eq!(snap.vault, VaultView { state: VaultShown::Open, ..Default::default() });
+        assert_eq!(snap.vault, VaultView::open(link.vault_checked.unwrap() + STALE_AFTER));
         (vault, link)
     }
 
@@ -1937,7 +2024,7 @@ mod tests {
         link.refresh().await.unwrap();
         let snap = link.snapshot(Utc::now());
         assert!(snap.active_at(Utc::now()));
-        assert_eq!(snap.vault, VaultView { state: VaultShown::Open, due: true, ..Default::default() });
+        assert_eq!(snap.vault, VaultView { due: true, ..VaultView::open(link.vault_checked.unwrap() + STALE_AFTER) });
     }
 
     /// `owner_check_required` to Start New Session: Held.
@@ -2256,6 +2343,108 @@ mod tests {
         assert!(LoopMarks { due: Some(due), woke: Some(due + TimeDelta::minutes(5)) }.slept(Utc::now()));
         assert!(LoopMarks { due: Some(due), woke: None }.slept(Utc::now()));
         assert!(!LoopMarks::default().slept(Utc::now()));
+    }
+
+    fn requests(vault: &FakeVault) -> usize {
+        vault.deposited().iter().filter(|k| *k == "device.session.request").count()
+    }
+
+    /// Lead review: a stored snapshot read after STALE_AFTER (after a
+    /// suspend, or while a command holds the link) shows Unknown and
+    /// nothing live, as `active_at` does for the session.
+    #[tokio::test]
+    async fn a_stored_snapshot_read_late_shows_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_vault, link) = live(dir.path()).await;
+        let now = Utc::now();
+        let snap = link.snapshot(now);
+        assert_eq!(snap.vault.open_until, link.vault_checked.map(|c| c + STALE_AFTER));
+        assert_eq!(snap.vault_at(now).state, VaultShown::Open);
+        assert!(snap.active_at(now));
+        let late = link.vault_checked.unwrap() + STALE_AFTER + TimeDelta::seconds(1);
+        assert_eq!(snap.vault_at(late).state, VaultShown::Unknown);
+        assert!(!snap.active_at(late), "nothing live");
+        assert_eq!(snap.shown_expiry(late), None);
+        assert!(snap.stale_at(late), "shown as not confirmed");
+        // An Open view without an `open_until` is never Open.
+        let bare = VaultView { state: VaultShown::Open, ..Default::default() };
+        assert_eq!(bare.at(now).state, VaultShown::Unknown);
+    }
+
+    /// Lead review: `stale` ("hasn't heard from your vault") only while the
+    /// vault view is Unknown. Held and Locked are the vault's word.
+    #[tokio::test]
+    async fn only_an_unknown_vault_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = live(dir.path()).await;
+        vault.hold(true, "");
+        link.refresh().await.unwrap();
+        let snap = link.snapshot(Utc::now());
+        assert_eq!((snap.vault.state, snap.stale), (VaultShown::Held, false));
+        vault.hold(false, "");
+        link.refresh().await.unwrap();
+        vault.lock_vault(None);
+        let _ = link.refresh().await;
+        let snap = link.snapshot(Utc::now());
+        assert_eq!((snap.vault.state, snap.stale), (VaultShown::Locked, false));
+
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = live(dir.path()).await;
+        vault.lock_silently();
+        let _ = link.refresh().await;
+        let snap = link.snapshot(Utc::now());
+        assert_eq!((snap.vault.state, snap.stale), (VaultShown::Unknown, true), "a session held, no word from the vault");
+    }
+
+    /// Lead review (defense in depth): no session request while the vault
+    /// is held or locked: refused with its notice, and nothing sent.
+    #[tokio::test]
+    async fn no_request_goes_while_held_or_locked() {
+        for locked in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (vault, mut link) = live(dir.path()).await;
+            if locked {
+                vault.lock_vault(None);
+                let _ = link.refresh().await;
+            } else {
+                vault.hold(true, "");
+                link.refresh().await.unwrap();
+            }
+            let r = link.request_access(|| panic!("not sent"), || false).await;
+            let (want, notice) = if locked { (RequestFailed::Locked, VAULT_LOCKED_NOTICE) } else { (RequestFailed::Held, VAULT_HELD_NOTICE) };
+            assert_eq!(r, Err(want));
+            assert_eq!(request_notice(&r.unwrap_err(), None), notice);
+            assert_eq!(requests(&vault), 0, "nothing sent");
+            never_sent_a_lock(&vault);
+        }
+    }
+
+    /// Unknown: the status is read first; if it doesn't say Open, the
+    /// request is refused with the Unknown text and not sent. If it says
+    /// Open, the request goes.
+    #[tokio::test]
+    async fn a_request_while_unknown_reads_the_status_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = live(dir.path()).await;
+        vault.lock_silently();
+        let _ = link.refresh().await;
+        assert_eq!(link.snapshot(Utc::now()).vault.state, VaultShown::Unknown);
+        let before = statuses(&vault);
+        let r = link.request_access(|| panic!("not sent"), || false).await;
+        assert_eq!(r, Err(RequestFailed::Unknown));
+        assert_eq!(request_notice(&r.unwrap_err(), None), VAULT_UNKNOWN_NOTICE);
+        assert_eq!(statuses(&vault), before + 1, "a status read was made");
+        assert_eq!(requests(&vault), 0, "nothing sent");
+
+        // No status read yet (Unknown at start), and the vault answers:
+        // the request goes, and is granted.
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        assert_eq!(link.snapshot(Utc::now()).vault.state, VaultShown::Unknown);
+        vault.grant_on_request(("s-2", Utc::now() + TimeDelta::hours(1)));
+        link.request_access(|| {}, || false).await.expect("granted");
+        assert_eq!(requests(&vault), 1);
+        assert!(link.snapshot(Utc::now()).active_at(Utc::now()));
     }
 
     /// Lead review M1: the refresh loop takes a wall-clock jump of more

@@ -1,7 +1,7 @@
 use serde::Serialize;
 use tauri::State;
 
-use crate::link::Snapshot;
+use crate::link::{Snapshot, VaultShown};
 use crate::state::AppState;
 
 #[derive(Debug, Serialize)]
@@ -26,8 +26,10 @@ pub struct SessionTimer {
 }
 
 /// The session's state, from the link's last snapshot: "active" only while
-/// [`Snapshot::active_at`] says so, "expired" when unlocked without a live
-/// session, "inactive" when locked or not paired.
+/// [`Snapshot::active_at`] says so; "suspended" while the vault is held or
+/// locked (#77: the vault's word, not an expiry, and the current UI's
+/// "Suspended" has no Start New Session); "expired" when unlocked without
+/// a live session otherwise; "inactive" when locked or not paired.
 fn status_of(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> SessionStatus {
     let none = |state: &str, reachable: bool| SessionStatus {
         state: state.to_string(),
@@ -51,7 +53,10 @@ fn status_of(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> SessionStat
             max_extensions: None,
             phone_reachable: snap.reachable,
         },
-        None if snap.link_open => none("expired", snap.reachable),
+        None if snap.link_open => match snap.vault_at(now).state {
+            VaultShown::Held | VaultShown::Locked => none("suspended", snap.reachable),
+            VaultShown::Open | VaultShown::Unknown => none("expired", snap.reachable),
+        },
         None => none("inactive", false),
     }
 }
@@ -87,6 +92,7 @@ mod tests {
         let mut snap = Snapshot { link_open: true, reachable: true, ..Default::default() };
         assert_eq!(status_of(&snap, now).state, "expired");
         snap.live_until = Some(now + chrono::TimeDelta::seconds(30));
+        snap.vault = crate::link::VaultView::open(now + chrono::TimeDelta::seconds(30));
         snap.session_id = Some("s".into());
         let s = status_of(&snap, now);
         assert_eq!((s.state.as_str(), s.seconds_remaining), ("active", Some(30)));
@@ -104,6 +110,7 @@ mod tests {
             expires_at: Some(now + chrono::TimeDelta::hours(1)),
             ends_at: Some(now + chrono::TimeDelta::minutes(59)),
             live_until: Some(now + chrono::TimeDelta::seconds(120)),
+            vault: crate::link::VaultView::open(now + chrono::TimeDelta::seconds(120)),
             ..Default::default()
         };
         let s = status_of(&snap, now);
@@ -112,5 +119,27 @@ mod tests {
         // Past the freshness window: not live, so no time at all.
         let later = status_of(&snap, now + chrono::TimeDelta::seconds(121));
         assert_eq!((later.state.as_str(), later.seconds_remaining), ("expired", None));
+    }
+
+    /// #77: held or locked is "suspended" (the vault's word), never
+    /// "expired" (which offers Start New Session); an Open past its
+    /// confirmation is Unknown, so "expired" with nothing live.
+    #[test]
+    fn held_and_locked_are_suspended_not_expired() {
+        use crate::link::VaultView;
+        let now = chrono::Utc::now();
+        for (state, want) in [(VaultShown::Held, "suspended"), (VaultShown::Locked, "suspended"), (VaultShown::Unknown, "expired")] {
+            let snap = Snapshot { link_open: true, vault: VaultView { state, ..Default::default() }, ..Default::default() };
+            assert_eq!(status_of(&snap, now).state, want, "{state:?}");
+        }
+        let snap = Snapshot {
+            link_open: true,
+            session_id: Some("s".into()),
+            live_until: Some(now + chrono::TimeDelta::hours(1)),
+            vault: VaultView::open(now + chrono::TimeDelta::seconds(120)),
+            ..Default::default()
+        };
+        assert_eq!(status_of(&snap, now).state, "active");
+        assert_eq!(status_of(&snap, now + chrono::TimeDelta::seconds(121)).state, "expired", "the stored Open ran out");
     }
 }
