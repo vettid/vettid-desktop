@@ -122,7 +122,7 @@ test('A time not today shows its date too, in the locale\'s format; today, the t
   assert.equal(shown, new Intl.DateTimeFormat(LOCALE, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(yesterday)));
   assert.match(shown, /Nov 4, 2026/);
   assert.equal(at, new Intl.DateTimeFormat(LOCALE, { hour: 'numeric', minute: '2-digit' }).format(new Date(AT)));
-  assert.deepEqual(screen({ state: 'locked', as_of: yesterday }).lines, [`Your vault was locked at ${shown}. This desktop can't reach it now to check.`]);
+  assert.deepEqual(screen({ state: 'locked', locked_since: yesterday, as_of: NOW.toISOString() }).lines, [`Your vault was locked at ${shown}. This desktop can't reach it now to check.`]);
   assert.deepEqual(screen({ state: 'held', waiting: null, idle_lock_at: yesterday }).lines.at(-1), `Your vault locks itself at ${shown} unless you do your daily check.`);
 });
 
@@ -139,4 +139,12 @@ test('Held and locked are "suspended", never "expired" (which offers Start New S
   assert.equal(notLiveState({ state: 'unknown' }), 'expired');
   assert.equal(notLiveState({ state: 'open' }), 'expired');
   assert.equal(notLiveState(null), 'expired');
+});
+
+test("'Locked at <time>' is the vault's lock time, not the last confirmation (owner decision, 2026-11-05)", () => {
+  const lockedAt = new Date(2026, 10, 5, 17, 14, 0).toISOString();
+  const confirmed = new Date(2026, 10, 5, 17, 40, 0).toISOString();
+  const lines = screen({ state: 'locked', locked_since: lockedAt, as_of: confirmed }).lines;
+  assert.deepEqual(lines, [`Your vault was locked at ${timeOf(lockedAt, LOCALE, NOW)}. This desktop can't reach it now to check.`]);
+  assert.ok(!lines[0].includes(timeOf(confirmed, LOCALE, NOW)));
 });

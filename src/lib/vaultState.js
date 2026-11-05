@@ -161,8 +161,11 @@ export function vaultScreen(view, locale, now = new Date()) {
     return { kind: 'held', lines, holdOff: null, showStart: false };
   }
   if (v.state === 'locked') {
-    // Owner decision 2: when this desktop can't check, "locked as of".
-    const lines = v.as_of ? [lockedAsOfText(timeOf(v.as_of, locale, now))] : [lockedText(v.reason)];
+    // Owner decision 2: when this desktop can't check, "locked as of". The
+    // time is when the vault locked (`locked_since`, the `ts` of its own
+    // `vault.locking`), not when this desktop last confirmed it (owner
+    // decision of 2026-11-05, option a); `as_of` only says it can't check.
+    const lines = v.as_of ? [lockedAsOfText(timeOf(v.locked_since ?? v.as_of, locale, now))] : [lockedText(v.reason)];
     return { kind: 'locked', lines, holdOff: null, showStart: false };
   }
   return { kind: 'unknown', lines: [TEXT.unknown], holdOff: null, showStart: false };
