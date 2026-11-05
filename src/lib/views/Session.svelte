@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { sessionStore, refreshSessionFromBackend, vaultStore, askToEnd, endBusy, endStatus } from '../stores/session';
-  import { vaultScreen, endOffered } from '../vaultState.js';
+  import { vaultScreen, endOffered, unreachableAlertShown } from '../vaultState.js';
   import SessionTimer from '../components/SessionTimer.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
 
@@ -150,7 +150,7 @@
     <div class="alert warning" role="status">{screen.holdOff}</div>
   {/if}
 
-  {#if session.state === 'suspended'}
+  {#if unreachableAlertShown(session)}
     <div class="alert warning">
       Your phone is unreachable. All vault operations are paused.
       Make sure your phone is connected to the internet and the VettID app is running.

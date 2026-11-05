@@ -2,7 +2,7 @@
 // VAULT-LOCK-PLAN §3.2-§3.4). Run with `npm test`.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { TEXT, vaultScreen, countsLine, lockedText, endOffered, notLiveState, timeOf, vaultAt, liveAt, msUntilOpenRunsOut } from '../src/lib/vaultState.js';
+import { TEXT, vaultScreen, countsLine, lockedText, endOffered, notLiveState, timeOf, vaultAt, liveAt, msUntilOpenRunsOut, unreachableAlertShown } from '../src/lib/vaultState.js';
 
 const LOCALE = 'en-US';
 // "Now" for the screens, and a time on the same day by this computer's clock.
@@ -124,6 +124,13 @@ test('A time not today shows its date too, in the locale\'s format; today, the t
   assert.equal(at, new Intl.DateTimeFormat(LOCALE, { hour: 'numeric', minute: '2-digit' }).format(new Date(AT)));
   assert.deepEqual(screen({ state: 'locked', as_of: yesterday }).lines, [`Your vault was locked at ${shown}. This desktop can't reach it now to check.`]);
   assert.deepEqual(screen({ state: 'held', waiting: null, idle_lock_at: yesterday }).lines.at(-1), `Your vault locks itself at ${shown} unless you do your daily check.`);
+});
+
+test('"Your phone is unreachable" only when the phone is unreachable, not for held or locked', () => {
+  assert.equal(unreachableAlertShown({ state: 'suspended', phoneReachable: true }), false, 'held or locked, reachable');
+  assert.equal(unreachableAlertShown({ state: 'active', phoneReachable: true }), false);
+  assert.equal(unreachableAlertShown({ state: 'suspended', phoneReachable: false }), true);
+  assert.equal(unreachableAlertShown({ state: 'active', phoneReachable: false }), true);
 });
 
 test('Held and locked are "suspended", never "expired" (which offers Start New Session)', () => {

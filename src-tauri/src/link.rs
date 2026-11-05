@@ -499,6 +499,9 @@ pub struct Link<T: Transport = Http, C: Clock = SystemClock> {
     marks: Arc<std::sync::Mutex<LoopMarks>>,
     /// How many times [`Link::resumed`] ran (for the logs and the tests).
     resumes: u32,
+    /// When this link last sent a `vault.status` of its own (answered or
+    /// not): what a focus read is throttled on ([`Link::focused`]).
+    last_attempt: Option<DateTime<Utc>>,
 }
 
 /// What the refresh loop records of its own rounds, by the wall clock.
@@ -568,6 +571,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
             read_now: false,
             marks: Arc::default(),
             resumes: 0,
+            last_attempt: None,
         }
     }
 
@@ -701,13 +705,23 @@ impl<T: Transport, C: Clock> Link<T, C> {
 
     /// The window gained focus (VAULT-LOCK-PLAN §3.1): a sleep the marks
     /// show is a resume ([`Link::resumed`]); and whether `vault.status`
-    /// should be read now: the vault hasn't confirmed its state within
-    /// [`FOCUS_RECHECK_AFTER`], or a read is asked for at once. Focus comes
-    /// often (every switch of window), so a fresh confirmation is enough.
+    /// should be read now. Yes when a read is asked for at once (a resume,
+    /// a notice). Otherwise it is throttled on the last status *sent*,
+    /// answered or not (lead review): while Open or Held, one at most every
+    /// [`FOCUS_RECHECK_AFTER`] (focus comes with every switch of window);
+    /// while Locked or Unknown, not before the refresh loop's backoff since
+    /// then, so that switching windows neither adds reads that wait at the
+    /// relay of a locked vault nor holds the link meanwhile.
     pub fn focused(&mut self, now: DateTime<Utc>) -> bool {
         self.check_gap(now);
-        let fresh = self.vault_checked.is_some_and(|c| now <= c + FOCUS_RECHECK_AFTER);
-        std::mem::take(&mut self.read_now) || !fresh
+        if std::mem::take(&mut self.read_now) {
+            return true;
+        }
+        let wait = match self.vault_now(now) {
+            VaultState::Open { .. } | VaultState::Held { .. } => FOCUS_RECHECK_AFTER,
+            VaultState::Locked { .. } | VaultState::Unknown => TimeDelta::from_std(self.backoff.unwrap_or(REFRESH_EVERY)).unwrap_or(TimeDelta::MAX),
+        };
+        self.last_attempt.is_none_or(|a| a.checked_add_signed(wait).is_some_and(|due| now >= due))
     }
 
     /// The refresh loop has the lock for a round: [`Link::resumed`] if its
@@ -744,6 +758,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// outbox held after a 429 or a 5xx) it is shown "as of" (lead review
     /// M4).
     async fn status_once(&mut self) -> Result<StatusRead, AccessError> {
+        self.last_attempt = Some(Utc::now());
         let r = self.access.read_status(&mut self.session, &mut self.store).await;
         let now = Utc::now();
         match &r {
@@ -2584,6 +2599,45 @@ mod tests {
         let before = shared.read().seq;
         shared.publish(live);
         assert_eq!(shared.read().seq, before + 1);
+    }
+
+    /// Lead review: focus reads are throttled on the last status sent, not
+    /// the last confirmation. While Unknown (a status unanswered), two
+    /// focuses 20 s apart read once: not again before the loop's backoff.
+    /// While Open, a focus more than FOCUS_RECHECK_AFTER after the last
+    /// read still reads.
+    #[tokio::test]
+    async fn focus_reads_are_throttled_on_the_last_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = live(dir.path()).await;
+        vault.lock_silently();
+        let _ = link.refresh().await;
+        assert_eq!(link.snapshot(Utc::now()).vault.state, VaultShown::Unknown);
+        let backoff = link.next_wait(Utc::now());
+        assert_eq!(backoff, REFRESH_EVERY);
+        // The last attempt a backoff ago: the first focus reads.
+        link.last_attempt = Some(Utc::now() - TimeDelta::seconds(61));
+        let before = statuses(&vault);
+        assert!(link.focus_read().await, "due: read");
+        assert_eq!(statuses(&vault), before + 1);
+        // A second focus 20 s later: not before the backoff, though that
+        // read wasn't answered either.
+        assert!(!link.focused(Utc::now() + TimeDelta::seconds(20)));
+        assert!(!link.focus_read().await);
+        assert_eq!(statuses(&vault), before + 1, "one read for the two focuses");
+        // The backoff later (grown by that unanswered read), it reads
+        // again; and a resume always does.
+        let wait = TimeDelta::from_std(link.backoff.expect("backing off")).unwrap();
+        assert!(!link.focused(Utc::now() + wait - TimeDelta::seconds(5)));
+        assert!(link.focused(Utc::now() + wait + TimeDelta::seconds(1)));
+        link.resumed();
+        assert!(link.focused(Utc::now()), "a read asked for at once");
+
+        // Open: a focus 16 s after the last read reads.
+        let dir = tempfile::tempdir().unwrap();
+        let (_vault, mut link) = live(dir.path()).await;
+        assert!(!link.focused(Utc::now()), "just read");
+        assert!(link.focused(Utc::now() + TimeDelta::seconds(16)));
     }
 
     /// Lead review M2: a focus read settles a stored end (#80) and leaves

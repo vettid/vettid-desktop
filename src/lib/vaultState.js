@@ -193,6 +193,17 @@ export function notLiveState(view) {
 }
 
 /**
+ * Whether the Session view's "Your phone is unreachable" alert shows: only
+ * when the last exchange went unanswered (`phoneReachable` false). Held and
+ * Locked are "suspended" too since #77, but they are the vault's word, not
+ * a lack of reach, and have their own texts.
+ * @param {{ state: string, phoneReachable: boolean }} session
+ */
+export function unreachableAlertShown(session) {
+  return !session.phoneReachable;
+}
+
+/**
  * When a read's Open runs out (ms from `now`), for a re-read then: `null`
  * if it isn't an Open that will.
  * @param {VaultView | null | undefined} view

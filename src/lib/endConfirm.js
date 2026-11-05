@@ -18,16 +18,6 @@ export function openEnd() {
 }
 
 /**
- * A read of the backend came in (and the screen may swap with it): the
- * confirmation is left exactly as it was.
- * @param {Confirm} confirm
- * @returns {Confirm}
- */
-export function afterRead(confirm) {
-  return confirm;
-}
-
-/**
  * The person answered: `yes` runs the action the confirmation was opened
  * for; either way it closes.
  * @param {Confirm} confirm

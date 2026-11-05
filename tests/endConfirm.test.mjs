@@ -3,22 +3,20 @@
 // `npm test`.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { CLOSED, openEnd, afterRead as confirmAfterRead, answer } from '../src/lib/endConfirm.js';
+import { CLOSED, openEnd, answer } from '../src/lib/endConfirm.js';
 import { afterRead, readIsStale } from '../src/lib/endState.js';
 import { vaultScreen } from '../src/lib/vaultState.js';
 
 const NOT_SENT = "This desktop couldn't reach your vault to end the session, so it may still be open.";
 
-test('an open End confirmation survives swaps to held, locked and unknown, still on End', () => {
-  let confirm = openEnd();
+test('an open End confirmation, answered after swaps to held, locked and unknown, runs End', () => {
+  // The confirmation lives in the store, above the views; no read touches
+  // it, so a screen swap (Start coming and going) leaves it as opened.
+  const confirm = openEnd();
   for (const state of ['held', 'locked', 'unknown', 'open']) {
-    // The screen swaps with the vault's state (Start comes and goes) ...
     vaultScreen({ state });
-    // ... and the confirmation is left as the person opened it.
-    confirm = confirmAfterRead(confirm);
-    assert.deepEqual(confirm, { open: true, action: 'end' }, state);
   }
-  // Answered after the swaps: it runs End, the action it was opened for.
+  assert.deepEqual(confirm, { open: true, action: 'end' });
   assert.deepEqual(answer(confirm, true), { confirm: CLOSED, run: 'end' });
 });
 
