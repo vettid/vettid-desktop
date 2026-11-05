@@ -2,7 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { onDestroy } from 'svelte';
-  import { activateSession, sessionNotice } from '../stores/session';
+  import { activateSession, sessionNotice, endPending } from '../stores/session';
 
   let step = $state<'idle' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error' | 'removed-unconfirmed'>('idle');
   let removedNotice = $state('');
@@ -91,6 +91,12 @@
 
     {#if $sessionNotice}
       <p class="error-text" role="status">{$sessionNotice}</p>
+    {:else if $endPending && step === 'idle'}
+      <!-- #80: an end the vault hasn't answered never looks like a confirmed one. -->
+      <div class="waiting" role="status">
+        <div class="spinner"></div>
+        <p>Ending your session… This desktop is waiting for your vault to confirm it.</p>
+      </div>
     {/if}
 
     {#if step === 'idle'}

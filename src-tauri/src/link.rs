@@ -20,7 +20,7 @@ use std::sync::{Arc, RwLock};
 use chrono::{DateTime, TimeDelta, Utc};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use vettid_device::access::{Access, AccessError, AccessEvent, EndOutcome, RequestOutcome};
+use vettid_device::access::{Access, AccessError, AccessEvent, EndOutcome, RequestOutcome, Settled};
 use vettid_device::pairing::{Clock, SystemClock};
 use vettid_device::session::{Session, SessionError};
 use vettid_device::store::Persist;
@@ -140,6 +140,39 @@ pub struct Snapshot {
     /// The access session is current as far as this desktop knows, but the
     /// vault hasn't confirmed it for [`STALE_AFTER`]: not shown as live.
     pub stale: bool,
+    /// An End session the vault hasn't answered yet (#80): one under way,
+    /// or a stored unanswered end that the refresh keeps sending. Shown as
+    /// "Ending your session…", never as ended.
+    pub end_pending: bool,
+    /// How the background refresh last settled a stored end (#80); `None`
+    /// if it hasn't, or a new End session has started since. A stored end
+    /// going away is not on its own a confirmation.
+    pub end_settled: Option<EndSettled>,
+    /// This link has had an End session, or opened with a stored one: an
+    /// end that went away without an outcome here is then "not confirmed".
+    pub end_seen: bool,
+}
+
+/// How the refresh settled a stored unanswered end (#80).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndSettled {
+    /// The vault answered the end `ok`, or `vault.status` names no session.
+    Confirmed,
+    /// Settled without that confirmation: what to tell the person.
+    NotConfirmed(&'static str),
+}
+
+/// What `settle`'s result says about the end (#80). `cleared`: the stored
+/// end is gone afterwards (an error answer clears it too, unconfirmed).
+fn end_settled(r: &Result<Settled, AccessError>, cleared: bool) -> Option<EndSettled> {
+    match r {
+        Ok(Settled::Answered | Settled::StatusNull) => Some(EndSettled::Confirmed),
+        Ok(Settled::OldVault) => Some(EndSettled::NotConfirmed(END_UNCONFIRMED_NOTICE)),
+        Ok(Settled::Moot) => Some(EndSettled::NotConfirmed(END_REPLACED_NOTICE)),
+        Ok(Settled::Clear) => None,
+        Err(_) if cleared => Some(EndSettled::NotConfirmed(END_UNCONFIRMED_NOTICE)),
+        Err(_) => None,
+    }
 }
 
 impl Snapshot {
@@ -149,9 +182,10 @@ impl Snapshot {
     }
 
     /// The same, without the session: what an operation that is ending it
-    /// shows meanwhile.
+    /// shows meanwhile (the end pending until the link's own snapshot says
+    /// how it went).
     pub fn without_session(&self) -> Snapshot {
-        Snapshot { session_id: None, expires_at: None, live_until: None, ..self.clone() }
+        Snapshot { session_id: None, expires_at: None, live_until: None, end_pending: true, end_settled: None, end_seen: true, ..self.clone() }
     }
 }
 
@@ -236,6 +270,10 @@ pub struct Link<T: Transport = Http, C: Clock = SystemClock> {
     /// The mailbox was collected once after the refusal (§8.6: a
     /// `device.unlinked` may still wait there).
     refusal_polled: bool,
+    /// How the refresh last settled a stored end (#80; see [`Snapshot`]).
+    end_settled: Option<EndSettled>,
+    /// See [`Snapshot::end_seen`].
+    end_seen: bool,
     /// When the vault last confirmed what this link knows of the session:
     /// a `vault.status` read, or an answered end. `None`: never in this
     /// run (no baseline).
@@ -267,7 +305,8 @@ impl<T: Transport, C: Clock> Link<T, C> {
         if session.access_end_unreadable() {
             log::warn!("link: the stored unanswered end didn't read; it is settled through vault.status");
         }
-        Link { session, store, access: Access::new(), reachable: false, refusal_polled: false, confirmed: None }
+        let end_seen = session.access_end().is_some() || session.access_end_unreadable();
+        Link { session, store, access: Access::new(), reachable: false, refusal_polled: false, confirmed: None, end_settled: None, end_seen }
     }
 
     /// The vault's mailbox refused this device (`token_revoked`, §8.6), or
@@ -304,7 +343,8 @@ impl<T: Transport, C: Clock> Link<T, C> {
         match self.session.poll(&mut self.store).await {
             Ok(msgs) => {
                 for m in &msgs {
-                    let _ = self.access.observe(&mut self.session, &mut self.store, m);
+                    let e = self.access.observe(&mut self.session, &mut self.store, m);
+                    self.note_end_answered(&e);
                 }
             }
             Err(e) => log::info!("link: collecting after the refusal: {}", e),
@@ -318,7 +358,8 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// `vault.status` anyway (§6.8).
     fn drain_held(&mut self) {
         for m in self.session.take_held() {
-            let _ = self.access.observe(&mut self.session, &mut self.store, &m);
+            let e = self.access.observe(&mut self.session, &mut self.store, &m);
+            self.note_end_answered(&e);
         }
     }
 
@@ -345,7 +386,13 @@ impl<T: Transport, C: Clock> Link<T, C> {
                 // The status read itself confirms what it named.
                 self.confirmed = Some(Utc::now());
                 if read.end_pending {
-                    self.access.settle(&mut self.session, &mut self.store).await.map(drop)
+                    let r = self.access.settle(&mut self.session, &mut self.store).await;
+                    // #80: kept, so the UI tells a confirmed end from one
+                    // that only stopped being sent.
+                    if let Some(s) = end_settled(&r, self.session.access_end().is_none()) {
+                        self.set_end_settled(s);
+                    }
+                    r.map(drop)
                 } else {
                     Ok(())
                 }
@@ -356,6 +403,24 @@ impl<T: Transport, C: Clock> Link<T, C> {
         self.drain_held();
         self.note_refused().await;
         r
+    }
+
+    /// Record how a stored end settled (#80), with a log line the staging
+    /// checks can see.
+    fn set_end_settled(&mut self, s: EndSettled) {
+        match &s {
+            EndSettled::Confirmed => log::info!("link: the stored end is confirmed"),
+            EndSettled::NotConfirmed(_) => log::info!("link: the stored end went without a confirmation"),
+        }
+        self.end_settled = Some(s);
+    }
+
+    /// A late `ok` to a stored end, handled on its own (`observe`): that is
+    /// the vault's confirmation (#80).
+    fn note_end_answered(&mut self, e: &Result<Option<AccessEvent>, AccessError>) {
+        if matches!(e, Ok(Some(AccessEvent::EndAnswered))) {
+            self.set_end_settled(EndSettled::Confirmed);
+        }
     }
 
     /// The vault removed this device (`device.unlinked`).
@@ -397,6 +462,9 @@ impl<T: Transport, C: Clock> Link<T, C> {
             reachable: self.reachable,
             refused,
             stale,
+            end_pending: self.session.access_end().is_some(),
+            end_settled: self.end_settled.clone(),
+            end_seen: self.end_seen,
         }
     }
 
@@ -420,6 +488,19 @@ impl<T: Transport, C: Clock> Link<T, C> {
         }
         if self.refused() {
             return Err(RequestFailed::Access(AccessError::Session(SessionError::Refused)));
+        }
+        // #80 (lead review M1): a stored unanswered end is settled here
+        // first, as the ordering rule needs anyway (§6.8), so its outcome is
+        // recorded; Access::request then finds nothing to settle.
+        if self.session.access_end().is_some() {
+            let r = self.access.settle(&mut self.session, &mut self.store).await;
+            if let Some(s) = end_settled(&r, self.session.access_end().is_none()) {
+                self.set_end_settled(s);
+            }
+            if let Err(e) = r {
+                self.reachable = answered(&e);
+                return Err(RequestFailed::Access(e));
+            }
         }
         // Access::request (the vault's default length: nothing to check; the
         // ordering rule settled first), with the answer's ts: a denial the
@@ -453,7 +534,9 @@ impl<T: Transport, C: Clock> Link<T, C> {
                     self.reachable = true;
                     let mut granted = false;
                     for m in &msgs {
-                        match self.access.observe(&mut self.session, &mut self.store, m) {
+                        let e = self.access.observe(&mut self.session, &mut self.store, m);
+                        self.note_end_answered(&e);
+                        match e {
                             Ok(Some(AccessEvent::Granted(_))) => granted = true,
                             // A denial from before this request's answer is
                             // about an earlier one.
@@ -490,11 +573,22 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// End all of this desktop's access (the person's End session, §6.8:
     /// no session named). The session is dropped here at once.
     pub async fn end(&mut self) -> Result<EndOutcome, AccessError> {
+        // A new end: an earlier one's settling no longer applies (#80).
+        self.end_settled = None;
+        self.end_seen = true;
         let r = self.access.end(&mut self.session, &mut self.store, None).await;
         self.reachable = r.as_ref().err().is_none_or(answered);
         if r.is_ok() {
             self.confirmed = Some(Utc::now());
         }
+        // #80: this end's own outcome; a stored end still pending has none yet.
+        self.end_settled = match &r {
+            Ok(EndOutcome::Ended) => Some(EndSettled::Confirmed),
+            Ok(EndOutcome::Unconfirmed) => Some(EndSettled::NotConfirmed(END_UNCONFIRMED_NOTICE)),
+            Ok(EndOutcome::Replaced) => Some(EndSettled::NotConfirmed(END_REPLACED_NOTICE)),
+            Err(_) if self.session.access_end().is_none() => Some(EndSettled::NotConfirmed(END_UNCONFIRMED_NOTICE)),
+            Err(_) => None,
+        };
         self.note_refused().await;
         r
     }
@@ -1037,6 +1131,27 @@ mod tests {
         assert_eq!(link.end().await, Err(AccessError::EndUnconfirmed));
         assert!(link.session.access_end().is_some());
         assert!(link.keep_refreshing(Utc::now()), "settled later by the refresh");
+        // #80: the UI sees the end as pending, not as done.
+        let snap = link.snapshot(Utc::now());
+        assert!(snap.end_pending && !snap.active_at(Utc::now()));
+    }
+
+    /// #80: a confirmed end isn't pending; what an end under way shows
+    /// meanwhile is.
+    #[tokio::test]
+    async fn a_confirmed_end_isnt_pending_and_one_under_way_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        vault.set_session(Some(("s-1", Utc::now() + TimeDelta::hours(1))));
+        link.read_status().await.unwrap();
+        let before = link.snapshot(Utc::now());
+        assert!(!before.end_pending);
+        let meanwhile = before.without_session();
+        assert!(meanwhile.end_pending && !meanwhile.active_at(Utc::now()));
+        assert_eq!(link.end().await, Ok(EndOutcome::Ended));
+        let after = link.snapshot(Utc::now());
+        assert!(!after.end_pending, "the vault answered");
+        assert_eq!(after.end_settled, Some(EndSettled::Confirmed), "#80: and that is a confirmation");
     }
 
     /// Item 4: no answer, and the session the resend named was replaced by
@@ -1062,9 +1177,58 @@ mod tests {
         let (_vault, mut link) = FakeVault::paired_with(dir.path(), true);
         assert!(link.session.access_end().is_some());
         assert!(link.keep_refreshing(Utc::now()));
+        assert!(link.snapshot(Utc::now()).end_pending, "#80: shown as pending after a restart");
         link.refresh().await.unwrap();
         assert!(link.session.access_end().is_none(), "answered");
         assert!(!link.keep_refreshing(Utc::now()));
+        let snap = link.snapshot(Utc::now());
+        assert!(!snap.end_pending, "#80: and no longer once answered");
+        assert_eq!(snap.end_settled, Some(EndSettled::Confirmed), "#80: answered, so confirmed");
+    }
+
+    /// #80 (review H1): a stored end that an old vault settles (no answer,
+    /// `vault.status` without its `session` member) goes away unconfirmed:
+    /// the UI is told so, never that it ended.
+    #[tokio::test]
+    async fn a_stored_end_settled_by_an_old_vault_is_not_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired_with(dir.path(), true);
+        vault.end_mode(fake::EndMode::Silent);
+        vault.absent_session_member();
+        link.refresh().await.unwrap();
+        let snap = link.snapshot(Utc::now());
+        assert!(!snap.end_pending, "no longer sent");
+        assert_eq!(snap.end_settled, Some(EndSettled::NotConfirmed(END_UNCONFIRMED_NOTICE)));
+    }
+
+    /// #80 (lead review M1): a stored end left by an offline End session is
+    /// settled by Start New Session before the refresh gets to it. The
+    /// vault's `ok` is recorded as a confirmation even though the request
+    /// is then denied.
+    #[tokio::test]
+    async fn a_stored_end_settled_by_a_request_is_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired_with(dir.path(), true);
+        assert!(link.snapshot(Utc::now()).end_pending);
+        vault.deny_on_request();
+        assert_eq!(link.request_access(|| {}, || false).await, Err(RequestFailed::Denied));
+        let snap = link.snapshot(Utc::now());
+        assert!(!snap.end_pending, "the request settled it first");
+        assert_eq!(snap.end_settled, Some(EndSettled::Confirmed));
+    }
+
+    /// #80: the settling outcome maps as the module says; a cleared end
+    /// after an error answer is not confirmed, and a still-stored one is
+    /// nothing yet.
+    #[test]
+    fn end_settled_maps_each_outcome() {
+        assert_eq!(end_settled(&Ok(Settled::Answered), true), Some(EndSettled::Confirmed));
+        assert_eq!(end_settled(&Ok(Settled::StatusNull), true), Some(EndSettled::Confirmed));
+        assert_eq!(end_settled(&Ok(Settled::OldVault), true), Some(EndSettled::NotConfirmed(END_UNCONFIRMED_NOTICE)));
+        assert_eq!(end_settled(&Ok(Settled::Moot), true), Some(EndSettled::NotConfirmed(END_REPLACED_NOTICE)));
+        assert_eq!(end_settled(&Ok(Settled::Clear), true), None);
+        assert_eq!(end_settled(&Err(AccessError::Vault("x".into())), true), Some(EndSettled::NotConfirmed(END_UNCONFIRMED_NOTICE)));
+        assert_eq!(end_settled(&Err(AccessError::EndUnconfirmed), false), None);
     }
 
     /// A request from a refused device isn't sent, and says why.
