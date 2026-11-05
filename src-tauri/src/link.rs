@@ -47,8 +47,14 @@ pub const PAIR_ALREADY_NOTICE: &str = "This desktop is already paired. To pair i
 pub const PAIR_FAILED_NOTICE: &str = "Not paired: this desktop couldn't finish pairing with your vault. Start again from your phone.";
 /// NEW TEXT (owner approval needed): paired, but no access session.
 pub const PAIRED_NO_ACCESS_NOTICE: &str = "This desktop is paired, but your vault hasn't given it access yet. Choose Start New Session to ask your phone.";
-/// NEW TEXT (owner approval needed): `too_soon` (§10.3).
-pub const REQUEST_TOO_SOON_NOTICE: &str = "Your vault asks this desktop to wait before asking again. Try again in a few minutes.";
+/// NEW TEXT (owner approval needed, #83): `too_soon` (§10.3), naming when:
+/// `at` is the vault's `allowed_after`, shown in this computer's local time.
+pub fn too_soon_notice(at: DateTime<Utc>) -> String {
+    format!(
+        "Your vault asks this desktop to wait before asking again. You can ask again at {}.",
+        at.with_timezone(&chrono::Local).format("%-I:%M %p")
+    )
+}
 /// NEW TEXT (owner approval needed): the owner declined the request.
 pub const REQUEST_DENIED_NOTICE: &str = "Your phone declined the request. This desktop has no access.";
 /// NEW TEXT (owner approval needed): the owner declined a renewal while a
@@ -233,7 +239,8 @@ fn live_until(access: &Access, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
 /// Why an access request ended without a live session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestFailed {
-    TooSoon,
+    /// Too soon after the last request; the vault's `allowed_after`.
+    TooSoon(DateTime<Utc>),
     Denied,
     /// Declined while a session is live: that one runs on (0.77.0).
     DeniedWhileLive,
@@ -264,7 +271,7 @@ pub fn access_notice(e: &AccessError, store: Option<&CredentialError>) -> String
 /// The plain notice for a failed request.
 pub fn request_notice(f: &RequestFailed, store: Option<&CredentialError>) -> String {
     match f {
-        RequestFailed::TooSoon => REQUEST_TOO_SOON_NOTICE.into(),
+        RequestFailed::TooSoon(at) => too_soon_notice(*at),
         RequestFailed::Denied => REQUEST_DENIED_NOTICE.into(),
         RequestFailed::DeniedWhileLive => RENEWAL_DENIED_NOTICE.into(),
         RequestFailed::Lapsed => REQUEST_LAPSED_NOTICE.into(),
@@ -529,9 +536,9 @@ impl<T: Transport, C: Clock> Link<T, C> {
         };
         let exp = match outcome {
             Ok(RequestOutcome::Requested { exp, .. }) => exp,
-            Ok(RequestOutcome::TooSoon { .. }) => {
+            Ok(RequestOutcome::TooSoon { allowed_after }) => {
                 self.reachable = true;
-                return Err(RequestFailed::TooSoon);
+                return Err(RequestFailed::TooSoon(allowed_after));
             }
             Err(e) => {
                 self.reachable = answered(&e);
@@ -804,6 +811,19 @@ mod tests {
     #[test]
     fn no_session_is_live_without_the_vaults_word() {
         assert_eq!(live_until(&Access::new(), Utc::now()), None);
+    }
+
+    /// #83: the too-soon notice names the time it may ask again, in
+    /// local time, as h:mm AM/PM (no zero padding on the hour).
+    #[test]
+    fn the_too_soon_notice_names_the_time() {
+        let at = Utc::now() + TimeDelta::minutes(7);
+        let n = request_notice(&RequestFailed::TooSoon(at), None);
+        let local = at.with_timezone(&chrono::Local);
+        assert!(n.starts_with("Your vault asks this desktop to wait before asking again. You can ask again at "), "{n}");
+        assert!(n.ends_with(&format!("{}.", local.format("%-I:%M %p"))), "{n}");
+        assert!(n.ends_with("AM.") || n.ends_with("PM."), "{n}");
+        assert!(!n.contains(" 0"), "no zero-padded hour: {n}");
     }
 
     /// The plain notices: an end-pending refusal, a relay failure and a

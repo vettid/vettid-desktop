@@ -131,7 +131,7 @@
     {#if step === 'code'}
       <ol class="instructions">
         <li>Open VettID on your phone.</li>
-        <li>Tap <strong>Connect Desktop</strong> from the feed FAB.</li>
+        <li>Go to <strong>Devices &amp; agents</strong> and tap <strong>Pair a desktop</strong>.</li>
         <li>Copy the pairing code your phone shows, and paste it below.</li>
       </ol>
 
