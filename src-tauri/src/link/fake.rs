@@ -77,6 +77,8 @@ struct State {
     held: bool,
     /// Out of reach: every deposit and collect fails to connect.
     offline: bool,
+    /// Every deposit is refused for now (`503`), while collects work.
+    deposits_fail: bool,
     /// The type of every message the relay took from the device.
     deposited: Vec<String>,
     /// The last `ts` this vault put on a message.
@@ -254,6 +256,7 @@ impl FakeVault {
             locked: false,
             held: false,
             offline: false,
+            deposits_fail: false,
             deposited: Vec::new(),
             last_ts: now - TimeDelta::minutes(1),
             after_request: None,
@@ -370,6 +373,12 @@ impl FakeVault {
         self.lock().after_request = Some(a);
     }
 
+    /// Deposits refused for now with a `503` (`true`), collects still
+    /// answered; or back (`false`).
+    pub(crate) fn fail_deposits(&self, on: bool) {
+        self.lock().deposits_fail = on;
+    }
+
     /// Out of reach (`true`) or back (`false`).
     pub(crate) fn offline(&self, on: bool) {
         self.lock().offline = on;
@@ -395,6 +404,10 @@ impl Transport for FakeVault {
         let mut s = self.lock();
         if s.offline {
             return Err(DepositError { error: RelayError::Connect, possibly_delivered: false });
+        }
+        if s.deposits_fail {
+            let error = RelayError::Relay { status: 503, code: "unavailable".into(), retry_after: None, quota: None };
+            return Err(DepositError { error, possibly_delivered: false });
         }
         if s.revoked {
             let error = RelayError::Relay { status: 403, code: "token_revoked".into(), retry_after: None, quota: None };

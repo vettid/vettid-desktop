@@ -530,10 +530,15 @@ impl<T: Transport, C: Clock> Link<T, C> {
 
     /// `vault.status`, once, and what its outcome says of the vault
     /// (VAULT-LOCK-PLAN §3.1). Answered: confirmed now. Unanswered (the
-    /// relay or the vault didn't answer): `Open` becomes `Unknown`; and
-    /// `Locked` stays `Locked` if the relay took the collects (a locked
-    /// vault answers nothing, §12.1), or is shown "as of" when the relay
-    /// couldn't be reached ([`Session::relay_failed`]).
+    /// relay or the vault didn't answer): `Open` and `Held` become
+    /// `Unknown` (a held vault answers `vault.status`); and `Locked` stays
+    /// `Locked` only on evidence that the relay took this status request
+    /// and a collect got through after it, with the last collect not
+    /// failed ([`Session::last_request_reached`],
+    /// [`Session::relay_failed`]): a locked vault answers nothing (§12.1).
+    /// Without that evidence (out of reach, a deposit refused for now, the
+    /// outbox held after a 429 or a 5xx) it is shown "as of" (lead review
+    /// M4).
     async fn status_once(&mut self) -> Result<StatusRead, AccessError> {
         let r = self.access.read_status(&mut self.session, &mut self.store).await;
         let now = Utc::now();
@@ -545,13 +550,13 @@ impl<T: Transport, C: Clock> Link<T, C> {
                 self.locked_as_of = false;
             }
             Err(e) if !answered(e) => {
-                self.access.vault_unconfirmed();
+                self.access.status_unanswered();
                 if matches!(self.access.vault(), VaultState::Locked { .. }) {
-                    if self.session.relay_failed() || matches!(e, AccessError::Session(SessionError::Relay(_))) {
-                        self.locked_as_of = true;
-                    } else {
+                    if self.session.last_request_reached() && !self.session.relay_failed() {
                         self.locked_as_of = false;
                         self.vault_checked = Some(now);
+                    } else {
+                        self.locked_as_of = true;
                     }
                 }
             }
@@ -700,24 +705,18 @@ impl<T: Transport, C: Clock> Link<T, C> {
         self.session.unlinked().is_some()
     }
 
-    /// Whether the background refresh still has something to do: a live
-    /// session to keep in view (and confirmed), an end to settle, no
-    /// baseline yet (`vault.status` failed: the session is learned once the
-    /// network is back), or a vault that is held, locked or unknown (so
-    /// that an unlock, a check or a lock is noticed, VAULT-LOCK-PLAN
-    /// §3.1). A refused device has none of those (nothing is
+    /// Whether the background refresh still has something to do. While
+    /// the link is open, always: the vault's state is kept in view in every
+    /// state, Open included, so that a lock whose notice was missed decays
+    /// Open to Unknown (VAULT-LOCK-PLAN §3.1; lead review M2), besides a
+    /// live session to keep confirmed, an end to settle and a baseline to
+    /// get. A refused device has none of those (nothing is
     /// sent to it), but its mailbox is still looked at for a
     /// `device.unlinked` (§8.6): true while it is refused and not unlinked.
     /// So whoever finds a refusal, or stops the refresh and restarts it
     /// "if needed", restarts it for that too.
-    pub fn keep_refreshing(&self, now: DateTime<Utc>) -> bool {
-        if self.refused() {
-            return !self.unlinked();
-        }
-        self.access.active_at(now)
-            || self.session.access_end().is_some()
-            || self.confirmed.is_none()
-            || !matches!(self.vault_now(now), VaultState::Open { .. })
+    pub fn keep_refreshing(&self, _now: DateTime<Utc>) -> bool {
+        !self.refused() || !self.unlinked()
     }
 
     /// What the UI may see now. A refused device shows no session; a
@@ -727,7 +726,11 @@ impl<T: Transport, C: Clock> Link<T, C> {
         let refused = self.refused();
         let known = if refused { None } else { live_until(&self.access, now) };
         let cap = self.confirmed.map(|c| c + STALE_AFTER);
-        let live_until = known.zip(cap).map(|(u, c)| u.min(c)).filter(|u| *u >= now);
+        let vault = if refused { VaultView::default() } else { self.vault_view(now) };
+        // Live only while the vault view is Open too, so the session's cap
+        // (`confirmed`, which an answered end also sets) and the vault's
+        // (`vault_checked`) can't disagree (lead review L3).
+        let live_until = known.zip(cap).map(|(u, c)| u.min(c)).filter(|u| *u >= now).filter(|_| vault.state == VaultShown::Open);
         let stale = known.is_some() && live_until.is_none();
         let current = live_until.and(self.access.current());
         Snapshot {
@@ -744,7 +747,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
             end_settled: self.end_settled.clone(),
             end_seen: self.end_seen,
             // A refused device knows nothing of the vault.
-            vault: if refused { VaultView::default() } else { self.vault_view(now) },
+            vault,
         }
     }
 
@@ -1003,9 +1006,23 @@ async fn finish_unlinked(shared: &Shared, erased: bool) {
     }
 }
 
+/// Whether the computer slept (or hibernated) through a wait of the
+/// refresh loop that was due to end at `due`: the wall clock at `woke` is
+/// more than two refreshes past it (VAULT-LOCK-PLAN §3.1, lead review M1).
+/// The wall clock, not `Instant`: whether a monotonic clock counts the
+/// time asleep differs by OS (it does on Windows, not on Linux or macOS),
+/// while the wall clock always moves on. A clock set forward that far reads
+/// as a resume too, which is the safe side (Open becomes Unknown until a
+/// status answers).
+pub fn slept_through(due: DateTime<Utc>, woke: DateTime<Utc>) -> bool {
+    due.checked_add_signed(TimeDelta::seconds(2 * REFRESH_EVERY.as_secs() as i64)).is_some_and(|late| woke > late)
+}
+
 /// The background refresh's loop over `link`: after `first`, a
 /// [`refresh_round`] every [`REFRESH_EVERY`] until there is nothing left to
-/// keep up ([`Link::keep_refreshing`]) or the link is gone. A refused
+/// keep up ([`Link::keep_refreshing`], which since #77 holds while the link
+/// is open) or the link is gone. A wall-clock jump past a round reads as a
+/// sleep or resume ([`slept_through`]): [`Link::resumed`] first. A refused
 /// device is told so once ([`REFUSED_NOTICE`]); from then on, and for as
 /// long as it is refused but not unlinked, the loop collects its mailbox
 /// every `refused_every` ([`recheck_refused_round`]), for a
@@ -1021,8 +1038,18 @@ pub async fn refresh_loop<T: Transport, C: Clock>(
 ) -> Option<bool> {
     let mut wait = first;
     loop {
+        let due = TimeDelta::from_std(wait).ok().and_then(|w| Utc::now().checked_add_signed(w));
         tokio::time::sleep(wait).await;
+        // Read before taking the lock: an operation holding it (a request
+        // waiting for the phone) is not a sleep.
+        let woke = Utc::now();
         let mut slot = link.lock().await;
+        if due.is_some_and(|d| slept_through(d, woke)) {
+            if let Some(l) = slot.as_mut() {
+                log::info!("link: the computer slept; the vault's state is checked again");
+                l.resumed();
+            }
+        }
         if slot.as_ref().is_some_and(|l| l.refused()) {
             // Already found refused (by this task, or by an operation that
             // told the person): only the slow look for `device.unlinked`.
@@ -1349,14 +1376,17 @@ mod tests {
     }
 
     /// LOW 7: with no baseline (no successful vault.status yet) the refresh
-    /// keeps going; once the vault says there is no session, it stops.
+    /// keeps going. (Once the vault says there is no session it used to
+    /// stop; since lead review M2 of #77 it goes on while the link is open,
+    /// so that the vault's Open decays: see
+    /// `an_idle_open_vault_decays_to_unknown`.)
     #[tokio::test]
     async fn the_refresh_runs_until_there_is_a_baseline() {
         let dir = tempfile::tempdir().unwrap();
         let (_vault, mut link) = FakeVault::paired(dir.path());
         assert!(link.keep_refreshing(Utc::now()), "no baseline yet");
         link.read_status().await.unwrap();
-        assert!(!link.keep_refreshing(Utc::now()), "no session, nothing to keep up");
+        assert!(link.keep_refreshing(Utc::now()), "no session, but the vault's state is kept in view");
     }
 
     /// MEDIUM 4: what a status read collected besides its answer is handed
@@ -1517,7 +1547,9 @@ mod tests {
         assert!(link.snapshot(Utc::now()).end_pending, "#80: shown as pending after a restart");
         link.refresh().await.unwrap();
         assert!(link.session.access_end().is_none(), "answered");
-        assert!(!link.keep_refreshing(Utc::now()));
+        // Nothing left to settle; the refresh goes on for the vault's
+        // state (lead review M2 of #77).
+        assert!(link.keep_refreshing(Utc::now()));
         let snap = link.snapshot(Utc::now());
         assert!(!snap.end_pending, "#80: and no longer once answered");
         assert_eq!(snap.end_settled, Some(EndSettled::Confirmed), "#80: answered, so confirmed");
@@ -1588,13 +1620,16 @@ mod tests {
     use fake::{owner_check, AfterRequest, UNLOCK_1};
 
     const UNLOCK_2: &str = "fedcba9876543210fedcba9876543210";
-    /// The type the desktop never sends, spelled so that this file doesn't
-    /// hold it as one string (see `no_code_path_sends_vault_lock`).
-    const VAULT_LOCK: &str = concat!("vault", ".lock");
+    /// The type the desktop never sends, put together at run time so that
+    /// no string literal here holds it or a piece of it (see
+    /// `no_code_path_sends_vault_lock`).
+    fn vault_lock() -> String {
+        ["vault", "lock"].join(".")
+    }
 
     /// Owner decision (2026-11-05): the desktop never sends `vault.lock`.
     fn never_sent_a_lock(vault: &FakeVault) {
-        assert!(!vault.deposited().iter().any(|k| k == VAULT_LOCK), "{:?}", vault.deposited());
+        assert!(!vault.deposited().iter().any(|k| *k == vault_lock()), "{:?}", vault.deposited());
     }
 
     fn statuses(vault: &FakeVault) -> usize {
@@ -1784,11 +1819,142 @@ mod tests {
         let (_vault, mut link) = live(dir.path()).await;
         let now = Utc::now();
         link.vault_checked = Some(now - STALE_AFTER - TimeDelta::seconds(1));
-        assert_eq!(link.snapshot(now).vault.state, VaultShown::Unknown);
+        link.confirmed = link.vault_checked;
+        let snap = link.snapshot(now);
+        assert_eq!(snap.vault.state, VaultShown::Unknown);
+        assert!(!snap.active_at(now), "no session shown live");
+        assert_eq!(snap.session_id, None);
         assert_eq!(link.vault_now(now), VaultState::Unknown);
         assert!(link.keep_refreshing(now));
         link.refresh().await.unwrap();
+        let snap = link.snapshot(Utc::now());
+        assert_eq!(snap.vault.state, VaultShown::Open);
+        assert!(snap.active_at(Utc::now()));
+    }
+
+    /// Lead review L3: the session's cap (`confirmed`, which an answered end
+    /// sets too) and the vault's (`vault_checked`) can't disagree: with the
+    /// vault view no longer Open, no session is shown live, even though the
+    /// session was confirmed lately. It is "stale" meanwhile.
+    #[tokio::test]
+    async fn no_session_is_shown_live_unless_the_vault_view_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_vault, mut link) = live(dir.path()).await;
+        let now = Utc::now();
+        link.vault_checked = Some(now - STALE_AFTER - TimeDelta::seconds(1));
+        link.confirmed = Some(now);
+        let snap = link.snapshot(now);
+        assert_eq!(snap.vault.state, VaultShown::Unknown);
+        assert!(!snap.active_at(now));
+        assert_eq!((snap.session_id.as_deref(), snap.ends_at, snap.live_until), (None, None, None));
+        assert!(snap.stale, "shown as not confirmed");
+    }
+
+    /// Lead review M2: an idle desktop (Open, no session) keeps refreshing,
+    /// so a lock whose notice it missed doesn't leave Open on the screen:
+    /// past STALE_AFTER the view is Unknown, and so after the next refresh,
+    /// which the locked vault leaves unanswered.
+    #[tokio::test]
+    async fn an_idle_open_vault_decays_to_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        link.read_status().await.unwrap();
         assert_eq!(link.snapshot(Utc::now()).vault.state, VaultShown::Open);
+        assert!(link.keep_refreshing(Utc::now()), "Open, no session: still refreshing");
+        vault.lock_silently();
+        let now = Utc::now();
+        link.vault_checked = Some(now - STALE_AFTER - TimeDelta::seconds(1));
+        assert_eq!(link.snapshot(now).vault.state, VaultShown::Unknown);
+        let mut slot = Some(link);
+        match refresh_round(&mut slot).await {
+            Round::Continue(snap) => assert_eq!(snap.vault.state, VaultShown::Unknown),
+            other => panic!("got {other:?}"),
+        }
+        never_sent_a_lock(&vault);
+    }
+
+    /// Lead review L2: a held vault answers `vault.status`, so an
+    /// unanswered one turns Held into Unknown.
+    #[tokio::test]
+    async fn held_becomes_unknown_on_an_unanswered_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = live(dir.path()).await;
+        vault.hold(true, "");
+        link.refresh().await.unwrap();
+        assert_eq!(link.snapshot(Utc::now()).vault.state, VaultShown::Held);
+        vault.lock_silently();
+        assert!(link.refresh().await.is_err());
+        let snap = link.snapshot(Utc::now());
+        assert_eq!(snap.vault.state, VaultShown::Unknown);
+        assert!(!snap.active_at(Utc::now()));
+    }
+
+    /// Lead review M3: a newer lock notice for another unlock makes Open
+    /// Unknown (never Locked) until the status read at once says; if that
+    /// read goes unanswered too, it stays Unknown.
+    #[tokio::test]
+    async fn a_newer_lock_notice_for_another_unlock_leaves_nothing_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = live(dir.path()).await;
+        vault.event_now("vault.locking", &locking_body(UNLOCK_2), Some(Utc::now() + TimeDelta::seconds(60)));
+        let msgs = link.session.poll(&mut link.store).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        for m in &msgs {
+            assert_eq!(link.access.observe(&mut link.session, &mut link.store, m), Ok(Some(AccessEvent::ReadStatus)));
+        }
+        let snap = link.snapshot(Utc::now());
+        assert!(!snap.active_at(Utc::now()), "not live while the status is read");
+        assert_eq!(snap.vault.state, VaultShown::Unknown);
+        assert!(link.access.take_status_wanted(), "the status is still asked for");
+        // The re-read, unanswered: still Unknown, never Locked.
+        vault.event_now("vault.locking", &locking_body(UNLOCK_2), Some(Utc::now() + TimeDelta::seconds(60)));
+        vault.lock_silently();
+        let _ = link.refresh().await;
+        assert_eq!(link.snapshot(Utc::now()).vault.state, VaultShown::Unknown);
+    }
+
+    /// Lead review M4: deposits refused for now (a 503) while collects
+    /// work: the status request never reached the relay, so a Locked
+    /// shown "as of" stays "as of", and its confirmation time doesn't move.
+    #[tokio::test]
+    async fn locked_stays_as_of_while_the_status_isnt_deposited() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = live(dir.path()).await;
+        vault.lock_vault(None);
+        let _ = link.refresh().await;
+        assert_eq!(link.snapshot(Utc::now()).vault.state, VaultShown::Locked);
+        // Reached and unanswered: confirmed.
+        let _ = link.refresh().await;
+        assert!(link.session.last_request_reached());
+        let snap = link.snapshot(Utc::now());
+        assert_eq!((snap.vault.state, snap.vault.as_of), (VaultShown::Locked, None));
+        link.resumed();
+        let checked = link.vault_checked.expect("confirmed");
+        vault.fail_deposits(true);
+        for _ in 0..2 {
+            let _ = link.refresh().await;
+            assert!(!link.session.relay_failed(), "collects get through");
+            assert!(!link.session.last_request_reached(), "the status wasn't deposited");
+            let snap = link.snapshot(Utc::now());
+            assert_eq!(snap.vault.state, VaultShown::Locked);
+            assert_eq!(snap.vault.as_of, Some(checked), "still as of the last confirmation");
+        }
+        never_sent_a_lock(&vault);
+    }
+
+    /// Lead review M1: the refresh loop takes a wall-clock jump of more
+    /// than two refreshes past the expected round as a sleep or resume.
+    #[test]
+    fn a_wall_clock_jump_past_the_round_reads_as_a_resume() {
+        let due = Utc::now();
+        let two = TimeDelta::seconds(2 * REFRESH_EVERY.as_secs() as i64);
+        assert!(!slept_through(due, due));
+        assert!(!slept_through(due, due + TimeDelta::seconds(5)), "a late round");
+        assert!(!slept_through(due, due + two), "exactly two refreshes late");
+        assert!(slept_through(due, due + two + TimeDelta::seconds(1)));
+        assert!(slept_through(due, due + TimeDelta::hours(8)), "a night asleep");
+        assert!(!slept_through(due, due - TimeDelta::hours(1)), "a clock set back");
+        assert!(!slept_through(DateTime::<Utc>::MAX_UTC, DateTime::<Utc>::MAX_UTC), "no overflow");
     }
 
     /// After sleep or resume, Open becomes Unknown (nothing live) until a
@@ -1940,45 +2106,81 @@ mod tests {
         never_sent_a_lock(&vault);
     }
 
-    /// No code path sends `vault.lock`: it can only go through
-    /// `Session::send_once` (the outbox refuses it, §8.6), which nothing in
-    /// the desktop or the access module calls; and the type is named as a
-    /// string only in the session engine's guard and its tests.
+    /// No code path sends `vault.lock` (owner decision, 2026-11-05). It
+    /// can go only through `Session::send_once` (the outbox refuses it,
+    /// §8.6). Across every crate under src-tauri (the desktop, vettid-device,
+    /// vettid-relay, vettid-vms), outside the session engine's own guard
+    /// (`crates/vettid-device/src/session.rs`) and test files:
+    /// - no call of `send_once(`;
+    /// - no string literal names the type, or builds it: one holding it
+    ///   (not `vault.locking`), one ending in `vault.`, holding `vault.{`
+    ///   (a `format!`), or starting with `.lock` (lead review L5).
     #[test]
     fn no_code_path_sends_vault_lock() {
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for e in std::fs::read_dir(dir).unwrap() {
                 let p = e.unwrap().path();
+                let name = p.file_name().unwrap().to_string_lossy().to_string();
                 if p.is_dir() {
-                    walk(&p, out);
+                    if !["target", "node_modules", "gen"].contains(&name.as_str()) {
+                        walk(&p, out);
+                    }
                 } else if p.extension().is_some_and(|x| x == "rs") {
                     out.push(p);
                 }
             }
         }
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let named = format!("{VAULT_LOCK}\"");
+        let kind = vault_lock();
+        let building = |seg: &str| {
+            let named = seg.match_indices(&kind).any(|(i, _)| !seg[i + kind.len()..].starts_with("ing"));
+            // A piece of a type is one word: a sentence ending in "your
+            // vault." is not one.
+            let piece = !seg.contains(char::is_whitespace)
+                && (seg.ends_with(&format!("{}.", "vault")) || seg.starts_with(&format!(".{}", "lock")));
+            named || piece || seg.contains(&format!("{}.{{", "vault"))
+        };
+        // The check itself catches what it should, and not more.
+        for (seg, hit) in [
+            (kind.clone(), true),
+            (format!("{kind} now"), true),
+            (format!("{}.{{}}", "vault"), true),
+            (format!("{}.", "vault"), true),
+            (format!(".{}", "lock"), true),
+            (format!("{kind}ing"), false),
+            (format!("to your {}.", "vault"), false),
+        ] {
+            assert_eq!(building(&seg), hit, "{seg}");
+        }
         let call = concat!("send", "_once(");
-        let (mut names, mut calls) = (Vec::new(), Vec::new());
-        for dir in ["src", "crates/vettid-device/src"] {
-            let mut files = Vec::new();
-            walk(&root.join(dir), &mut files);
-            assert!(!files.is_empty());
-            for f in files {
-                let rel = f.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
-                let text = std::fs::read_to_string(&f).unwrap();
-                for (i, line) in text.lines().enumerate() {
-                    if line.contains(&named) {
-                        names.push(format!("{rel}:{}", i + 1));
-                    }
-                    if line.contains(call) {
-                        calls.push(format!("{rel}:{}", i + 1));
-                    }
+        let (mut found, mut in_guard, mut crates) = (Vec::new(), 0, std::collections::BTreeSet::new());
+        let mut files = Vec::new();
+        walk(&root.join("src"), &mut files);
+        walk(&root.join("crates"), &mut files);
+        for f in files {
+            let rel = f.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+            if let Some(c) = rel.strip_prefix("crates/").and_then(|r| r.split('/').next()) {
+                crates.insert(c.to_string());
+            }
+            let guard = rel == "crates/vettid-device/src/session.rs";
+            let test = rel.contains("/tests/") || rel.ends_with("/tests.rs") || rel.starts_with("tests/");
+            let text = std::fs::read_to_string(&f).unwrap();
+            for (i, line) in text.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let hit = line.contains(call) || line.split('"').skip(1).step_by(2).any(building);
+                if hit && guard {
+                    in_guard += 1;
+                } else if hit && !test {
+                    found.push(format!("{rel}:{}: {}", i + 1, line.trim()));
                 }
             }
         }
-        let engine = |l: &String| l.starts_with("crates/vettid-device/src/session.rs:") || l.starts_with("crates/vettid-device/src/session/");
-        assert!(!names.is_empty() && names.iter().all(engine), "named outside the engine's guard: {names:?}");
-        assert!(calls.iter().all(engine), "send_once called outside the engine: {calls:?}");
+        for c in ["vettid-device", "vettid-relay", "vettid-vms"] {
+            assert!(crates.contains(c), "{c} scanned: {crates:?}");
+        }
+        assert!(in_guard > 0, "the engine's guard is where the type is named");
+        assert!(found.is_empty(), "the lock type named, built or sendable outside the engine's guard: {found:#?}");
     }
 }

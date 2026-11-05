@@ -58,10 +58,12 @@
 //! - These statements are ordered by the vault's `ts` (and `seq`), as the
 //!   session's are, in their own order: an older one never replaces a
 //!   newer one (§8.4).
-//! - A `vault.locking` naming another `unlock_id` changes nothing (§10.2
-//!   "Locks"), and one when no `unlock_id` is held (or one without the
-//!   member) makes the state `Unknown`, never `Locked` (owner decision 1,
-//!   2026-11-05): either way the event says to read `vault.status` now
+//! - A `vault.locking` naming another `unlock_id` never sets `Locked`
+//!   (§10.2 "Locks"), but a newer one makes the state `Unknown` (the
+//!   `unlock_id` held is out of date); one when no `unlock_id` is held (or
+//!   one without the member) makes it `Unknown` too, never `Locked` (owner
+//!   decision 1, 2026-11-05): either way the event says to read
+//!   `vault.status` now
 //!   ([`AccessEvent::ReadStatus`]). A status never sets `Open` with an
 //!   `unlock_id` a lock notice has ended.
 //! - `device.session.granted` and `.ended` never change it (§3.6.3).
@@ -682,6 +684,17 @@ impl Access {
         }
     }
 
+    /// A `vault.status` went unanswered: `Open` and `Held` become
+    /// `Unknown` (a held vault still answers `vault.status`, §3.6.3, so
+    /// silence says it may no longer be held). `Locked` stays: the app
+    /// decides whether it is still confirmed (VAULT-LOCK-PLAN §3.1; lead
+    /// review L2).
+    pub fn status_unanswered(&mut self) {
+        if matches!(self.vault, VaultState::Open { .. } | VaultState::Held { .. }) {
+            self.vault = VaultState::Unknown;
+        }
+    }
+
     /// Whether a lock or hold notice observed since the last call asked
     /// for `vault.status` to be read now ([`AccessEvent::ReadStatus`], or
     /// a notice that didn't check out); cleared by the call.
@@ -746,7 +759,7 @@ impl Access {
             // §11.4 time rule needs an unlock result, which a desktop
             // doesn't have. As with none held (owner decision 1,
             // 2026-11-05): Unknown, never Locked, and read the status.
-            self.vault = VaultState::Unknown;
+            self.unknown_from_notice(at, seq);
             return AccessEvent::ReadStatus;
         };
         let known = self.ended.contains(&named);
@@ -765,18 +778,39 @@ impl Access {
                     AccessEvent::ReadStatus
                 }
             }
-            // Another unlock's (R1: ignored), but the unlock_id held may
-            // be out of date: read the status.
-            Some(_) => AccessEvent::ReadStatus,
+            // Another unlock's. R1's "MUST ignore" is about confirming a
+            // lock: this notice confirms nothing, and Locked is never set
+            // on it. But a newer notice of another unlock shows the
+            // unlock_id held is out of date, so the vault's word that it is
+            // open is no longer current: Unknown until the status, read
+            // now, says (lead review M3). An older one changes nothing.
+            Some(_) => {
+                if self.vault_not_older(at, seq) {
+                    self.vault_mark(at, seq);
+                    self.vault = VaultState::Unknown;
+                }
+                AccessEvent::ReadStatus
+            }
             // The lock already applied, again: nothing new.
             None if known => AccessEvent::ReadStatus,
             // None held (no status read yet, or a vault before release L):
             // owner decision 1 (2026-11-05): Unknown, never Locked.
             None => {
-                self.vault = VaultState::Unknown;
+                self.unknown_from_notice(at, seq);
                 AccessEvent::ReadStatus
             }
         }
+    }
+
+    /// A lock notice this desktop can't place (none held, or none named):
+    /// Unknown in any case (owner decision 1, 2026-11-05), and, when the
+    /// notice isn't older than what is applied, its order is marked, so a
+    /// status from before it can't set Open again (lead review L1).
+    fn unknown_from_notice(&mut self, at: DateTime<Utc>, seq: Option<u64>) {
+        if self.vault_not_older(at, seq) {
+            self.vault_mark(at, seq);
+        }
+        self.vault = VaultState::Unknown;
     }
 
     /// Apply what the vault said at `at` (its `ts`) with `seq`: `Some` a

@@ -281,6 +281,26 @@ pub struct Session<T: Transport, C: Clock> {
     probe_next: bool,
     outbox_backoff: TimeDelta,
     refresh_sent: Option<DateTime<Utc>>,
+    /// The requests this session sent lately (newest last, at most
+    /// [`TRACKED_KEEP`]), for [`Session::last_request_reached`]. In memory
+    /// only.
+    tracked: Vec<Tracked>,
+    /// The inner id of the last [`Session::request`] or
+    /// [`Session::request_again`].
+    last_request: Option<String>,
+}
+
+/// How many sent requests [`Session`] tracks.
+const TRACKED_KEEP: usize = 16;
+
+/// A request this session sent: whether the relay took its envelope (a
+/// deposit answered `ok`, not a "possibly delivered"), and whether a
+/// collect got through after that.
+struct Tracked {
+    id: String,
+    payload: Vec<u8>,
+    deposited: bool,
+    collected_after: bool,
 }
 
 impl<T: Transport, C: Clock> std::fmt::Debug for Session<T, C> {
@@ -353,6 +373,8 @@ impl<T: Transport, C: Clock> Session<T, C> {
             probe_next: false,
             outbox_backoff: OUTBOX_BACKOFF,
             refresh_sent: None,
+            tracked: Vec::new(),
+            last_request: None,
         };
         // At most the newest MAX_AWAITING, the others aborted (their queued
         // hs.resp taken out of the outbox).
@@ -481,6 +503,18 @@ impl<T: Transport, C: Clock> Session<T, C> {
     /// (§12.1), so that is not the relay's failure (VAULT-LOCK-PLAN §3.1).
     pub fn relay_failed(&self) -> bool {
         self.probe_next
+    }
+
+    /// Whether the relay took the last [`Session::request`] (or
+    /// [`Session::request_again`]) and a collect got through after that:
+    /// the evidence that a request left unanswered reached the relay, and
+    /// the vault didn't answer it (a locked vault collects nothing,
+    /// §12.1). False while it waits in the outbox (a hold after a 429 or a
+    /// 5xx, a deposit that failed), when its deposit was only "possibly
+    /// delivered", and before a collect after it (VAULT-LOCK-PLAN §3.1).
+    pub fn last_request_reached(&self) -> bool {
+        let Some(id) = &self.last_request else { return false };
+        self.tracked.iter().any(|t| t.id == *id && t.deposited && t.collected_after)
     }
 
     fn own_pk(&self) -> VerifyingKey {
@@ -627,6 +661,16 @@ impl<T: Transport, C: Clock> Session<T, C> {
             self.rollback(cp);
             return Err(e.into());
         }
+        if request {
+            // Queued last: its envelope is the outbox's last entry.
+            if let Some(entry) = self.state.outbox.last() {
+                self.tracked.retain(|t| t.id != id);
+                self.tracked.push(Tracked { id: id.clone(), payload: entry.payload.clone(), deposited: false, collected_after: false });
+                if self.tracked.len() > TRACKED_KEEP {
+                    self.tracked.remove(0);
+                }
+            }
+        }
         // Stored: a temporary failure or a store error after the deposit
         // doesn't change the answer. Only a refusal does: the device was
         // removed, and this message won't go (it is reported as dropped).
@@ -707,7 +751,9 @@ impl<T: Transport, C: Clock> Session<T, C> {
     /// `TimedOut` the request stays armed: [`Session::resend`] it with the
     /// same id rather than sending a new one.
     pub async fn request(&mut self, store: &mut impl Persist, kind: &str, body: &str, timeout: TimeDelta) -> Result<Inner, SessionError> {
+        self.last_request = None;
         let id = self.send(store, kind, body, true).await?;
+        self.last_request = Some(id.clone());
         self.wait_for(store, id, timeout).await
     }
 
@@ -715,7 +761,9 @@ impl<T: Transport, C: Clock> Session<T, C> {
     /// application retry, §8.6): the vault answers it from its cache
     /// instead of acting twice.
     pub async fn request_again(&mut self, store: &mut impl Persist, id: &str, kind: &str, body: &str, timeout: TimeDelta) -> Result<Inner, SessionError> {
+        self.last_request = None;
         let id = self.resend(store, id, kind, body, true).await?;
+        self.last_request = Some(id.clone());
         self.wait_for(store, id, timeout).await
     }
 
@@ -777,7 +825,12 @@ impl<T: Transport, C: Clock> Session<T, C> {
                 continue;
             }
             let taken = match self.transport.deposit(&to.url, &to.mailbox, &token, &e.payload).await {
-                Ok(_) => true,
+                Ok(_) => {
+                    if let Some(t) = self.tracked.iter_mut().find(|t| t.payload == e.payload) {
+                        t.deposited = true;
+                    }
+                    true
+                }
                 Err(d) => match &d.error {
                     RelayError::Relay { code, .. } if code == "token_revoked" => {
                         self.state.refused = true;
@@ -895,6 +948,11 @@ impl<T: Transport, C: Clock> Session<T, C> {
             self.collect_backoff = COLLECT_BACKOFF;
         }
         self.probe_next = false;
+        // What the relay took before this collect was sent is now known to
+        // have reached it, with a collect after (`last_request_reached`).
+        for t in self.tracked.iter_mut().filter(|t| t.deposited) {
+            t.collected_after = true;
+        }
         if self.hold_releasable {
             self.hold_until = self.clock.now().min(self.hold_until);
             self.outbox_backoff = OUTBOX_BACKOFF;

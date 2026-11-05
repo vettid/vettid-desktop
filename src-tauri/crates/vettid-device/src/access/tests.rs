@@ -1111,23 +1111,65 @@ async fn a_matching_lock_notice_locks() {
     }
 }
 
-/// A `vault.locking` naming another unlock changes nothing, and asks for a
-/// status read now.
+/// A `vault.locking` naming another unlock never locks, and asks for a
+/// status read now. Newer than what is applied, it makes the state Unknown
+/// (the unlock_id held is out of date: lead review M3), and a status from
+/// before it can't open again; older, it changes nothing.
 #[tokio::test]
 async fn a_lock_notice_for_another_unlock_reads_the_status() {
     let (relay, mut vault, faults, mut store) = paired().await;
     let mut s = session(&relay, &faults, &mut store);
     let mut a = access();
     status_read(&mut a, &mut s, &mut store, &mut vault, vault_status_body(Some(UNLOCK_A), None, Some("s-1"))).await.unwrap();
+    let applied = a.vault_learned_at().unwrap();
+    // Older than the status: no change.
     let before = a.vault().clone();
-    assert_eq!(a.observe(&mut s, &mut store, &event_at(TYPE_LOCKING, &locking(Some(UNLOCK_B), None), Utc::now())), Ok(Some(AccessEvent::ReadStatus)));
+    let old = event_at(TYPE_LOCKING, &locking(Some(UNLOCK_B), None), applied - TimeDelta::seconds(1));
+    assert_eq!(a.observe(&mut s, &mut store, &old), Ok(Some(AccessEvent::ReadStatus)));
     assert_eq!(a.vault(), &before, "no change");
     assert!(a.active_at(Utc::now()));
     assert!(a.take_status_wanted());
     assert!(!a.take_status_wanted(), "taken");
+    // Newer: Unknown, never Locked, and the status is asked for.
+    let t = Utc::now();
+    let other = "00000000000000000000000000000001";
+    assert_eq!(a.observe(&mut s, &mut store, &event_at(TYPE_LOCKING, &locking(Some(other), None), t)), Ok(Some(AccessEvent::ReadStatus)));
+    assert_eq!(a.vault(), &VaultState::Unknown);
+    assert!(!a.active_at(Utc::now()), "nothing live until the status says");
+    assert!(a.take_status_wanted());
+    assert_eq!(a.unlock_id(), Some(UNLOCK_A), "the unlock_id held is kept: a notice naming it still applies");
+    // A status from before that notice doesn't open.
+    a.observe(&mut s, &mut store, &status_at(&vault_status_body(Some(UNLOCK_A), None, Some("s-1")), t - TimeDelta::milliseconds(500))).unwrap();
+    assert_eq!(a.vault(), &VaultState::Unknown);
     // B is over, so a later status naming B doesn't open.
-    a.observe(&mut s, &mut store, &status_at(&vault_status_body(Some(UNLOCK_B), None, Some("s-1")), Utc::now() + TimeDelta::seconds(1))).unwrap();
-    assert_eq!(a.unlock_id(), Some(UNLOCK_A), "a status naming an ended unlock is ignored");
+    a.observe(&mut s, &mut store, &status_at(&vault_status_body(Some(UNLOCK_B), None, Some("s-1")), t + TimeDelta::seconds(1))).unwrap();
+    assert_eq!(a.vault(), &VaultState::Unknown, "a status naming an ended unlock is ignored");
+    // A newer status of the current unlock opens again.
+    a.observe(&mut s, &mut store, &status_at(&vault_status_body(Some(UNLOCK_A), None, Some("s-1")), t + TimeDelta::seconds(2))).unwrap();
+    assert!(matches!(a.vault(), VaultState::Open { .. }));
+    assert!(a.active_at(Utc::now()));
+}
+
+/// Lead review L1: a notice this desktop can't place (none named, none
+/// held) marks the order when it isn't older, so a status from before it
+/// can't set Open again.
+#[tokio::test]
+async fn a_notice_it_cant_place_keeps_older_statuses_out() {
+    let (relay, _vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let t = Utc::now();
+    for (held, notice) in [(Some(UNLOCK_A), locking(None, None)), (None, locking(Some(UNLOCK_A), None))] {
+        let mut a = access();
+        a.observe(&mut s, &mut store, &status_at(&vault_status_body(held, None, Some("s-1")), t)).unwrap();
+        baseline_only(&mut a);
+        assert!(a.active_at(Utc::now()));
+        assert_eq!(a.observe(&mut s, &mut store, &event_at(TYPE_LOCKING, &notice, t + TimeDelta::seconds(2))), Ok(Some(AccessEvent::ReadStatus)));
+        assert_eq!(a.vault(), &VaultState::Unknown, "{notice}");
+        a.observe(&mut s, &mut store, &status_at(&vault_status_body(held, None, Some("s-1")), t + TimeDelta::seconds(1))).unwrap();
+        assert_eq!(a.vault(), &VaultState::Unknown, "a status from before the notice doesn't open: {notice}");
+        a.observe(&mut s, &mut store, &status_at(&vault_status_body(held, None, Some("s-1")), t + TimeDelta::seconds(3))).unwrap();
+        assert!(matches!(a.vault(), VaultState::Open { .. }), "a newer one does: {notice}");
+    }
 }
 
 /// Owner decision 1 (2026-11-05): a `vault.locking` when no unlock_id is
@@ -1170,15 +1212,24 @@ async fn an_expired_lock_notice_changes_nothing() {
     let mut s = session(&relay, &faults, &mut store);
     let mut a = access();
     status_read(&mut a, &mut s, &mut store, &mut vault, vault_status_body(Some(UNLOCK_A), None, Some("s-1"))).await.unwrap();
+    // Newer than the status (stamped a minute ago) and naming its unlock:
+    // applied, it would lock.
     let mut expired = event(TYPE_LOCKING, &locking(Some(UNLOCK_A), None));
-    expired.ts = Utc::now() - TimeDelta::minutes(2);
-    expired.exp = Some(Utc::now() - TimeDelta::minutes(1));
+    expired.ts = Utc::now() - TimeDelta::seconds(30);
+    expired.exp = Some(Utc::now() - TimeDelta::seconds(1));
+    let copy = expired.clone();
     deposit(&mut vault, expired).await;
     deposit(&mut vault, event(TYPE_LOCKING, &locking(Some(UNLOCK_A), None))).await;
     let msgs = s.poll(&mut store).await.unwrap();
-    assert!(msgs.is_empty(), "dropped: {msgs:?}");
+    assert!(msgs.is_empty(), "dropped by the engine: {msgs:?}");
+    for m in &msgs {
+        a.observe(&mut s, &mut store, m).unwrap();
+    }
     assert!(matches!(a.vault(), VaultState::Open { .. }));
     assert!(a.active_at(Utc::now()));
+    // Not vacuous: the same notice, handed over, would have locked. Only
+    // the engine's drop kept the state Open.
+    assert_eq!(a.observe(&mut s, &mut store, &copy), Ok(Some(AccessEvent::Locked)));
 }
 
 /// A malformed unlock_id in a status gives Unknown (never "absent"): no
