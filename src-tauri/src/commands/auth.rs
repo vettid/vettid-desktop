@@ -635,6 +635,9 @@ pub struct SessionInfoResponse {
     /// always [`Snapshot::vault_at`], so a stored Open past its
     /// confirmation is Unknown.
     pub vault: link::VaultView,
+    /// The snapshot's publish counter ([`Snapshot::seq`]): the frontend
+    /// applies a read only if this isn't older than the last it applied.
+    pub seq: u64,
 }
 
 /// What the frontend polls (cheap, no network) to drive the expiry UI:
@@ -671,6 +674,7 @@ fn session_info(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> Result<S
             None => snap.end_seen.then(|| link::END_UNCONFIRMED_NOTICE.to_string()),
         },
         vault: snap.vault_at(now),
+        seq: snap.seq,
     })
 }
 
@@ -1315,7 +1319,8 @@ mod tests {
         assert!(r.local_wiped);
         assert_eq!(r.notice.as_deref(), Some(REVOKE_NOT_SENT_NOTICE));
         assert!(!*state.is_registered.read().await);
-        assert_eq!(state.snapshot(), Snapshot::default());
+        // Cleared (the publish counter aside, which every publish moves).
+        assert_eq!(Snapshot { seq: 0, ..state.snapshot() }, Snapshot::default());
     }
 
     /// Logout's end of access: "ended" only for the vault's confirmed end;
@@ -1651,6 +1656,7 @@ mod tests {
             end_seen: false,
             // Confirmed a minute past the session's cap.
             vault: link::VaultView::open(until + chrono::TimeDelta::seconds(60)),
+            seq: 0,
         };
         let info = session_info(&snap, now).unwrap();
         assert!(info.is_active);

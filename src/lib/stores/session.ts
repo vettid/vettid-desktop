@@ -2,6 +2,10 @@ import { get, writable } from 'svelte/store';
 import { afterRead, afterEnd, readIsStale } from '../endState.js';
 import { notLiveState, liveAt, msUntilOpenRunsOut, type VaultView } from '../vaultState.js';
 import { CLOSED, openEnd, answer, type Confirm } from '../endConfirm.js';
+import { createReadOrder } from '../readOrder.js';
+
+/** Overlapping reads land in order (#77): see readOrder.js. */
+const readOrder = createReadOrder();
 
 export interface SessionState {
   state: 'inactive' | 'active' | 'suspended' | 'expired' | 'revoked';
@@ -234,6 +238,7 @@ export function resetSession() {
 export async function refreshSessionFromBackend(): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
   const seq = endSeq;
+  const readNo = readOrder.begin();
   try {
     const info = await invoke<{
       connection_id: string;
@@ -246,9 +251,13 @@ export async function refreshSessionFromBackend(): Promise<void> {
       end_confirmed?: boolean;
       end_notice?: string | null;
       vault?: VaultView | null;
+      seq?: number;
     }>('get_session_info');
     // #80: from before an End session press: it would undo it.
     if (readIsStale(seq, endSeq)) return;
+    // #77: an answer older than one already applied (another read, begun
+    // later, answered first) would put the store back.
+    if (!readOrder.accept(readNo, typeof info.seq === 'number' ? info.seq : null)) return;
 
     // #77: the vault's state, as of this read. It changes nothing of the
     // end's state below (a pending end and its notice survive a swap).
@@ -293,6 +302,7 @@ export async function refreshSessionFromBackend(): Promise<void> {
     }
   } catch {
     if (readIsStale(seq, endSeq)) return;
+    if (!readOrder.accept(readNo, null)) return;
     // No link open (this desktop's own Lock, or before its unlock): no
     // vault state; the screen is the one the app always showed there.
     vaultStore.set(null);

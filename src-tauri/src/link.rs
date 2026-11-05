@@ -215,6 +215,10 @@ pub struct Snapshot {
     /// The vault's lock and hold, as far as this desktop knows
     /// (VAULT-LOCK-PLAN §3.1).
     pub vault: VaultView,
+    /// The publish counter (#77): set by [`Shared::publish`], one more than
+    /// the snapshot it replaces, so the frontend can drop a read that
+    /// returns an older snapshot than one it has already applied.
+    pub seq: u64,
 }
 
 /// The vault's state as the UI shows it (VAULT-LOCK-PLAN §3.1, §3.3): what
@@ -994,6 +998,8 @@ impl<T: Transport, C: Clock> Link<T, C> {
             end_seen: self.end_seen,
             // A refused device knows nothing of the vault.
             vault,
+            // Set when published (Shared::publish).
+            seq: 0,
         }
     }
 
@@ -1183,10 +1189,14 @@ pub type Changed = Arc<RwLock<Option<Arc<dyn Fn() + Send + Sync>>>>;
 /// The Tauri event a [`Changed`] call emits (no payload).
 pub const CHANGED_EVENT: &str = "vault:changed";
 
-/// What a change of which [`Shared::publish`] tells the UI at once: the
-/// vault's state and whether a session is live, both at `now`.
-fn shown(s: &Snapshot, now: DateTime<Utc>) -> (VaultShown, bool) {
-    (s.vault_at(now).state, s.active_at(now))
+/// What a change of which [`Shared::publish`] tells the UI at once:
+/// everything the screen shows of the vault at `now` (its state, Locked
+/// "as of" or not, the reason, the counts, the deadline, `idle_lock_at`,
+/// `due`), and whether a session is live. Not `open_until`, which every
+/// confirmation moves and the screen doesn't show (an Open past it is
+/// Unknown here already).
+fn shown(s: &Snapshot, now: DateTime<Utc>) -> (VaultView, bool) {
+    (VaultView { open_until: None, ..s.vault_at(now) }, s.active_at(now))
 }
 
 /// The handles the background refresh needs (clones of `AppState`'s).
@@ -1200,14 +1210,16 @@ pub struct Shared {
 }
 
 impl Shared {
-    /// Store `s` as what the UI may know; if that changes the vault's
-    /// state or whether a session is live, call [`Changed`] (#77).
+    /// Store `s` as what the UI may know, with the next publish counter
+    /// ([`Snapshot::seq`]); if that changes what the screen shows of the
+    /// vault or whether a session is live, call [`Changed`] (#77).
     pub fn publish(&self, s: Snapshot) {
         let now = Utc::now();
         let (before, after) = {
             let mut g = self.snapshot.write().unwrap_or_else(|p| p.into_inner());
             let before = shown(&g, now);
-            *g = s;
+            let seq = g.seq + 1;
+            *g = Snapshot { seq, ..s };
             (before, shown(&g, now))
         };
         if before != after {
@@ -2545,8 +2557,33 @@ mod tests {
         assert_eq!(count(), 2, "held");
         shared.publish(Snapshot { vault: VaultView { state: VaultShown::Locked, ..Default::default() }, live_until: None, ..live.clone() });
         assert_eq!(count(), 3, "locked");
-        shared.publish(Snapshot { live_until: None, ..live });
+        shared.publish(Snapshot { live_until: None, ..live.clone() });
         assert_eq!(count(), 4, "open, not live");
+        // Everything else the screen shows of the vault (lead review).
+        let locked = VaultView { state: VaultShown::Locked, locked_since: Some(now), ..Default::default() };
+        let mut n = 4;
+        for v in [
+            locked.clone(),
+            VaultView { as_of: Some(now), ..locked.clone() },
+            locked.clone(),
+            VaultView { reason: Some("idle"), ..locked.clone() },
+            VaultView { state: VaultShown::Held, ..Default::default() },
+            VaultView { state: VaultShown::Held, waiting: Some(Counts { messages: 1, ..Default::default() }), ..Default::default() },
+            VaultView { state: VaultShown::Held, waiting: Some(Counts { messages: 2, ..Default::default() }), ..Default::default() },
+            VaultView { state: VaultShown::Held, waiting: Some(Counts { messages: 2, ..Default::default() }), idle_lock_at: Some(now), ..Default::default() },
+            VaultView { due: true, ..open.clone() },
+        ] {
+            shared.publish(Snapshot { vault: v.clone(), live_until: None, ..live.clone() });
+            n += 1;
+            assert_eq!(count(), n, "{v:?}");
+        }
+        // A new confirmation only moves open_until: nothing shown changes.
+        shared.publish(Snapshot { vault: VaultView { due: true, ..VaultView::open(now + TimeDelta::minutes(3)) }, live_until: None, ..live.clone() });
+        assert_eq!(count(), n, "open_until alone");
+        // Each publish takes the next counter.
+        let before = shared.read().seq;
+        shared.publish(live);
+        assert_eq!(shared.read().seq, before + 1);
     }
 
     /// Lead review M2: a focus read settles a stored end (#80) and leaves
