@@ -458,7 +458,7 @@ pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String
     // Review MEDIUM 3: open already, or a pairing under way: the store is
     // left alone. A busy link (a Start New Session waiting for the phone)
     // is not waited for.
-    if let Some(r) = already_open(&state.pairing, &state.link, state.snapshot().unlocked).await {
+    if let Some(r) = already_open(&state.pairing, &state.link, state.snapshot().link_open).await {
         return Ok(r);
     }
 
@@ -641,7 +641,7 @@ pub async fn get_session_info(state: State<'_, AppState>) -> Result<SessionInfoR
 }
 
 fn session_info(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> Result<SessionInfoResponse, String> {
-    if !snap.unlocked {
+    if !snap.link_open {
         return Err("not unlocked".to_string());
     }
     let active = snap.active_at(now);
@@ -653,7 +653,7 @@ fn session_info(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> Result<S
         seconds_remaining: until.map_or(0, |t| (t - now).num_seconds().max(0)),
         is_active: active,
         // Not while an end is pending: that one's state is shown (#80, L3).
-        notice: (snap.stale && !active && !snap.end_pending).then(|| link::STALE_NOTICE.to_string()),
+        notice: (snap.stale_at(now) && !active && !snap.end_pending).then(|| link::STALE_NOTICE.to_string()),
         end_pending: snap.end_pending,
         end_confirmed: snap.end_settled == Some(link::EndSettled::Confirmed),
         // With no end pending: what to say unless the end was confirmed. An
@@ -1107,7 +1107,7 @@ pub async fn get_status(state: State<'_, AppState>) -> Result<AuthStatus, String
     let config_dir = store::default_config_dir().ok();
     let pairings = state.pairing.load(std::sync::atomic::Ordering::SeqCst);
     let is_registered = registered(
-        *state.is_registered.read().await || snap.unlocked,
+        *state.is_registered.read().await || snap.link_open,
         pairings,
         || config_dir.as_deref().is_some_and(|dir| device_store::exists(dir) || store::exists(dir)),
     );
@@ -1125,7 +1125,7 @@ pub async fn get_status(state: State<'_, AppState>) -> Result<AuthStatus, String
         key_notices: device_store::protection_notices(protection).into_iter().map(str::to_string).collect(),
         is_registered,
         pairing_under_way: pairings > 0,
-        is_unlocked: snap.unlocked,
+        is_unlocked: snap.link_open,
         has_active_session: snap.active_at(chrono::Utc::now()),
         hostname: fp.hostname,
         platform: fp.platform,
@@ -1234,9 +1234,10 @@ mod tests {
         for which in ["lock", "logout", "end session"] {
             let state = AppState::new();
             let live = Snapshot {
-                unlocked: true,
+                link_open: true,
                 session_id: Some("s".into()),
                 live_until: Some(chrono::Utc::now() + chrono::TimeDelta::hours(1)),
+                vault: link::VaultView::open(chrono::Utc::now() + chrono::TimeDelta::hours(1)),
                 ..Default::default()
             };
             state.publish(live);
@@ -1478,7 +1479,13 @@ mod tests {
     #[test]
     fn an_overtaken_start_new_session_isnt_shown_live() {
         let now = chrono::Utc::now();
-        let live = Snapshot { unlocked: true, session_id: Some("s".into()), live_until: Some(now + chrono::TimeDelta::minutes(5)), ..Default::default() };
+        let live = Snapshot {
+            link_open: true,
+            session_id: Some("s".into()),
+            live_until: Some(now + chrono::TimeDelta::minutes(5)),
+            vault: link::VaultView::open(now + chrono::TimeDelta::minutes(5)),
+            ..Default::default()
+        };
         let r = extend_response(Ok(()), true, &live, now, None);
         assert!(!r.success);
         assert_eq!(r.error.as_deref(), Some(link::REQUEST_STOPPED_NOTICE));
@@ -1590,7 +1597,7 @@ mod tests {
         assert!(session_info(&Snapshot::default(), now).is_err());
         let until = now + chrono::TimeDelta::seconds(90);
         let snap = Snapshot {
-            unlocked: true,
+            link_open: true,
             device_id: Some("dev".into()),
             session_id: Some("s1".into()),
             expires_at: Some(until + chrono::TimeDelta::seconds(60)),
@@ -1602,6 +1609,8 @@ mod tests {
             end_pending: false,
             end_settled: None,
             end_seen: false,
+            // Confirmed a minute past the session's cap.
+            vault: link::VaultView::open(until + chrono::TimeDelta::seconds(60)),
         };
         let info = session_info(&snap, now).unwrap();
         assert!(info.is_active);
@@ -1631,6 +1640,11 @@ mod tests {
         assert!(!later.is_active);
         assert_eq!((later.expires_at, later.seconds_remaining, later.session_id.as_str()), (0, 0, ""));
         assert_eq!(later.notice, None);
+        // Read after the vault view's own confirmation ran out (the stored
+        // snapshot, after a suspend): nothing live, and "not confirmed".
+        let late = session_info(&snap, until + chrono::TimeDelta::seconds(61)).unwrap();
+        assert!(!late.is_active);
+        assert_eq!(late.notice.as_deref(), Some(link::STALE_NOTICE));
         let stale = Snapshot { live_until: None, stale: true, ..snap };
         let info = session_info(&stale, now).unwrap();
         assert!(!info.is_active);
