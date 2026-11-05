@@ -125,7 +125,7 @@
 
 <div class="pairing">
   <div class="card">
-    <h1>Connect Desktop</h1>
+    <h1>Pair a desktop</h1>
     <p class="subtitle">Pair this desktop to your VettID vault.</p>
 
     {#if step === 'code'}
