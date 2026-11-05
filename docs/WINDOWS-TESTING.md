@@ -356,9 +356,17 @@ saved pairing works as above.
   while anything is left in `%LOCALAPPDATA%\vettid-desktop` (hidden files and subfolders included; a folder
   it can't read counts as left) or the earlier format's Credential Manager entry
   (`vettid-desktop/master-key-v1/local`, checked with `cmdkey`) is still there. It exits 0 when neither is.
+  `cmdkey`'s output counts as "absent" only in its absent shape (no line but the header naming the target,
+  and a `* … *` marker line); anything else counts as present. Only English output was seen here.
   It deletes only the leftover `uninstall.exe`, and then the folder if that is empty: the install folder can
-  be shared with other files (`/D=`). A management tool must count 2 as a failure, which Intune's default
-  return codes do.
+  be shared with other files (`/D=`). It refuses a folder that isn't a full path below a drive or a share.
+  A management tool must count 2 as a failure, which Intune's default return codes do.
+- **A 2 is a failure to retry, not always with an event.** An uninstall started within a second or two of
+  the install returned 2 in 4 of 5 runs here, removed nothing and wrote no event; the next run gave 0. This
+  is the row "Uninstall within about a second of the install" above, not explained yet (possibly Defender
+  scanning the new files). Every run started 10 s or more after the install gave the expected result.
+- **If the script can't run** (an execution policy set by Group Policy, Constrained Language Mode, AppLocker
+  or WDAC), the result is a failure exit code or "detected", never a false "uninstalled".
 - **Don't build the command yourself.** A plain `uninstall.exe /S` (Windows' `UninstallString`) returns 0 at
   once, before the wipe has run. `uninstall.exe /S _?=<folder>` without `/WIPEPAIRING` waits but **keeps the
   pairing**, and exits 0 with no event: it is the form an installer uses to update.
@@ -392,7 +400,8 @@ or handle a detection script. The scripts were run as below.
 **Run from a standard account** (2026-11-04, Windows 11 Pro 10.0.26300, the #71 debug installer). This was a
 temporary local account in Users only, not Administrators, with its own profile. The installer, the
 uninstaller and both scripts were run as that account through secondary logon (`Start-Process -Credential
--LoadUserProfile`), and a fixture `device.enc` stood in for a pairing:
+-LoadUserProfile`), and a fixture `device.enc` stood in for a pairing. Each uninstall started 10 s or more
+after the install:
 
 | Case | Exit code | Afterwards |
 |---|---|---|
@@ -408,7 +417,8 @@ uninstaller and both scripts were run as that account through secondary logon (`
 | `uninstall-vettid.ps1` again | 2, no new event | still detected |
 | The pairing folder deleted by hand, then `uninstall-vettid.ps1` | 0 | not detected; `uninstall.exe` removed; the other app's file kept |
 | A fixture Credential Manager entry `vettid-desktop/master-key-v1/local`, program gone | 2 | detected (legacy entry); after deleting it, 0 and not detected |
-| The pairing folder unreadable (a deny ACE) | 2 | detected ("couldn't check") |
+| The pairing folder unreadable (a deny-read ACE, then a deny-full-control ACE on the folder) | 2, 2 | detected ("couldn't check") both times |
+| The product key set to `C:\`, `C:`, `C:foo`, `\foo`, `relative` (program gone) | 2 each | nothing deleted |
 | Only a hidden file in a subfolder of the pairing folder | 2 | detected |
 | Program there, `uninstall.exe` not a program | 2 | program kept |
 | Program there, `uninstall.exe` missing | 2 | program kept |
