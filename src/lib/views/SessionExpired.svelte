@@ -3,7 +3,13 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { onDestroy } from 'svelte';
   import { noticeOf } from '../tooSoon.js';
-  import { activateSession, sessionNotice, endPending } from '../stores/session';
+  import { activateSession, sessionNotice, endPending, vaultStore, askToEnd, endBusy } from '../stores/session';
+  import { vaultScreen, endOffered } from '../vaultState.js';
+
+  // #77: the vault's lock and hold (§3.2-§3.4). Held, locked or unknown,
+  // this screen says so in place of the session, with End session; Start
+  // New Session only while the vault is open.
+  let screen = $derived(vaultScreen($vaultStore));
 
   let step = $state<'idle' | 'awaiting-qr' | 'awaiting-approval' | 'success' | 'error' | 'removed-unconfirmed'>('idle');
   let removedNotice = $state('');
@@ -87,11 +93,19 @@
 
 <div class="wrap">
   <div class="card">
-    <h1>Start a new session</h1>
-    <p class="subtitle">
-      Your pairing is in place — tap Start to ask your phone to authorize this
-      desktop again. Your data stays hidden until the phone approves.
-    </p>
+    {#if screen.showStart}
+      <h1>Start a new session</h1>
+      <p class="subtitle">
+        Your pairing is in place — tap Start to ask your phone to authorize this
+        desktop again. Your data stays hidden until the phone approves.
+      </p>
+    {:else}
+      <div class="vault-state {screen.kind}" role="status">
+        {#each screen.lines as line, i}
+          <p class:lead={i === 0}>{line}</p>
+        {/each}
+      </div>
+    {/if}
 
     {#if $sessionNotice}
       <p class="error-text" role="status">{$sessionNotice}</p>
@@ -104,9 +118,18 @@
     {/if}
 
     {#if step === 'idle'}
-      <button class="btn primary" onclick={start}>
-        Start New Session
-      </button>
+      {#if screen.showStart}
+        <button class="btn primary" onclick={start}>
+          Start New Session
+        </button>
+      {/if}
+      {#if endOffered(screen.kind, false)}
+        <!-- §3.2: End session in every state; device.session.end is
+             allowed while held, and a stored end keeps retrying. -->
+        <button class="btn danger" onclick={askToEnd} disabled={$endBusy}>
+          End session
+        </button>
+      {/if}
       <button class="btn ghost" onclick={logoutFromHere}>
         Remove this desktop instead
       </button>
@@ -149,6 +172,14 @@
   .btn.primary:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn.ghost { background: transparent; color: var(--text-muted);
                border: 1px solid rgba(255,255,255,0.1); }
+  .btn.danger { background: rgba(244, 67, 54, 0.12); color: #ef5350;
+                border: 1px solid rgba(244, 67, 54, 0.35); }
+  .btn.danger:disabled { opacity: 0.5; cursor: not-allowed; }
+  .vault-state { padding: 16px; border-radius: 8px; margin-bottom: 20px;
+                 background: rgba(255, 152, 0, 0.1); border: 1px solid rgba(255, 152, 0, 0.3); }
+  .vault-state.unknown { background: rgba(255, 255, 255, 0.04); border-color: rgba(255, 255, 255, 0.1); }
+  .vault-state p { color: var(--text-muted); line-height: 1.5; margin-top: 8px; }
+  .vault-state p.lead { color: var(--text); font-size: 1.05rem; margin-top: 0; }
   .waiting { display: flex; align-items: center; gap: 12px; padding: 16px;
              background: rgba(15, 52, 96, 0.3); border-radius: 8px; margin-top: 16px; }
   .waiting p { color: var(--text-muted); }

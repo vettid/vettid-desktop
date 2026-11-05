@@ -83,6 +83,7 @@ pub fn run() {
             auth::extend_session,
             auth::end_session,
             auth::get_session_info,
+            auth::check_vault,
             auth::get_status,
             // Vault commands — independent
             vault::list_connections,
