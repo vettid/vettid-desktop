@@ -683,19 +683,19 @@ pub async fn check_vault(state: State<'_, AppState>) -> Result<bool, String> {
 }
 
 /// [`check_vault`]: a sleep the refresh loop's marks show is taken as a
-/// resume ([`Link::focused`]), and `vault.status` is read if the vault's
-/// word is old (or a read is asked for), then the snapshot is published and
-/// the refresh restarted. Not while an operation holds the link (a request
-/// waiting for the phone reads the vault itself), nor for a refused device.
+/// resume ([`Link::focused`]), and if the vault's word is old (or a read
+/// is asked for) the link refreshes: `vault.status`, and a stored
+/// unanswered end settled (#80), as the background refresh does. Then the
+/// snapshot is published. The refresh loop is left as it is: its schedule
+/// and its backoff stay (lead review). Not while an operation holds the
+/// link (a request waiting for the phone reads the vault itself), nor for
+/// a refused device.
 pub(crate) async fn check_vault_now(state: &AppState) -> bool {
     let mark = reset_mark(state);
     let Ok(mut slot) = state.link.try_lock() else { return false };
     let Some(link) = slot.as_mut() else { return false };
-    if link.refused() || !link.focused(chrono::Utc::now()) {
+    if !link.focus_read().await {
         return false;
-    }
-    if let Err(e) = link.read_status().await {
-        log::info!("check_vault: {}", e);
     }
     if link.unlinked() {
         let link = slot.take().expect("checked above");
@@ -705,7 +705,6 @@ pub(crate) async fn check_vault_now(state: &AppState) -> bool {
     }
     if !overtaken_by_reset(state, mark) {
         state.publish(link.snapshot(chrono::Utc::now()));
-        state.start_refresh(false);
     }
     true
 }

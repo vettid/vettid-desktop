@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
-use crate::link::{Link, Notify, Shared, Snapshot};
+use crate::link::{Changed, Link, Notify, Shared, Snapshot};
 use crate::session::delegation::DelegationManager;
 
 #[cfg(feature = "webrtc")]
@@ -29,6 +29,10 @@ pub struct AppState {
     /// Tells the frontend what the background refresh found (set up in
     /// `lib.rs` once there is a window).
     pub notify: Notify,
+
+    /// Tells the frontend that what it shows of the vault, or whether a
+    /// session is live, has changed (#77; set up in `lib.rs`).
+    pub changed: Changed,
 
     /// Pending phone-approval tracker.
     pub delegation: Arc<Mutex<DelegationManager>>,
@@ -86,6 +90,7 @@ impl AppState {
             snapshot: Arc::new(std::sync::RwLock::new(Snapshot::default())),
             refresh_task: Arc::new(std::sync::Mutex::new(None)),
             notify: Arc::new(std::sync::RwLock::new(None)),
+            changed: Arc::new(std::sync::RwLock::new(None)),
             delegation: Arc::new(Mutex::new(DelegationManager::new())),
             is_registered: Arc::new(RwLock::new(false)),
             pairing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -105,6 +110,7 @@ impl AppState {
             snapshot: self.snapshot.clone(),
             is_registered: self.is_registered.clone(),
             notify: self.notify.clone(),
+            changed: self.changed.clone(),
         }
     }
 

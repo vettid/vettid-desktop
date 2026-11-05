@@ -123,7 +123,7 @@
           Start New Session
         </button>
       {/if}
-      {#if endOffered(screen.kind, false)}
+      {#if endOffered(screen.kind)}
         <!-- §3.2: End session in every state; device.session.end is
              allowed while held, and a stored end keeps retrying. -->
         <button class="btn danger" onclick={askToEnd} disabled={$endBusy}>

@@ -102,7 +102,7 @@
             disabled={busy || session.state !== 'active'}>
       Lock now
     </button>
-    {#if endOffered(screen.kind, session.state === 'active')}
+    {#if endOffered(screen.kind)}
       <button class="action-btn danger" onclick={askToEnd}
               disabled={busy || $endBusy}>
         End session

@@ -1,6 +1,6 @@
 import { get, writable } from 'svelte/store';
 import { afterRead, afterEnd, readIsStale } from '../endState.js';
-import { notLiveState, type VaultView } from '../vaultState.js';
+import { notLiveState, liveAt, msUntilOpenRunsOut, type VaultView } from '../vaultState.js';
 import { CLOSED, openEnd, answer, type Confirm } from '../endConfirm.js';
 
 export interface SessionState {
@@ -111,11 +111,37 @@ export async function endSessionNow(): Promise<void> {
 export async function checkVaultOnFocus(): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
   try {
-    const read = await invoke<boolean>('check_vault');
-    if (read) await refreshSessionFromBackend();
+    await invoke<boolean>('check_vault');
   } catch {
     // Nothing to check (no link): the poll goes on as before.
   }
+  // Read again whether or not the backend read the vault: what it shows
+  // may have changed since the last poll anyway.
+  await refreshSessionFromBackend();
+}
+
+/**
+ * The backend tells the window at once when what it shows of the vault,
+ * or whether a session is live, changes (`vault:changed`, #77): read
+ * again then, not on the next poll. Returns the unlisten function.
+ */
+export async function listenForVaultChanges(): Promise<() => void> {
+  const { listen } = await import('@tauri-apps/api/event');
+  return listen('vault:changed', () => {
+    refreshSessionFromBackend();
+  });
+}
+
+/** A re-read for when the last read's Open runs out (see vaultState.js). */
+let decayTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleDecayRead(view: VaultView | null): void {
+  if (decayTimer) clearTimeout(decayTimer);
+  decayTimer = null;
+  const ms = msUntilOpenRunsOut(view);
+  // Read just after it runs out: the backend then says Unknown, or Open
+  // again if the vault confirmed it meanwhile.
+  if (ms !== null) decayTimer = setTimeout(() => refreshSessionFromBackend(), ms + 500);
 }
 
 /** The not-confirmed notice End session showed while its end stayed
@@ -165,6 +191,8 @@ export function activateSession(
   ownerName?: string,
 ) {
   sessionNotice.set(null);
+  // A new session is live: the last End session's message no longer applies.
+  endStatus.set('');
   resetEndState();
   sessionStore.set({
     state: 'active',
@@ -225,12 +253,18 @@ export async function refreshSessionFromBackend(): Promise<void> {
     // #77: the vault's state, as of this read. It changes nothing of the
     // end's state below (a pending end and its notice survive a swap).
     vaultStore.set(info.vault ?? null);
+    scheduleDecayRead(info.vault ?? null);
+    // Live as the backend said, and only while the vault's Open hasn't run
+    // out (as the backend's vault_at).
+    const live = liveAt(!!info.is_active, info.vault);
 
     // #80: an End session still waiting for the vault, and its notice.
     // A live session makes an earlier end's "not confirmed" moot (#80, L1).
-    applyEndState(!!info.end_pending, !!info.end_confirmed, info.is_active ? null : (info.end_notice ?? null));
+    applyEndState(!!info.end_pending, !!info.end_confirmed, live ? null : (info.end_notice ?? null));
 
-    if (info.is_active) {
+    if (live) {
+      // A new session gone live: the last End session's message goes.
+      if (get(sessionStore).state !== 'active') endStatus.set('');
       // Confirmed again: the stale-session notice no longer applies.
       if (staleNoticeShown) {
         const shown = staleNoticeShown;
@@ -259,7 +293,10 @@ export async function refreshSessionFromBackend(): Promise<void> {
     }
   } catch {
     if (readIsStale(seq, endSeq)) return;
+    // No link open (this desktop's own Lock, or before its unlock): no
+    // vault state; the screen is the one the app always showed there.
     vaultStore.set(null);
+    scheduleDecayRead(null);
     // No link: nothing is known of an end; its notice isn't touched.
     applyEndState(null);
     // `get_session_info` throws "not unlocked" when AppState has no

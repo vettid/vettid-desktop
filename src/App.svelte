@@ -13,6 +13,7 @@
     answerEnd,
     endBusy,
     checkVaultOnFocus,
+    listenForVaultChanges,
   } from './lib/stores/session';
   import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
   import { themeStore } from './lib/stores/theme';
@@ -63,6 +64,7 @@
   let pairingNotice = $state('');
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let unlistenFocus: (() => void) | null = null;
+  let unlistenChanges: (() => void) | null = null;
 
   // #77 (§3.2): End session's confirmation is held here, above the views,
   // so a screen swap (the vault held, locked or unknown) neither closes it
@@ -130,6 +132,13 @@
       await refreshRegistration();
       await refreshSessionFromBackend();
     }, 30_000);
+    // #77: the backend says at once when the vault's state, or whether a
+    // session is live, changes.
+    try {
+      unlistenChanges = await listenForVaultChanges();
+    } catch (e) {
+      console.warn('No vault change events:', e);
+    }
     // #77 (§3.1): when the window gains focus, the backend reads the
     // vault's status if its word is old (and a sleep it saw is a resume).
     try {
@@ -144,6 +153,7 @@
   onDestroy(() => {
     if (pollTimer) clearInterval(pollTimer);
     unlistenFocus?.();
+    unlistenChanges?.();
   });
 
   // Auto-routing on state transitions. The user can navigate around

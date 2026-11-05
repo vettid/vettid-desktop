@@ -4,10 +4,13 @@
 // 2026-11-05): change them only with the owner's approval.
 
 /**
- * The backend's view of the vault (`get_session_info`'s `vault`, already
- * taken at the time of the read).
+ * The backend's view of the vault (`get_session_info`'s `vault`, taken at
+ * the time of the read). An Open counts only until `open_until` (the
+ * vault's last confirmation plus the backend's STALE_AFTER): read late, it
+ * is Unknown, as the backend's `vault_at` says (see `vaultAt`).
  * @typedef {{
  *   state: 'unknown' | 'open' | 'held' | 'locked',
+ *   open_until?: string | null,
  *   due?: boolean,
  *   waiting?: { messages: number, requests: number, calls: number, other: number } | null,
  *   deadline?: string | null,
@@ -16,6 +19,13 @@
  *   as_of?: string | null,
  *   reason?: string | null,
  * }} VaultView
+ */
+
+/**
+ * Which screen: a vault state, or `none` when no link is open (this
+ * desktop's own Lock, or before its unlock): then the screen is the one
+ * the app always showed there, with Start New Session, and no vault state.
+ * @typedef {'none' | 'unknown' | 'open' | 'held' | 'locked'} Kind
  */
 
 export const TEXT = Object.freeze({
@@ -30,12 +40,18 @@ export const TEXT = Object.freeze({
 });
 
 /**
- * A time of day in the reader's own locale, as tooSoon.js writes it.
+ * A time in the reader's own locale: the time of day (as tooSoon.js
+ * writes it) when it falls on today's date by this computer's clock, and
+ * the locale's date and time otherwise (a lock seen the next morning).
  * @param {string} iso
  * @param {string | undefined} [locale]
+ * @param {Date} [now]
  */
-export function timeOf(iso, locale) {
-  return new Intl.DateTimeFormat(locale, { hour: 'numeric', minute: '2-digit' }).format(new Date(iso));
+export function timeOf(iso, locale, now = new Date()) {
+  const t = new Date(iso);
+  const today = t.getFullYear() === now.getFullYear() && t.getMonth() === now.getMonth() && t.getDate() === now.getDate();
+  const options = today ? { hour: 'numeric', minute: '2-digit' } : { dateStyle: 'medium', timeStyle: 'short' };
+  return new Intl.DateTimeFormat(locale, /** @type {Intl.DateTimeFormatOptions} */ (options)).format(t);
 }
 
 /** @param {string} time */
@@ -46,6 +62,30 @@ export function lockedAsOfText(time) {
 /** @param {string} time */
 export function idleLockText(time) {
   return `Your vault locks itself at ${time} unless you do your daily check.`;
+}
+
+/**
+ * The view at `now`: an Open past its `open_until` (or without one) is
+ * Unknown, as the backend's `vault_at` says. Anything else as it is.
+ * @param {VaultView | null | undefined} view
+ * @param {Date} [now]
+ * @returns {VaultView | null | undefined}
+ */
+export function vaultAt(view, now = new Date()) {
+  if (view?.state !== 'open') return view;
+  const until = view.open_until ? new Date(view.open_until).getTime() : NaN;
+  return until >= now.getTime() ? view : { state: 'unknown' };
+}
+
+/**
+ * Whether a read's session is live at `now`: the backend said so, and the
+ * vault's Open hasn't run out since (`vaultAt`).
+ * @param {boolean} isActive
+ * @param {VaultView | null | undefined} view
+ * @param {Date} [now]
+ */
+export function liveAt(isActive, view, now = new Date()) {
+  return isActive && vaultAt(view, now)?.state === 'open';
 }
 
 /**
@@ -87,56 +127,58 @@ export function countsLine(w) {
 }
 
 /**
- * What the screen shows for the vault (`view` at the time of the read):
- * - `kind`: which state;
- * - `lines`: the texts, in order (none for a plain Open);
+ * What the screen shows for the vault, at `now`:
+ * - `kind`: which state (`none`: no link open);
+ * - `lines`: the texts, in order (none for a plain Open, nor for `none`);
  * - `holdOff`: the line for `due` (Open past the deadline with the hold
  *   off), or null;
- * - `showStart`: Start New Session is offered only while Open: held,
- *   locked or unknown, the vault would refuse it or not answer (§3.2).
- * A missing view (no link) is Unknown.
+ * - `showStart`: Start New Session is offered only while Open (and with no
+ *   link, as always): held, locked or unknown, the vault would refuse it
+ *   or not answer (§3.2).
  *
- * @param {VaultView | null | undefined} view
+ * @param {VaultView | null | undefined} view `null`: no link open
  * @param {string | undefined} [locale]
- * @returns {{ kind: 'unknown' | 'open' | 'held' | 'locked', lines: string[], holdOff: string | null, showStart: boolean }}
+ * @param {Date} [now]
+ * @returns {{ kind: Kind, lines: string[], holdOff: string | null, showStart: boolean }}
  */
-export function vaultScreen(view, locale) {
-  const state = view?.state ?? 'unknown';
-  if (state === 'open') {
-    return { kind: 'open', lines: [], holdOff: view?.due ? TEXT.holdOff : null, showStart: true };
+export function vaultScreen(view, locale, now = new Date()) {
+  if (view == null) return { kind: 'none', lines: [], holdOff: null, showStart: true };
+  const v = vaultAt(view, now) ?? { state: 'unknown' };
+  if (v.state === 'open') {
+    return { kind: 'open', lines: [], holdOff: v.due ? TEXT.holdOff : null, showStart: true };
   }
-  if (state === 'held') {
+  if (v.state === 'held') {
     /** @type {string[]} */
     const lines = [TEXT.held];
-    if (view?.waiting) {
-      const counts = countsLine(view.waiting);
+    if (v.waiting) {
+      const counts = countsLine(v.waiting);
       if (counts) lines.push(counts);
     } else {
       // No notice and no status gave the counts (§3.6.5): never zeros.
       lines.push(TEXT.heldNoCounts);
     }
-    if (view?.idle_lock_at) lines.push(idleLockText(timeOf(view.idle_lock_at, locale)));
+    if (v.idle_lock_at) lines.push(idleLockText(timeOf(v.idle_lock_at, locale, now)));
     return { kind: 'held', lines, holdOff: null, showStart: false };
   }
-  if (state === 'locked') {
+  if (v.state === 'locked') {
     // Owner decision 2: when this desktop can't check, "locked as of".
-    const lines = view?.as_of ? [lockedAsOfText(timeOf(view.as_of, locale))] : [lockedText(view?.reason)];
+    const lines = v.as_of ? [lockedAsOfText(timeOf(v.as_of, locale, now))] : [lockedText(v.reason)];
     return { kind: 'locked', lines, holdOff: null, showStart: false };
   }
   return { kind: 'unknown', lines: [TEXT.unknown], holdOff: null, showStart: false };
 }
 
 /**
- * Whether End session is offered (§3.2): in every vault state, held,
- * locked and unknown included (`device.session.end` is allowed while held,
- * and a stored end keeps retrying through a lock), and while Open whenever
- * a session is live. Open with no session has nothing to end.
+ * Whether End session is offered (§3.2): in every vault state, Open with
+ * no live session included (an end with nothing to end is harmless;
+ * `device.session.end` is allowed while held, and a stored end keeps
+ * retrying through a lock). Not with no link open: that screen is the one
+ * the app always showed there.
  *
- * @param {'unknown' | 'open' | 'held' | 'locked'} kind
- * @param {boolean} live
+ * @param {Kind} kind
  */
-export function endOffered(kind, live) {
-  return kind !== 'open' || live;
+export function endOffered(kind) {
+  return kind !== 'none';
 }
 
 /**
@@ -148,4 +190,17 @@ export function endOffered(kind, live) {
  */
 export function notLiveState(view) {
   return view?.state === 'held' || view?.state === 'locked' ? 'suspended' : 'expired';
+}
+
+/**
+ * When a read's Open runs out (ms from `now`), for a re-read then: `null`
+ * if it isn't an Open that will.
+ * @param {VaultView | null | undefined} view
+ * @param {Date} [now]
+ * @returns {number | null}
+ */
+export function msUntilOpenRunsOut(view, now = new Date()) {
+  if (view?.state !== 'open' || !view.open_until) return null;
+  const ms = new Date(view.open_until).getTime() - now.getTime();
+  return ms >= 0 ? ms : null;
 }

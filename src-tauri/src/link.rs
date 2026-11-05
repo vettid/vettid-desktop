@@ -680,6 +680,21 @@ impl<T: Transport, C: Clock> Link<T, C> {
         first
     }
 
+    /// The window gained focus: [`Link::focused`], and if a read is due, a
+    /// [`Link::refresh`] (`vault.status`, and a stored unanswered end
+    /// settled, #80). The refresh loop's schedule, marks and backoff are
+    /// left to it (lead review): a focus doesn't push its rounds back.
+    /// True if it read.
+    pub async fn focus_read(&mut self) -> bool {
+        if self.refused() || !self.focused(Utc::now()) {
+            return false;
+        }
+        if let Err(e) = self.refresh().await {
+            log::info!("link: focus read: {}", e);
+        }
+        true
+    }
+
     /// The window gained focus (VAULT-LOCK-PLAN §3.1): a sleep the marks
     /// show is a resume ([`Link::resumed`]); and whether `vault.status`
     /// should be read now: the vault hasn't confirmed its state within
@@ -1160,6 +1175,20 @@ pub type Notify = Arc<RwLock<Option<Arc<dyn Fn(String) + Send + Sync>>>>;
 /// The Tauri event that carries a [`Notify`] notice to the frontend.
 pub const NOTICE_EVENT: &str = "vault:notice";
 
+/// Called when a published snapshot changes what the UI shows of the
+/// vault's state or whether a session is live (#77): the frontend reads the
+/// session again at once ([`CHANGED_EVENT`]) instead of on its next poll.
+pub type Changed = Arc<RwLock<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
+/// The Tauri event a [`Changed`] call emits (no payload).
+pub const CHANGED_EVENT: &str = "vault:changed";
+
+/// What a change of which [`Shared::publish`] tells the UI at once: the
+/// vault's state and whether a session is live, both at `now`.
+fn shown(s: &Snapshot, now: DateTime<Utc>) -> (VaultShown, bool) {
+    (s.vault_at(now).state, s.active_at(now))
+}
+
 /// The handles the background refresh needs (clones of `AppState`'s).
 #[derive(Clone)]
 pub struct Shared {
@@ -1167,11 +1196,25 @@ pub struct Shared {
     pub snapshot: Arc<RwLock<Snapshot>>,
     pub is_registered: Arc<tokio::sync::RwLock<bool>>,
     pub notify: Notify,
+    pub changed: Changed,
 }
 
 impl Shared {
+    /// Store `s` as what the UI may know; if that changes the vault's
+    /// state or whether a session is live, call [`Changed`] (#77).
     pub fn publish(&self, s: Snapshot) {
-        *self.snapshot.write().unwrap_or_else(|p| p.into_inner()) = s;
+        let now = Utc::now();
+        let (before, after) = {
+            let mut g = self.snapshot.write().unwrap_or_else(|p| p.into_inner());
+            let before = shown(&g, now);
+            *g = s;
+            (before, shown(&g, now))
+        };
+        if before != after {
+            if let Some(f) = self.changed.read().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                f();
+            }
+        }
     }
 
     pub fn read(&self) -> Snapshot {
@@ -2472,6 +2515,58 @@ mod tests {
         link.request_access(|| {}, || false).await.expect("granted");
         assert_eq!(requests(&vault), 1);
         assert!(link.snapshot(Utc::now()).active_at(Utc::now()));
+    }
+
+    /// #77: a published snapshot that changes the vault's state or whether
+    /// a session is live calls `changed`; one that changes neither doesn't.
+    #[test]
+    fn publish_tells_the_ui_of_a_change_at_once() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = calls.clone();
+        let changed: Changed = Arc::new(RwLock::new(Some(Arc::new(move || {
+            c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }))));
+        let shared = Shared {
+            link: Arc::new(Mutex::new(None)),
+            snapshot: Arc::default(),
+            is_registered: Arc::default(),
+            notify: Arc::default(),
+            changed,
+        };
+        let count = || calls.load(std::sync::atomic::Ordering::SeqCst);
+        let now = Utc::now();
+        let open = VaultView::open(now + TimeDelta::minutes(2));
+        let live = Snapshot { link_open: true, live_until: Some(now + TimeDelta::minutes(2)), vault: open.clone(), ..Default::default() };
+        shared.publish(live.clone());
+        assert_eq!(count(), 1, "unknown to open and live");
+        shared.publish(Snapshot { reachable: true, ..live.clone() });
+        assert_eq!(count(), 1, "nothing shown changed");
+        shared.publish(Snapshot { vault: VaultView { state: VaultShown::Held, ..Default::default() }, live_until: None, ..live.clone() });
+        assert_eq!(count(), 2, "held");
+        shared.publish(Snapshot { vault: VaultView { state: VaultShown::Locked, ..Default::default() }, live_until: None, ..live.clone() });
+        assert_eq!(count(), 3, "locked");
+        shared.publish(Snapshot { live_until: None, ..live });
+        assert_eq!(count(), 4, "open, not live");
+    }
+
+    /// Lead review M2: a focus read settles a stored end (#80) and leaves
+    /// the refresh loop's marks as they are; a fresh focus reads nothing.
+    #[tokio::test]
+    async fn a_focus_read_settles_a_stored_end_and_keeps_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired_with(dir.path(), true);
+        let marks = LoopMarks { due: Some(Utc::now() + TimeDelta::seconds(40)), woke: None };
+        *link.marks() = marks;
+        assert!(link.focus_read().await, "nothing confirmed yet: read");
+        assert!(link.session.access_end().is_none(), "the stored end is settled");
+        assert_eq!(link.snapshot(Utc::now()).end_settled, Some(EndSettled::Confirmed));
+        assert!(vault.deposited().iter().any(|k| k == "device.session.end"));
+        let after = *link.marks();
+        assert_eq!(after.woke, None);
+        assert!(after.due >= marks.due, "the loop's round isn't moved earlier, nor reset: {after:?}");
+        let before = statuses(&vault);
+        assert!(!link.focus_read().await, "just confirmed: nothing read");
+        assert_eq!(statuses(&vault), before);
     }
 
     /// A read asked for at once (here by a resume) survives a refresh

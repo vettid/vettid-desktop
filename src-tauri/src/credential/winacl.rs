@@ -174,6 +174,17 @@ fn failed(what: impl Into<String>) -> AclError {
     AclError::Failed(what.into())
 }
 
+/// [`failed`] for an I/O error: its text (with the OS error code) and its
+/// kind, for the logs (#90: a save that fails now and then on Windows).
+fn io_failed(what: &str, e: &std::io::Error) -> AclError {
+    failed(format!("{what}: {e} (kind {:?})", e.kind()))
+}
+
+/// [`failed`] for a Win32 error `code`: the code and the kind it maps to.
+fn win_failed(what: &str, code: u32) -> AclError {
+    failed(format!("{what}: error {code} (kind {:?})", std::io::Error::from_raw_os_error(code as i32).kind()))
+}
+
 /// The calling thread's last error, read before anything else can change it.
 fn last_error() -> u32 {
     // SAFETY: reads the calling thread's last-error value.
@@ -519,7 +530,7 @@ fn entry_at(path: &Path) -> Result<Entry, AclError> {
         }
         Ok(_) => Ok(Entry::Present),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Entry::Absent),
-        Err(e) => Err(failed(format!("stat: {}", e))),
+        Err(e) => Err(io_failed("stat", &e)),
     }
 }
 
@@ -599,7 +610,7 @@ pub(crate) fn check_private(path: &Path) -> Result<(), AclError> {
 pub(crate) fn ensure_private_dir(dir: &Path) -> Result<(), AclError> {
     let user = current_user_sid()?;
     if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| failed(format!("create parent: {}", e)))?;
+        std::fs::create_dir_all(parent).map_err(|e| io_failed("create parent", &e))?;
     }
     let parent = hold_parent_of(dir, &user)?;
     let sd = Descriptor::from_sddl(&folder_sddl(&sid_string(&user)?))?;
@@ -952,7 +963,7 @@ fn write_private_file_with(
         )
     };
     if handle == INVALID_HANDLE_VALUE || handle.is_null() {
-        return Err(failed(format!("create temporary file: error {}", last_error())));
+        return Err(win_failed("create temporary file", last_error()));
     }
     let mut temp = TempFile { path: &temp_path, keep: false };
     // SAFETY: `handle` is a valid, owned file handle; `File` closes it.
@@ -972,8 +983,8 @@ fn write_private_file_with(
         return Err(failed("temporary file is not in the pairing folder"));
     }
 
-    file.write_all(data).map_err(|e| failed(format!("write: {}", e)))?;
-    file.sync_all().map_err(|e| failed(format!("flush: {}", e)))?;
+    file.write_all(data).map_err(|e| io_failed("write", &e))?;
+    file.sync_all().map_err(|e| io_failed("flush", &e))?;
 
     before_replace(&temp_path, &file)?;
 
@@ -1014,7 +1025,7 @@ fn open_for_check(path: &Path) -> Result<File, AclError> {
         .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .map_err(|e| failed(format!("open {}: {}", path.display(), e)))
+        .map_err(|e| io_failed(&format!("open {}", path.display()), &e))
 }
 
 /// Whether `path`'s DACL is protected (does not inherit). For tests.
