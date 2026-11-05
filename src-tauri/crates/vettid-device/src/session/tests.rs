@@ -1059,3 +1059,106 @@ async fn a_broken_inbox_entry_is_dropped_on_load() {
     s.send(&mut store, "test.after", "{}", false).await.unwrap();
     assert_eq!(vault_receive(&mut vault).await.kind, "test.after", "the keys survived");
 }
+
+/// #81: a failed collect makes the next poll wait (full jitter, doubling
+/// to the cap), and a collect that works resets it. Time is paused, so the
+/// waits pass at once.
+#[tokio::test(start_paused = true)]
+async fn failed_collects_back_off_and_a_good_one_resets() {
+    let (relay, _vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    faults.lock().unwrap().collects = 6;
+    let start = tokio::time::Instant::now();
+    for _ in 0..6 {
+        assert!(s.poll(&mut store).await.is_err());
+    }
+    assert_eq!(s.collect_backoff, COLLECT_MAX_BACKOFF, "1, 2, 4, 8, 16, then the 30 s cap");
+    assert!(start.elapsed() <= std::time::Duration::from_secs(1 + 2 + 4 + 8 + 16 + 25), "each wait within its cap");
+    assert!(start.elapsed() > std::time::Duration::ZERO, "the polls did wait");
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.collect_backoff, COLLECT_MAX_BACKOFF, "a good probe alone doesn't reset it");
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.collect_backoff, COLLECT_BACKOFF, "a good long-poll does");
+}
+
+/// #86: deposits held only by this session's own backoff after transport
+/// failures go out as soon as a collect works again, not minutes later.
+#[tokio::test]
+async fn an_outbox_held_after_transport_failures_goes_out_when_the_relay_answers() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    s.outbox_backoff = TimeDelta::minutes(5);
+    faults.lock().unwrap().temporary = 1;
+    let id = s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+    assert_eq!(s.outbox_len(), 1, "held for minutes by the backoff");
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.outbox_len(), 0, "the relay answered: sent at once");
+    assert_eq!(s.outbox_backoff, OUTBOX_BACKOFF);
+    assert_eq!(vault_receive(&mut vault).await.id, id);
+}
+
+/// #81 review: a hold from the relay's own answer (a 5xx, a 429 with no
+/// retry_after) is kept after a good collect: the outbox backoff still
+/// spaces those out; only an unreachable relay's hold is released.
+#[tokio::test]
+async fn a_hold_from_the_relays_own_answer_survives_a_good_collect() {
+    for (server, limited) in [(1, 0), (0, 1)] {
+        let (relay, mut vault, faults, mut store) = paired().await;
+        let mut s = session(&relay, &faults, &mut store, Ticking::new());
+        s.outbox_backoff = TimeDelta::minutes(5);
+        {
+            let mut f = faults.lock().unwrap();
+            f.server_errors = server;
+            f.rate_limited = limited;
+        }
+        s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+        let tried = faults.lock().unwrap().deposits_seen;
+        s.poll(&mut store).await.unwrap();
+        assert_eq!(faults.lock().unwrap().deposits_seen, tried, "held: not tried again on the good collect");
+        assert_eq!(s.outbox_len(), 1);
+        s.hold_until = Utc::now() - TimeDelta::seconds(1);
+        s.poll(&mut store).await.unwrap();
+        assert_eq!(s.outbox_len(), 0);
+        assert_eq!(vault_receive(&mut vault).await.kind, "test.ping");
+    }
+}
+
+/// #81 review: the wait after a failed collect stays within its cap, keeps
+/// to what the relay asked for, and leaves out the time already spent.
+#[test]
+fn the_collect_wait_is_bounded() {
+    use std::time::Duration as D;
+    for _ in 0..200 {
+        let w = collect_wait(D::from_secs(8), D::ZERO, D::ZERO);
+        assert!(w <= D::from_secs(8));
+    }
+    assert_eq!(collect_wait(D::from_secs(8), D::from_secs(8), D::ZERO), D::from_secs(8), "the relay's retry_after");
+    assert_eq!(collect_wait(D::from_secs(8), D::from_secs(8), D::from_secs(3)), D::from_secs(5), "less the time spent");
+    assert_eq!(collect_wait(D::from_secs(8), D::from_secs(8), D::from_secs(20)), D::ZERO);
+    let seen: std::collections::HashSet<_> = (0..50).map(|_| collect_wait(D::from_secs(8), D::ZERO, D::ZERO)).collect();
+    assert!(seen.len() > 1, "jittered");
+}
+
+/// #86 (lead review): after the relay was out of reach, the first collect
+/// that works doesn't long-poll, so a held deposit goes out at once, not a
+/// long-poll (25 s) later. The fake relay long-polls here, in paused time.
+#[tokio::test(start_paused = true)]
+async fn after_a_failed_collect_the_next_one_is_a_probe() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    {
+        let mut f = faults.lock().unwrap();
+        f.temporary = 1;
+        f.collects = 1;
+        f.long_poll = true;
+    }
+    let id = s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+    assert_eq!(s.outbox_len(), 1, "held");
+    assert!(s.poll(&mut store).await.is_err(), "the relay still out of reach");
+    let back = tokio::time::Instant::now();
+    s.poll(&mut store).await.unwrap();
+    assert!(back.elapsed() < std::time::Duration::from_secs(5), "no long-poll before the deposit");
+    assert_eq!(s.outbox_len(), 0, "sent on the first good collect");
+    assert_eq!(vault_receive(&mut vault).await.id, id);
+    assert!(!s.probe_next, "long-polls again from here");
+}
