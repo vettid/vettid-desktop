@@ -1769,6 +1769,33 @@ mod tests {
         assert!(!link.snapshot(Utc::now()).active_at(Utc::now()));
     }
 
+    /// #49: the wait for the phone ends at the request's own `exp`, the
+    /// moment the vault drops it and refuses an approval
+    /// (vettid-vault `hSessionApprove`), and never before it. Only then is
+    /// the person told the phone didn't answer and the desktop has no
+    /// access; nothing is live.
+    #[tokio::test]
+    async fn an_unanswered_request_lapses_at_its_exp_not_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        link.read_status().await.unwrap();
+        let window = TimeDelta::seconds(2);
+        vault.request_window(window);
+        let start = Utc::now();
+        let mut asked = false;
+        // An upper bound too: a wait that never lapses fails here, not hangs.
+        let r = tokio::time::timeout(std::time::Duration::from_secs(12), link.request_access(|| asked = true, || false))
+            .await
+            .expect("lapsed within 10 s of exp");
+        let waited = Utc::now() - start;
+        assert!(asked, "the phone was asked");
+        assert_eq!(r, Err(RequestFailed::Lapsed));
+        // `exp` is written in milliseconds: allow that much.
+        assert!(waited >= window - TimeDelta::milliseconds(2), "stopped after {waited}, before exp");
+        assert_eq!(request_notice(&r.unwrap_err(), None), REQUEST_LAPSED_NOTICE);
+        assert!(!link.snapshot(Utc::now()).active_at(Utc::now()));
+    }
+
     /// Item 3: a renewal declined while a session is live doesn't say "no
     /// access": the session runs on.
     #[tokio::test]
