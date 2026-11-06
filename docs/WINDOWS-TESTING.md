@@ -534,8 +534,8 @@ Still not tested: Intune and ConfigMgr themselves, and an interactive session of
 
 DESKTOP-REWORK-PLAN §4 "At-rest protectors", "Done": "DPAPI: tested as a second Windows user". Run on 2026-11-06
 in Windows Sandbox (Windows 11 Pro 10.0.26300, networking off), with the **real** DPAPI protector and store code:
-the ignored test `credential::device_store::tests::dpapi_copy_refusal_step` (debug test binary built from
-`ff1ee96`, this test's branch on `3a4eca5`, statically linked), run by two temporary standard accounts, A and B
+the ignored test `credential::device_store::tests::dpapi_copy_refusal_step` (debug test binary built from the
+working tree then committed unchanged as `ff1ee96`, on `3a4eca5`; statically linked), run by two temporary standard accounts, A and B
 (Users only), each as a scheduled task. The state was a fixed fixture, not a pairing; no vault or relay was
 involved. The harness is described below the table.
 
@@ -571,7 +571,7 @@ anywhere) and "Log on as a batch job". Each step ran as a one-off scheduled task
 `VETTID_COPY_TEST=seal|open` and `VETTID_COPY_TEST_DIR=%LOCALAPPDATA%\vt13`. The administrator copied A's file out
 with `robocopy /B` and granted B read on the copy; B wrote it over its own `device.enc`, and the two files' SHA-256
 were compared. The test step refuses to run on the real store folder, and `seal` won't overwrite an existing file.
-Earlier runs of the harness had the same results, without B's own open and the hashes, which the review asked for.
+Earlier complete runs of the harness had the same results, without B's own open and the hashes, which the review asked for.
 
 ## Not tested yet
 
