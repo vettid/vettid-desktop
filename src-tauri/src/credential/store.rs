@@ -584,7 +584,14 @@ pub fn remove_legacy_pairing(config_dir: &Path) -> Result<(), CredentialError> {
         Some(pending) => pending.and(legacy),
         None => legacy,
     };
-    record_wipe(config_dir, &wiping);
+    // #13 (review M1): with no marker on disk, deleting `connection.enc`
+    // would leave `master-key-v1` known only to this process; after a
+    // restart nothing would say an earlier format was here, and a log-out
+    // would skip the full keyring sweep. Kept until the marker can be
+    // written (its key is removed by log-out, which reads the file again).
+    if !record_wipe(config_dir, &wiping) {
+        return Err(CredentialError::IoError("the earlier pairing is kept: its removal couldn't be recorded".into()));
+    }
     delete_locked(config_dir)?;
     confirm_gone(config_dir, CREDENTIAL_FILE)
 }
@@ -608,23 +615,63 @@ fn wipe_then(
 ) -> Result<(), CredentialError> {
     let _one_at_a_time = writer_lock();
     WIPES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let wiping = match config_dir {
+    let (wiping, recorded) = match config_dir {
         Some(dir) => begin_wipe(dir, super::device_store::what_is_sealed(dir)),
-        None => super::protector::Wiping::unknown(),
+        None => (super::protector::Wiping::unknown(), true),
     };
-    let wiped = match config_dir {
-        Some(dir) => wipe_locked(dir),
-        None => Err(CredentialError::NoConfigDir),
-    };
-    let keys = remove_keys(&wiping);
-    if let Err(e) = &keys {
-        log::error!("Credential store: a key was not removed: {}", e);
-    }
-    let done = wiped.and(keys);
+    let done = file_then_keys(
+        recorded,
+        || match config_dir {
+            Some(dir) => wipe_locked(dir),
+            None => Err(CredentialError::NoConfigDir),
+        },
+        || {
+            let keys = remove_keys(&wiping);
+            if let Err(e) = &keys {
+                log::error!("Credential store: a key was not removed: {}", e);
+            }
+            keys
+        },
+    );
     if let (Ok(()), Some(dir)) = (&done, config_dir) {
         finish_wipe(dir);
     }
     done
+}
+
+/// A wipe's two parts, the device file (and folder) and the protectors'
+/// external keys, in the fail-secure order (#13, lead decision):
+/// - **`recorded`** (the wipe's marker is on disk): the file, then the keys,
+///   both always tried. A key left behind is still known after a restart,
+///   from the marker, and the next log-out removes it.
+/// - **Not recorded** (no marker could be written, so a restart would
+///   forget which protector kept a key): the keys **first**. If removing
+///   them fails, the file is left as it is: it is the retry signal, since
+///   the next log-out reads its header again. If the keys go and the file
+///   then can't be removed: for a protector that keeps its key outside the
+///   file (the Secret Service, the earlier format's `master-key-v1`), the
+///   file is left with no key and can't be opened; the next launch fails
+///   to open it and the person is told, and the next log-out removes it.
+///   A TPM- or DPAPI-sealed file keeps its key inside the file, so it still
+///   opens; there the result is the plain "not removed", as before.
+///
+/// Either way the result is Ok only if both are confirmed gone. On
+/// Windows the marker is never written (DPAPI keeps nothing outside the
+/// file) and `wipe_marker::write` is a no-op Ok, so `recorded` is always
+/// true there and the order is the first one.
+pub(super) fn file_then_keys(
+    recorded: bool,
+    remove_file: impl FnOnce() -> Result<(), CredentialError>,
+    remove_keys: impl FnOnce() -> Result<(), CredentialError>,
+) -> Result<(), CredentialError> {
+    if recorded {
+        let file = remove_file();
+        let keys = remove_keys();
+        file.and(keys)
+    } else {
+        remove_keys()?;
+        remove_file()
+    }
 }
 
 /// Wipes of `config_dir`s that haven't finished, in this process: kept
@@ -637,14 +684,15 @@ static PENDING_WIPES: std::sync::LazyLock<std::sync::Mutex<std::collections::Has
 /// it removes, `on_disk` together with any wipe of it that hasn't finished
 /// (its marker, or this process's memory), recorded in the marker and in
 /// memory. The caller holds the writer lock, and calls [`finish_wipe`]
-/// only once every part is confirmed gone.
-pub(super) fn begin_wipe(config_dir: &Path, on_disk: super::protector::Wiping) -> super::protector::Wiping {
+/// only once every part is confirmed gone. Also whether the marker is on
+/// disk (see [`file_then_keys`]).
+pub(super) fn begin_wipe(config_dir: &Path, on_disk: super::protector::Wiping) -> (super::protector::Wiping, bool) {
     let wiping = match pending_wipe(config_dir) {
         Some(pending) => pending.and(on_disk),
         None => on_disk,
     };
-    record_wipe(config_dir, &wiping);
-    wiping
+    let recorded = record_wipe(config_dir, &wiping);
+    (wiping, recorded)
 }
 
 /// A wipe of `config_dir` that hasn't finished: its marker and this
@@ -658,12 +706,19 @@ pub(super) fn pending_wipe(config_dir: &Path) -> Option<super::protector::Wiping
 }
 
 /// Record `wiping` as the pending wipe of `config_dir` (the marker, and
-/// memory). The caller holds the writer lock.
-pub(super) fn record_wipe(config_dir: &Path, wiping: &super::protector::Wiping) {
-    if let Err(e) = wipe_marker::write(config_dir, wiping) {
-        log::warn!("Credential store: the wipe's marker wasn't written ({}); this process remembers it, a restart loses it", e);
-    }
+/// memory). The caller holds the writer lock. True if the marker is on
+/// disk (next to the folder, or in the fallback place); false if only this
+/// process remembers it.
+pub(super) fn record_wipe(config_dir: &Path, wiping: &super::protector::Wiping) -> bool {
+    let recorded = match wipe_marker::write(config_dir, wiping) {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("Credential store: the wipe's marker wasn't written ({}); this process remembers it, a restart loses it", e);
+            false
+        }
+    };
     PENDING_WIPES.lock().unwrap_or_else(|e| e.into_inner()).insert(config_dir.to_path_buf(), wiping.clone());
+    recorded
 }
 
 /// After a wipe of `config_dir` whose every part is confirmed gone: the
@@ -715,14 +770,188 @@ mod wipe_marker {
         }
     }
 
-    /// The pending wipe, if a marker is there; one that can't be read or
+    /// The fallback place for the marker (#13), for when it can't be
+    /// written next to the pairing folder: `$XDG_STATE_HOME` (if absolute)
+    /// or `~/.local/state`, then `vettid-desktop-wipe/`, a folder made
+    /// `0700`. Tests use none unless they set one ([`set_fallback_for_tests`]),
+    /// so they never write to the developer's real state folder.
+    ///
+    /// The place follows the environment at launch: a later launch with
+    /// another `XDG_STATE_HOME` won't see a marker left here. Then a key
+    /// left in the Secret Service (whose file is already gone) is skipped
+    /// only if the keyring is locked; accepted, as the rarer case.
+    #[cfg(unix)]
+    fn fallback_path(config_dir: &Path) -> Option<PathBuf> {
+        #[cfg(test)]
+        let base = FALLBACK_FOR_TESTS.with(|b| b.borrow().clone())?;
+        #[cfg(not(test))]
+        let base = match std::env::var_os("XDG_STATE_HOME").map(PathBuf::from).filter(|p| p.is_absolute()) {
+            Some(p) => p,
+            // Review L3: never a relative (or empty) HOME.
+            None => Some(PathBuf::from(std::env::var_os("HOME")?)).filter(|p| p.is_absolute())?.join(".local").join("state"),
+        };
+        // The name is the folder's name plus a hash of its full path (review
+        // L3), so two config folders never share a fallback marker.
+        use sha2::Digest;
+        use std::os::unix::ffi::OsStrExt;
+        let digest = sha2::Sha256::digest(config_dir.as_os_str().as_bytes());
+        let mut name = config_dir.file_name()?.to_os_string();
+        name.push(format!(".{}{SUFFIX}", hex::encode(&digest[..8])));
+        Some(base.join("vettid-desktop-wipe").join(name))
+    }
+
+    /// The fallback folder (review L3): made `0700` if missing (and its
+    /// entry synced), then checked: a real folder (not a symlink), owned by
+    /// this user, not open to the group or others. Anything else isn't used.
+    #[cfg(unix)]
+    fn fallback_folder(dir: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+        match std::fs::symlink_metadata(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+                if let Some(parent) = dir.parent() {
+                    std::fs::File::open(parent)?.sync_all()?;
+                }
+            }
+            Err(e) => return Err(e),
+            Ok(_) => {}
+        }
+        private_folder(dir)
+    }
+
+    /// A real folder (not a symlink), this user's, not open to the group or
+    /// others: else an error.
+    #[cfg(unix)]
+    fn private_folder(dir: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(dir)?;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        if !m.file_type().is_dir() || m.uid() != me || m.mode() & 0o077 != 0 {
+            return Err(std::io::Error::other("the fallback folder isn't this user's private folder"));
+        }
+        Ok(())
+    }
+
+    /// `dir` made `0700` through a handle opened without following a
+    /// symlink (`O_DIRECTORY|O_NOFOLLOW`), checked on that handle (a folder,
+    /// this user's) and changed with `fchmod`: no path is followed between
+    /// the check and the change. False if it isn't this user's folder.
+    #[cfg(unix)]
+    fn make_private(dir: &Path) -> std::io::Result<bool> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let f = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NOCTTY).open(dir) {
+            Ok(f) => f,
+            // Not a folder, or a symlink: not this user's folder.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTDIR) | Some(libc::ELOOP)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let m = f.metadata()?;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        if !m.file_type().is_dir() || m.uid() != me {
+            return Ok(false);
+        }
+        f.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        Ok(true)
+    }
+
+    /// The fallback marker, if any (review: read only from a private
+    /// folder). A folder that's there but not private gives "nothing known",
+    /// so the sweep stays full: a marker someone else could have written
+    /// must never narrow it.
+    #[cfg(unix)]
+    fn read_fallback(config_dir: &Path) -> Option<Wiping> {
+        let path = fallback_path(config_dir)?;
+        let dir = path.parent()?;
+        match std::fs::symlink_metadata(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => Some(Wiping::unknown()),
+            Ok(_) => match private_folder(dir) {
+                Ok(()) => read_at(&path),
+                Err(_) => {
+                    // Lead review (Opus L1): a folder of ours left open to
+                    // others is made private again, so later log-outs can
+                    // trust what this build writes there. What is in it now
+                    // may not be ours: "nothing known" this time, and a file
+                    // that isn't ours is never trusted later either (`ours`).
+                    match make_private(dir) {
+                        Ok(true) => {
+                            log::warn!("Credential store: the wipe marker's fallback folder was open to others; made private");
+                            // Lead review: whatever is there now (even a
+                            // marker of ours renamed into place by someone
+                            // else) is replaced with "nothing known".
+                            if let Err(e) = write_at(&path, &Wiping::unknown()) {
+                                log::warn!("Credential store: the fallback marker couldn't be reset: {e}");
+                            }
+                        }
+                        Ok(false) => log::warn!("Credential store: the wipe marker's fallback folder isn't this user's folder; not used"),
+                        Err(e) => log::warn!("Credential store: the wipe marker's fallback folder is open to others and couldn't be made private: {e}"),
+                    }
+                    Some(Wiping::unknown())
+                }
+            },
+        }
+    }
+
+    #[cfg(all(unix, test))]
+    thread_local! {
+        static FALLBACK_FOR_TESTS: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Tests: where the fallback marker goes, on this thread (`None`: no
+    /// fallback).
+    #[cfg(all(unix, test))]
+    pub(crate) fn set_fallback_for_tests(base: Option<PathBuf>) {
+        FALLBACK_FOR_TESTS.with(|b| *b.borrow_mut() = base);
+    }
+
+    #[cfg(all(unix, test))]
+    pub(crate) fn fallback_path_for_tests(config_dir: &Path) -> Option<PathBuf> {
+        fallback_path(config_dir)
+    }
+
+    /// The pending wipe, if a marker is there (next to the folder, or in
+    /// the fallback place; both: together); one that can't be read or
     /// parsed is "nothing known".
     #[cfg(unix)]
     pub(super) fn read(config_dir: &Path) -> Option<Wiping> {
+        let here = path(config_dir).and_then(|p| read_at(&p));
+        let there = read_fallback(config_dir);
+        match (here, there) {
+            (Some(a), Some(b)) => Some(a.and(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// A marker this build could have written: an open file (checked on the
+    /// handle, not the path) that is a regular file, this user's, with one
+    /// link (lead review: never a FIFO, a device, a hard link or another
+    /// user's file, whatever a folder once open to others holds).
+    #[cfg(unix)]
+    fn ours(f: &std::fs::File) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        // Private too (lead review): `O_TRUNC` keeps an existing file's mode,
+        // so a marker of ours that others could write isn't trusted.
+        f.metadata().is_ok_and(|m| m.file_type().is_file() && m.uid() == me && m.nlink() == 1 && m.mode() & 0o077 == 0)
+    }
+
+    /// The flags for opening a marker that may not be ours: no symlink
+    /// followed, never blocking (a FIFO), never a controlling terminal.
+    #[cfg(unix)]
+    const UNTRUSTED_OPEN: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY;
+
+    /// Opened without following a symlink and without blocking (a FIFO
+    /// can't hang the wipe under the writer lock), then checked with
+    /// [`ours`]; anything else is "nothing known", so the sweep stays full.
+    #[cfg(unix)]
+    fn read_at(path: &Path) -> Option<Wiping> {
         use std::io::Read;
         use std::os::unix::fs::OpenOptionsExt;
-        let path = path(config_dir)?;
-        match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path) {
+        match std::fs::OpenOptions::new().read(true).custom_flags(UNTRUSTED_OPEN).open(path) {
+            Ok(f) if !ours(&f) => Some(Wiping::unknown()),
             Ok(f) => {
                 let mut text = String::new();
                 Some(match f.take(256).read_to_string(&mut text) {
@@ -735,18 +964,64 @@ mod wipe_marker {
         }
     }
 
+    /// Next to the folder, or else in the fallback place (#13). Ok if either
+    /// is on disk and synced.
     #[cfg(unix)]
     pub(super) fn write(config_dir: &Path, w: &Wiping) -> std::io::Result<()> {
+        let path = path(config_dir).ok_or_else(|| std::io::Error::other("no folder name"))?;
+        let here = match write_at(&path, w) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let Some(fallback) = fallback_path(config_dir) else { return Err(here) };
+        let made = match fallback.parent() {
+            Some(dir) => fallback_folder(dir),
+            None => Ok(()),
+        };
+        match made.and_then(|()| write_at(&fallback, w)) {
+            Ok(()) => {
+                log::warn!("Credential store: the wipe's marker went to the fallback place ({here})");
+                Ok(())
+            }
+            Err(e) => Err(std::io::Error::other(format!("{here}; the fallback too: {e}"))),
+        }
+    }
+
+    /// Something at `path` that isn't [`ours`] (a FIFO, another user's
+    /// file, a hard link, a symlink) is removed first; then the marker is
+    /// created without following a symlink or blocking, and checked again on
+    /// its handle before it is written (lead review).
+    #[cfg(unix)]
+    fn write_at(path: &Path, w: &Wiping) -> std::io::Result<()> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let path = path(config_dir).ok_or_else(|| std::io::Error::other("no folder name"))?;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)?;
+        let open_existing = std::fs::OpenOptions::new().read(true).custom_flags(UNTRUSTED_OPEN).open(path);
+        let existing_ours = match &open_existing {
+            Ok(f) => ours(f),
+            Err(_) => false,
+        };
+        let exists = !matches!(&open_existing, Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        drop(open_existing);
+        if exists && !existing_ours {
+            match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
+        // A marker of ours is rewritten in place; otherwise a new file is
+        // made with O_EXCL (lead review), so nothing raced into place
+        // meanwhile is ever truncated or written: the create fails instead.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).mode(0o600).custom_flags(UNTRUSTED_OPEN);
+        if existing_ours {
+            opts.truncate(true);
+        } else {
+            opts.create_new(true);
+        }
+        let mut f = opts.open(path)?;
+        if !ours(&f) {
+            return Err(std::io::Error::other("the marker isn't this user's own file"));
+        }
         f.write_all(encode(w).as_bytes())?;
         f.sync_all()?;
         if let Some(parent) = path.parent() {
@@ -755,13 +1030,16 @@ mod wipe_marker {
         Ok(())
     }
 
+    /// Both places; an error if either is still there.
     #[cfg(unix)]
     pub(super) fn remove(config_dir: &Path) -> std::io::Result<()> {
-        let Some(path) = path(config_dir) else { return Ok(()) };
-        match std::fs::remove_file(path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        let gone = |p: Option<PathBuf>| match p.map(std::fs::remove_file) {
+            Some(Err(e)) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
-        }
+        };
+        let here = gone(path(config_dir));
+        let there = gone(fallback_path(config_dir));
+        here.and(there)
     }
 
     #[cfg(not(unix))]
@@ -1701,6 +1979,194 @@ pub(crate) mod tests {
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(first.is_err() && second.is_err());
         assert!(root || !marker_written, "root can write it anyway");
+    }
+
+    /// #13 (lead decision): the two failure orders of a wipe's parts.
+    #[test]
+    fn a_wipe_without_a_marker_removes_the_key_first() {
+        use std::cell::RefCell;
+        let fail = || Err(CredentialError::IoError("no".into()));
+        // Recorded: the file, then the keys, both always tried.
+        let order = RefCell::new(Vec::new());
+        let r = file_then_keys(true, || { order.borrow_mut().push("file"); Ok(()) }, || { order.borrow_mut().push("keys"); fail() });
+        assert!(r.is_err());
+        assert_eq!(*order.borrow(), ["file", "keys"]);
+        // Not recorded, the keys fail: the file is left, as the retry signal.
+        let order = RefCell::new(Vec::new());
+        let r = file_then_keys(false, || { order.borrow_mut().push("file"); Ok(()) }, || { order.borrow_mut().push("keys"); fail() });
+        assert!(r.is_err());
+        assert_eq!(*order.borrow(), ["keys"], "the file isn't touched");
+        // Not recorded, the keys go, the file can't be removed: an error
+        // (the file is left with no key).
+        let order = RefCell::new(Vec::new());
+        let r = file_then_keys(false, || { order.borrow_mut().push("file"); fail() }, || { order.borrow_mut().push("keys"); Ok(()) });
+        assert!(r.is_err());
+        assert_eq!(*order.borrow(), ["keys", "file"]);
+        assert!(file_then_keys(false, || Ok(()), || Ok(())).is_ok());
+    }
+
+    /// #13: no marker could be written and the Secret Service key couldn't
+    /// be removed: the device file is kept (the next log-out reads its
+    /// header again), where it used to be deleted first.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn with_no_marker_a_key_not_removed_keeps_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("parent");
+        let dir = parent.join("vettid-desktop");
+        sealed_by(&dir, "secret-service");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
+        let r = wipe_then(Some(&dir), remove_unreachable);
+        let kept = dir.join(DEVICE_FILE).exists();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(r.is_err());
+        assert!(root || kept, "the file is the retry signal");
+    }
+
+    /// #13: the marker can't go next to the folder, so it goes to the
+    /// fallback place, and a later process (no memory) still finds it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_marker_falls_back_and_is_found_after_a_restart() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        wipe_marker::set_fallback_for_tests(Some(state.path().to_path_buf()));
+        let parent = base.path().join("parent");
+        let dir = parent.join("vettid-desktop");
+        sealed_by(&dir, "secret-service");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
+        let first = wipe_then(Some(&dir), remove_unreachable);
+        // A restart: this process's memory of it is gone.
+        PENDING_WIPES.lock().unwrap().remove(&dir);
+        let found = wipe_marker::read(&dir);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        wipe_marker::set_fallback_for_tests(None);
+        assert!(first.is_err());
+        if !root {
+            assert_eq!(found.and_then(|w| w.sealed_by).as_deref(), Some("secret-service"), "from the fallback marker");
+            let names: Vec<String> = fs::read_dir(state.path().join("vettid-desktop-wipe"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(matches!(&names[..], [n] if n.starts_with("vettid-desktop.") && n.ends_with(".wipe-pending")), "{names:?}");
+        }
+        // Two config folders of the same name don't share a fallback marker.
+        wipe_marker::set_fallback_for_tests(Some(state.path().to_path_buf()));
+        let a = wipe_marker::fallback_path_for_tests(Path::new("/one/vettid-desktop"));
+        let b = wipe_marker::fallback_path_for_tests(Path::new("/two/vettid-desktop"));
+        wipe_marker::set_fallback_for_tests(None);
+        assert_ne!(a, b);
+    }
+
+    /// #13 (review L3): a fallback folder open to the group isn't used.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fallback_folder_open_to_others_isnt_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let shared = state.path().join("vettid-desktop-wipe");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
+        wipe_marker::set_fallback_for_tests(Some(state.path().to_path_buf()));
+        let parent = base.path().join("parent");
+        let dir = parent.join("vettid-desktop");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
+        let written = wipe_marker::write(&dir, &super::super::protector::Wiping::unknown());
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        wipe_marker::set_fallback_for_tests(None);
+        assert!(root || written.is_err(), "not written to a folder others can write");
+        assert_eq!(fs::read_dir(&shared).unwrap().count(), 0);
+        // A marker someone else put there (saying "tpm") isn't believed: it
+        // reads as "nothing known", so the sweep stays full.
+        wipe_marker::set_fallback_for_tests(Some(state.path().to_path_buf()));
+        let forged = wipe_marker::fallback_path_for_tests(&dir).unwrap();
+        fs::write(&forged, "vettid-desktop-wipe-v1\ntpm\n0\n").unwrap();
+        // Another user's file can't be made without root: a second link to
+        // it stands in for "not this build's own file".
+        fs::hard_link(&forged, state.path().join("elsewhere")).unwrap();
+        let first = wipe_marker::read(&dir);
+        let mode = fs::metadata(&shared).unwrap().permissions().mode() & 0o777;
+        // After the repair the folder is private, but the planted file is
+        // still not trusted (lead review M1): read twice.
+        let second = wipe_marker::read(&dir);
+        wipe_marker::set_fallback_for_tests(None);
+        let unknown = Some(super::super::protector::Wiping::unknown());
+        assert_eq!(first, unknown);
+        assert_eq!(mode, 0o700, "made private");
+        assert_eq!(second, unknown, "still not trusted after the repair");
+    }
+
+    /// #13 (lead review): a FIFO where the marker goes neither hangs a read
+    /// nor a write (`O_NONBLOCK`), reads as "nothing known", and is replaced
+    /// by a real marker when one is written.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_planted_fifo_marker_doesnt_hang_and_isnt_trusted() {
+        let state = tempfile::tempdir().unwrap();
+        wipe_marker::set_fallback_for_tests(Some(state.path().to_path_buf()));
+        let dir = Path::new("/nonexistent-parent-for-test/vettid-desktop");
+        let fifo = wipe_marker::fallback_path_for_tests(dir).unwrap();
+        fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(fifo.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo has no other preconditions.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let read = wipe_marker::read(dir);
+        // The marker can't go next to a folder whose parent doesn't exist,
+        // so it goes to the fallback place, replacing the FIFO.
+        let written = wipe_marker::write(dir, &super::super::protector::Wiping { sealed_by: Some("secret-service".into()), legacy: false });
+        let after = wipe_marker::read(dir);
+        let is_file = fs::symlink_metadata(&fifo).map(|m| m.file_type().is_file()).unwrap_or(false);
+        // A marker of ours that others could write isn't trusted either.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fifo, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let open_mode = wipe_marker::read(dir);
+        wipe_marker::set_fallback_for_tests(None);
+        assert_eq!(open_mode, Some(super::super::protector::Wiping::unknown()), "a marker others can write");
+        assert_eq!(read, Some(super::super::protector::Wiping::unknown()));
+        assert!(written.is_ok(), "{written:?}");
+        assert!(is_file);
+        assert_eq!(after.and_then(|w| w.sealed_by).as_deref(), Some("secret-service"));
+    }
+
+    /// #13 (review M1): retiring an earlier build's `connection.enc` when no
+    /// marker can be written keeps it (an error), so a restart still knows
+    /// an earlier format was here and log-out sweeps for its key.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_legacy_pairing_is_kept_when_its_removal_cant_be_recorded() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("parent");
+        let dir = parent.join("vettid-desktop");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(CREDENTIAL_FILE), b"{}").unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
+        let r = remove_legacy_pairing(&dir);
+        let kept = dir.join(CREDENTIAL_FILE).exists();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        PENDING_WIPES.lock().unwrap().remove(&dir);
+        if !root {
+            assert!(r.is_err());
+            assert!(kept, "kept until its removal can be recorded");
+        }
     }
 
     /// No known folder, or a relative one, is refused: never the current

@@ -118,6 +118,9 @@ jobs:
             credential::tpm::tests::tpm_an_owner_auth_value_is_failing
             credential::tpm::tests::tpm_the_unpinned_format_is_refused
             credential::tpm::tests::tpm_a_replaced_srk_wont_open
+            credential::tpm::tests::tpm_a_power_cycle_reopens
+            credential::tpm::tests::tpm_a_gone_srk_wont_open
+            credential::tpm::tests::tpm_a_cleared_tpm_wont_open
             credential::device_store::tests::linux_round_trip_through_the_tpm
             credential::secret_service::tests::a_bus_without_a_secret_service_is_absent
           )

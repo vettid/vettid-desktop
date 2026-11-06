@@ -46,7 +46,12 @@
 //! disclosed: with the Secret Service unreachable, an item orphaned by a
 //! crash between `wrap` and the file's save, or a `master-key-v1` that an
 //! earlier build failed to remove after deleting its own file, stays in
-//! the keyring, and log-out reports nothing to remove. The
+//! the keyring, and log-out reports nothing to remove. The same holds when
+//! the Secret Service is present but nothing being wiped could have an
+//! item there (the header names another protector): such strays (for
+//! example an item `wrap` made before a save that then failed) are removed
+//! only if already unlocked and deletable without a prompt, else they stay
+//! and are logged (#13). The
 //! header is read unauthenticated, so a forged one (`"protector":"tpm"`
 //! over a file the Secret Service sealed) makes log-out skip that item
 //! while the Secret Service is unreachable: a false "removed". Forging it
@@ -218,6 +223,18 @@ fn connect() -> Result<Service, dbus_secret_service::Error> {
     Service::connect_with_max_prompt_timeout(EncryptionType::Dh, PROMPT_TIMEOUT_S)
 }
 
+/// As [`connect`], but no prompt is ever shown on this connection (#13,
+/// lead review): with a prompt timeout of 0, dbus-secret-service 4.1 returns
+/// `Error::Prompt` before calling the prompt, so an operation the service
+/// wants confirmed (a Delete that some implementations prompt for) fails
+/// at once instead of showing a window and waiting under the writer lock.
+fn connect_without_prompts() -> Result<Service, dbus_secret_service::Error> {
+    if cfg!(test) {
+        panic!("a test reached the real Secret Service");
+    }
+    Service::connect_with_max_prompt_timeout(EncryptionType::Dh, 0)
+}
+
 /// An attribute search: every item having all of these attributes.
 type Search = &'static [(&'static str, &'static str)];
 
@@ -284,6 +301,16 @@ fn sweep(bus: &BusSource, searches: &[Search], what: &'static str, could_hold: b
         log::info!("protector secret-service: {what}: nothing of the wiped pairing was kept there ({why})");
         return Ok(());
     }
+    // #13 (lead review of #70): nothing being wiped could have an item here
+    // (its header named another protector, and no earlier format was
+    // there). Tidy up what can be seen without unlocking, and never ask the
+    // person to unlock a keyring for it: a dismissed prompt would make a
+    // log-out "not removed" for a key that was never there. A wipe whose
+    // header is unknown keeps `could_hold` and the full sweep below.
+    if !could_hold {
+        best_effort_sweep(searches, what);
+        return Ok(());
+    }
     let ss = connect().map_err(|e| not_removed(format!("connect: {e}")))?;
     unlock_all_collections(&ss).map_err(|e| not_removed(format!("unlock: {e}")))?;
     let items = matching(&ss, searches).map_err(|e| not_removed(format!("search: {e}")))?;
@@ -306,6 +333,36 @@ fn sweep(bus: &BusSource, searches: &[Search], what: &'static str, could_hold: b
         Ok(left) if left.is_empty() => Ok(()),
         Ok(left) => Err(not_removed(format!("{} still there", left.len()))),
         Err(e) => Err(not_removed(format!("could not be checked: {e}"))),
+    }
+}
+
+/// [`sweep`] when nothing wiped could have an item in the Secret Service:
+/// delete the matching items that are already unlocked, without unlocking
+/// anything, on a connection that never prompts (a Delete the service
+/// would confirm fails and is logged), and only log what happens. It
+/// decides nothing.
+fn best_effort_sweep(searches: &[Search], what: &'static str) {
+    let ss = match connect_without_prompts() {
+        Ok(ss) => ss,
+        Err(e) => return log::info!("protector secret-service: {what}: not checked ({e}); nothing of the wiped pairing was kept there"),
+    };
+    match matching(&ss, searches) {
+        Ok(items) => {
+            let mut skipped = 0;
+            for item in &items {
+                if matches!(item.is_locked(), Ok(false)) {
+                    if let Err(e) = item.delete() {
+                        log::info!("protector secret-service: {what}: a stray item wasn't removed: {e}");
+                    }
+                } else {
+                    skipped += 1;
+                }
+            }
+            if skipped > 0 {
+                log::info!("protector secret-service: {what}: {skipped} locked stray item(s) left (not unlocked for this)");
+            }
+        }
+        Err(e) => log::info!("protector secret-service: {what}: not searched ({e}); nothing of the wiped pairing was kept there"),
     }
 }
 

@@ -13,7 +13,10 @@
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{GetLastError, LocalFree, ERROR_INVALID_DATA, NTE_BAD_DATA};
-use windows_sys::Win32::NetworkManagement::NetManagement::{NetApiBufferFree, NetGetJoinInformation, NetSetupDomainName};
+use windows_sys::Win32::NetworkManagement::NetManagement::{
+    NetApiBufferFree, NetFreeAadJoinInformation, NetGetAadJoinInformation, NetGetJoinInformation, NetSetupDomainName, DSREG_DEVICE_JOIN,
+    DSREG_JOIN_INFO,
+};
 use windows_sys::Win32::System::GroupPolicy::{PT_ROAMING, PT_ROAMING_PREEXISTING};
 use windows_sys::Win32::UI::Shell::GetProfileType;
 use windows_sys::Win32::Security::Cryptography::{
@@ -164,12 +167,24 @@ pub struct Reach {
     pub domain: bool,
     /// The profile roams: the DPAPI master keys travel with it.
     pub roaming: bool,
+    /// This computer is joined to an organization's Microsoft Entra ID
+    /// (#13; `NetGetJoinInformation` doesn't see that join): its
+    /// administrators are this computer's administrators, who can run code
+    /// as the user.
+    pub entra: bool,
 }
 
 /// NEW TEXT (owner approval needed): Settings, when this computer is
 /// joined to a domain.
 pub(crate) const DOMAIN_NOTICE: &str =
     "This computer is joined to your organization's domain. An administrator of that domain may be able to open this desktop's saved pairing.";
+
+/// NEW TEXT (owner approval needed, #13): Settings, when this computer is
+/// joined to an organization's Microsoft Entra ID. It claims only what §4
+/// says of any administrator: they can run code as the user while the user
+/// is logged on.
+pub(crate) const ENTRA_NOTICE: &str =
+    "This computer is joined to your organization's Microsoft Entra ID. Its administrators can manage this computer, and may be able to open this desktop's saved pairing while you're signed in.";
 
 /// NEW TEXT (owner approval needed): Settings, when the profile roams.
 pub(crate) const ROAMING_NOTICE: &str =
@@ -180,17 +195,17 @@ impl Reach {
     /// and gives no notice, so no notice is not a guarantee (the plan says
     /// so); the failure is logged by its code.
     pub fn here() -> Self {
-        Self::from_checks(domain_joined(), roaming_profile())
+        Self::from_checks(domain_joined(), roaming_profile(), entra_joined())
     }
 
-    fn from_checks(domain: Result<bool, u32>, roaming: Result<bool, u32>) -> Self {
+    fn from_checks(domain: Result<bool, u32>, roaming: Result<bool, u32>, entra: Result<bool, u32>) -> Self {
         let checked = |what: &str, r: Result<bool, u32>| {
             r.unwrap_or_else(|code| {
-                log::warn!("dpapi: the {what} check failed (error {code}); no notice");
+                log::warn!("dpapi: the {what} check failed (error {code}, {code:#010x}); no notice");
                 false
             })
         };
-        Reach { domain: checked("domain", domain), roaming: checked("roaming profile", roaming) }
+        Reach { domain: checked("domain", domain), roaming: checked("roaming profile", roaming), entra: checked("Entra join", entra) }
     }
 
     /// The notices for Settings, in order.
@@ -198,6 +213,9 @@ impl Reach {
         let mut out = Vec::new();
         if self.domain {
             out.push(DOMAIN_NOTICE);
+        }
+        if self.entra {
+            out.push(ENTRA_NOTICE);
         }
         if self.roaming {
             out.push(ROAMING_NOTICE);
@@ -221,6 +239,37 @@ fn domain_joined() -> Result<bool, u32> {
         return Err(code);
     }
     Ok(status == NetSetupDomainName)
+}
+
+/// `NetGetAadJoinInformation`: this computer is joined to Microsoft Entra ID
+/// (a device join; a work account merely registered on a personal computer,
+/// `DSREG_WORKPLACE_JOIN`, doesn't make its administrators this computer's).
+/// Not joined: no information, and `S_FALSE`. `NetGetAadJoinInformation`
+/// is imported at load time, so the app needs Windows 10 1607 or later (no
+/// supported Windows is older). A hybrid join shows both this notice and
+/// the domain one.
+fn entra_joined() -> Result<bool, u32> {
+    let mut info: *mut DSREG_JOIN_INFO = ptr::null_mut();
+    // SAFETY: `info` is a live local out-pointer; a non-null result is freed
+    // with NetFreeAadJoinInformation below, once.
+    let hr = unsafe { NetGetAadJoinInformation(ptr::null(), &mut info) };
+    let joined = if info.is_null() {
+        false
+    } else {
+        // SAFETY: non-null, allocated by NetGetAadJoinInformation; read
+        // before it is freed.
+        let device = unsafe { (*info).joinType } == DSREG_DEVICE_JOIN;
+        // SAFETY: as above; freed once.
+        unsafe { NetFreeAadJoinInformation(info) };
+        device
+    };
+    // Success is any non-negative HRESULT: S_OK, or S_FALSE (1), which is
+    // what a computer joined to nothing answers (seen on tempe, where
+    // `dsregcmd /status` says AzureAdJoined NO).
+    if hr < 0 {
+        return Err(hr as u32);
+    }
+    Ok(joined)
 }
 
 /// `GetProfileType`: the current user's profile roams.
@@ -308,12 +357,18 @@ mod tests {
     /// A failed check gives no notice; either check alone gives its own.
     #[test]
     fn reach_notices_follow_the_checks() {
-        assert_eq!(Reach::from_checks(Ok(false), Ok(false)).notices(), Vec::<&str>::new());
-        assert_eq!(Reach::from_checks(Ok(true), Ok(false)).notices(), vec![DOMAIN_NOTICE]);
-        assert_eq!(Reach::from_checks(Ok(false), Ok(true)).notices(), vec![ROAMING_NOTICE]);
-        assert_eq!(Reach::from_checks(Ok(true), Ok(true)).notices(), vec![DOMAIN_NOTICE, ROAMING_NOTICE]);
-        assert_eq!(Reach::from_checks(Err(5), Err(5)), Reach::default());
-        assert_eq!(Reach::from_checks(Err(5), Ok(true)).notices(), vec![ROAMING_NOTICE]);
+        assert_eq!(Reach::from_checks(Ok(false), Ok(false), Ok(false)).notices(), Vec::<&str>::new());
+        assert_eq!(Reach::from_checks(Ok(true), Ok(false), Ok(false)).notices(), vec![DOMAIN_NOTICE]);
+        assert_eq!(Reach::from_checks(Ok(false), Ok(true), Ok(false)).notices(), vec![ROAMING_NOTICE]);
+        assert_eq!(Reach::from_checks(Ok(true), Ok(true), Ok(false)).notices(), vec![DOMAIN_NOTICE, ROAMING_NOTICE]);
+        assert_eq!(Reach::from_checks(Err(5), Err(5), Err(5)), Reach::default());
+        assert_eq!(Reach::from_checks(Err(5), Ok(true), Err(5)).notices(), vec![ROAMING_NOTICE]);
+        // #13: an Entra-only join (NetGetJoinInformation says workgroup).
+        assert_eq!(Reach::from_checks(Ok(false), Ok(false), Ok(true)).notices(), vec![ENTRA_NOTICE]);
+        assert_eq!(Reach::from_checks(Ok(true), Ok(true), Ok(true)).notices(), vec![DOMAIN_NOTICE, ENTRA_NOTICE, ROAMING_NOTICE]);
+        // This machine's own check runs; its answer isn't asserted (a
+        // developer's laptop may well be joined).
+        let _ = entra_joined();
     }
 
     /// The real checks run on this machine (their answer isn't asserted).
