@@ -280,7 +280,7 @@ pub struct Session<T: Transport, C: Clock> {
     /// long-poll later (#86, lead review).
     probe_next: bool,
     outbox_backoff: TimeDelta,
-    refresh_sent: Option<DateTime<Utc>>,
+    refresh_sent: Option<tokio::time::Instant>,
     /// The requests this session sent lately (newest last, at most
     /// [`TRACKED_KEEP`]), for [`Session::last_request_reached`]. In memory
     /// only.
@@ -339,7 +339,7 @@ struct Checkpoint {
     state: DeviceState,
     keys: KeyringState,
     awaiting: Vec<(ResponderState, String)>,
-    refresh_sent: Option<DateTime<Utc>>,
+    refresh_sent: Option<tokio::time::Instant>,
     dropped: usize,
 }
 
@@ -792,9 +792,16 @@ impl<T: Transport, C: Clock> Session<T, C> {
 
     /// Poll until the response to `id` arrives, up to `timeout`.
     async fn wait_for(&mut self, store: &mut impl Persist, id: String, timeout: TimeDelta) -> Result<Inner, SessionError> {
+        // It ends at the earlier of this session's clock reaching `timeout`
+        // and `timeout` of monotonic time (#106): a clock set back can't
+        // stretch the wait, and one set forward ends it early (the safe
+        // direction).
         let deadline = self.clock.now() + timeout;
+        let mono = tokio::time::Instant::now() + timeout.to_std().unwrap_or_default();
         loop {
-            let left = (deadline - self.clock.now()).num_seconds().clamp(1, POLL_WAIT_SECS) as u64;
+            let wall_left = (deadline - self.clock.now()).num_seconds();
+            let mono_left = i64::try_from(mono.saturating_duration_since(tokio::time::Instant::now()).as_secs()).unwrap_or(i64::MAX);
+            let left = wall_left.min(mono_left).clamp(1, POLL_WAIT_SECS) as u64;
             match self.poll_batch(store, left).await {
                 Ok(mut got) => {
                     if let Some(i) = got.iter().position(|m| m.response.as_ref().is_some_and(|r| r.re == id)) {
@@ -811,7 +818,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
                 // Removed (or refused) meanwhile: no answer will come.
                 return Err(SessionError::Refused);
             }
-            if self.clock.now() >= deadline {
+            if self.clock.now() >= deadline || tokio::time::Instant::now() >= mono {
                 return Err(SessionError::TimedOut);
             }
         }
@@ -1295,13 +1302,14 @@ impl<T: Transport, C: Clock> Session<T, C> {
             }
         }
         let held_left = self.state.vault_token_exp - now;
-        let due = self.refresh_sent.is_none_or(|t| now - t >= REFRESH_EVERY);
+        // The spacing between refresh requests is local: monotonic (#106).
+        let due = self.refresh_sent.is_none_or(|t| t.elapsed() >= REFRESH_EVERY.to_std().unwrap_or_default());
         if held_left < REFRESH_BELOW && held_left > TimeDelta::zero() && due {
             if let Ok(i) = self.inner(None, RELAY_TOKEN_REFRESH, "{}".into(), None, None) {
                 let id = i.id.clone();
                 if self.queue(REFRESH_REQUEST, i).is_ok() {
                     self.arm(&id, RELAY_TOKEN_REFRESH, None);
-                    self.refresh_sent = Some(now);
+                    self.refresh_sent = Some(tokio::time::Instant::now());
                 }
             }
         }

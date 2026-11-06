@@ -257,3 +257,20 @@ fn stored_state_round_trips() {
     assert_eq!(Epoch::restore(back.epoch).id(), epoch.id());
     assert_eq!(DeviceState::from_json(b"{}").unwrap_err(), StoreError::Corrupt);
 }
+
+/// #106: a pairing window's end passes once its time has run as monotonic
+/// time, even if the wall clock was set back meanwhile; and it passes at
+/// once when the wall clock reaches it (a clock set forward).
+#[tokio::test(start_paused = true)]
+async fn a_deadline_passes_by_either_clock() {
+    let clock = Ticking::new();
+    let d = Deadline::new(&clock, clock.start + TimeDelta::seconds(10));
+    assert!(!d.passed(&clock));
+    clock.ticks.store(-3600, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(11)).await;
+    assert!(d.passed(&clock), "set back an hour, but 11 s passed");
+    let clock = Ticking::new();
+    let d = Deadline::new(&clock, clock.start + TimeDelta::seconds(10));
+    clock.ticks.store(3600, std::sync::atomic::Ordering::SeqCst);
+    assert!(d.passed(&clock), "set forward past the wall deadline");
+}

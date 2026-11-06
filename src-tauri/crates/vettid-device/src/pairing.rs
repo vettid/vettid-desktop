@@ -184,9 +184,38 @@ fn cleared(store: &mut impl Persist, e: PairError) -> PairError {
     }
 }
 
+/// A window's end (#106): the wall-clock time (the code's expiry, or the
+/// stored pairing deadline, which the vault judges and a restart resumes),
+/// and, for this run, the same time left as monotonic time. It has passed
+/// when either has: a clock set back can't stretch a wait past the time it
+/// had left, and one set forward ends it early (the safe direction).
+#[derive(Debug, Clone, Copy)]
+struct Deadline {
+    wall: DateTime<Utc>,
+    mono: tokio::time::Instant,
+}
+
+impl Deadline {
+    fn new(clock: &impl Clock, wall: DateTime<Utc>) -> Self {
+        let left = (wall - clock.now()).to_std().unwrap_or_default();
+        Deadline { wall, mono: tokio::time::Instant::now() + left }
+    }
+
+    fn passed(&self, clock: &impl Clock) -> bool {
+        clock.now() >= self.wall || tokio::time::Instant::now() >= self.mono
+    }
+
+    /// Whole seconds left by the earlier of the two (0 once passed).
+    fn secs_left(&self, clock: &impl Clock) -> i64 {
+        let wall = (self.wall - clock.now()).num_seconds();
+        let mono = self.mono.saturating_duration_since(tokio::time::Instant::now()).as_secs();
+        wall.min(i64::try_from(mono).unwrap_or(i64::MAX))
+    }
+}
+
 /// Run `op` until it succeeds, fails for good, or the window ends:
 /// temporary relay failures (`retryable`) are retried with backoff.
-async fn retrying<R, Fut>(clock: &impl Clock, deadline: DateTime<Utc>, mut op: impl FnMut() -> Fut) -> Result<R, PairError>
+async fn retrying<R, Fut>(clock: &impl Clock, deadline: &Deadline, mut op: impl FnMut() -> Fut) -> Result<R, PairError>
 where
     Fut: Future<Output = Result<R, RelayError>>,
 {
@@ -194,7 +223,7 @@ where
     loop {
         match op().await {
             Ok(r) => return Ok(r),
-            Err(e) if e.retryable() && clock.now() < deadline => {
+            Err(e) if e.retryable() && !deadline.passed(clock) => {
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 delay = (delay * 2).min(BACKOFF_MAX_MS);
             }
@@ -205,8 +234,8 @@ where
 
 /// The long-poll wait: 1–25 s, and no longer than the window (the floor
 /// keeps collect from spinning near the end).
-fn wait_secs(clock: &impl Clock, deadline: DateTime<Utc>) -> u64 {
-    (deadline - clock.now()).num_seconds().clamp(1, COLLECT_WAIT_SECS) as u64
+fn wait_secs(clock: &impl Clock, deadline: &Deadline) -> u64 {
+    deadline.secs_left(clock).clamp(1, COLLECT_WAIT_SECS) as u64
 }
 
 /// Deposit, treating "maybe delivered" as sent (the receiver dedupes) and
@@ -217,7 +246,7 @@ fn wait_secs(clock: &impl Clock, deadline: DateTime<Utc>) -> u64 {
 async fn deposit(
     t: &impl Transport,
     clock: &impl Clock,
-    deadline: DateTime<Utc>,
+    deadline: &Deadline,
     to: &RelayAddr,
     token: &Token,
     payload: &[u8],
@@ -227,7 +256,7 @@ async fn deposit(
         match t.deposit(&to.url, &to.mailbox, token, payload).await {
             Ok(_) => return Ok(()),
             Err(e) if e.possibly_delivered => return Ok(()),
-            Err(e) if e.error.retryable() && clock.now() < deadline => {
+            Err(e) if e.error.retryable() && !deadline.passed(clock) => {
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 delay = (delay * 2).min(BACKOFF_MAX_MS);
             }
@@ -271,8 +300,8 @@ pub async fn start<T: Transport, C: Clock>(
     // The code's own expiry bounds these steps, and never more than a
     // pairing window from now.
     let code_exp = i64::try_from(qr.exp).ok().and_then(|e| DateTime::from_timestamp(e, 0)).unwrap_or(now);
-    let code_deadline = code_exp.min(now + PAIRING_WINDOW);
-    let registration = retrying(&clock, code_deadline, || transport.register(&own_url)).await?;
+    let code_deadline = Deadline::new(&clock, code_exp.min(now + PAIRING_WINDOW));
+    let registration = retrying(&clock, &code_deadline, || transport.register(&own_url)).await?;
     // Not retried: a claim is single-fetch, and a lost answer means it is gone.
     let blob = transport.get_claim(&qr.relay, &qr.claim_id).await?;
     let bundle = open_bundle(&blob, &qr, Kind::Desktop, clock.now()).map_err(PairError::Code)?;
@@ -303,17 +332,17 @@ pub async fn start<T: Transport, C: Clock>(
         now,
     })
     .map_err(PairError::Handshake)?;
-    let deadline = now + PAIRING_WINDOW;
-    deposit(&transport, &clock, deadline, &vault.relay, &Token::from_received(bundle.token.clone()), initiator.envelope()).await?;
+    let deadline = Deadline::new(&clock, now + PAIRING_WINDOW);
+    deposit(&transport, &clock, &deadline, &vault.relay, &Token::from_received(bundle.token.clone()), initiator.envelope()).await?;
 
     // Step 5: hs.resp. Anything that isn't it is acked and dropped.
     let (out, resp_msg) = 'resp: loop {
-        if clock.now() >= deadline {
+        if deadline.passed(&clock) {
             return Err(PairError::TimedOut);
         }
-        let batch = retrying(&clock, deadline, || transport.collect(&own_url, wait_secs(&clock, deadline), COLLECT_MAX)).await?;
+        let batch = retrying(&clock, &deadline, || transport.collect(&own_url, wait_secs(&clock, &deadline), COLLECT_MAX)).await?;
         for m in batch {
-            if clock.now() >= deadline {
+            if deadline.passed(&clock) {
                 return Err(PairError::TimedOut);
             }
             if let Some(sender) = resp_candidate(&m, &initiator) {
@@ -327,7 +356,7 @@ pub async fn start<T: Transport, C: Clock>(
                     Err(_) => {}
                 }
             }
-            retrying(&clock, deadline, || transport.ack(&own_url, &m.msg_id)).await?;
+            retrying(&clock, &deadline, || transport.ack(&own_url, &m.msg_id)).await?;
         }
     };
     let now = clock.now();
@@ -344,7 +373,7 @@ pub async fn start<T: Transport, C: Clock>(
         vault_token_exp: request_exp,
         issued_exp,
         phase: Phase::Pending,
-        pairing_deadline: deadline,
+        pairing_deadline: deadline.wall,
         device_id: None,
         vault_id: None,
         epoch: out.epoch.snapshot(),
@@ -364,7 +393,7 @@ pub async fn start<T: Transport, C: Clock>(
     // Stored before hs.fin goes out and before hs.resp is acked; from here
     // on, any failure removes it again.
     state.save(store)?;
-    if let Err(e) = deposit(&transport, &clock, deadline, &vault.relay, &Token::from_received(request), &out.fin).await {
+    if let Err(e) = deposit(&transport, &clock, &deadline, &vault.relay, &Token::from_received(request), &out.fin).await {
         return Err(cleared(store, e));
     }
     // Best effort: the state is stored, so a redelivered hs.resp is only a
@@ -422,16 +451,16 @@ impl<T: Transport, C: Clock> Pairing<T, C> {
     async fn wait(&mut self, store: &mut impl Persist) -> Result<Paired, PairError> {
         let own_url = self.state.relay_url.clone();
         let own_pk = SigningKey::from_bytes(&self.state.relay_seed).verifying_key();
-        let deadline = self.state.pairing_deadline;
+        let deadline = Deadline::new(&self.clock, self.state.pairing_deadline);
         loop {
-            if self.clock.now() >= deadline {
+            if deadline.passed(&self.clock) {
                 return Err(PairError::TimedOut);
             }
             let (transport, clock) = (&self.transport, &self.clock);
-            let batch = retrying(clock, deadline, || transport.collect(&own_url, wait_secs(clock, deadline), COLLECT_MAX)).await?;
+            let batch = retrying(clock, &deadline, || transport.collect(&own_url, wait_secs(clock, &deadline), COLLECT_MAX)).await?;
             for m in batch {
                 let now = self.clock.now();
-                if now >= deadline {
+                if deadline.passed(&self.clock) {
                     return Err(PairError::TimedOut);
                 }
                 match self.answer(&m, &own_pk, now) {
@@ -459,7 +488,7 @@ impl<T: Transport, C: Clock> Pairing<T, C> {
                     }
                     Answer::Drop => {
                         let (transport, clock) = (&self.transport, &self.clock);
-                        retrying(clock, deadline, || transport.ack(&own_url, &m.msg_id)).await?;
+                        retrying(clock, &deadline, || transport.ack(&own_url, &m.msg_id)).await?;
                     }
                 }
             }
