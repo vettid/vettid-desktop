@@ -39,13 +39,58 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      # The Ubuntu packages for the build and for the TPM and Secret Service
+      # tests. Their .deb files are cached: on 2026-11-06 the mirror served
+      # 65 MB at 38 kB/s (29 min), and the job ran out of time before
+      # `cargo test` (#98, #110). With the cache apt fetches only the indexes.
+      # The key follows the runner image, whose updates bring new versions.
+      - name: runner image version
+        id: image
+        run: echo "version=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      - name: restore apt package cache
+        id: apt-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/apt-cache
+          key: apt-${{ steps.image.outputs.version }}-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: apt-${{ steps.image.outputs.version }}-
+      # Its own limit, so a stalled mirror fails here and says so, instead of
+      # using up the job's 30 minutes. A healthy run takes under a minute.
       - name: install Tauri system dependencies
+        timeout-minutes: 12
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libssl-dev \
-            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+          set -euo pipefail
+          pkgs=(
+            build-essential pkg-config libssl-dev
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
             libxdo-dev libdbus-1-dev libtss2-dev
+            swtpm dbus-daemon
+          )
+          opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          mkdir -p ~/apt-cache
+          if compgen -G "$HOME/apt-cache/*.deb" > /dev/null; then
+            sudo cp "$HOME"/apt-cache/*.deb /var/cache/apt/archives/
+          fi
+          sudo timeout 240 apt-get "${opts[@]}" update \
+            || { echo "::error::apt-get update failed or took over 4 minutes (a slow or broken Ubuntu mirror)"; exit 1; }
+          sudo timeout 420 apt-get "${opts[@]}" install -y --no-install-recommends "${pkgs[@]}" \
+            || { echo "::error::apt-get install failed or took over 7 minutes (a slow or broken Ubuntu mirror)"; exit 1; }
+          # Keep only versions the mirror still has, so the cache doesn't grow.
+          sudo apt-get autoclean -y > /dev/null
+          rm -f "$HOME"/apt-cache/*.deb
+          if compgen -G "/var/cache/apt/archives/*.deb" > /dev/null; then
+            cp /var/cache/apt/archives/*.deb "$HOME/apt-cache/"
+          fi
+          echo "apt cache: $(ls "$HOME/apt-cache" | wc -l) files, $(du -sh "$HOME/apt-cache" | cut -f1)"
+      # Saved now, not at the end, so a later failing step still leaves the
+      # cache for the next run.
+      - name: save apt package cache
+        if: steps.apt-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/apt-cache
+          key: ${{ steps.apt-cache.outputs.cache-primary-key }}
       - name: rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
@@ -66,7 +111,6 @@ jobs:
       - name: TPM and Secret Service tests (swtpm, dbus-daemon)
         shell: bash
         run: |
-          sudo apt-get install -y --no-install-recommends swtpm dbus-daemon
           tests=(
             credential::tpm::tests::tpm_round_trip_against_swtpm
             credential::tpm::tests::tpm_uses_the_persistent_srk_when_there
