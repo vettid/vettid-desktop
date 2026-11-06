@@ -296,10 +296,12 @@ pub struct Session<T: Transport, C: Clock> {
     /// takes. In memory only. SECURITY: display only, never used to adjust
     /// a timestamp or a check.
     clock_refused: Option<Option<i64>>,
-    /// The relay has taken a signed call from this clock since the session
-    /// opened or since its last `timestamp_stale` (#107, review A): only
-    /// then is this clock trusted to judge an outbox entry stamped ahead
-    /// of it (see `flush`).
+    /// The relay has just taken a signed call from this clock (#107, reviews
+    /// A and M2): the collect right before the flush at the end of a poll,
+    /// or a deposit earlier in the same flush. Cleared before every other
+    /// flush, so a confirmation never carries over to a later moment (the
+    /// clock can jump back over a sleep). Only then is this clock trusted
+    /// to judge an outbox entry stamped ahead of it (see `flush`).
     clock_confirmed: bool,
     /// See [`COLLECT_BACKOFF`].
     collect_backoff: std::time::Duration,
@@ -750,6 +752,8 @@ impl<T: Transport, C: Clock> Session<T, C> {
         // Stored: a temporary failure or a store error after the deposit
         // doesn't change the answer. Only a refusal does: the device was
         // removed, and this message won't go (it is reported as dropped).
+        // #107 (review M2): no relay call just took this clock.
+        self.clock_confirmed = false;
         match self.flush(store).await {
             Err(SessionError::Refused) => Err(SessionError::Refused),
             _ => Ok(id),
@@ -936,6 +940,9 @@ impl<T: Transport, C: Clock> Session<T, C> {
             // (review A) it is this clock that may be behind, for now (a
             // dual-boot start before the time sync): neither sent nor
             // dropped; it waits, and is judged once the relay takes a call.
+            // The vault's 5 min, not the relay's 90 s: with a clock up to
+            // 90 s off, an entry 5 to 6.5 min ahead might still have been
+            // taken, but it is reported, never lost unseen (the safe side).
             if e.created - now > MAX_CLOCK_SKEW_FUTURE {
                 if !self.clock_confirmed {
                     break;
@@ -1043,6 +1050,10 @@ impl<T: Transport, C: Clock> Session<T, C> {
     }
 
     async fn poll_batch(&mut self, store: &mut impl Persist, wait_secs: u64) -> Result<Vec<Inner>, SessionError> {
+        // #107 (review M2): an earlier confirmation may be stale (the clock
+        // can jump back over a sleep); only this poll's own collect counts,
+        // for the flush after it.
+        self.clock_confirmed = false;
         match self.flush(store).await {
             Ok(()) | Err(SessionError::Relay(_)) | Err(SessionError::Refused) => {}
             Err(e) => return Err(e),
@@ -1118,6 +1129,8 @@ impl<T: Transport, C: Clock> Session<T, C> {
             // Best effort: what isn't acked comes again, and is a duplicate.
             let _ = self.transport.ack(&self.state.relay_url, id).await;
         }
+        // Right after a collect the relay took: this clock is confirmed for
+        // this flush (#107).
         let flushed = self.flush(store).await;
         // The inbox events not yet returned (stored, so not lost) come
         // first, then the batch's other events.
