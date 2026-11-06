@@ -6,4 +6,5 @@
 # builds too); other targets ignore it. Here, not in a workflow, so every
 # build from this repo gets it: local, CI and release.
 [env]
-STATIC_VCRUNTIME = "true"
+# force: a STATIC_VCRUNTIME already in the environment can't turn it off.
+STATIC_VCRUNTIME = { value = "true", force = true }
