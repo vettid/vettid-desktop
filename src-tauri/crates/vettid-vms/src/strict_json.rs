@@ -197,11 +197,12 @@ pub fn as_string(raw: &str) -> Result<String, JsonError> {
         return Err(JsonError::Type);
     }
     let mut p = Parser { s: raw.as_bytes(), text: raw, i: 0 };
-    let s = p.string().map_err(|_| JsonError::Type)?;
+    // #60: wiped if refused for trailing text.
+    let mut s = Zeroizing::new(p.string().map_err(|_| JsonError::Type)?);
     if p.i != raw.len() {
         return Err(JsonError::Type);
     }
-    Ok(s)
+    Ok(std::mem::take(&mut *s))
 }
 
 /// Read a raw value as an integer in `[min, max]`, written as a plain JSON
@@ -815,6 +816,8 @@ mod tests {
         for (raw, want) in cases {
             let s = as_string(raw).unwrap();
             assert_eq!(s, want, "{raw}");
+            // Equality catches a regrowth. std's String records the capacity
+            // asked for, not what the allocator gave, so this is exact.
             assert_eq!(s.capacity(), raw.len() - 2, "{raw}: allocated once, at the raw length");
         }
     }

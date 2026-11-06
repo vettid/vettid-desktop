@@ -162,12 +162,15 @@ impl Inner {
     /// session mode, and must be absent in sealed mode.
     pub fn marshal(&self, mode: Mode) -> Result<String, EnvelopeError> {
         self.validate(mode)?;
-        let body = if self.body.is_empty() {
+        // The body may be secret (a held inner, #60): its compacted copy is
+        // wiped, and the builder is sized once for everything, so it never
+        // reallocates (each reallocation would leave a copy of the body).
+        let body = Zeroizing::new(if self.body.is_empty() {
             "{}".to_string()
         } else {
             strict_json::compact_object(&self.body, 2).map_err(|_| EnvelopeError::Inner)?
-        };
-        let mut b = Builder::new().uint("v", INNER_VERSION).string("id", &self.id).string("type", &self.kind).string("ts", &format_ts(self.ts));
+        });
+        let mut b = Builder::with_capacity(self.marshal_capacity(body.len())).uint("v", INNER_VERSION).string("id", &self.id).string("type", &self.kind).string("ts", &format_ts(self.ts));
         if let Some(seq) = self.seq {
             b = b.uint("seq", seq);
         }
@@ -191,6 +194,21 @@ impl Inner {
             }
         }
         Ok(b.raw("body", &body).finish())
+    }
+
+    /// Room for [`Inner::marshal`]'s output with a compacted body of
+    /// `body_len` bytes: every string member at its longest escaped form
+    /// (6 bytes for each byte, a control character's escape), the fixed
+    /// members and names, the error object and the closing brace.
+    fn marshal_capacity(&self, body_len: usize) -> usize {
+        let response = self.response.as_ref().map_or(0, |r| {
+            let error = match &r.status {
+                Status::Ok => 0,
+                Status::Error { code, message } => code.len() + message.as_deref().map_or(0, str::len),
+            };
+            r.re.len() + error
+        });
+        256 + body_len + 6 * (self.id.len() + self.kind.len() + response)
     }
 
     /// Parse an (unpadded) inner plaintext strictly (§5.3): unknown members
@@ -304,6 +322,28 @@ mod tests {
         // Unknown members are ignored.
         let extra = SPEC_INNER.replacen(r#""body""#, r#""future":[1],"body""#, 1);
         assert!(Inner::parse(extra.as_bytes(), Mode::Sealed).is_ok());
+    }
+
+    /// #60: marshal sizes its buffer once: the output never regrew (each
+    /// regrowth would leave an unwiped copy of a possibly secret body), for
+    /// a large body and the longest response members.
+    #[test]
+    fn marshal_never_regrows() {
+        let mut i = ping();
+        i.seq = Some(7);
+        i.exp = parse_ts("2026-10-01T12:05:00.000Z");
+        i.response = Some(Response { re: RE.into(), status: Status::Error { code: "not_found".into(), message: Some("m".repeat(500)) } });
+        let body = format!(r#"{{"secret":"{}"}}"#, "s".repeat(10_000));
+        i.body = Zeroizing::new(body.clone());
+        let j = i.marshal(Mode::Session).unwrap();
+        assert_eq!(j.capacity(), i.marshal_capacity(body.len()), "allocated once");
+        assert!(j.len() <= j.capacity());
+        for b in ["", "{}"] {
+            let mut p = ping();
+            p.body = Zeroizing::new(b.into());
+            let j = p.marshal(Mode::Sealed).unwrap();
+            assert_eq!(j.capacity(), p.marshal_capacity(2));
+        }
     }
 
     /// Every must-reject form of §5.3 the vault's tests and the 0.83.1
