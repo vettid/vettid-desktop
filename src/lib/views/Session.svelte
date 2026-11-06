@@ -1,19 +1,12 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
-  import { sessionStore, refreshSessionFromBackend, vaultStore, askToEnd, endBusy, endStatus } from '../stores/session';
+  import { sessionStore, vaultStore, askToEnd, endBusy, endStatus } from '../stores/session';
   import { vaultScreen, endOffered, unreachableAlertShown } from '../vaultState.js';
   import SessionTimer from '../components/SessionTimer.svelte';
-  import ConfirmDialog from '../components/ConfirmDialog.svelte';
 
   let session = $derived($sessionStore);
   // #77: the vault's state (the hold-off line while `due`).
   let screen = $derived(vaultScreen($vaultStore));
-
-  let busy = $state(false);
-  let busyLabel = $state('');
-  let statusMessage = $state('');
-
-  let lockDialogOpen = $state(false);
 
   // Identity for the "Session for {name} ({email})" line. Pulled
   // from profile.get on mount — the same op the Vault view uses for
@@ -41,45 +34,10 @@
     if (session.state === 'active') loadIdentity();
   });
 
-  async function doLock() {
-    if (busy) return;
-    busy = true;
-    busyLabel = 'Locking…';
-    statusMessage = '';
-    try {
-      await invoke('lock');
-      statusMessage = 'Locked. The next launch auto-unlocks.';
-      await refreshSessionFromBackend();
-    } catch (e) {
-      statusMessage = `Lock failed: ${e}`;
-    } finally {
-      busy = false;
-    }
-  }
-
   // End session, its confirmation and its "Ending your session…" overlay
   // live above the views (stores/session.ts, App.svelte, #77): a screen
   // swap while it is open or under way loses nothing.
 </script>
-
-<ConfirmDialog
-  bind:open={lockDialogOpen}
-  title="Lock now?"
-  message="Your vault stays paired — the next launch auto-unlocks."
-  confirmLabel="Lock"
-  onConfirm={doLock}
-/>
-
-{#if busy}
-  <!-- Full-view takeover while end-session / lock is in flight. The
-       end-session round-trip with the vault (through the relay)
-       can take a beat; without this the user sees a frozen, still-
-       clickable screen and assumes nothing happened. -->
-  <div class="busy-overlay">
-    <div class="busy-spinner"></div>
-    <p>{busyLabel}</p>
-  </div>
-{/if}
 
 <div class="session-view">
   <header>
@@ -92,24 +50,17 @@
     <p class="hint">Live state of this desktop's vault session.</p>
   </header>
 
-  <!-- Actions row up top: Lock and End. Inline native confirm
-       dialogs keep the click count down vs the previous two-step
-       reveal — the user reported it felt like "nothing happened"
-       because the confirm button wasn't where the muscle memory
-       expected. -->
+  <!-- Actions row up top: End session (#76: no Lock now; the owner's
+       decision: End session is how this desktop's access stops). -->
   <div class="actions">
-    <button class="action-btn" onclick={() => lockDialogOpen = true}
-            disabled={busy || session.state !== 'active'}>
-      Lock now
-    </button>
     {#if endOffered(screen.kind)}
       <button class="action-btn danger" onclick={askToEnd}
-              disabled={busy || $endBusy}>
+              disabled={$endBusy}>
         End session
       </button>
     {/if}
-    {#if statusMessage || $endStatus}
-      <span class="status-msg">{statusMessage || $endStatus}</span>
+    {#if $endStatus}
+      <span class="status-msg">{$endStatus}</span>
     {/if}
   </div>
 
@@ -264,30 +215,5 @@
     background: rgba(255, 152, 0, 0.1);
     border: 1px solid rgba(255, 152, 0, 0.3);
     color: var(--warning);
-  }
-
-  .busy-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 50;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 16px;
-    background: var(--bg, #0e0e12);
-    color: var(--text, #e8e8ea);
-    font-size: 0.95rem;
-  }
-  .busy-spinner {
-    width: 30px;
-    height: 30px;
-    border: 3px solid rgba(255, 255, 255, 0.1);
-    border-top-color: var(--accent, #6b8afd);
-    border-radius: 50%;
-    animation: session-busy-spin 0.9s linear infinite;
-  }
-  @keyframes session-busy-spin {
-    to { transform: rotate(360deg); }
   }
 </style>

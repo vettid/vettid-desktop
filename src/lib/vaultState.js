@@ -22,8 +22,8 @@
  */
 
 /**
- * Which screen: a vault state, or `none` when no link is open (this
- * desktop's own Lock, or before its unlock): then the screen is the one
+ * Which screen: a vault state, or `none` when no link is open (before
+ * its unlock, or after one that failed): then the screen is the one
  * the app always showed there, with Start New Session, and no vault state.
  * @typedef {'none' | 'unknown' | 'open' | 'held' | 'locked'} Kind
  */

@@ -6,7 +6,7 @@
   let theme = $derived($themeStore);
 
   // Sub-pages cover persistent preferences only — live session ops
-  // (Lock, End session) moved to the Session
+  // (End session) moved to the Session
   // screen since they're transient operations the user reaches via
   // the top-bar pill. Settings keeps Device / Appearance / Danger
   // Zone (Log out) / About.
@@ -231,8 +231,8 @@
     {:else if subPage === 'danger'}
       <h2>Danger zone</h2>
       <p class="hint">
-        Log out removes this desktop's pairing entirely. For lock or end-session
-        (which keep the pairing), open the Session screen from the top-bar pill.
+        Log out removes this desktop's pairing entirely. To end this desktop's
+        session and keep the pairing, open the Session screen from the top-bar pill.
       </p>
       <div class="card danger">
         <div class="row">
@@ -467,6 +467,5 @@
   }
 
   .btn-row { display: flex; gap: 8px; margin-top: 10px; }
-  .lock-msg { padding: 6px 0 0; font-size: 0.85rem; color: var(--text-muted); }
   .logout-msg { padding: 8px 0 0; font-size: 0.85rem; color: var(--text-muted); }
 </style>

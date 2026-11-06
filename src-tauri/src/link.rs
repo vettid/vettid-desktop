@@ -178,8 +178,8 @@ pub fn plain_store_notice(e: &CredentialError) -> Option<String> {
 /// operation; holds no secret.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
-    /// A paired device's state is open in memory (this desktop's own lock,
-    /// #76; not the vault's, which is [`Snapshot::vault`]).
+    /// A paired device's state is open in memory (false before unlock, or
+    /// after one that failed; the vault's lock is [`Snapshot::vault`]).
     pub link_open: bool,
     /// The id the vault gave this device.
     pub device_id: Option<String>,
