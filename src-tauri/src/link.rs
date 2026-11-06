@@ -1783,7 +1783,10 @@ mod tests {
         vault.request_window(window);
         let start = Utc::now();
         let mut asked = false;
-        let r = link.request_access(|| asked = true, || false).await;
+        // An upper bound too: a wait that never lapses fails here, not hangs.
+        let r = tokio::time::timeout(std::time::Duration::from_secs(12), link.request_access(|| asked = true, || false))
+            .await
+            .expect("lapsed within 10 s of exp");
         let waited = Utc::now() - start;
         assert!(asked, "the phone was asked");
         assert_eq!(r, Err(RequestFailed::Lapsed));
