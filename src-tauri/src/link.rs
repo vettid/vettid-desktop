@@ -81,7 +81,7 @@ pub fn too_soon_retry_at(at: DateTime<Utc>, now: DateTime<Utc>) -> Option<DateTi
 }
 /// NEW TEXT (owner approval needed): the owner declined the request.
 pub const REQUEST_DENIED_NOTICE: &str = "Your phone declined the request. This desktop has no access.";
-/// NEW TEXT (owner approval needed, #96): the owner declined a new session
+/// Owner-approved text (#96, 2026-11-06): the owner declined a new session
 /// while the current one was live: it runs on (0.77.0). With its end time
 /// the frontend says "Your phone declined a new session. The current one
 /// continues until {time}." in the computer's own locale. This text is for

@@ -13,7 +13,7 @@ export function tooSoonNotice(retryAt, locale) {
 }
 
 /**
- * NEW TEXT (owner approval needed, #96): the phone declined a new session
+ * Owner-approved text (#96, 2026-11-06): the phone declined a new session
  * while the current one is live; it runs on until its end time, in the
  * reader's own locale.
  *
