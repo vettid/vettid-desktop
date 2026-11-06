@@ -1751,8 +1751,40 @@ mod tests {
         vault.event("device.session.ended", "{\"reason\":\"denied\"}", Utc::now() - TimeDelta::seconds(30));
         vault.grant_on_request(("s-2", Utc::now() + TimeDelta::hours(1)));
         let mut asked = false;
-        link.request_access(|| asked = true, || false).await.expect("granted");
+        // #90: say which failure, if it ever fails again.
+        if let Err(f) = link.request_access(|| asked = true, || false).await {
+            panic!("not granted: {f:?}");
+        }
         assert!(asked);
+        let snap = link.snapshot(Utc::now());
+        assert!(snap.active_at(Utc::now()));
+        assert_eq!(snap.session_id.as_deref(), Some("s-2"));
+    }
+
+    /// #90, a regression guard for the fake vault (test infrastructure),
+    /// not for the device: one way the test above could fail by timing. The
+    /// fake once stamped each message with the wall clock as it was then. A
+    /// clock that stepped back after an earlier message left that message
+    /// stamped ahead of the grant and of the status confirming it: both
+    /// looked older than what this desktop had already learned, were
+    /// (rightly) ignored as stale, and the request ended `NotConfirmed`.
+    /// Here an earlier message is stamped 10 s ahead (an `ended`, as a
+    /// clock 10 s fast would have stamped it). The fake's stamps no longer
+    /// go back (`State::now` stamps after the last message, #92): the grant
+    /// comes after it and is confirmed. With `State::now` as it was, this
+    /// fails with `NotConfirmed`. Not covered: the device's own clock (a
+    /// step back holds its outbox, #105) and a store write failing on
+    /// Windows; #90 lists both.
+    #[tokio::test]
+    async fn a_message_stamped_ahead_doesnt_lose_the_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        link.read_status().await.unwrap();
+        vault.event("device.session.ended", "{\"reason\":\"ended\"}", Utc::now() + TimeDelta::seconds(10));
+        vault.grant_on_request(("s-2", Utc::now() + TimeDelta::hours(1)));
+        if let Err(f) = link.request_access(|| {}, || false).await {
+            panic!("not granted: {f:?}");
+        }
         let snap = link.snapshot(Utc::now());
         assert!(snap.active_at(Utc::now()));
         assert_eq!(snap.session_id.as_deref(), Some("s-2"));
