@@ -10,6 +10,8 @@ on:
   pull_request:
     paths:
       - "src-tauri/**"
+      - ".cargo/**"
+      - "scripts/windows/check-no-vcruntime.ps1"
       - ".github/workflows/windows.yml"
 
 permissions:
@@ -63,3 +65,14 @@ jobs:
       # need a second Windows account don't exist yet.
       - name: cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      # The program must not need the Visual C++ runtime, which a fresh
+      # Windows doesn't have (#112): without it the app doesn't start, and the
+      # uninstaller's wipe can't run. .cargo/config.toml sets STATIC_VCRUNTIME;
+      # this fails if the built program imports a VCRUNTIME DLL anyway.
+      - name: no Visual C++ runtime DLL needed (#112)
+        shell: pwsh
+        run: |
+          cargo build --manifest-path src-tauri/Cargo.toml --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./scripts/windows/check-no-vcruntime.ps1 src-tauri/target/debug/vettid-desktop.exe
+          exit $LASTEXITCODE

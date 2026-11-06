@@ -30,6 +30,13 @@ lists only `app`, `dmg`, `appimage` and `deb`.
 - One compiler warning, in both runs: `unquote` in `commands/auth.rs` is unused on Windows, because only the
   Linux branch of `resolve_os_details` calls it.
 - On its first run Tauri downloads NSIS 3.11 and checks its hashes.
+- **The Visual C++ runtime is linked in** (#112): `src-tauri/build.rs` and `.cargo/config.toml` set
+  `STATIC_VCRUNTIME`, so the program starts on a PC without the runtime. The UCRT, part of Windows 10 and 11,
+  stays a DLL. After a release build, check it:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows/check-no-vcruntime.ps1 src-tauri/target/release/vettid-desktop.exe`
+  must exit 0. CI checks the debug build the same way.
+- **Servicing:** Windows Update doesn't patch a VC runtime linked into the program. A fix to it reaches members
+  only with a rebuild, so build releases with a current MSVC toolset (an up-to-date Visual Studio Build Tools).
 
 ## Smart App Control
 
