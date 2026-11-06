@@ -1,7 +1,7 @@
 # Uninstall VettID Desktop for the signed-in user, and report whether the saved pairing is confirmed gone.
 # Run it as that user (user context), not as SYSTEM: see docs/WINDOWS-TESTING.md, "IT-managed installs".
 # Exit 0: uninstalled, and the pairing confirmed gone (or nothing was installed or paired).
-# Exit 2: not confirmed, or anything unexpected (events 1001-1003 in the Application log may say more).
+# Exit 2: not confirmed, or anything unexpected (events 1001-1004 in the Application log may say more).
 $ErrorActionPreference = 'Stop'
 try {
     # A service account (SYSTEM, LocalService, NetworkService) sees its own profile, not the person's: refuse.

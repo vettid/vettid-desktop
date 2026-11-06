@@ -85,6 +85,9 @@ struct State {
     last_ts: DateTime<Utc>,
     /// What happens once the next `device.session.request` is answered.
     after_request: Option<AfterRequest>,
+    /// How long after its answer a session request lapses (its `exp`):
+    /// 5 minutes unless a test sets it (#49).
+    request_window: Option<TimeDelta>,
 }
 
 /// What the fake vault does once it has answered a request for a session.
@@ -260,6 +263,7 @@ impl FakeVault {
             deposited: Vec::new(),
             last_ts: now - TimeDelta::minutes(1),
             after_request: None,
+            request_window: None,
         })));
         let t = fake.clone();
         let session = Session::open(&mut store, move |_| t, SystemClock).expect("open").expect("paired");
@@ -373,6 +377,11 @@ impl FakeVault {
         self.lock().after_request = Some(a);
     }
 
+    /// Session requests lapse `window` after their answer (their `exp`).
+    pub(crate) fn request_window(&self, window: TimeDelta) {
+        self.lock().request_window = Some(window);
+    }
+
     /// Deposits refused for now with a `503` (`true`), collects still
     /// answered; or back (`false`).
     pub(crate) fn fail_deposits(&self, on: bool) {
@@ -451,7 +460,8 @@ impl Transport for FakeVault {
         }
         if inner.response.is_none() && inner.kind == "device.session.request" {
             let now = s.now();
-            let body = Builder::new().string("request_id", "req-1").string("exp", &format_ts(now + TimeDelta::minutes(5))).finish();
+            let window = s.request_window.unwrap_or(TimeDelta::minutes(5));
+            let body = Builder::new().string("request_id", "req-1").string("exp", &format_ts(now + window)).finish();
             let answer = State::inner_at("device.session.request", ok(&inner), body, now);
             s.send(answer);
             if let Some((id, exp)) = s.on_request.take() {

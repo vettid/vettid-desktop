@@ -270,6 +270,43 @@ async fn held_messages_survive_a_failing_poll() {
     assert!(s.poll(&mut store).await.is_err(), "now the collect fails");
 }
 
+/// #105: a device clock set back after the session opened doesn't hold the
+/// outbox. The hold is a span of monotonic time, not a wall-clock instant:
+/// with the open time as a wall-clock hold, nothing was sent until the
+/// clock caught up again (2 minutes here; an hour after an hour's
+/// correction).
+#[tokio::test]
+async fn a_clock_set_back_doesnt_hold_the_outbox() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let clock = Ticking::new();
+    let mut s = session(&relay, &faults, &mut store, clock.clone());
+    clock.ticks.store(-120, std::sync::atomic::Ordering::SeqCst);
+    let id = s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+    assert_eq!(s.outbox_len(), 0, "sent at once, not held until the clock catches up");
+    assert_eq!(vault_receive(&mut vault).await.id, id);
+}
+
+/// #105: a backoff hold set before the clock is set back still ends on
+/// time. It is a span of monotonic time (5 s at most here), not a wall-clock
+/// instant the step would push 2 minutes away. Time is paused, so the span
+/// passes at once with `advance`.
+#[tokio::test(start_paused = true)]
+async fn a_backoff_set_before_a_clock_step_ends_on_time() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let clock = Ticking::new();
+    let mut s = session(&relay, &faults, &mut store, clock.clone());
+    faults.lock().unwrap().server_errors = 1;
+    s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+    assert_eq!(s.outbox_len(), 1, "the 5xx left it held");
+    clock.ticks.store(-120, std::sync::atomic::Ordering::SeqCst);
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.outbox_len(), 1, "still within its backoff");
+    tokio::time::advance(std::time::Duration::from_secs(6)).await;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.outbox_len(), 0, "sent once the backoff passed, despite the clock");
+    assert_eq!(vault_receive(&mut vault).await.kind, "test.ping");
+}
+
 /// Any 429 (a full mailbox too) keeps the entry in the outbox (§8.6), and
 /// its retry_after (600 s here) holds: neither another send nor a poll
 /// tries it early.
@@ -285,7 +322,7 @@ async fn a_quota_429_keeps_the_entry() {
     s.poll(&mut store).await.unwrap();
     assert_eq!(faults.lock().unwrap().deposits_seen, tried, "held: not tried again yet");
     assert_eq!(s.outbox_len(), 2);
-    s.hold_until = Utc::now() - TimeDelta::seconds(1);
+    s.hold_until = None;
     s.poll(&mut store).await.unwrap();
     assert_eq!(s.outbox_len(), 0);
     assert_eq!(vault_receive(&mut vault).await.kind, "test.ping");
@@ -396,7 +433,7 @@ async fn the_outbox_cap_and_token_entries() {
     // The vault's token to us runs low: a refresh request goes out (once
     // per hour), and the answer's token is kept.
     s.state.vault_token_exp = Utc::now() + TimeDelta::days(2);
-    s.hold_until = Utc::now() - TimeDelta::seconds(1);
+    s.hold_until = None;
     s.poll(&mut store).await.unwrap();
     let ask = vault_receive(&mut vault).await;
     assert_eq!(ask.kind, "relay.token.refresh");
@@ -571,7 +608,7 @@ async fn a_retransmitted_init_is_answered_once() {
     let init_id = s.state.outbox[0].re.clone().expect("tagged with its hs.init");
     assert!(!s.state.seen_inner.contains_key(&init_id), "not handled until the relay takes hs.resp");
     vault.deposit_raw(&init).await;
-    s.hold_until = Utc::now() - TimeDelta::seconds(1);
+    s.hold_until = None;
     s.poll(&mut store).await.unwrap();
     assert_eq!((s.outbox_len(), vault.waiting(), s.awaiting.len()), (0, 1, 1), "the queued answer went, once");
     assert!(s.state.seen_inner.contains_key(&init_id));
@@ -958,7 +995,7 @@ async fn unlinked_ends_rekeys_and_requests() {
     vault.start_rekey().await;
     s.poll(&mut store).await.unwrap();
     assert_eq!((s.awaiting.len(), s.outbox_len()), (1, 1));
-    s.hold_until = Utc::now() - TimeDelta::seconds(1);
+    s.hold_until = None;
     faults.lock().unwrap().temporary = 1000;
     vault_deposit(&mut vault, event("device.unlinked", "{}"), None).await;
     s.poll(&mut store).await.unwrap();
@@ -1141,7 +1178,7 @@ async fn a_hold_from_the_relays_own_answer_survives_a_good_collect() {
         s.poll(&mut store).await.unwrap();
         assert_eq!(faults.lock().unwrap().deposits_seen, tried, "held: not tried again on the good collect");
         assert_eq!(s.outbox_len(), 1);
-        s.hold_until = Utc::now() - TimeDelta::seconds(1);
+        s.hold_until = None;
         s.poll(&mut store).await.unwrap();
         assert_eq!(s.outbox_len(), 0);
         assert_eq!(vault_receive(&mut vault).await.kind, "test.ping");
