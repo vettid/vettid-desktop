@@ -267,7 +267,7 @@ Var VettidWipe
 Function un.onUninstFailed
   ${If} $VettidWipe == ""
     ; NEW TEXT (owner approval needed).
-    StrCpy $7 "VettID Desktop's uninstall stopped before it finished, and nothing was removed: the program and this desktop's saved pairing are probably still on this computer. This usually means VettID Desktop was running and couldn't be closed, or the uninstall was canceled. Close VettID Desktop, then uninstall it again."
+    StrCpy $7 "VettID Desktop's uninstall stopped before it finished, and nothing was removed: the program and this desktop's saved pairing are still on this computer. This usually means VettID Desktop was running and couldn't be closed, or the uninstall was canceled. Close VettID Desktop, then try again."
   ${Else}
     ; NEW TEXT (owner approval needed).
     StrCpy $7 "VettID Desktop's uninstall stopped before it finished (result $VettidWipe). Removing this desktop's saved pairing was tried, but the program may still be on this computer and may still be running, so the pairing's removal isn't confirmed. Close VettID Desktop, then uninstall it again. If this desktop was paired, also remove it on the phone."

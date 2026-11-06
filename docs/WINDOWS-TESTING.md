@@ -254,9 +254,8 @@ also open its window) exits 0.
   delete %LOCALAPPDATA%\vettid-desktop if it's there, and any vettid-desktop entry in that account's Windows
   Credential Manager. Remove this desktop on the phone too." The 1004 texts: before the wipe ran (or when it
   is skipped), "VettID Desktop's uninstall stopped before it finished, and nothing was removed: the program
-  and this desktop's saved pairing are probably still on this computer. This usually means VettID Desktop was
-  running and couldn't be closed, or the uninstall was canceled. Close VettID Desktop, then uninstall it
-  again." After the wipe ran: "VettID Desktop's uninstall stopped before it finished (result `<code>`).
+  and this desktop's saved pairing are still on this computer. This usually means VettID Desktop was running
+  and couldn't be closed, or the uninstall was canceled. Close VettID Desktop, then try again." After the wipe ran: "VettID Desktop's uninstall stopped before it finished (result `<code>`).
   Removing this desktop's saved pairing was tried, but the program may still be on this computer and may
   still be running, so the pairing's removal isn't confirmed. Close VettID Desktop, then uninstall it again.
   If this desktop was paired, also remove it on the phone."
