@@ -218,12 +218,14 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --target aarch64-apple-darwin
           rustup default stable
+      # Caches the target directory and ~/.cargo/bin (the installed CLI).
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          workspaces: src-tauri
       - name: tauri CLI
-        run: cargo install tauri-cli --version '^2' --locked
+        run: command -v cargo-tauri || cargo install tauri-cli --version '^2' --locked
       - run: npm ci
-      - name: build, ad-hoc sign, make the DMG, verify
+      - name: build, ad-hoc sign, make the DMG, verify (the DMG and the app in it)
         env:
           APPLE_SIGNING_IDENTITY: "-"
         run: scripts/macos-release.sh --sign-only
-      - name: verify the app too
-        run: scripts/macos-verify.sh --adhoc "src-tauri/target/aarch64-apple-darwin/release/bundle/macos/VettID Desktop.app"

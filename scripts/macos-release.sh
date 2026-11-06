@@ -12,7 +12,10 @@
 #   --dry-run    print the steps and check the inputs; build nothing
 #
 # Environment:
-#   APPLE_SIGNING_IDENTITY    required; the Developer ID Application identity
+#   APPLE_SIGNING_IDENTITY    required; the Developer ID Application identity,
+#                             by name or by the 40-hex SHA-1 of the certificate
+#                             (use the SHA-1 when a renewed certificate sits
+#                             beside the old one: `security find-identity -v -p codesigning`)
 #   VETTID_NOTARY_PROFILE     notarytool keychain profile (default: vettid-notary)
 #   VETTID_PROVISION_PROFILE  optional path to a provisioning profile; embedded
 #                             as Contents/embedded.provisionprofile before
@@ -52,8 +55,8 @@ if [[ "$IDENTITY" == "-" && "$SIGN_ONLY" -eq 0 && "$DRY" -eq 0 ]]; then
     echo "ERROR: an ad-hoc identity cannot be notarized; use --sign-only." >&2
     exit 1
 fi
-if [[ "$IDENTITY" != "-" && "$IDENTITY" != Developer\ ID\ Application:* ]]; then
-    echo "ERROR: APPLE_SIGNING_IDENTITY must be a \"Developer ID Application: ...\" identity." >&2
+if [[ "$IDENTITY" != "-" && "$IDENTITY" != Developer\ ID\ Application:* && ! "$IDENTITY" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+    echo "ERROR: APPLE_SIGNING_IDENTITY must be a \"Developer ID Application: ...\" name or a 40-hex SHA-1." >&2
     exit 1
 fi
 if [[ -n "$PROVISION" && ! -f "$PROVISION" ]]; then
@@ -72,7 +75,10 @@ cd "$REPO_ROOT"
 #    so it signs ad-hoc; the real signature is made below, after the optional
 #    provisioning profile is in the bundle.
 build=(cargo tauri build --target "$TARGET" --bundles app)
-[[ "$CALLS" -eq 1 ]] && build+=(--features webrtc)
+if [[ "$CALLS" -eq 1 ]]; then
+    build+=(--features webrtc)
+    export LIBOPUS_STATIC=1   # link libopus statically (audiopus_sys), no Homebrew dylib in the app
+fi
 echo "==> Building the app"
 if [[ "$DRY" -eq 0 ]]; then
     env -u APPLE_SIGNING_IDENTITY -u APPLE_CERTIFICATE -u APPLE_CERTIFICATE_PASSWORD "${build[@]}"
@@ -98,6 +104,16 @@ if [[ "$IDENTITY" == "-" ]]; then sign_opts+=(--timestamp=none); else sign_opts+
 
 echo "==> Signing the app"
 if [[ "$DRY" -eq 0 ]]; then
+    # Frameworks, nested apps and several executables need bundle signing,
+    # deepest first. The app has none today; refuse rather than sign them wrongly.
+    nested="$(find "$APP/Contents" \( -name '*.framework' -o -name '*.app' -o -name '*.xpc' \) -prune -print | head -3)"
+    nmain="$(find "$APP/Contents/MacOS" -type f | wc -l | tr -d ' ')"
+    if [[ -n "$nested" || "$nmain" -ne 1 ]]; then
+        echo "ERROR: the bundle has a framework, nested app, XPC service or more than one executable in Contents/MacOS;" >&2
+        echo "       they must be signed deepest first, which this script does not do yet:" >&2
+        echo "$nested" >&2
+        exit 1
+    fi
     while IFS= read -r -d '' f; do
         if file "$f" | grep -q 'Mach-O' && [[ "$f" != "$APP/Contents/MacOS/"* ]]; then
             codesign "${sign_opts[@]}" "$f"
@@ -113,7 +129,7 @@ if [[ "$DRY" -eq 0 ]]; then
     rm -f "$DMG"
     stage="$(mktemp -d)"
     trap 'rm -rf "$stage"' EXIT
-    cp -R "$APP" "$stage/"
+    ditto "$APP" "$stage/$(basename "$APP")"
     ln -s /Applications "$stage/Applications"
     hdiutil create -quiet -volname "VettID Desktop" -srcfolder "$stage" -format UDZO -fs HFS+ "$DMG"
 else
@@ -129,7 +145,19 @@ if [[ "$SIGN_ONLY" -eq 1 ]]; then
     exit 0
 fi
 echo "==> Notarizing (profile: $PROFILE)"
-run xcrun notarytool submit "$DMG" --keychain-profile "$PROFILE" --wait
+if [[ "$DRY" -eq 0 ]]; then
+    result="$(xcrun notarytool submit "$DMG" --keychain-profile "$PROFILE" --wait --output-format json)"
+    status="$(printf '%s' "$result" | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')"
+    subid="$(printf '%s' "$result" | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')"
+    echo "notarization: $status (submission $subid)"
+    if [[ "$status" != "Accepted" ]]; then
+        echo "ERROR: not accepted. See why with:" >&2
+        echo "  xcrun notarytool log $subid --keychain-profile \"$PROFILE\"" >&2
+        exit 1
+    fi
+else
+    echo "+ xcrun notarytool submit \"$DMG\" --keychain-profile \"$PROFILE\" --wait --output-format json"
+fi
 run xcrun stapler staple "$DMG"
 
 # 6. Verify.

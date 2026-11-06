@@ -24,6 +24,10 @@ notarizes but does not re-sign: the signature a member installs is VettID's.
    export APPLE_SIGNING_IDENTITY="Developer ID Application: <name> (<team>)"
    ```
 
+   When a renewed certificate sits beside the old one, the name is
+   ambiguous: use the certificate's 40-hex SHA-1 instead
+   (`security find-identity -v -p codesigning`).
+
 ## Release
 
 ```bash
@@ -47,10 +51,21 @@ scripts/macos-verify.sh <app or dmg>           # the full release check
 scripts/macos-verify.sh --adhoc <app or dmg>   # ad-hoc build: no Developer ID, Gatekeeper or staple check
 ```
 
+For a DMG the staple is checked on the DMG (`stapler staple` stamps only
+the DMG); the app inside is not checked for its own staple, and
+`spctl --type execute` on it finds its ticket online. A bare `.app` is
+checked for its own staple.
+
 It checks the signature, the hardened runtime flag, the Developer ID
 authority, that the signed entitlements equal `src-tauri/entitlements.plist`
-exactly, no `get-task-allow`, arm64 only, no dylib outside the system or the
-bundle, Gatekeeper (`spctl`) and the stapled ticket.
+exactly, no `get-task-allow`, arm64 only, no library outside the system or
+the bundle (every Mach-O; `@rpath` entries must resolve inside
+`Contents/Frameworks`), Gatekeeper (`spctl`) and the stapled ticket.
+
+With `--calls` the script sets `LIBOPUS_STATIC=1`, so libopus is linked
+statically (no Homebrew dylib). The library check confirms that on the first
+calls build; if it fails, do not disable library validation: link statically
+or bundle and sign the library.
 
 ## Entitlements
 

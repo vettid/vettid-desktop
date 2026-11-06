@@ -7,7 +7,9 @@
 	the signed app against THIS file and fails on any difference, so it is
 	the one place to add or remove an entitlement.
 
-	Not granted, on purpose: allow-jit, allow-unsigned-executable-memory,
+	Not granted, on purpose: network.client (it matters only under the App
+	Sandbox, which is off; outgoing connections need nothing under the hardened
+	runtime), allow-jit, allow-unsigned-executable-memory,
 	allow-dyld-environment-variables, disable-library-validation (WKWebView
 	runs its JIT in Apple's own WebContent process, which has these itself;
 	the app has no dylib outside the bundle), network.server (the app
@@ -15,9 +17,6 @@
 	A later keychain-access-groups entry (the macOS Keychain protector)
 	needs an embedded provisioning profile: see docs/MACOS-RELEASE.md.
 	-->
-	<!-- Outgoing connections: the relay (WSS) and the call signaling. -->
-	<key>com.apple.security.network.client</key>
-	<true/>
 	<!-- The microphone of the calls (cpal, behind the webrtc feature). -->
 	<key>com.apple.security.device.audio-input</key>
 	<true/>
