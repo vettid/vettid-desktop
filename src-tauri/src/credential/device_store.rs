@@ -554,7 +554,13 @@ pub(crate) mod tests {
         };
         let dir = std::path::PathBuf::from(dir);
         // Never the real store: this must not touch a member's pairing.
-        assert!(store::default_config_dir().map_or(true, |d| d != dir), "not the real store");
+        // Canonical paths, compared case-insensitively (Windows), so another
+        // spelling of the same folder can't slip past (lead review).
+        let same = |a: &Path, b: &Path| {
+            let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().to_lowercase();
+            canon(a) == canon(b)
+        };
+        assert!(store::default_config_dir().map_or(true, |d| !same(&d, &dir)), "not the real store");
         let mut s = DeviceStore::new(&dir, store::wipe_epoch());
         match mode.as_str() {
             "seal" => {
