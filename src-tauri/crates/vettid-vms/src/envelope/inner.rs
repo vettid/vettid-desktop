@@ -170,7 +170,8 @@ impl Inner {
         } else {
             strict_json::compact_object(&self.body, 2).map_err(|_| EnvelopeError::Inner)?
         });
-        let mut b = Builder::with_capacity(self.marshal_capacity(body.len())).uint("v", INNER_VERSION).string("id", &self.id).string("type", &self.kind).string("ts", &format_ts(self.ts));
+        let cap = self.marshal_capacity(body.len());
+        let mut b = Builder::with_capacity(cap).uint("v", INNER_VERSION).string("id", &self.id).string("type", &self.kind).string("ts", &format_ts(self.ts));
         if let Some(seq) = self.seq {
             b = b.uint("seq", seq);
         }
@@ -193,7 +194,9 @@ impl Inner {
                 }
             }
         }
-        Ok(b.raw("body", &body).finish())
+        let out = b.raw("body", &body).finish();
+        debug_assert!(out.len() <= cap, "marshal_capacity too small: a regrowth left a copy");
+        Ok(out)
     }
 
     /// Room for [`Inner::marshal`]'s output with a compacted body of
@@ -269,7 +272,11 @@ impl Inner {
 
     /// Marshal and bucket-pad.
     pub fn encode(&self, mode: Mode) -> Result<Vec<u8>, EnvelopeError> {
-        pad(self.marshal(mode)?.as_bytes())
+        // #60 (lead review M1): the plaintext inner is wiped once padded;
+        // `pad` copies it once into an exactly sized buffer, which callers
+        // wrap in `Zeroizing`.
+        let m = Zeroizing::new(self.marshal(mode)?);
+        pad(m.as_bytes())
     }
 
     /// Strictly unpad and parse.
