@@ -266,8 +266,11 @@ pub struct Session<T: Transport, C: Clock> {
     /// Something changed that must be stored with the batch.
     dirty: bool,
     /// The outbox isn't tried before this (a backoff, or the relay's
-    /// `retry_after`, §8.6): no send or poll moves it earlier.
-    hold_until: DateTime<Utc>,
+    /// `retry_after`, §8.6): no send or poll moves it earlier. `None`: no
+    /// hold. A monotonic instant, not this session's clock (#105): the hold
+    /// is a span of time, and a wall clock set back would otherwise stop
+    /// the outbox for about the size of the step.
+    hold_until: Option<tokio::time::Instant>,
     /// The hold came only from failing to reach the relay (a connect or
     /// transport error, no `retry_after`): released once a collect gets
     /// through (#86). A hold from the relay's own answer (a 5xx, a 429) is
@@ -367,7 +370,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
             dropped: Vec::new(),
             maybe_sent: Vec::new(),
             dirty: false,
-            hold_until: now,
+            hold_until: None,
             hold_releasable: false,
             collect_backoff: COLLECT_BACKOFF,
             probe_next: false,
@@ -833,7 +836,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
         if self.state.refused {
             return Err(SessionError::Refused);
         }
-        if self.state.outbox.is_empty() || now < self.hold_until {
+        if self.state.outbox.is_empty() || self.hold_until.is_some_and(|h| tokio::time::Instant::now() < h) {
             return Ok(());
         }
         let to = self.state.vault.relay.clone();
@@ -898,7 +901,8 @@ impl<T: Transport, C: Clock> Session<T, C> {
                 // The backoff part with jitter (half fixed, half random), so
                 // desktops that failed together don't retry together (§7.2).
                 let own = TimeDelta::from_std(equal_jitter(self.outbox_backoff.to_std().unwrap_or_default())).unwrap_or(self.outbox_backoff);
-                self.hold_until = now + wait.map_or(own, |w| w.max(own));
+                let hold = wait.map_or(own, |w| w.max(own)).to_std().unwrap_or_default();
+                self.hold_until = Some(tokio::time::Instant::now() + hold);
                 self.hold_releasable = unreachable;
                 self.outbox_backoff = (self.outbox_backoff * 2).min(OUTBOX_MAX_BACKOFF);
                 Err(SessionError::Relay(err))
@@ -977,7 +981,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
             t.collected_after = true;
         }
         if self.hold_releasable {
-            self.hold_until = self.clock.now().min(self.hold_until);
+            self.hold_until = None;
             self.outbox_backoff = OUTBOX_BACKOFF;
             self.hold_releasable = false;
         }
