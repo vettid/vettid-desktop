@@ -648,11 +648,17 @@ fn wipe_then(
 ///   forget which protector kept a key): the keys **first**. If removing
 ///   them fails, the file is left as it is: it is the retry signal, since
 ///   the next log-out reads its header again. If the keys go and the file
-///   then can't be removed, the file is left with no key, so it can't be
-///   opened: the next launch fails to open it and the person is told, and
-///   the next log-out removes it.
+///   then can't be removed: for a protector that keeps its key outside the
+///   file (the Secret Service, the earlier format's `master-key-v1`), the
+///   file is left with no key and can't be opened; the next launch fails
+///   to open it and the person is told, and the next log-out removes it.
+///   A TPM- or DPAPI-sealed file keeps its key inside the file, so it still
+///   opens; there the result is the plain "not removed", as before.
 ///
-/// Either way the result is Ok only if both are confirmed gone.
+/// Either way the result is Ok only if both are confirmed gone. On
+/// Windows the marker is never written (DPAPI keeps nothing outside the
+/// file) and `wipe_marker::write` is a no-op Ok, so `recorded` is always
+/// true there and the order is the first one.
 pub(super) fn file_then_keys(
     recorded: bool,
     remove_file: impl FnOnce() -> Result<(), CredentialError>,
@@ -838,9 +844,27 @@ mod wipe_marker {
         match std::fs::symlink_metadata(dir) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => Some(Wiping::unknown()),
-            Ok(_) => match private_folder(dir) {
+            Ok(m) => match private_folder(dir) {
                 Ok(()) => read_at(&path),
-                Err(_) => Some(Wiping::unknown()),
+                Err(_) => {
+                    // Lead review (Opus L1): a folder of ours left open to
+                    // others is made private again, so later log-outs can
+                    // trust what this build writes there. What is in it now
+                    // may not be ours: "nothing known" this time, and the
+                    // wipe that follows rewrites the marker.
+                    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                    // SAFETY: geteuid has no preconditions.
+                    let me = unsafe { libc::geteuid() };
+                    if m.file_type().is_dir() && m.uid() == me {
+                        match std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+                            Ok(()) => log::warn!("Credential store: the wipe marker's fallback folder was open to others; made private"),
+                            Err(e) => log::warn!("Credential store: the wipe marker's fallback folder is open to others and couldn't be made private: {e}"),
+                        }
+                    } else {
+                        log::warn!("Credential store: the wipe marker's fallback folder isn't this user's private folder; not used");
+                    }
+                    Some(Wiping::unknown())
+                }
             },
         }
     }

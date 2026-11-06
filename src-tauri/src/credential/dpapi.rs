@@ -201,7 +201,7 @@ impl Reach {
     fn from_checks(domain: Result<bool, u32>, roaming: Result<bool, u32>, entra: Result<bool, u32>) -> Self {
         let checked = |what: &str, r: Result<bool, u32>| {
             r.unwrap_or_else(|code| {
-                log::warn!("dpapi: the {what} check failed (error {code}); no notice");
+                log::warn!("dpapi: the {what} check failed (error {code}, {code:#010x}); no notice");
                 false
             })
         };
@@ -244,7 +244,10 @@ fn domain_joined() -> Result<bool, u32> {
 /// `NetGetAadJoinInformation`: this computer is joined to Microsoft Entra ID
 /// (a device join; a work account merely registered on a personal computer,
 /// `DSREG_WORKPLACE_JOIN`, doesn't make its administrators this computer's).
-/// Not joined: no information, and `S_FALSE`.
+/// Not joined: no information, and `S_FALSE`. `NetGetAadJoinInformation`
+/// is imported at load time, so the app needs Windows 10 1607 or later (no
+/// supported Windows is older). A hybrid join shows both this notice and
+/// the domain one.
 fn entra_joined() -> Result<bool, u32> {
     let mut info: *mut DSREG_JOIN_INFO = ptr::null_mut();
     // SAFETY: `info` is a live local out-pointer; a non-null result is freed
