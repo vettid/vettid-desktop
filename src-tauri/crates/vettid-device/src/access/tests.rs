@@ -172,6 +172,21 @@ async fn a_request_held_when_its_wait_ends_is_withdrawn() {
     assert_eq!(vault.waiting(), 0, "no stale request reached the vault");
 }
 
+/// #107 (lead review): the access request carries an `exp` (its wait plus
+/// the clock margin), so a stored copy that outlives its wait expires
+/// instead of reaching the phone late.
+#[tokio::test]
+async fn an_access_request_expires() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    let before = Utc::now();
+    let (got, req) = tokio::join!(a.request(&mut s, &mut store, None), answer(&mut vault, TYPE_REQUEST, Status::Ok, requested_body()));
+    assert!(got.is_ok());
+    let exp = req.exp.expect("an exp");
+    assert!(exp > before && exp <= Utc::now() + a.timeout + STATUS_EXP_MARGIN + TimeDelta::seconds(5), "{exp}");
+}
+
 #[tokio::test]
 async fn seconds_are_checked_before_sending() {
     let (relay, mut vault, faults, mut store) = paired().await;
