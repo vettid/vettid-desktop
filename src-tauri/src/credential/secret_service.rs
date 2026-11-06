@@ -284,6 +284,16 @@ fn sweep(bus: &BusSource, searches: &[Search], what: &'static str, could_hold: b
         log::info!("protector secret-service: {what}: nothing of the wiped pairing was kept there ({why})");
         return Ok(());
     }
+    // #13 (lead review of #70): nothing being wiped could have an item here
+    // (its header named another protector, and no earlier format was
+    // there). Tidy up what can be seen without unlocking, and never ask the
+    // person to unlock a keyring for it: a dismissed prompt would make a
+    // log-out "not removed" for a key that was never there. A wipe whose
+    // header is unknown keeps `could_hold` and the full sweep below.
+    if !could_hold {
+        best_effort_sweep(searches, what);
+        return Ok(());
+    }
     let ss = connect().map_err(|e| not_removed(format!("connect: {e}")))?;
     unlock_all_collections(&ss).map_err(|e| not_removed(format!("unlock: {e}")))?;
     let items = matching(&ss, searches).map_err(|e| not_removed(format!("search: {e}")))?;
@@ -306,6 +316,28 @@ fn sweep(bus: &BusSource, searches: &[Search], what: &'static str, could_hold: b
         Ok(left) if left.is_empty() => Ok(()),
         Ok(left) => Err(not_removed(format!("{} still there", left.len()))),
         Err(e) => Err(not_removed(format!("could not be checked: {e}"))),
+    }
+}
+
+/// [`sweep`] when nothing wiped could have an item in the Secret Service:
+/// delete the matching items that are already unlocked, without unlocking
+/// anything (no prompt), and only log what happens. It decides nothing.
+fn best_effort_sweep(searches: &[Search], what: &'static str) {
+    let ss = match connect() {
+        Ok(ss) => ss,
+        Err(e) => return log::info!("protector secret-service: {what}: not checked ({e}); nothing of the wiped pairing was kept there"),
+    };
+    match matching(&ss, searches) {
+        Ok(items) => {
+            for item in &items {
+                if matches!(item.is_locked(), Ok(false)) {
+                    if let Err(e) = item.delete() {
+                        log::info!("protector secret-service: {what}: a stray item wasn't removed: {e}");
+                    }
+                }
+            }
+        }
+        Err(e) => log::info!("protector secret-service: {what}: not searched ({e}); nothing of the wiped pairing was kept there"),
     }
 }
 

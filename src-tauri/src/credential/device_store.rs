@@ -314,10 +314,15 @@ impl DeviceStore {
         self.sealing = None;
         // The marker first (`store::begin_wipe`), so a log-out after a
         // clear that left a key knows what the file was.
-        let wiping = store::begin_wipe(&self.dir, what_is_sealed(&self.dir));
-        let file = store::remove_file_locked(&self.dir, DEVICE_FILE).and_then(|()| store::confirm_gone(&self.dir, DEVICE_FILE));
-        let keys = self.protectors.remove_external_keys(&wiping).map_err(CredentialError::from);
-        let done = file.and(keys);
+        let (wiping, recorded) = store::begin_wipe(&self.dir, what_is_sealed(&self.dir));
+        // The fail-secure order when no marker could be written (#13).
+        let dir = self.dir.clone();
+        let protectors = &self.protectors;
+        let done = store::file_then_keys(
+            recorded,
+            || store::remove_file_locked(&dir, DEVICE_FILE).and_then(|()| store::confirm_gone(&dir, DEVICE_FILE)),
+            || protectors.remove_external_keys(&wiping).map_err(CredentialError::from),
+        );
         if done.is_ok() {
             store::finish_wipe(&self.dir);
         }
@@ -394,13 +399,23 @@ pub(super) fn retire_legacy_with(dir: &Path, protectors: &Protectors) -> Result<
     // removes only those, never what that wipe left.
     let earlier = store::pending_wipe(dir);
     let this = Wiping::legacy_file();
-    store::record_wipe(dir, &earlier.clone().map_or_else(|| this.clone(), |e| e.and(this.clone())));
-    let file = store::remove_file_locked(dir, DEVICE_FILE).and_then(|()| store::confirm_gone(dir, DEVICE_FILE));
-    let key = protectors.remove_legacy_key(&this);
+    let recorded = store::record_wipe(dir, &earlier.clone().map_or_else(|| this.clone(), |e| e.and(this.clone())));
+    let remove_file = || store::remove_file_locked(dir, DEVICE_FILE).and_then(|()| store::confirm_gone(dir, DEVICE_FILE));
+    // With no marker on disk, the key first (#13; see `store::file_then_keys`):
+    // if it isn't removed, the file stays as the retry signal.
+    let (file, key) = if recorded {
+        (remove_file(), protectors.remove_legacy_key(&this))
+    } else {
+        let key = protectors.remove_legacy_key(&this);
+        let file = if key.is_ok() { remove_file() } else { Ok(()) };
+        (file, key)
+    };
     match (file, key) {
         (Ok(()), Ok(())) => {
             match earlier {
-                Some(e) => store::record_wipe(dir, &e),
+                Some(e) => {
+                    store::record_wipe(dir, &e);
+                }
                 None => store::finish_wipe(dir),
             }
             Ok(true)
