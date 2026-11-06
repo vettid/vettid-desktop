@@ -81,9 +81,12 @@ pub fn too_soon_retry_at(at: DateTime<Utc>, now: DateTime<Utc>) -> Option<DateTi
 }
 /// NEW TEXT (owner approval needed): the owner declined the request.
 pub const REQUEST_DENIED_NOTICE: &str = "Your phone declined the request. This desktop has no access.";
-/// NEW TEXT (owner approval needed): the owner declined a renewal while a
-/// session is still live: it runs on (0.77.0).
-pub const RENEWAL_DENIED_NOTICE: &str = "Your phone declined the request. The current session continues until it ends.";
+/// NEW TEXT (owner approval needed, #96): the owner declined a new session
+/// while the current one is still live: it runs on (0.77.0). With its end
+/// time the frontend says "Your phone declined a new session. The current
+/// one continues until {time}." in the computer's own locale; this text is
+/// for when there is no time to name.
+pub const RENEWAL_DENIED_NOTICE: &str = "Your phone declined a new session. The current one continues until it ends.";
 /// NEW TEXT (owner approval needed): the request lapsed unanswered.
 pub const REQUEST_LAPSED_NOTICE: &str = "Your phone didn't answer in time. This desktop has no access. Try again.";
 /// NEW TEXT (owner approval needed): a lock, log-out or End session here

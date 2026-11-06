@@ -26,6 +26,8 @@
     expires_at?: number;
     /** After too_soon: when it may ask again (unix seconds, #83). */
     retry_at?: number | null;
+    /** Declined while the current session is live: when it ends (unix seconds, #96). */
+    continues_until?: number | null;
   }
 
   /**
@@ -49,7 +51,7 @@
         activateSession(result.session_id, result.expires_at, result.connection_id);
       } else {
         step = 'error';
-        // #83: the time in this computer's own locale.
+        // #83, #96: the time in this computer's own locale.
         errorMessage = noticeOf(result, 'Extension failed');
       }
     } catch (e: any) {

@@ -64,6 +64,10 @@ pub struct RegisterResponse {
     /// Unix seconds: when the person may ask again after `too_soon` (#83),
     /// for the frontend to show in the computer's own locale.
     pub retry_at: Option<i64>,
+    /// Unix seconds: the phone declined a new session while the current one
+    /// is live (#96), and this is when that one ends, as the session timer
+    /// shows it, for the frontend to name in the computer's own locale.
+    pub continues_until: Option<i64>,
 }
 
 impl RegisterResponse {
@@ -76,6 +80,7 @@ impl RegisterResponse {
             expires_at: None,
             paired_without_session: false,
             retry_at: None,
+            continues_until: None,
         }
     }
 
@@ -93,6 +98,7 @@ impl RegisterResponse {
             expires_at: snap.shown_expiry(chrono::Utc::now()).map(|t| t.timestamp()),
             paired_without_session: false,
             retry_at: None,
+            continues_until: None,
         }
     }
 }
@@ -789,6 +795,13 @@ fn extend_response(
         Err(link::RequestFailed::TooSoon(at)) => match link::too_soon_retry_at(at, now) {
             Some(t) => RegisterResponse { retry_at: Some(t.timestamp()), ..RegisterResponse::failed(link::REQUEST_TOO_SOON_NOTICE) },
             None => RegisterResponse::failed(link::REQUEST_TOO_SOON_NOW_NOTICE),
+        },
+        // #96: the time the current session ends, from the same snapshot
+        // and `now` the screen shows, so the notice and the timer agree. No
+        // time (the session no longer counts as live): the text alone.
+        Err(link::RequestFailed::DeniedWhileLive) => RegisterResponse {
+            continues_until: snap.shown_expiry(now).map(|t| t.timestamp()),
+            ..RegisterResponse::failed(link::RENEWAL_DENIED_NOTICE)
         },
         Err(f) => RegisterResponse::failed(link::request_notice(&f, failure)),
     }
@@ -1524,6 +1537,33 @@ mod tests {
         assert!(extend_response(Ok(()), false, &live, now, None).success);
         let r = extend_response(Ok(()), false, &Snapshot::default(), now, None);
         assert_eq!(r.error.as_deref(), Some(link::ACCESS_NOT_CONFIRMED_NOTICE));
+    }
+
+    /// #96: the phone declined a new session while the current one is
+    /// live. Not shown as a success (no new session), and the notice names
+    /// the time the timer shows; with no live session it names none.
+    #[test]
+    fn a_declined_new_session_names_when_the_current_one_ends() {
+        let now = chrono::Utc::now();
+        let until = now + chrono::TimeDelta::minutes(5);
+        let live = Snapshot {
+            link_open: true,
+            session_id: Some("s".into()),
+            live_until: Some(until),
+            vault: link::VaultView::open(until),
+            ..Default::default()
+        };
+        let r = extend_response(Err(link::RequestFailed::DeniedWhileLive), false, &live, now, None);
+        assert!(!r.success);
+        assert!(r.session_id.is_none() && r.expires_at.is_none());
+        assert_eq!(r.error.as_deref(), Some(link::RENEWAL_DENIED_NOTICE));
+        assert_eq!(r.continues_until, live.shown_expiry(now).map(|t| t.timestamp()));
+        assert!(r.continues_until.is_some());
+        let r = extend_response(Err(link::RequestFailed::DeniedWhileLive), false, &Snapshot::default(), now, None);
+        assert_eq!((r.error.as_deref(), r.continues_until), (Some(link::RENEWAL_DENIED_NOTICE), None));
+        // A plain decline, and an overtaken one, name no time.
+        assert_eq!(extend_response(Err(link::RequestFailed::Denied), false, &live, now, None).continues_until, None);
+        assert_eq!(extend_response(Err(link::RequestFailed::DeniedWhileLive), true, &live, now, None).continues_until, None);
     }
 
     /// #76: Start New Session with no link open (a launch whose unlock
