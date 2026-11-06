@@ -202,3 +202,33 @@ jobs:
           tar -xzf gl.tgz gitleaks
       - name: scan full history
         run: ./gitleaks git --redact --verbose .
+
+  macos:
+    # The Apple silicon app, signed ad-hoc (no secrets here), then checked by
+    # scripts/macos-verify.sh in its ad-hoc mode: entitlements equal to
+    # src-tauri/entitlements.plist, hardened runtime, arm64 only, no stray
+    # dylib. The Developer ID signature and notarization are done on the
+    # owner's Mac (docs/MACOS-RELEASE.md), not here.
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-apple-darwin
+          rustup default stable
+      # Caches the target directory and ~/.cargo/bin (the installed CLI).
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          workspaces: src-tauri
+      - name: tauri CLI
+        run: command -v cargo-tauri || cargo install tauri-cli --version '=2.10.1' --locked
+      - run: npm ci
+      - name: build, ad-hoc sign, make the DMG, verify (the DMG and the app in it)
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+        run: scripts/macos-release.sh --sign-only

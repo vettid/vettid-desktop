@@ -554,6 +554,44 @@ pub(crate) mod tests {
 
     const STATE: &[u8] = b"{\"v\":1,\"ik_seed\":\"c2VjcmV0LXNlZWQtYnl0ZXM\"}";
 
+    /// #13 (DESKTOP-REWORK-PLAN §4 "Done": DPAPI copy refusal as a second
+    /// Windows user). One step of the two-account run in
+    /// docs/WINDOWS-TESTING.md, with the **real** DPAPI protector, so it is
+    /// ignored in normal runs. `VETTID_COPY_TEST=seal` saves a fixture state
+    /// in `VETTID_COPY_TEST_DIR`; `=open` loads the file there and prints
+    /// the outcome (never key or state bytes) for the harness to check.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs two Windows accounts; see docs/WINDOWS-TESTING.md"]
+    fn dpapi_copy_refusal_step() {
+        let (Ok(mode), Ok(dir)) = (std::env::var("VETTID_COPY_TEST"), std::env::var("VETTID_COPY_TEST_DIR")) else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        // Never the real store: this must not touch a member's pairing.
+        // Canonical paths, compared case-insensitively (Windows), so another
+        // spelling of the same folder can't slip past (lead review).
+        let same = |a: &Path, b: &Path| {
+            let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().to_lowercase();
+            canon(a) == canon(b)
+        };
+        assert!(store::default_config_dir().map_or(true, |d| !same(&d, &dir)), "not the real store");
+        let mut s = DeviceStore::new(&dir, store::wipe_epoch());
+        match mode.as_str() {
+            "seal" => {
+                assert!(!dir.join(DEVICE_FILE).exists(), "seal won't overwrite a device file");
+                s.save(STATE).expect("sealed");
+                println!("COPYTEST sealed protector={}", read_sealed(&dir).header.protector);
+            }
+            "open" => match s.load() {
+                Ok(Some(v)) => println!("COPYTEST opened same_state={}", &v[..] == STATE),
+                Ok(None) => println!("COPYTEST no_file"),
+                Err(kind) => println!("COPYTEST refused store_error={kind:?} failure={:?}", s.take_failure()),
+            },
+            other => panic!("unknown mode {other}"),
+        }
+    }
+
     fn read_sealed(dir: &Path) -> SealedFile {
         serde_json::from_slice(&fs::read(dir.join(DEVICE_FILE)).unwrap()).unwrap()
     }
