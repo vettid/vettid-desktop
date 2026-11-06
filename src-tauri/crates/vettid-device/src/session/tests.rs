@@ -222,6 +222,49 @@ async fn the_outbox_survives_failures_and_restarts() {
     assert_eq!(vault_receive(&mut vault).await.id, id);
 }
 
+/// #107: a deposit the relay refuses for this computer's clock
+/// (`timestamp_stale`) is held, not dropped; the session says the clock was
+/// refused, with how far off (from the relay's `Date`); the next call the
+/// relay takes clears that, and the held message goes out.
+#[tokio::test]
+async fn a_clock_refusal_holds_the_outbox_and_says_so() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    assert_eq!(s.clock_refused(), None);
+    // The relay's clock is ten minutes behind this one.
+    let relay_now = Utc::now().timestamp() - 600;
+    {
+        let mut f = faults.lock().unwrap();
+        f.clock_deposits = 1;
+        f.clock_date = Some(relay_now);
+    }
+    let id = s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+    assert_eq!(s.outbox_len(), 1, "held, not dropped");
+    assert!(s.take_dropped().is_empty(), "not reported lost");
+    let off = s.clock_refused().expect("refused").expect("offset known");
+    assert!((off - 600).abs() <= 5, "offset {off}");
+    // The clock is fixed: a collect gets through, which releases the hold.
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.clock_refused(), None, "cleared by a call the relay took");
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.outbox_len(), 0);
+    assert_eq!(vault_receive(&mut vault).await.id, id);
+}
+
+/// #107: a collect refused for the clock fails at once with the clock
+/// error (no amount without a `Date`), and the next good one clears it.
+#[tokio::test]
+async fn a_clock_refused_collect_says_so() {
+    let (relay, _vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    faults.lock().unwrap().clock_collects = 1;
+    let e = s.poll(&mut store).await.unwrap_err();
+    assert_eq!(e.clock_skew(), Some(None));
+    assert_eq!(s.clock_refused(), Some(None));
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.clock_refused(), None);
+}
+
 /// token_revoked: this device was unlinked; nothing more is sent.
 #[tokio::test]
 async fn a_revoked_device_stops_sending() {

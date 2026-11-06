@@ -703,7 +703,12 @@ fn session_info(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> Result<S
         seconds_remaining: until.map_or(0, |t| (t - now).num_seconds().max(0)),
         is_active: active,
         // Not while an end is pending: that one's state is shown (#80, L3).
-        notice: (snap.stale_at(now) && !active && !snap.end_pending).then(|| link::STALE_NOTICE.to_string()),
+        // #107: when the relay refused this computer's clock, that's why
+        // nothing is confirmed: say so, not "hasn't heard from your vault".
+        notice: match snap.clock_refused {
+            Some(offset) if !active && !snap.end_pending => Some(link::clock_notice(offset)),
+            _ => (snap.stale_at(now) && !active && !snap.end_pending).then(|| link::STALE_NOTICE.to_string()),
+        },
         end_pending: snap.end_pending,
         end_confirmed: snap.end_settled == Some(link::EndSettled::Confirmed),
         // With no end pending: what to say unless the end was confirmed. An
@@ -1762,6 +1767,22 @@ mod tests {
         assert_eq!(state.resets_finished.load(SeqCst), 2);
     }
 
+    /// #107: while the relay refuses this computer's clock, the session
+    /// info's notice says so (in place of "hasn't heard from your vault"),
+    /// unless a session is live or an end is pending.
+    #[test]
+    fn session_info_names_a_refused_clock() {
+        let now = chrono::Utc::now();
+        let refused = Snapshot { link_open: true, clock_refused: Some(Some(300)), stale: true, ..Default::default() };
+        assert_eq!(session_info(&refused, now).unwrap().notice, Some(link::clock_notice(Some(300))));
+        let unknown = Snapshot { clock_refused: Some(None), ..refused.clone() };
+        assert_eq!(session_info(&unknown, now).unwrap().notice, Some(link::clock_notice(None)));
+        let ending = Snapshot { end_pending: true, ..refused.clone() };
+        assert_eq!(session_info(&ending, now).unwrap().notice, None);
+        let fine = Snapshot { clock_refused: None, ..refused };
+        assert_ne!(session_info(&fine, now).unwrap().notice, Some(link::clock_notice(Some(300))));
+    }
+
     /// The session info comes from the snapshot: live up to `live_until`
     /// only, and "not unlocked" without a link.
     #[test]
@@ -1779,6 +1800,7 @@ mod tests {
             reachable: true,
             refused: false,
             stale: false,
+            clock_refused: None,
             end_pending: false,
             end_settled: None,
             end_seen: false,

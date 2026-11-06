@@ -119,6 +119,16 @@ pub enum RelayError {
     TooLarge,
     /// A base URL or an id this client refuses to put in a request.
     Invalid,
+    /// The relay refused the request's signed timestamp as outside its
+    /// freshness window (`401 timestamp_stale`, §4.1: more than 90 s from
+    /// the relay's clock). §7.2: treat it as a wrong local clock (#107).
+    /// `server_date` is the response's HTTP `Date` (Unix seconds), if it
+    /// had a readable one.
+    ///
+    /// SECURITY: the relay is untrusted. `server_date` is only for telling
+    /// the person roughly how far off this computer's clock is. It must
+    /// never adjust a timestamp this client sends or any check it makes.
+    ClockSkew { server_date: Option<i64> },
 }
 
 impl RelayError {
@@ -126,6 +136,7 @@ impl RelayError {
     pub fn code(&self) -> Option<&str> {
         match self {
             Self::Relay { code, .. } => Some(code),
+            Self::ClockSkew { .. } => Some(TIMESTAMP_STALE),
             _ => None,
         }
     }
@@ -138,7 +149,9 @@ impl RelayError {
         match self {
             Self::Relay { status, code, .. } => (*status == 429 && code == "rate_limited") || *status >= 500,
             Self::Connect | Self::Transport => true,
-            Self::Malformed | Self::TooLarge | Self::Invalid => false,
+            // Not unchanged: the same clock gives the same refusal. The
+            // caller holds what it was sending and tries again later.
+            Self::Malformed | Self::TooLarge | Self::Invalid | Self::ClockSkew { .. } => false,
         }
     }
 
@@ -149,7 +162,8 @@ impl RelayError {
         match self {
             Self::Relay { status, .. } => *status >= 500,
             Self::Transport | Self::Malformed | Self::TooLarge => true,
-            Self::Connect | Self::Invalid => false,
+            // A 401: refused before anything was stored.
+            Self::Connect | Self::Invalid | Self::ClockSkew { .. } => false,
         }
     }
 
@@ -222,6 +236,7 @@ impl std::fmt::Display for RelayError {
             Self::Malformed => f.write_str("relay: malformed response"),
             Self::TooLarge => f.write_str("relay: response too large"),
             Self::Invalid => f.write_str("relay: invalid request"),
+            Self::ClockSkew { .. } => f.write_str("relay: 401 timestamp_stale (this computer's clock)"),
         }
     }
 }
@@ -249,6 +264,23 @@ fn parse_error(status: u16, body: &[u8]) -> RelayError {
     });
     let quota = field("quota").and_then(|q| q.as_str()).filter(|q| valid_code(q)).map(str::to_string);
     RelayError::Relay { status, code, retry_after, quota }
+}
+
+/// §4.1's code for a signed timestamp outside the relay's window.
+pub const TIMESTAMP_STALE: &str = "timestamp_stale";
+
+/// An error answer, with the response's HTTP `Date` if it had one: a
+/// `401 timestamp_stale` is [`RelayError::ClockSkew`] (#107), anything
+/// else [`parse_error`]'s.
+fn classify_error(status: u16, body: &[u8], date: Option<&str>) -> RelayError {
+    match parse_error(status, body) {
+        RelayError::Relay { status: 401, code, .. } if code == TIMESTAMP_STALE => {
+            // SECURITY: display only (see `ClockSkew`).
+            let server_date = date.and_then(|d| chrono::DateTime::parse_from_rfc2822(d.trim()).ok()).map(|d| d.timestamp());
+            RelayError::ClockSkew { server_date }
+        }
+        other => other,
+    }
 }
 
 /// The relay's advertised limits (§6.1). Members this client doesn't know
@@ -615,10 +647,12 @@ async fn read_capped(resp: &mut reqwest::Response, limit: usize) -> Result<Optio
 async fn read_response(mut resp: reqwest::Response, limit: usize, expect: &[u16]) -> Result<(u16, Vec<u8>), RelayError> {
     let status = resp.status().as_u16();
     if status >= 400 {
+        // The relay's clock, for a `timestamp_stale` (#107; display only).
+        let date = resp.headers().get(reqwest::header::DATE).and_then(|v| v.to_str().ok()).map(str::to_string);
         // An error body that breaks off is still that status, not a
         // transport failure (which would be retried and count as stored).
         let body = read_capped(&mut resp, MAX_ERROR_BODY).await.ok().flatten().unwrap_or_default();
-        return Err(parse_error(status, &body));
+        return Err(classify_error(status, &body, date.as_deref()));
     }
     if !expect.contains(&status) {
         return Err(RelayError::Malformed);
@@ -674,6 +708,24 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
+
+    /// #107: a `401 timestamp_stale` is `ClockSkew`, with the response's
+    /// `Date` when it reads; never retried, never counted as stored. Other
+    /// errors are as before.
+    #[test]
+    fn timestamp_stale_is_clock_skew() {
+        let body = br#"{"code":"timestamp_stale","message":"timestamp outside the freshness window"}"#;
+        let e = classify_error(401, body, Some("Fri, 06 Nov 2026 17:00:00 GMT"));
+        assert_eq!(e, RelayError::ClockSkew { server_date: Some(1_793_984_400) });
+        assert_eq!(e.code(), Some(TIMESTAMP_STALE));
+        assert!(!e.retryable() && !e.may_have_stored());
+        assert_eq!(classify_error(401, body, None), RelayError::ClockSkew { server_date: None });
+        assert_eq!(classify_error(401, body, Some("yesterday")), RelayError::ClockSkew { server_date: None });
+        // Another 401, or the code on another status: unchanged.
+        let other = br#"{"code":"signature_invalid"}"#;
+        assert!(matches!(classify_error(401, other, Some("Fri, 06 Nov 2026 17:00:00 GMT")), RelayError::Relay { status: 401, .. }));
+        assert!(matches!(classify_error(400, body, None), RelayError::Relay { status: 400, .. }));
+    }
 
     /// What the stub relay saw of one request.
     #[derive(Debug, Clone)]
