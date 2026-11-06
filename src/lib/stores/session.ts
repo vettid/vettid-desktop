@@ -37,6 +37,15 @@ export const sessionStore = writable<SessionState>(initialState);
 export const sessionNotice = writable<string | null>(null);
 
 /**
+ * A notice for the app's banner, which stays up across a change of screen
+ * until dismissed (#96): the phone declined a new session while the current
+ * one is live, and the app then moves from the Start-a-new-session screen to
+ * Connections, which would drop a notice kept on that screen. App.svelte
+ * takes it and clears it.
+ */
+export const bannerNotice = writable<string | null>(null);
+
+/**
  * An End session the vault hasn't answered yet (#80), from the backend:
  * the Start-a-new-session screen says "Ending your session…" meanwhile,
  * so an unconfirmed end never looks like a confirmed one.

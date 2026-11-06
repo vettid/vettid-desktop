@@ -798,7 +798,8 @@ fn extend_response(
         },
         // #96: the time the current session ends, from the same snapshot
         // and `now` the screen shows, so the notice and the timer agree. No
-        // time (the session no longer counts as live): the text alone.
+        // time (the session no longer counts as live): the text alone, which
+        // claims nothing about the session.
         Err(link::RequestFailed::DeniedWhileLive) => RegisterResponse {
             continues_until: snap.shown_expiry(now).map(|t| t.timestamp()),
             ..RegisterResponse::failed(link::RENEWAL_DENIED_NOTICE)
@@ -1557,10 +1558,20 @@ mod tests {
         assert!(!r.success);
         assert!(r.session_id.is_none() && r.expires_at.is_none());
         assert_eq!(r.error.as_deref(), Some(link::RENEWAL_DENIED_NOTICE));
-        assert_eq!(r.continues_until, live.shown_expiry(now).map(|t| t.timestamp()));
-        assert!(r.continues_until.is_some());
-        let r = extend_response(Err(link::RequestFailed::DeniedWhileLive), false, &Snapshot::default(), now, None);
-        assert_eq!((r.error.as_deref(), r.continues_until), (Some(link::RENEWAL_DENIED_NOTICE), None));
+        assert_eq!(r.continues_until, Some(until.timestamp()));
+        // The vault's own end, when known, as the timer shows it.
+        let ends = now + chrono::TimeDelta::minutes(3);
+        let known = Snapshot { ends_at: Some(ends), ..live.clone() };
+        let r = extend_response(Err(link::RequestFailed::DeniedWhileLive), false, &known, now, None);
+        assert_eq!(r.continues_until, Some(ends.timestamp()));
+        // No longer live here (ended a moment ago, or never): no time, and a
+        // text that claims nothing about a session.
+        let lapsed = Snapshot { live_until: Some(now - chrono::TimeDelta::seconds(1)), ..live.clone() };
+        for snap in [&lapsed, &Snapshot::default()] {
+            let r = extend_response(Err(link::RequestFailed::DeniedWhileLive), false, snap, now, None);
+            assert_eq!((r.error.as_deref(), r.continues_until), (Some(link::RENEWAL_DENIED_NOTICE), None));
+        }
+        assert!(!link::RENEWAL_DENIED_NOTICE.contains("continues"));
         // A plain decline, and an overtaken one, name no time.
         assert_eq!(extend_response(Err(link::RequestFailed::Denied), false, &live, now, None).continues_until, None);
         assert_eq!(extend_response(Err(link::RequestFailed::DeniedWhileLive), true, &live, now, None).continues_until, None);

@@ -14,6 +14,7 @@
     endBusy,
     checkVaultOnFocus,
     listenForVaultChanges,
+    bannerNotice,
   } from './lib/stores/session';
   import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
   import { themeStore } from './lib/stores/theme';
@@ -62,6 +63,15 @@
   // The `unlock` command's notice: the saved pairing could not be opened,
   // or it opened but another account can open it too (#24).
   let pairingNotice = $state('');
+  // A view's notice that must outlive the view (#96), shown in the same
+  // banner until dismissed.
+  $effect(() => {
+    const n = $bannerNotice;
+    if (n) {
+      pairingNotice = n;
+      bannerNotice.set(null);
+    }
+  });
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let unlistenFocus: (() => void) | null = null;
   let unlistenChanges: (() => void) | null = null;
