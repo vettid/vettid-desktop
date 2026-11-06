@@ -1769,6 +1769,33 @@ mod tests {
         assert!(!link.snapshot(Utc::now()).active_at(Utc::now()));
     }
 
+    /// #49: the wait for the phone ends at the request's own `exp`, the
+    /// moment the vault drops it and refuses an approval
+    /// (vettid-vault `hSessionApprove`), and never before it. Only then is
+    /// the person told the phone didn't answer and the desktop has no
+    /// access; nothing is live.
+    #[tokio::test]
+    async fn an_unanswered_request_lapses_at_its_exp_not_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        link.read_status().await.unwrap();
+        let window = TimeDelta::seconds(2);
+        vault.request_window(window);
+        let start = Utc::now();
+        let mut asked = false;
+        // An upper bound too: a wait that never lapses fails here, not hangs.
+        let r = tokio::time::timeout(std::time::Duration::from_secs(12), link.request_access(|| asked = true, || false))
+            .await
+            .expect("lapsed within 10 s of exp");
+        let waited = Utc::now() - start;
+        assert!(asked, "the phone was asked");
+        assert_eq!(r, Err(RequestFailed::Lapsed));
+        // `exp` is written in milliseconds: allow that much.
+        assert!(waited >= window - TimeDelta::milliseconds(2), "stopped after {waited}, before exp");
+        assert_eq!(request_notice(&r.unwrap_err(), None), REQUEST_LAPSED_NOTICE);
+        assert!(!link.snapshot(Utc::now()).active_at(Utc::now()));
+    }
+
     /// Item 3: a renewal declined while a session is live doesn't say "no
     /// access": the session runs on.
     #[tokio::test]
@@ -1989,6 +2016,43 @@ mod tests {
         assert!(snap.active_at(Utc::now()));
         assert_eq!(snap.vault, VaultView::open(link.vault_checked.unwrap() + STALE_AFTER));
         (vault, link)
+    }
+
+    /// #47: a restart never shows the last run's session as live. A launch
+    /// opens the session from the store (`Session::open`, then
+    /// `Link::new`, as `Link::open`), and nothing that makes a session live
+    /// is kept on disk (only an unanswered end, #80, and pending request
+    /// ids): it is not live, nor shown stale, before this run's own
+    /// `vault.status`, and not live after it if the vault ended the session
+    /// meanwhile. Only a status that names a session makes it live again.
+    #[tokio::test]
+    async fn a_restart_doesnt_show_the_last_runs_session_as_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, link) = live(dir.path()).await;
+        // The restart: the session opened again from what is stored.
+        let Link { mut store, .. } = link;
+        let t = vault.clone();
+        let session = Session::open(&mut store, move |_| t, SystemClock).expect("open").expect("paired");
+        let mut link = Link::new(session, store);
+        let now = Utc::now();
+        let snap = link.snapshot(now);
+        assert!(!snap.active_at(now), "not live before this run's vault.status");
+        assert_eq!((snap.session_id.as_deref(), snap.live_until, snap.expires_at), (None, None, None));
+        assert!(!snap.stale, "nothing of the last run's session, not even as stale");
+        assert_eq!(snap.vault.state, VaultShown::Unknown);
+
+        // The vault ended the session while this desktop was off.
+        vault.set_session(None);
+        link.read_status().await.unwrap();
+        let now = Utc::now();
+        let snap = link.snapshot(now);
+        assert!(!snap.active_at(now), "an ended session isn't live after a restart");
+        assert_eq!((snap.session_id.as_deref(), snap.live_until), (None, None));
+
+        // Control: a status that names a session makes it live.
+        vault.set_session(Some(("s-2", Utc::now() + TimeDelta::hours(1))));
+        link.read_status().await.unwrap();
+        assert!(link.snapshot(Utc::now()).active_at(Utc::now()));
     }
 
     /// A lock from the phone, its notice collected by the refresh (whose
