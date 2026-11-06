@@ -515,10 +515,16 @@ pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String
             log::warn!("unlock: saved pairing could not be opened: {}", e);
             let notice = failure.as_ref().and_then(link::plain_store_notice).unwrap_or_else(|| UNLOCK_FAILED_NOTICE.to_string());
             // #97: Start New Session repeats it, unless a log-out wiped the
-            // pairing meanwhile ("the pairing is kept" would be false).
-            if store::wipe_epoch() == since {
-                set_unlock_notice(&state, Some(notice.clone()));
+            // pairing meanwhile ("the pairing is kept" would be false) or a
+            // new pairing has started (the notice is about the old one).
+            // Checked under the notice's lock: log-out and register clear
+            // it after they change what's checked, so either order ends
+            // right.
+            let mut kept = state.unlock_notice.lock().unwrap_or_else(|e| e.into_inner());
+            if store::wipe_epoch() == since && state.pairing.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                *kept = Some(notice.clone());
             }
+            drop(kept);
             return Ok(UnlockResponse { unlocked: false, notice: Some(notice) });
         }
     };
