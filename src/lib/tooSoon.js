@@ -13,16 +13,33 @@ export function tooSoonNotice(retryAt, locale) {
 }
 
 /**
- * A failed pairing or session response's notice (#83): the too-soon one
- * with its time when the backend sent `retry_at`, otherwise its `error`.
+ * Owner-approved text (#96, 2026-11-06): the phone declined a new session
+ * while the current one is live; it runs on until its end time, in the
+ * reader's own locale.
+ *
+ * @param {number} until Unix seconds: when the current session ends, as the timer shows it
+ * @param {string | undefined} [locale] For tests; the computer's own by default
+ * @returns {string}
+ */
+export function declinedWhileLiveNotice(until, locale) {
+  const time = new Intl.DateTimeFormat(locale, { hour: 'numeric', minute: '2-digit' }).format(new Date(until * 1000));
+  return `Your phone declined a new session. The current one continues until ${time}.`;
+}
+
+/**
+ * A failed pairing or session response's notice: the too-soon one with its
+ * time when the backend sent `retry_at` (#83), the declined-while-live one
+ * with its time when it sent `continues_until` (#96), otherwise its `error`.
  * Both the pairing and the Start-a-new-session screens use it, so they
  * agree.
  *
- * @param {{ retry_at?: number | null, error?: string | null }} result
+ * @param {{ retry_at?: number | null, continues_until?: number | null, error?: string | null }} result
  * @param {string} [fallback]
  * @param {string | undefined} [locale]
  * @returns {string}
  */
 export function noticeOf(result, fallback = '', locale) {
-  return result.retry_at ? tooSoonNotice(result.retry_at, locale) : (result.error || fallback);
+  if (result.retry_at) return tooSoonNotice(result.retry_at, locale);
+  if (result.continues_until) return declinedWhileLiveNotice(result.continues_until, locale);
+  return result.error || fallback;
 }

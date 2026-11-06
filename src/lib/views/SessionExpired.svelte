@@ -3,7 +3,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { onDestroy } from 'svelte';
   import { noticeOf } from '../tooSoon.js';
-  import { activateSession, sessionNotice, endPending, vaultStore, askToEnd, endBusy } from '../stores/session';
+  import { activateSession, sessionNotice, declinedNotice, endPending, vaultStore, askToEnd, endBusy } from '../stores/session';
   import { vaultScreen, endOffered } from '../vaultState.js';
 
   // #77: the vault's lock and hold (§3.2-§3.4). Held, locked or unknown,
@@ -26,6 +26,8 @@
     expires_at?: number;
     /** After too_soon: when it may ask again (unix seconds, #83). */
     retry_at?: number | null;
+    /** Declined while the current session is live: when it ends (unix seconds, #96). */
+    continues_until?: number | null;
   }
 
   /**
@@ -36,6 +38,8 @@
    */
   async function start() {
     errorMessage = '';
+    // #96: a new request makes an earlier decline's notice moot.
+    declinedNotice.set(null);
     step = 'awaiting-qr';
 
     unlistenRequested = await listen('session:requested', () => {
@@ -49,8 +53,12 @@
         activateSession(result.session_id, result.expires_at, result.connection_id);
       } else {
         step = 'error';
-        // #83: the time in this computer's own locale.
+        // #83, #96: the time in this computer's own locale.
         errorMessage = noticeOf(result, 'Extension failed');
+        // #96: declined while the current session is live. The app moves on
+        // to Connections, which unmounts this screen and its notice, so the
+        // app's own banner for it shows it there.
+        if (result.continues_until) declinedNotice.set({ text: errorMessage, until: result.continues_until, seen: false });
       }
     } catch (e: any) {
       step = 'error';

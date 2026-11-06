@@ -27,3 +27,13 @@ test('#83: both screens take the same notice from a response', async () => {
   assert.equal(noticeOf({ retry_at: null, error: 'The error.' }), 'The error.');
   assert.equal(noticeOf({ error: '' }, 'Pairing failed'), 'Pairing failed');
 });
+
+test('#96: a decline while the session is live names its end time, in the locale', async () => {
+  const { noticeOf, declinedWhileLiveNotice } = await import('../src/lib/tooSoon.js');
+  const declined = 'Your phone declined a new session. The current one continues until';
+  assert.equal(plain(declinedWhileLiveNotice(at, 'en-US')), `${declined} 10:48 AM.`);
+  assert.equal(plain(declinedWhileLiveNotice(at, 'de-DE')), `${declined} 10:48.`);
+  assert.equal(plain(noticeOf({ continues_until: at, error: 'x' }, '', 'en-US')), `${declined} 10:48 AM.`);
+  // No time from the backend: its own text.
+  assert.equal(noticeOf({ continues_until: null, error: 'The error.' }), 'The error.');
+});

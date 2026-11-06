@@ -14,6 +14,7 @@
     endBusy,
     checkVaultOnFocus,
     listenForVaultChanges,
+    declinedNotice,
   } from './lib/stores/session';
   import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
   import { themeStore } from './lib/stores/theme';
@@ -23,6 +24,7 @@
   import { resetSecretsUnlock } from './lib/stores/secrets';
   import { pairingHeld } from './lib/stores/navigation';
   import { nextView } from './lib/routing.js';
+  import { declinedStep } from './lib/declined.js';
 
   import Pairing from './lib/views/Pairing.svelte';
   import SessionExpired from './lib/views/SessionExpired.svelte';
@@ -62,6 +64,21 @@
   // The `unlock` command's notice: the saved pairing could not be opened,
   // or it opened but another account can open it too (#24).
   let pairingNotice = $state('');
+  // #96: "your phone declined a new session" has its own banner, so it never
+  // replaces the one above, and it follows the rule in declined.js: shown
+  // only while the session it names is active and before its end time, and
+  // gone for good after. A timer removes it at that time even if nothing
+  // else changes.
+  let declinedText = $state<string | null>(null);
+  $effect(() => {
+    const n = $declinedNotice;
+    const { show, next } = declinedStep(n, sessionState.state, sessionState.expiresAt, Math.floor(Date.now() / 1000));
+    declinedText = show;
+    if (next !== n) declinedNotice.set(next);
+    if (!next) return;
+    const t = setTimeout(() => declinedNotice.set(null), Math.max(0, next.until * 1000 - Date.now()));
+    return () => clearTimeout(t);
+  });
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let unlistenFocus: (() => void) | null = null;
   let unlistenChanges: (() => void) | null = null;
@@ -303,6 +320,12 @@
     <div class="pairing-notice" role="alert">
       <p>{pairingNotice}</p>
       <button onclick={() => pairingNotice = ''}>Dismiss</button>
+    </div>
+  {/if}
+  {#if declinedText}
+    <div class="pairing-notice" role="status">
+      <p>{declinedText}</p>
+      <button onclick={() => declinedNotice.set(null)}>Dismiss</button>
     </div>
   {/if}
 
