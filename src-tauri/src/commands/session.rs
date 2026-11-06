@@ -29,7 +29,7 @@ pub struct SessionTimer {
 /// [`Snapshot::active_at`] says so; "suspended" while the vault is held or
 /// locked (#77: the vault's word, not an expiry, and the current UI's
 /// "Suspended" has no Start New Session); "expired" when unlocked without
-/// a live session otherwise; "inactive" when locked or not paired.
+/// a live session otherwise; "inactive" when no link is open or not paired.
 fn status_of(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> SessionStatus {
     let none = |state: &str, reachable: bool| SessionStatus {
         state: state.to_string(),

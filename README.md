@@ -34,7 +34,7 @@ src-tauri/src/
 ├── lib.rs                  # Tauri app builder, IPC handler registration
 ├── main.rs                 # Entry point
 ├── commands/
-│   ├── auth.rs             # register, unlock, lock, get_status
+│   ├── auth.rs             # register, unlock, get_status
 │   ├── session.rs          # get_session_status, get_session_timer
 │   └── vault.rs            # list_connections, get_connection, list_feed,
 │                           #   query_audit, list_messages, list_secrets_catalog,

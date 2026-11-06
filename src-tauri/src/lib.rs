@@ -85,7 +85,6 @@ pub fn run() {
             // Auth commands
             auth::register,
             auth::unlock,
-            auth::lock,
             auth::logout,
             auth::extend_session,
             auth::end_session,

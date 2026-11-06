@@ -12,10 +12,13 @@
 
 **Owner decision of 2026-11-05** (thread 01M6PHX9DKPAXGKRPNQ6HX7V8V):
 **the desktop never locks the vault.** Locking is available only from the
-phone. The desktop's "Lock" stays this desktop's own lock (#76), and the
+phone. The desktop's "Lock" stays this desktop's own lock (#76; superseded
+2026-11-06, see below), and the
 desktop never sends `vault.lock`. VAULT-MESSAGING §3.6.5 and §10.2 say a
 desktop may lock; the lead writes the erratum ("desktops don't lock the
-vault, owner decision 2026-11-05").
+vault, owner decision 2026-11-05"). *Since 2026-11-06 (owner decision,
+#76) the desktop has no lock of its own either: End session is how this
+desktop's access stops.*
 
 What this note covers is the other half: what the vault tells a desktop
 about its lock and hold, and how the desktop shows it honestly.
@@ -53,8 +56,8 @@ about its lock and hold, and how the desktop shows it honestly.
   (suspended) session, so the desktop **shows the session as active**
   while every request is refused `owner_check_required`: a session shown
   as usable when it is not.
-- "Lock" (`commands/auth.rs` `lock`) drops the link from memory. It locks
-  this desktop only (#76), and stays so.
+- The desktop's own "Lock now" is removed (#76, owner decision
+  2026-11-06): End session is how this desktop's access stops.
 
 ## 3. Design
 
@@ -139,7 +142,6 @@ about its lock and hold, and how the desktop shows it honestly.
 - **Start New Session** is hidden while Held, Locked or Unknown. The
   vault would refuse it or not answer, and the desktop asks only for
   what can be used now.
-- "Lock" stays as it is: it locks this desktop.
 
 ### 3.3 The hold
 
