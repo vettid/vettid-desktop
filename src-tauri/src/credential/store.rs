@@ -584,7 +584,14 @@ pub fn remove_legacy_pairing(config_dir: &Path) -> Result<(), CredentialError> {
         Some(pending) => pending.and(legacy),
         None => legacy,
     };
-    record_wipe(config_dir, &wiping);
+    // #13 (review M1): with no marker on disk, deleting `connection.enc`
+    // would leave `master-key-v1` known only to this process; after a
+    // restart nothing would say an earlier format was here, and a log-out
+    // would skip the full keyring sweep. Kept until the marker can be
+    // written (its key is removed by log-out, which reads the file again).
+    if !record_wipe(config_dir, &wiping) {
+        return Err(CredentialError::IoError("the earlier pairing is kept: its removal couldn't be recorded".into()));
+    }
     delete_locked(config_dir)?;
     confirm_gone(config_dir, CREDENTIAL_FILE)
 }
@@ -769,11 +776,42 @@ mod wipe_marker {
         #[cfg(not(test))]
         let base = match std::env::var_os("XDG_STATE_HOME").map(PathBuf::from).filter(|p| p.is_absolute()) {
             Some(p) => p,
-            None => PathBuf::from(std::env::var_os("HOME")?).join(".local").join("state"),
+            // Review L3: never a relative (or empty) HOME.
+            None => Some(PathBuf::from(std::env::var_os("HOME")?)).filter(|p| p.is_absolute())?.join(".local").join("state"),
         };
+        // The name is the folder's name plus a hash of its full path (review
+        // L3), so two config folders never share a fallback marker.
+        use sha2::Digest;
+        use std::os::unix::ffi::OsStrExt;
+        let digest = sha2::Sha256::digest(config_dir.as_os_str().as_bytes());
         let mut name = config_dir.file_name()?.to_os_string();
-        name.push(SUFFIX);
+        name.push(format!(".{}{SUFFIX}", hex::encode(&digest[..8])));
         Some(base.join("vettid-desktop-wipe").join(name))
+    }
+
+    /// The fallback folder (review L3): made `0700` if missing (and its
+    /// entry synced), then checked: a real folder (not a symlink), owned by
+    /// this user, not open to the group or others. Anything else isn't used.
+    #[cfg(unix)]
+    fn fallback_folder(dir: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        match std::fs::symlink_metadata(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+                if let Some(parent) = dir.parent() {
+                    std::fs::File::open(parent)?.sync_all()?;
+                }
+            }
+            Err(e) => return Err(e),
+            Ok(_) => {}
+        }
+        let m = std::fs::symlink_metadata(dir)?;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        if !m.file_type().is_dir() || m.uid() != me || m.mode() & 0o077 != 0 {
+            return Err(std::io::Error::other("the fallback folder isn't this user's private folder"));
+        }
+        Ok(())
     }
 
     #[cfg(all(unix, test))]
@@ -786,6 +824,11 @@ mod wipe_marker {
     #[cfg(all(unix, test))]
     pub(crate) fn set_fallback_for_tests(base: Option<PathBuf>) {
         FALLBACK_FOR_TESTS.with(|b| *b.borrow_mut() = base);
+    }
+
+    #[cfg(all(unix, test))]
+    pub(crate) fn fallback_path_for_tests(config_dir: &Path) -> Option<PathBuf> {
+        fallback_path(config_dir)
     }
 
     /// The pending wipe, if a marker is there (next to the folder, or in
@@ -829,10 +872,7 @@ mod wipe_marker {
         };
         let Some(fallback) = fallback_path(config_dir) else { return Err(here) };
         let made = match fallback.parent() {
-            Some(dir) => {
-                use std::os::unix::fs::DirBuilderExt;
-                std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
-            }
+            Some(dir) => fallback_folder(dir),
             None => Ok(()),
         };
         match made.and_then(|()| write_at(&fallback, w)) {
@@ -1883,8 +1923,42 @@ pub(crate) mod tests {
         assert!(first.is_err());
         if !root {
             assert_eq!(found.and_then(|w| w.sealed_by).as_deref(), Some("secret-service"), "from the fallback marker");
-            assert!(state.path().join("vettid-desktop-wipe").join("vettid-desktop.wipe-pending").exists());
+            let names: Vec<String> = fs::read_dir(state.path().join("vettid-desktop-wipe"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(matches!(&names[..], [n] if n.starts_with("vettid-desktop.") && n.ends_with(".wipe-pending")), "{names:?}");
         }
+        // Two config folders of the same name don't share a fallback marker.
+        wipe_marker::set_fallback_for_tests(Some(state.path().to_path_buf()));
+        let a = wipe_marker::fallback_path_for_tests(Path::new("/one/vettid-desktop"));
+        let b = wipe_marker::fallback_path_for_tests(Path::new("/two/vettid-desktop"));
+        wipe_marker::set_fallback_for_tests(None);
+        assert_ne!(a, b);
+    }
+
+    /// #13 (review L3): a fallback folder open to the group isn't used.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fallback_folder_open_to_others_isnt_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let shared = state.path().join("vettid-desktop-wipe");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
+        wipe_marker::set_fallback_for_tests(Some(state.path().to_path_buf()));
+        let parent = base.path().join("parent");
+        let dir = parent.join("vettid-desktop");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
+        let written = wipe_marker::write(&dir, &super::super::protector::Wiping::unknown());
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        wipe_marker::set_fallback_for_tests(None);
+        assert!(root || written.is_err(), "not written to a folder others can write");
+        assert_eq!(fs::read_dir(&shared).unwrap().count(), 0);
     }
 
     /// No known folder, or a relative one, is refused: never the current

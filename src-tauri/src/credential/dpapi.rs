@@ -363,8 +363,9 @@ mod tests {
         // #13: an Entra-only join (NetGetJoinInformation says workgroup).
         assert_eq!(Reach::from_checks(Ok(false), Ok(false), Ok(true)).notices(), vec![ENTRA_NOTICE]);
         assert_eq!(Reach::from_checks(Ok(true), Ok(true), Ok(true)).notices(), vec![DOMAIN_NOTICE, ENTRA_NOTICE, ROAMING_NOTICE]);
-        // This machine's own check runs and answers (tempe is not joined).
-        assert_eq!(entra_joined(), Ok(false), "tempe is joined to nothing");
+        // This machine's own check runs; its answer isn't asserted (a
+        // developer's laptop may well be joined).
+        let _ = entra_joined();
     }
 
     /// The real checks run on this machine (their answer isn't asserted).

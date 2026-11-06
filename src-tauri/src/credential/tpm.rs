@@ -784,10 +784,12 @@ pub(super) mod tests {
         ctx.execute_with_nullauth_session(|c| c.evict_control(Provision::Owner, primary.into(), Persistent::Persistent(handle))).unwrap();
     }
 
+    /// The key is refused as "won't open" (a load failure: the file is kept,
+    /// the person is told and re-pairs), not "failing" and not opened.
     fn wont_open(p: &Tpm, wrapped: &[u8], what: &str) {
         match p.unwrap(wrapped) {
-            Err(ProtectorError::WontOpen(_)) | Err(ProtectorError::Failing { .. }) => {}
-            other => panic!("{what}: expected a refusal, got {:?}", other.map(|_| "a key")),
+            Err(ProtectorError::WontOpen(_)) => {}
+            other => panic!("{what}: expected won't open, got {:?}", other.map(|_| "a key")),
         }
     }
 

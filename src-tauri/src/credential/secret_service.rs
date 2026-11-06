@@ -329,12 +329,18 @@ fn best_effort_sweep(searches: &[Search], what: &'static str) {
     };
     match matching(&ss, searches) {
         Ok(items) => {
+            let mut skipped = 0;
             for item in &items {
                 if matches!(item.is_locked(), Ok(false)) {
                     if let Err(e) = item.delete() {
                         log::info!("protector secret-service: {what}: a stray item wasn't removed: {e}");
                     }
+                } else {
+                    skipped += 1;
                 }
+            }
+            if skipped > 0 {
+                log::info!("protector secret-service: {what}: {skipped} locked stray item(s) left (not unlocked for this)");
             }
         }
         Err(e) => log::info!("protector secret-service: {what}: not searched ({e}); nothing of the wiped pairing was kept there"),
