@@ -805,7 +805,7 @@ mod wipe_marker {
     /// this user, not open to the group or others. Anything else isn't used.
     #[cfg(unix)]
     fn fallback_folder(dir: &Path) -> std::io::Result<()> {
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        use std::os::unix::fs::DirBuilderExt;
         match std::fs::symlink_metadata(dir) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
@@ -840,7 +840,12 @@ mod wipe_marker {
     #[cfg(unix)]
     fn make_private(dir: &Path) -> std::io::Result<bool> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-        let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(dir)?;
+        let f = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NOCTTY).open(dir) {
+            Ok(f) => f,
+            // Not a folder, or a symlink: not this user's folder.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTDIR) | Some(libc::ELOOP)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
         let m = f.metadata()?;
         // SAFETY: geteuid has no preconditions.
         let me = unsafe { libc::geteuid() };
@@ -871,7 +876,15 @@ mod wipe_marker {
                     // may not be ours: "nothing known" this time, and a file
                     // that isn't ours is never trusted later either (`ours`).
                     match make_private(dir) {
-                        Ok(true) => log::warn!("Credential store: the wipe marker's fallback folder was open to others; made private"),
+                        Ok(true) => {
+                            log::warn!("Credential store: the wipe marker's fallback folder was open to others; made private");
+                            // Lead review: whatever is there now (even a
+                            // marker of ours renamed into place by someone
+                            // else) is replaced with "nothing known".
+                            if let Err(e) = write_at(&path, &Wiping::unknown()) {
+                                log::warn!("Credential store: the fallback marker couldn't be reset: {e}");
+                            }
+                        }
                         Ok(false) => log::warn!("Credential store: the wipe marker's fallback folder isn't this user's folder; not used"),
                         Err(e) => log::warn!("Credential store: the wipe marker's fallback folder is open to others and couldn't be made private: {e}"),
                     }
@@ -920,8 +933,15 @@ mod wipe_marker {
         use std::os::unix::fs::MetadataExt;
         // SAFETY: geteuid has no preconditions.
         let me = unsafe { libc::geteuid() };
-        f.metadata().is_ok_and(|m| m.file_type().is_file() && m.uid() == me && m.nlink() == 1)
+        // Private too (lead review): `O_TRUNC` keeps an existing file's mode,
+        // so a marker of ours that others could write isn't trusted.
+        f.metadata().is_ok_and(|m| m.file_type().is_file() && m.uid() == me && m.nlink() == 1 && m.mode() & 0o077 == 0)
     }
+
+    /// The flags for opening a marker that may not be ours: no symlink
+    /// followed, never blocking (a FIFO), never a controlling terminal.
+    #[cfg(unix)]
+    const UNTRUSTED_OPEN: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY;
 
     /// Opened without following a symlink and without blocking (a FIFO
     /// can't hang the wipe under the writer lock), then checked with
@@ -930,7 +950,7 @@ mod wipe_marker {
     fn read_at(path: &Path) -> Option<Wiping> {
         use std::io::Read;
         use std::os::unix::fs::OpenOptionsExt;
-        match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path) {
+        match std::fs::OpenOptions::new().read(true).custom_flags(UNTRUSTED_OPEN).open(path) {
             Ok(f) if !ours(&f) => Some(Wiping::unknown()),
             Ok(f) => {
                 let mut text = String::new();
@@ -975,25 +995,30 @@ mod wipe_marker {
     fn write_at(path: &Path, w: &Wiping) -> std::io::Result<()> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let open_existing = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path);
-        let foreign = match &open_existing {
-            Ok(f) => !ours(f),
-            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        let open_existing = std::fs::OpenOptions::new().read(true).custom_flags(UNTRUSTED_OPEN).open(path);
+        let existing_ours = match &open_existing {
+            Ok(f) => ours(f),
+            Err(_) => false,
         };
+        let exists = !matches!(&open_existing, Err(e) if e.kind() == std::io::ErrorKind::NotFound);
         drop(open_existing);
-        if foreign {
+        if exists && !existing_ours {
             match std::fs::remove_file(path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
                 _ => {}
             }
         }
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)?;
+        // A marker of ours is rewritten in place; otherwise a new file is
+        // made with O_EXCL (lead review), so nothing raced into place
+        // meanwhile is ever truncated or written: the create fails instead.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).mode(0o600).custom_flags(UNTRUSTED_OPEN);
+        if existing_ours {
+            opts.truncate(true);
+        } else {
+            opts.create_new(true);
+        }
+        let mut f = opts.open(path)?;
         if !ours(&f) {
             return Err(std::io::Error::other("the marker isn't this user's own file"));
         }
@@ -2105,7 +2130,14 @@ pub(crate) mod tests {
         let written = wipe_marker::write(dir, &super::super::protector::Wiping { sealed_by: Some("secret-service".into()), legacy: false });
         let after = wipe_marker::read(dir);
         let is_file = fs::symlink_metadata(&fifo).map(|m| m.file_type().is_file()).unwrap_or(false);
+        // A marker of ours that others could write isn't trusted either.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fifo, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let open_mode = wipe_marker::read(dir);
         wipe_marker::set_fallback_for_tests(None);
+        assert_eq!(open_mode, Some(super::super::protector::Wiping::unknown()), "a marker others can write");
         assert_eq!(read, Some(super::super::protector::Wiping::unknown()));
         assert!(written.is_ok(), "{written:?}");
         assert!(is_file);
