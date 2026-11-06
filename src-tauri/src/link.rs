@@ -1761,17 +1761,20 @@ mod tests {
         assert_eq!(snap.session_id.as_deref(), Some("s-2"));
     }
 
-    /// #90: the one way the test above could fail by timing. The fake vault
-    /// once stamped each message with the wall clock as it was then. A
+    /// #90, a regression guard for the fake vault (test infrastructure),
+    /// not for the device: one way the test above could fail by timing. The
+    /// fake once stamped each message with the wall clock as it was then. A
     /// clock that stepped back after an earlier message left that message
     /// stamped ahead of the grant and of the status confirming it: both
     /// looked older than what this desktop had already learned, were
     /// (rightly) ignored as stale, and the request ended `NotConfirmed`.
     /// Here an earlier message is stamped 10 s ahead (an `ended`, as a
-    /// clock 10 s fast would have stamped it). A vault's stamps don't go
-    /// back, and the fake's no longer do (`State::now` stamps after the
-    /// last message, #92): the grant comes after it and is confirmed. With
-    /// `State::now` as it was, this fails with `NotConfirmed`.
+    /// clock 10 s fast would have stamped it). The fake's stamps no longer
+    /// go back (`State::now` stamps after the last message, #92): the grant
+    /// comes after it and is confirmed. With `State::now` as it was, this
+    /// fails with `NotConfirmed`. Not covered: the device's own clock (a
+    /// step back holds its outbox, #105) and a store write failing on
+    /// Windows; #90 lists both.
     #[tokio::test]
     async fn a_message_stamped_ahead_doesnt_lose_the_grant() {
         let dir = tempfile::tempdir().unwrap();
