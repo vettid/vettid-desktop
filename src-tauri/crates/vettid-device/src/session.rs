@@ -1206,7 +1206,9 @@ impl<T: Transport, C: Clock> Session<T, C> {
             }
             // Only what the store can write back (it can't fail for a parsed
             // event; dropped otherwise rather than lose the state).
-            if inner.marshal(Mode::Session).is_ok() {
+            // #60: the check's output is the whole inner, body included:
+            // wiped, not just dropped.
+            if inner.marshal(Mode::Session).map(Zeroizing::new).is_ok() {
                 // Returned with the batch, once it is stored and acked.
                 self.state.inbox.push(inner);
             }

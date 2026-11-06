@@ -5,7 +5,7 @@
  * After a read.
  * - `wasPending`, `nowPending`: whether an End session was waiting for the
  *   vault before and after it (`nowPending` null: the read couldn't tell,
- *   for example no link while locked).
+ *   for example with no link open).
  * - `notice`: the notice on screen. `endNotice`: the not-confirmed notice
  *   End session showed (null if none).
  * - `confirmed`: the backend settled the stored end and the vault confirmed

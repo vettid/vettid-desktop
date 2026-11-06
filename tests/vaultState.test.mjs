@@ -73,7 +73,7 @@ test('Unknown: the Unknown text', () => {
   assert.deepEqual(screen({ state: 'unknown' }), { kind: 'unknown', lines: [TEXT.unknown], holdOff: null, showStart: false });
 });
 
-test('No link open (own Lock, before unlock): the screen the app always showed, no vault state, Start shown', () => {
+test('No link open (before unlock, or after a log-out): the screen the app always showed, no vault state, Start shown', () => {
   for (const v of [null, undefined]) {
     assert.deepEqual(screen(v), { kind: 'none', lines: [], holdOff: null, showStart: true });
   }

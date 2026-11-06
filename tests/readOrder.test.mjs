@@ -46,7 +46,7 @@ test('in order, and the same snapshot twice, both apply', () => {
 test('a failed read (no link, no counter) is ordered by when it began', () => {
   const order = createReadOrder();
   const early = order.begin(); // a read of the live session, still on its way
-  const lockRead = order.begin(); // after this desktop's own Lock: no link
+  const lockRead = order.begin(); // after a log-out: no link
   assert.equal(order.accept(lockRead, null), true);
   assert.equal(order.accept(early, 5), false, 'begun before the failure that was applied');
   // The link opens again: a later read applies, and orders by its counter.

@@ -54,7 +54,7 @@ pub struct AppState {
     /// two never overlap (#33).
     pub session_op: Arc<Mutex<()>>,
 
-    /// Memory resets (lock, End session, log-out) this process has started
+    /// Memory resets (End session, log-out) this process has started
     /// and finished (#43). A reset bumps `resets_started` before it clears
     /// anything and `resets_finished` when it's done. `unlock` (and a
     /// pairing) installs its link only if none was under way when it

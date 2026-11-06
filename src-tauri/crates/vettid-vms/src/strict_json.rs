@@ -19,6 +19,7 @@ use std::collections::HashSet;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use zeroize::Zeroizing;
 
 /// The deepest nesting of objects and arrays, the top object included.
 pub const MAX_DEPTH: usize = 32;
@@ -183,9 +184,10 @@ impl<'a> Object<'a> {
     }
 
     /// A required member of canonical standard base64 with padding that
-    /// decodes to exactly `n` bytes (`None`: any length).
+    /// decodes to exactly `n` bytes (`None`: any length). It may be secret:
+    /// every copy made on the way is wiped (#60).
     pub fn base64(&self, name: &str, n: Option<usize>) -> Result<Vec<u8>, JsonError> {
-        decode_std(&self.string(name)?, n)
+        decode_std(&Zeroizing::new(self.string(name)?), n)
     }
 }
 
@@ -195,11 +197,12 @@ pub fn as_string(raw: &str) -> Result<String, JsonError> {
         return Err(JsonError::Type);
     }
     let mut p = Parser { s: raw.as_bytes(), text: raw, i: 0 };
-    let s = p.string().map_err(|_| JsonError::Type)?;
+    // #60: wiped if refused for trailing text.
+    let mut s = Zeroizing::new(p.string().map_err(|_| JsonError::Type)?);
     if p.i != raw.len() {
         return Err(JsonError::Type);
     }
-    Ok(s)
+    Ok(std::mem::take(&mut *s))
 }
 
 /// Read a raw value as an integer in `[min, max]`, written as a plain JSON
@@ -236,12 +239,20 @@ pub fn as_array(raw: &str) -> Result<Vec<&str>, JsonError> {
 /// Decode canonical standard base64 with padding, of exactly `n` bytes
 /// (`None`: any length). CR, LF and any non-canonical spelling (non-zero
 /// trailing bits, missing padding) are refused.
+///
+/// The bytes may be secret (#60): they are decoded once, into a buffer
+/// that is wiped if they are refused, and the re-encoding that checks the
+/// spelling is wiped too.
 pub fn decode_std(s: &str, n: Option<usize>) -> Result<Vec<u8>, JsonError> {
-    let b = STANDARD.decode(s).map_err(|_| JsonError::Base64)?;
-    if n.is_some_and(|n| b.len() != n) || STANDARD.encode(&b) != s {
+    // Room for any decoding of `s`: decode_slice needs it, and the buffer
+    // never grows.
+    let mut b = Zeroizing::new(vec![0u8; s.len() / 4 * 3 + 3]);
+    let len = STANDARD.decode_slice(s, &mut b[..]).map_err(|_| JsonError::Base64)?;
+    b.truncate(len);
+    if n.is_some_and(|n| b.len() != n) || *Zeroizing::new(STANDARD.encode(&b[..])) != s {
         return Err(JsonError::Base64);
     }
-    Ok(b)
+    Ok(std::mem::take(&mut *b))
 }
 
 /// Check `raw` as a strict object at nesting `level` and return it
@@ -364,9 +375,21 @@ impl Builder {
         self
     }
 
-    /// A standard-base64 member.
-    pub fn base64(self, n: &str, v: &[u8]) -> Self {
-        self.string(n, &STANDARD.encode(v))
+    /// A standard-base64 member. `v` may be secret (#60): it is encoded
+    /// straight into the buffer, through a small buffer that is wiped, and
+    /// no other copy is made. Base64 needs no JSON escape.
+    pub fn base64(mut self, n: &str, v: &[u8]) -> Self {
+        self.name(n);
+        self.out.push('"');
+        // 48 bytes encode to 64 characters with no padding: only the last
+        // chunk can be padded, as in one encoding of the whole.
+        let mut buf = Zeroizing::new([0u8; 64]);
+        for chunk in v.chunks(48) {
+            let len = STANDARD.encode_slice(chunk, &mut buf[..]).expect("64 bytes hold 48 encoded");
+            self.out.push_str(std::str::from_utf8(&buf[..len]).expect("base64 is ASCII"));
+        }
+        self.out.push('"');
+        self
     }
 
     /// A member whose value is already-encoded JSON; the caller vouches for
@@ -417,7 +440,8 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Some(b'{') => self.object(depth + 1).map(drop),
             Some(b'[') => self.array_elements(depth + 1).map(drop),
-            Some(b'"') => self.string().map(drop),
+            // #60: the checked string may be secret; it is wiped, not just dropped.
+            Some(b'"') => self.string().map(|s| drop(Zeroizing::new(s))),
             Some(b't') => self.literal(b"true"),
             Some(b'f') => self.literal(b"false"),
             Some(b'n') => self.literal(b"null"),
@@ -540,6 +564,22 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The raw length of the string whose body starts at `self.i` (after
+    /// its opening quote), up to its closing quote or the end of the text:
+    /// at least the length of the unescaped string, since every escape is
+    /// at least as long as what it stands for.
+    fn raw_string_len(&self) -> usize {
+        let mut j = self.i;
+        while let Some(&c) = self.s.get(j) {
+            match c {
+                b'"' => break,
+                b'\\' => j += 2,
+                _ => j += 1,
+            }
+        }
+        j.min(self.s.len()) - self.i
+    }
+
     fn hex4(&mut self) -> Result<u32, JsonError> {
         let h = self.s.get(self.i..self.i + 4).ok_or(JsonError::Syntax)?;
         let h = std::str::from_utf8(h).map_err(|_| JsonError::Syntax)?;
@@ -552,9 +592,15 @@ impl<'a> Parser<'a> {
 
     /// A string, unescaped. A surrogate escape must be a high one followed
     /// at once by a `\u` escape of a low one.
+    ///
+    /// A string may be secret (#60): it is unescaped into a buffer sized
+    /// once, from its raw length (which bounds the unescaped one), so it
+    /// never reallocates and leaves no copy behind; the buffer is wiped if
+    /// the string is refused. A caller that drops it wipes it (as the
+    /// check of a whole text does).
     fn string(&mut self) -> Result<String, JsonError> {
         self.expect(b'"')?;
-        let mut out = String::new();
+        let mut out = Zeroizing::new(String::with_capacity(self.raw_string_len()));
         loop {
             let start = self.i;
             while let Some(c) = self.peek() {
@@ -568,7 +614,8 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 Some(b'"') => {
                     self.i += 1;
-                    return Ok(out);
+                    // Moved out, not copied: the empty buffer left is wiped.
+                    return Ok(std::mem::take(&mut *out));
                 }
                 Some(b'\\') => {
                     self.i += 1;
@@ -738,6 +785,41 @@ mod tests {
             assert_eq!(decode_std(bad, want), Err(JsonError::Base64), "{bad:?}");
         }
         assert_eq!(decode_std("AQID", Some(4)), Err(JsonError::Base64));
+    }
+
+    /// #60: a base64 member is written in 48-byte chunks straight into the
+    /// buffer; the result is exactly one encoding of the whole, padding
+    /// only at the end, for every length across chunk boundaries. And it
+    /// reads back.
+    #[test]
+    fn base64_members_are_written_whole_and_read_back() {
+        for len in 0..=200usize {
+            let v: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            let text = Builder::new().base64("k", &v).finish();
+            assert_eq!(text, ["{\"k\":\"", &STANDARD.encode(&v), "\"}"].concat(), "{len}");
+            let o = parse_object(text.as_bytes()).unwrap();
+            assert_eq!(o.base64("k", Some(len)).unwrap(), v, "{len}");
+        }
+    }
+
+    /// #60: a string is unescaped into one buffer sized from its raw
+    /// length, which never grows (a reallocation would leave an unwiped
+    /// copy): its capacity is the raw body's length.
+    #[test]
+    fn a_string_is_unescaped_into_one_buffer() {
+        let cases = [
+            ("\"plain secret\"", "plain secret"),
+            ("\"a\\nb\\\"c\\\\d\"", "a\nb\"c\\d"),
+            ("\"\\u00e9\\ud83d\\ude00x\"", "\u{e9}\u{1f600}x"),
+            ("\"\"", ""),
+        ];
+        for (raw, want) in cases {
+            let s = as_string(raw).unwrap();
+            assert_eq!(s, want, "{raw}");
+            // Equality catches a regrowth. std's String records the capacity
+            // asked for, not what the allocator gave, so this is exact.
+            assert_eq!(s.capacity(), raw.len() - 2, "{raw}: allocated once, at the raw length");
+        }
     }
 
     #[test]

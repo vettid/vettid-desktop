@@ -178,8 +178,8 @@ pub fn plain_store_notice(e: &CredentialError) -> Option<String> {
 /// operation; holds no secret.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
-    /// A paired device's state is open in memory (this desktop's own lock,
-    /// #76; not the vault's, which is [`Snapshot::vault`]).
+    /// A paired device's state is open in memory (false before unlock, or
+    /// after one that failed; the vault's lock is [`Snapshot::vault`]).
     pub link_open: bool,
     /// The id the vault gave this device.
     pub device_id: Option<String>,
@@ -1766,6 +1766,33 @@ mod tests {
         link.read_status().await.unwrap();
         vault.deny_on_request();
         assert_eq!(link.request_access(|| {}, || false).await, Err(RequestFailed::Denied));
+        assert!(!link.snapshot(Utc::now()).active_at(Utc::now()));
+    }
+
+    /// #49: the wait for the phone ends at the request's own `exp`, the
+    /// moment the vault drops it and refuses an approval
+    /// (vettid-vault `hSessionApprove`), and never before it. Only then is
+    /// the person told the phone didn't answer and the desktop has no
+    /// access; nothing is live.
+    #[tokio::test]
+    async fn an_unanswered_request_lapses_at_its_exp_not_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = FakeVault::paired(dir.path());
+        link.read_status().await.unwrap();
+        let window = TimeDelta::seconds(2);
+        vault.request_window(window);
+        let start = Utc::now();
+        let mut asked = false;
+        // An upper bound too: a wait that never lapses fails here, not hangs.
+        let r = tokio::time::timeout(std::time::Duration::from_secs(12), link.request_access(|| asked = true, || false))
+            .await
+            .expect("lapsed within 10 s of exp");
+        let waited = Utc::now() - start;
+        assert!(asked, "the phone was asked");
+        assert_eq!(r, Err(RequestFailed::Lapsed));
+        // `exp` is written in milliseconds: allow that much.
+        assert!(waited >= window - TimeDelta::milliseconds(2), "stopped after {waited}, before exp");
+        assert_eq!(request_notice(&r.unwrap_err(), None), REQUEST_LAPSED_NOTICE);
         assert!(!link.snapshot(Utc::now()).active_at(Utc::now()));
     }
 
