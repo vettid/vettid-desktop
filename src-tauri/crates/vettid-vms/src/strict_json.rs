@@ -341,7 +341,9 @@ pub fn escaped_len(s: &str) -> usize {
 /// builder is dropped, and it never grows by reallocation in place. Before
 /// each write it makes room for exactly what follows; if there isn't any,
 /// it moves to a bigger buffer and wipes the old one ([`Builder::reserve`]).
-/// [`Builder::with_capacity`] still avoids even that copy.
+/// [`Builder::with_capacity`] still avoids even that copy. A builder dropped
+/// by a panic is wiped only if the panic unwinds: don't build with
+/// `panic = "abort"`.
 pub struct Builder {
     out: Zeroizing<String>,
     first: bool,
@@ -388,19 +390,25 @@ impl Builder {
 
     fn name(&mut self, n: &str) {
         self.reserve(escaped_len(n) + 2);
+        let cap = self.out.capacity();
         if !self.first {
             self.out.push(',');
         }
         self.first = false;
         write_string(&mut self.out, n);
         self.out.push(':');
+        // If `escaped_len` ever falls behind `write_string` (a new escape),
+        // the buffer would have grown in place, unwiped: caught here.
+        debug_assert_eq!(cap, self.out.capacity(), "escaped_len short of write_string");
     }
 
     /// A string member.
     pub fn string(mut self, n: &str, v: &str) -> Self {
         self.name(n);
         self.reserve(escaped_len(v));
+        let cap = self.out.capacity();
         write_string(&mut self.out, v);
+        debug_assert_eq!(cap, self.out.capacity(), "escaped_len short of write_string");
         self
     }
 
