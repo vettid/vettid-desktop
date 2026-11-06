@@ -1793,6 +1793,7 @@ mod tests {
         assert!(link::pair_clock_notice(None).starts_with("Not paired. This computer's clock"));
         assert!(link::end_clock_notice(Some(600)).starts_with("This computer's clock is off by about 10 minutes."));
         assert!(link::end_clock_notice(None).contains("may still be open"));
+        assert!(!link::end_clock_notice(None).contains("try again"), "it keeps trying on its own");
     }
 
     /// #107: while the relay refuses this computer's clock, the session

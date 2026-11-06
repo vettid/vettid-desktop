@@ -273,6 +273,40 @@ async fn a_message_held_under_a_clock_ahead_is_reported_not_sent() {
     assert_eq!(faults.lock().unwrap().deposits_seen, tried, "never deposited");
 }
 
+/// #107 (review A): a message queued with a right clock, then the clock goes
+/// ten minutes behind (a dual-boot start before the time sync; the relay
+/// refuses it). The entry looks stamped ahead, but the relay hasn't taken
+/// this clock, so it is kept, neither sent nor dropped; once the clock is
+/// right again it is delivered.
+#[tokio::test]
+async fn a_clock_behind_for_a_while_loses_nothing() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let clock = Ticking::new();
+    let mut s = session(&relay, &faults, &mut store, clock.clone());
+    faults.lock().unwrap().temporary = 1;
+    let id = s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+    assert_eq!(s.outbox_len(), 1, "held by an unreachable relay");
+    clock.ticks.store(-600, std::sync::atomic::Ordering::SeqCst);
+    {
+        let mut f = faults.lock().unwrap();
+        f.clock_deposits = 1000;
+        f.clock_collects = 1000;
+    }
+    assert!(s.poll(&mut store).await.unwrap_err().clock_skew().is_some());
+    assert_eq!(s.outbox_len(), 1, "kept");
+    assert!(s.take_dropped().is_empty(), "not dropped");
+    clock.ticks.store(0, std::sync::atomic::Ordering::SeqCst);
+    {
+        let mut f = faults.lock().unwrap();
+        f.clock_deposits = 0;
+        f.clock_collects = 0;
+    }
+    s.poll(&mut store).await.unwrap();
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.outbox_len(), 0);
+    assert_eq!(vault_receive(&mut vault).await.id, id);
+}
+
 /// #107: a collect refused for the clock fails at once with the clock
 /// error (no amount without a `Date`), and the next good one clears it.
 #[tokio::test]

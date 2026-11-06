@@ -296,6 +296,11 @@ pub struct Session<T: Transport, C: Clock> {
     /// takes. In memory only. SECURITY: display only, never used to adjust
     /// a timestamp or a check.
     clock_refused: Option<Option<i64>>,
+    /// The relay has taken a signed call from this clock since the session
+    /// opened or since its last `timestamp_stale` (#107, review A): only
+    /// then is this clock trusted to judge an outbox entry stamped ahead
+    /// of it (see `flush`).
+    clock_confirmed: bool,
     /// See [`COLLECT_BACKOFF`].
     collect_backoff: std::time::Duration,
     /// The last collect failed: the next one doesn't long-poll (`wait`
@@ -393,6 +398,7 @@ impl<T: Transport, C: Clock> Session<T, C> {
             hold_until: None,
             hold_releasable: false,
             clock_refused: None,
+            clock_confirmed: false,
             collect_backoff: COLLECT_BACKOFF,
             probe_next: false,
             outbox_backoff: OUTBOX_BACKOFF,
@@ -537,11 +543,15 @@ impl<T: Transport, C: Clock> Session<T, C> {
     /// Other errors leave it as it was: they say nothing about the clock.
     fn note_clock(&mut self, failed: Option<&RelayError>) {
         match failed {
-            None => self.clock_refused = None,
+            None => {
+                self.clock_refused = None;
+                self.clock_confirmed = true;
+            }
             Some(RelayError::ClockSkew { server_date }) => {
                 // SECURITY: display only; the relay's `Date` adjusts nothing.
                 let offset = server_date.map(|d| self.clock.now().timestamp() - d);
                 self.clock_refused = Some(offset);
+                self.clock_confirmed = false;
             }
             Some(_) => {}
         }
@@ -918,12 +928,24 @@ impl<T: Transport, C: Clock> Session<T, C> {
         let mut changed = false;
         let mut temporary = None;
         while let Some(e) = self.state.outbox.first().cloned() {
-            // #107 (review H1): stamped while this clock ran ahead, and the
-            // clock was set right since: the vault would reject its `ts`
-            // (more than 5 min in the future, §8.4) after the relay took
-            // it, so it would be lost unseen. Dropped here, and reported.
-            let from_the_future = e.created - now > MAX_CLOCK_SKEW_FUTURE;
-            if now - e.created > OUTBOX_MAX_AGE || e.exp.is_some_and(|x| now > x) || from_the_future {
+            // #107 (review H1): stamped more than 5 min ahead of this clock.
+            // If the relay has taken this clock since (`clock_confirmed`),
+            // the entry was stamped while the clock ran ahead: the vault
+            // would reject its `ts` (§8.4) after the relay took it, so it
+            // would be lost unseen. Dropped here, and reported. Otherwise
+            // (review A) it is this clock that may be behind, for now (a
+            // dual-boot start before the time sync): neither sent nor
+            // dropped; it waits, and is judged once the relay takes a call.
+            if e.created - now > MAX_CLOCK_SKEW_FUTURE {
+                if !self.clock_confirmed {
+                    break;
+                }
+                self.state.outbox.remove(0);
+                self.lost(e);
+                changed = true;
+                continue;
+            }
+            if now - e.created > OUTBOX_MAX_AGE || e.exp.is_some_and(|x| now > x) {
                 self.state.outbox.remove(0);
                 self.lost(e);
                 changed = true;

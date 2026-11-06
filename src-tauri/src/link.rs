@@ -116,7 +116,12 @@ const CLOCK_SETTINGS: &str = "in your computer's date and time settings, turn on
 /// rounded to whole minutes, or whole hours from 90 minutes; over a day it
 /// says "more than a day"; unknown, it names no amount.
 pub fn clock_notice(offset: Option<i64>) -> String {
-    let how = match offset.map(i64::unsigned_abs) {
+    format!("{} Set it to the correct time ({CLOCK_SETTINGS}), then try again.", clock_how(offset))
+}
+
+/// [`clock_notice`]'s first sentence: how far off the clock is.
+fn clock_how(offset: Option<i64>) -> String {
+    match offset.map(i64::unsigned_abs) {
         Some(s) if s >= 86_400 => "This computer's clock is off by more than a day.".to_string(),
         // From 90 minutes, whole hours.
         Some(s) if s >= 5_400 => format!("This computer's clock is off by about {} hours.", (s + 1_800) / 3_600),
@@ -125,8 +130,7 @@ pub fn clock_notice(offset: Option<i64>) -> String {
             n => format!("This computer's clock is off by about {n} minutes."),
         },
         None => "This computer's clock seems to be wrong.".to_string(),
-    };
-    format!("{how} Set it to the correct time ({CLOCK_SETTINGS}), then try again.")
+    }
 }
 
 /// How far this computer's clock is from the relay's `Date` (seconds, local
@@ -144,11 +148,11 @@ pub fn pair_clock_notice(offset: Option<i64>) -> String {
 /// NEW TEXT (owner approval needed, #107): End session couldn't be sent
 /// because the relay refused this computer's clock. The end is kept and
 /// sent again (as with [`END_NOT_SENT_NOTICE`]), so the session may still
-/// be open meanwhile.
+/// be open meanwhile. No "try again": it keeps trying on its own.
 pub fn end_clock_notice(offset: Option<i64>) -> String {
     format!(
-        "{} Until then this desktop can't end the session, so it may still be open. It keeps trying while it runs; you can also end it on your phone.",
-        clock_notice(offset)
+        "{} Set it to the correct time ({CLOCK_SETTINGS}). Until then this desktop can't end the session, so it may still be open. It keeps trying while it runs; you can also end it on your phone.",
+        clock_how(offset)
     )
 }
 /// NEW TEXT (owner approval needed): the ordering rule (§6.8 "Ending")
