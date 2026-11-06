@@ -261,6 +261,27 @@ async fn a_clock_set_back_doesnt_hold_the_outbox() {
     assert_eq!(vault_receive(&mut vault).await.id, id);
 }
 
+/// #105: a backoff hold set before the clock is set back still ends on
+/// time. It is a span of monotonic time (5 s at most here), not a wall-clock
+/// instant the step would push 2 minutes away. Time is paused, so the span
+/// passes at once with `advance`.
+#[tokio::test(start_paused = true)]
+async fn a_backoff_set_before_a_clock_step_ends_on_time() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let clock = Ticking::new();
+    let mut s = session(&relay, &faults, &mut store, clock.clone());
+    faults.lock().unwrap().server_errors = 1;
+    s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+    assert_eq!(s.outbox_len(), 1, "the 5xx left it held");
+    clock.ticks.store(-120, std::sync::atomic::Ordering::SeqCst);
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.outbox_len(), 1, "still within its backoff");
+    tokio::time::advance(std::time::Duration::from_secs(6)).await;
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.outbox_len(), 0, "sent once the backoff passed, despite the clock");
+    assert_eq!(vault_receive(&mut vault).await.kind, "test.ping");
+}
+
 /// Any 429 (a full mailbox too) keeps the entry in the outbox (§8.6), and
 /// its retry_after (600 s here) holds: neither another send nor a poll
 /// tries it early.
