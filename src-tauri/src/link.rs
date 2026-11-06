@@ -1991,6 +1991,38 @@ mod tests {
         (vault, link)
     }
 
+    /// #47: a restart never shows the last run's session as live. The link
+    /// a launch opens is `Link::new(session, store)` (as `Link::open`), and
+    /// nothing of the access session is kept on disk (only an unanswered
+    /// end, #80): it is not live before this run's own `vault.status`, and
+    /// not after it either if the vault ended the session meanwhile. Only a
+    /// status that names the session makes it live again.
+    #[tokio::test]
+    async fn a_restart_doesnt_show_the_last_runs_session_as_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, link) = live(dir.path()).await;
+        // The restart: a new link on the same session and store.
+        let Link { session, store, .. } = link;
+        let mut link = Link::new(session, store);
+        let now = Utc::now();
+        let snap = link.snapshot(now);
+        assert!(!snap.active_at(now), "not live before this run's vault.status");
+        assert_eq!((snap.session_id.as_deref(), snap.live_until), (None, None));
+
+        // The vault ended the session while this desktop was off.
+        vault.set_session(None);
+        link.read_status().await.unwrap();
+        let now = Utc::now();
+        let snap = link.snapshot(now);
+        assert!(!snap.active_at(now), "an ended session isn't live after a restart");
+        assert_eq!((snap.session_id.as_deref(), snap.live_until), (None, None));
+
+        // Control: a status that names a session makes it live.
+        vault.set_session(Some(("s-2", Utc::now() + TimeDelta::hours(1))));
+        link.read_status().await.unwrap();
+        assert!(link.snapshot(Utc::now()).active_at(Utc::now()));
+    }
+
     /// A lock from the phone, its notice collected by the refresh (whose
     /// status the locked vault leaves unanswered): Locked, with its reason,
     /// nothing live, and the refresh keeps going.
