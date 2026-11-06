@@ -72,7 +72,7 @@
   let declinedText = $state<string | null>(null);
   $effect(() => {
     const n = $declinedNotice;
-    const { show, next } = declinedStep(n, sessionState.state, Math.floor(Date.now() / 1000));
+    const { show, next } = declinedStep(n, sessionState.state, sessionState.expiresAt, Math.floor(Date.now() / 1000));
     declinedText = show;
     if (next !== n) declinedNotice.set(next);
     if (!next) return;

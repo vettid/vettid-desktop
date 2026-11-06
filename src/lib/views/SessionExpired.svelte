@@ -38,6 +38,8 @@
    */
   async function start() {
     errorMessage = '';
+    // #96: a new request makes an earlier decline's notice moot.
+    declinedNotice.set(null);
     step = 'awaiting-qr';
 
     unlistenRequested = await listen('session:requested', () => {
