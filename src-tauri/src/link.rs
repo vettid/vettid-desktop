@@ -2018,6 +2018,43 @@ mod tests {
         (vault, link)
     }
 
+    /// #47: a restart never shows the last run's session as live. A launch
+    /// opens the session from the store (`Session::open`, then
+    /// `Link::new`, as `Link::open`), and nothing that makes a session live
+    /// is kept on disk (only an unanswered end, #80, and pending request
+    /// ids): it is not live, nor shown stale, before this run's own
+    /// `vault.status`, and not live after it if the vault ended the session
+    /// meanwhile. Only a status that names a session makes it live again.
+    #[tokio::test]
+    async fn a_restart_doesnt_show_the_last_runs_session_as_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, link) = live(dir.path()).await;
+        // The restart: the session opened again from what is stored.
+        let Link { mut store, .. } = link;
+        let t = vault.clone();
+        let session = Session::open(&mut store, move |_| t, SystemClock).expect("open").expect("paired");
+        let mut link = Link::new(session, store);
+        let now = Utc::now();
+        let snap = link.snapshot(now);
+        assert!(!snap.active_at(now), "not live before this run's vault.status");
+        assert_eq!((snap.session_id.as_deref(), snap.live_until, snap.expires_at), (None, None, None));
+        assert!(!snap.stale, "nothing of the last run's session, not even as stale");
+        assert_eq!(snap.vault.state, VaultShown::Unknown);
+
+        // The vault ended the session while this desktop was off.
+        vault.set_session(None);
+        link.read_status().await.unwrap();
+        let now = Utc::now();
+        let snap = link.snapshot(now);
+        assert!(!snap.active_at(now), "an ended session isn't live after a restart");
+        assert_eq!((snap.session_id.as_deref(), snap.live_until), (None, None));
+
+        // Control: a status that names a session makes it live.
+        vault.set_session(Some(("s-2", Utc::now() + TimeDelta::hours(1))));
+        link.read_status().await.unwrap();
+        assert!(link.snapshot(Utc::now()).active_at(Utc::now()));
+    }
+
     /// A lock from the phone, its notice collected by the refresh (whose
     /// status the locked vault leaves unanswered): Locked, with its reason,
     /// nothing live, and the refresh keeps going.
