@@ -250,17 +250,28 @@ Var VettidWipe
 !macroend
 
 ; #74: an uninstall that stops part way exits with 2 and wrote no event: an
-; `Abort` in Section Uninstall, most likely the template's own
-; CheckIfAppIsRunning (in NSIS_HOOK_PREUNINSTALL above, and again in the
-; template after it) when the app is running and can't be closed, or the
-; person cancels. NSIS calls un.onUninstFailed then, silent (/S) included;
-; not after `Quit` (the 1002 refusal above, which writes its own event), and
-; not after a finished uninstall (checked in a test uninstaller, makensis
-; 3.11). The template doesn't define it. Nothing is claimed removed: the
-; program, the uninstaller and the saved pairing may all still be there.
+; `Abort` in Section Uninstall, from the app check (CheckIfAppIsRunning) when
+; the app is running and can't be closed, or the person cancels its box. It
+; runs twice: in NSIS_HOOK_PREUNINSTALL above, before the wipe, and in the
+; template after the hook, after the wipe. NSIS calls un.onUninstFailed then,
+; silent (/S) included; not after `Quit` (the 1002 refusal above, which
+; writes its own event), not after a finished uninstall, and not when a page
+; is skipped or the person cancels a page (checked in a test uninstaller,
+; makensis 3.11, and in the NSIS manual). The template doesn't define it.
+;
+; $VettidWipe says which: "" if the wipe didn't run (the first check, or an
+; update or in-place run, which skip it), else the wipe's result. After the
+; wipe the pairing may well be gone, so the text must still say to remove
+; the desktop on the phone. Never use $UpdateMode or $PassiveMode here: they
+; are declared after this file (see "Why these are macros" above).
 Function un.onUninstFailed
-  ; NEW TEXT (owner approval needed).
-  StrCpy $7 "VettID Desktop's uninstall stopped before it finished, so nothing was confirmed removed: the program and this desktop's saved pairing may still be on this computer. This usually means VettID Desktop was running and couldn't be closed. Close it, then uninstall again."
+  ${If} $VettidWipe == ""
+    ; NEW TEXT (owner approval needed).
+    StrCpy $7 "VettID Desktop's uninstall stopped before it finished, and nothing was removed: the program and this desktop's saved pairing are probably still on this computer. This usually means VettID Desktop was running and couldn't be closed, or the uninstall was canceled. Close VettID Desktop, then uninstall it again."
+  ${Else}
+    ; NEW TEXT (owner approval needed).
+    StrCpy $7 "VettID Desktop's uninstall stopped before it finished (result $VettidWipe). Removing this desktop's saved pairing was tried, but the program may still be on this computer and may still be running, so the pairing's removal isn't confirmed. Close VettID Desktop, then uninstall it again. If this desktop was paired, also remove it on the phone."
+  ${EndIf}
   !insertmacro VETTID_REPORT_EVENT 1004
 FunctionEnd
 

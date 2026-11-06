@@ -213,7 +213,9 @@ also open its window) exits 0.
   phone.
 - If the template's own app check (step 2) is canceled or fails (the app was started again after the
   wipe), the uninstall stops there and step 3 doesn't run. The wipe has already run, but the person sees
-  neither message, only the template's "is running" one; the exit code is non-zero.
+  neither message, only the template's "is running" one; the exit code is 2. Since #74 it writes event 1004
+  with the wipe's result, saying the pairing's removal isn't confirmed and to remove the desktop on the phone
+  too (case G below).
 - If NSIS ever ran a real uninstall in place (say, if it couldn't copy itself to `%TEMP%`), the hook would
   keep the pairing and say nothing. Not found: the manual doesn't say what NSIS does then, and the NSIS
   download here has no source for the uninstaller's start-up.
@@ -230,10 +232,12 @@ also open its window) exits 0.
 - **The event log:** every failure the hooks detect, silent or not, writes a Warning, source "VettID Desktop", to the Application
   log: event ID 1001 when the pairing couldn't be removed or confirmed, 1002 when the uninstall was refused
   because another account ran it, 1003 when the program itself couldn't be deleted, and (#74) 1004 when the
-  uninstall stopped before it finished: an `Abort` in the uninstall, such as the template's app check when the
-  app is running and can't be closed, or the person cancelling it (exit 2; nothing confirmed removed). Under
-  `/P`, an aborted uninstall's progress page stays open (the template sets auto-close only at the end of the
-  uninstall), and 1004 is written once that window is closed. The source isn't registered (that needs an administrator), so Event Viewer says the
+  uninstall stopped before it finished: an `Abort` from the app check (`CheckIfAppIsRunning`), when the app is
+  running and can't be closed or the person cancels its box (exit 2). Under `/P`, an aborted uninstall's
+  progress page stays open, and 1004 is written only once that window is closed: don't use `/P` unattended
+  (the script uses `/S`). When an installer runs the old uninstaller in place for an upgrade, an app-check
+  abort there writes 1004 too, although that uninstall keeps the pairing by design; the installer then says
+  it couldn't uninstall the old version. The source isn't registered (that needs an administrator), so Event Viewer says the
   description isn't found and shows the text as the event's data. Find it with
   `Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='VettID Desktop']]]"`. Its text (for
   the owner's approval) names no person, folder or account; 1001's and 1003's give the wipe's result code.
@@ -248,10 +252,14 @@ also open its window) exits 0.
   computer: its program was still in its folder after the uninstall, and may still be running (result
   `<code>`). Close VettID Desktop, then delete its program folder; for the account that installed it, also
   delete %LOCALAPPDATA%\vettid-desktop if it's there, and any vettid-desktop entry in that account's Windows
-  Credential Manager. Remove this desktop on the phone too." The 1004 text: "VettID Desktop's uninstall stopped
-  before it finished, so nothing was confirmed removed: the program and this desktop's saved pairing may still
-  be on this computer. This usually means VettID Desktop was running and couldn't be closed. Close it, then
-  uninstall again."
+  Credential Manager. Remove this desktop on the phone too." The 1004 texts: before the wipe ran (or when it
+  is skipped), "VettID Desktop's uninstall stopped before it finished, and nothing was removed: the program
+  and this desktop's saved pairing are probably still on this computer. This usually means VettID Desktop was
+  running and couldn't be closed, or the uninstall was canceled. Close VettID Desktop, then uninstall it
+  again." After the wipe ran: "VettID Desktop's uninstall stopped before it finished (result `<code>`).
+  Removing this desktop's saved pairing was tried, but the program may still be on this computer and may
+  still be running, so the pairing's removal isn't confirmed. Close VettID Desktop, then uninstall it again.
+  If this desktop was paired, also remove it on the phone."
 
 **Who can run `--uninstall-wipe`:** anyone who can run a program as this Windows user, who can already delete
 these files and entries. It opens no window, prints nothing and isn't passed to a running app.
@@ -291,11 +299,12 @@ result code, ID 1002 for 10 and 10d, and ID 1003 for 13.
 an `Abort` in `Section Uninstall` exits 2 and NSIS calls `un.onUninstFailed`; `SetErrorLevel 2` then `Quit`
 (the 1002 path) exits 2 and doesn't call it; a finished uninstall exits 0 and doesn't call it. Then the mock
 above, with this branch's hooks, the template's passive auto-close at the end of the uninstall, and a
-stand-in app check that aborts on request:
+stand-in app check that aborts on request, before the wipe or only after it:
 
 | Case | Uninstaller exit code | Wipe ran | Events |
 |---|---|---|---|
-| A. `/S`, the app check aborts | 2 | no (program kept) | one 1004 |
+| A. `/S`, the hooks' app check aborts (before the wipe) | 2 | no (program kept) | one 1004, the "nothing was removed" text |
+| G. `/S`, the template's app check aborts (after the wipe, code 10) | 2 | yes (program kept) | one 1004, the "result 10 … also remove it on the phone" text |
 | B. `/S`, finished, code 11 | 2 | yes | one 1001 (a real pairing was on this machine, so the post-check found `device.enc`, as designed) |
 | C. `/S`, finished, code 20 | 2 | yes | one 1001 |
 | D. `/S`, another account (the 1002 refusal, `Quit`) | 2 | no | one 1002, no 1004 |
@@ -392,9 +401,11 @@ saved pairing works as above.
   Intune's default return codes do.
 - **A 2 without an event.** The script's own 2s (listed above) write no event, and some come after the
   uninstaller removed things (its 0 with the pairing left, or the program gone with the pairing left). A 2
-  from the uninstaller itself with no event came from a build before #74: it stopped before removing anything;
-  retry it. Since #74, an uninstall that stops part way writes event 1004, and the uninstaller's other 2s come
-  with event 1001, 1002 or 1003 (see Scripts). An uninstall started within a
+  from the uninstaller itself with no event most likely came from a build before #74, where an uninstall that
+  stopped part way wrote none (it may have run the wipe already): retry it. Since #74, such a stop writes event
+  1004, and the uninstaller's other 2s come with event 1001, 1002 or 1003 (see Scripts). An event can still be
+  missing if it couldn't be written, or if the uninstaller was ended (for example a `/P` run whose open
+  progress page a tool killed). An uninstall started within a
   second or two of the install returned 2 in 4 of 5 runs here, removed nothing and wrote no event, and the
   next run gave 0 (the row "Uninstall within about a second of the install" above). Every path in the hooks that sets 2 also
   writes an event, so this one comes from elsewhere. The likely cause (a hypothesis) is NSIS's own "aborted"
