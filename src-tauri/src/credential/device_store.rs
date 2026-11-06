@@ -553,9 +553,12 @@ pub(crate) mod tests {
             return;
         };
         let dir = std::path::PathBuf::from(dir);
-        let mut s = DeviceStore::new(&dir, crate::credential::store::wipe_epoch());
+        // Never the real store: this must not touch a member's pairing.
+        assert!(store::default_config_dir().map_or(true, |d| d != dir), "not the real store");
+        let mut s = DeviceStore::new(&dir, store::wipe_epoch());
         match mode.as_str() {
             "seal" => {
+                assert!(!dir.join(DEVICE_FILE).exists(), "seal won't overwrite a device file");
                 s.save(STATE).expect("sealed");
                 println!("COPYTEST sealed protector={}", read_sealed(&dir).header.protector);
             }
