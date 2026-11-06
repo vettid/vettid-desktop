@@ -19,13 +19,15 @@
 #                             signing (needed once the entitlements include
 #                             keychain-access-groups)
 #
-# Output: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/
+# Output: <target dir>/aarch64-apple-darwin/release/bundle/dmg/ (CARGO_TARGET_DIR, else src-tauri/target)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET=aarch64-apple-darwin
 ENTITLEMENTS="$REPO_ROOT/src-tauri/entitlements.plist"
-BUNDLE_DIR="$REPO_ROOT/src-tauri/target/$TARGET/release/bundle"
+# Cargo's target directory: CARGO_TARGET_DIR when set (a CI cache, another disk), else src-tauri/target.
+TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/src-tauri/target}"
+BUNDLE_DIR="$TARGET_DIR/$TARGET/release/bundle"
 CALLS=0 SIGN_ONLY=0 DRY=0
 
 for arg in "$@"; do
