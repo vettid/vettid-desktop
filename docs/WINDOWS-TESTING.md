@@ -530,6 +530,44 @@ Reading or writing a stored entry in a batch logon wasn't tested.
 
 Still not tested: Intune and ConfigMgr themselves, and an interactive session of the standard account.
 
+## At-rest protection: a second Windows user can't open the pairing (DPAPI, #13)
+
+DESKTOP-REWORK-PLAN §4 "At-rest protectors", "Done": "DPAPI: tested as a second Windows user". Run on 2026-11-06
+in Windows Sandbox (Windows 11 Pro 10.0.26300, networking off), with the **real** DPAPI protector and store code:
+the ignored test `credential::device_store::tests::dpapi_copy_refusal_step` (debug test binary from `3a4eca5`,
+statically linked), run by two temporary standard accounts, A and B (Users only), each as a scheduled task. The
+state was a fixed fixture, not a pairing; no vault or relay was involved. The harness is described below the
+table.
+
+| Step | Account | Result |
+|---|---|---|
+| Seal a fixture `device.enc` in A's own folder | A | sealed, protector `dpapi` |
+| Open it | A | opened, the same state |
+| Read A's file directly | B | denied (access denied) |
+| Open A's folder as a store | B | refused before DPAPI: reading the file is denied (os error 5) |
+| Seal B's own fixture (a proper store folder), then overwrite B's file with A's bytes | B, an administrator | the copy is B's file, in B's folder |
+| Open that copy | B | **refused by DPAPI**: "couldn't open with Windows data protection" (`NotOpened`); the state is not read |
+| Open A's own file again | A | opened, the same state |
+
+So a copy of `device.enc` doesn't open for another account on the same computer, even when that account owns the
+copy: the data key is wrapped to A's DPAPI master key. The second account stands in for "another machine", as §4
+says; a second machine (or VM) wasn't used.
+
+Seen on the way:
+- **The administrator couldn't list the ACL** of A's folder or file with `icacls` (access denied): the owner-only
+  DACL doesn't include Administrators. The copy was taken with backup rights (`robocopy /B`). An administrator can
+  still run code as A, or read A's DPAPI master key while A is logged on; §4 puts that out of scope.
+- **What B would be told:** the copied file gives `NotOpened` ("couldn't open its saved pairing with Windows data
+  protection just now ... Sign out of your computer and back in to try again. If it keeps happening, remove this
+  desktop ... and pair again"). For a copy, signing in again won't help; the re-pair advice that follows is the
+  right one. A copied file on another account isn't a real case for the app, which only reads the account's own
+  folder.
+
+The harness: in the Sandbox, as its administrator, two accounts were made with random passwords (never written
+anywhere) and "Log on as a batch job". Each step ran as a one-off scheduled task as A or B with
+`VETTID_COPY_TEST=seal|open` and `VETTID_COPY_TEST_DIR=%LOCALAPPDATA%\vt13`. The administrator copied A's file out
+with `robocopy /B` and granted B read on the copy; B wrote it over its own `device.enc`.
+
 ## Not tested yet
 
 - Interactive install and uninstall, and what SmartScreen and Defender show a person (left for the owner).
