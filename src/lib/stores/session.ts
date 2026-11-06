@@ -305,6 +305,13 @@ export async function refreshSessionFromBackend(): Promise<void> {
       if (info.notice) {
         sessionNotice.set(info.notice);
         staleNoticeShown = info.notice;
+      } else if (staleNoticeShown) {
+        // #107: the backend no longer says it (the clock was set right, or
+        // the vault answered): the notice it gave goes, if still shown. A
+        // notice from elsewhere is left.
+        const shown = staleNoticeShown;
+        sessionNotice.update(n => (n === shown ? null : n));
+        staleNoticeShown = null;
       }
       // #77: held or locked is the vault's word ("suspended"), not an
       // expiry.

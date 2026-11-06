@@ -144,6 +144,49 @@ fn events_and_answers_are_parsed_strictly() {
     assert_eq!(parse_request_answer(&req), Err(AccessError::Malformed), "not a response");
 }
 
+/// #107 (lead decision a): an access request whose wait ended while it was
+/// still held (here: the relay refused this computer's clock) is dropped
+/// and reported, so it can't reach the phone as a stale prompt once the
+/// clock is fixed.
+#[tokio::test]
+async fn a_request_held_when_its_wait_ends_is_withdrawn() {
+    let (relay, vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    {
+        let mut f = faults.lock().unwrap();
+        f.clock_deposits = 1000;
+        f.clock_collects = 1000;
+    }
+    let got = a.request(&mut s, &mut store, None).await;
+    assert!(matches!(&got, Err(AccessError::Session(e)) if e.clock_skew().is_some()), "{got:?}");
+    assert_eq!(s.outbox_len(), 0, "not left to go out later");
+    assert_eq!(s.take_dropped(), vec![TYPE_REQUEST.to_string()], "reported");
+    // The clock is fixed: nothing is sent late.
+    {
+        let mut f = faults.lock().unwrap();
+        f.clock_deposits = 0;
+        f.clock_collects = 0;
+    }
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(vault.waiting(), 0, "no stale request reached the vault");
+}
+
+/// #107 (lead review): the access request carries an `exp` (its wait plus
+/// the clock margin), so a stored copy that outlives its wait expires
+/// instead of reaching the phone late.
+#[tokio::test]
+async fn an_access_request_expires() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store);
+    let mut a = access();
+    let before = Utc::now();
+    let (got, req) = tokio::join!(a.request(&mut s, &mut store, None), answer(&mut vault, TYPE_REQUEST, Status::Ok, requested_body()));
+    assert!(got.is_ok());
+    let exp = req.exp.expect("an exp");
+    assert!(exp > before && exp <= Utc::now() + a.timeout + STATUS_EXP_MARGIN + TimeDelta::seconds(5), "{exp}");
+}
+
 #[tokio::test]
 async fn seconds_are_checked_before_sending() {
     let (relay, mut vault, faults, mut store) = paired().await;

@@ -222,6 +222,143 @@ async fn the_outbox_survives_failures_and_restarts() {
     assert_eq!(vault_receive(&mut vault).await.id, id);
 }
 
+/// #107: a deposit the relay refuses for this computer's clock
+/// (`timestamp_stale`) is held, not dropped; the session says the clock was
+/// refused, with how far off (from the relay's `Date`); the next call the
+/// relay takes clears that, and the held message goes out.
+#[tokio::test]
+async fn a_clock_refusal_holds_the_outbox_and_says_so() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    assert_eq!(s.clock_refused(), None);
+    // The relay's clock is ten minutes behind this one.
+    let relay_now = Utc::now().timestamp() - 600;
+    {
+        let mut f = faults.lock().unwrap();
+        f.clock_deposits = 1;
+        f.clock_date = Some(relay_now);
+    }
+    let id = s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+    assert_eq!(s.outbox_len(), 1, "held, not dropped");
+    assert!(s.take_dropped().is_empty(), "not reported lost");
+    let off = s.clock_refused().expect("refused").expect("offset known");
+    assert!((off - 600).abs() <= 5, "offset {off}");
+    // The clock is fixed: a collect gets through, which releases the hold.
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.clock_refused(), None, "cleared by a call the relay took");
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.outbox_len(), 0);
+    assert_eq!(vault_receive(&mut vault).await.id, id);
+}
+
+/// #107 (review H1): held while this clock ran ten minutes ahead, then the
+/// clock is set right. Its `ts` is now more than 5 min in the future, which
+/// the vault would reject after the relay took it: it is dropped and
+/// reported instead, never deposited.
+#[tokio::test]
+async fn a_message_held_under_a_clock_ahead_is_reported_not_sent() {
+    let (relay, _vault, faults, mut store) = paired().await;
+    let clock = Ticking::new();
+    let mut s = session(&relay, &faults, &mut store, clock.clone());
+    clock.ticks.store(600, std::sync::atomic::Ordering::SeqCst);
+    faults.lock().unwrap().clock_deposits = 1;
+    s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+    assert_eq!(s.outbox_len(), 1, "held");
+    let tried = faults.lock().unwrap().deposits_seen;
+    clock.ticks.store(0, std::sync::atomic::Ordering::SeqCst);
+    s.poll(&mut store).await.unwrap();
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.outbox_len(), 0);
+    assert_eq!(s.take_dropped(), vec!["test.ping".to_string()], "reported");
+    assert_eq!(faults.lock().unwrap().deposits_seen, tried, "never deposited");
+}
+
+/// #107 (review A): a message queued with a right clock, then the clock goes
+/// ten minutes behind (a dual-boot start before the time sync; the relay
+/// refuses it). The entry looks stamped ahead, but the relay hasn't taken
+/// this clock, so it is kept, neither sent nor dropped; once the clock is
+/// right again it is delivered.
+/// The session is reopened after the clock went behind (the dual-boot
+/// restart): nothing in memory holds the outbox, and the relay hasn't taken
+/// this clock, so the ahead check itself must keep the entry.
+#[tokio::test]
+async fn a_clock_behind_for_a_while_loses_nothing() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let clock = Ticking::new();
+    let mut s = session(&relay, &faults, &mut store, clock.clone());
+    faults.lock().unwrap().temporary = 1;
+    let id = s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+    assert_eq!(s.outbox_len(), 1, "held by an unreachable relay");
+    drop(s);
+    clock.ticks.store(-600, std::sync::atomic::Ordering::SeqCst);
+    {
+        let mut f = faults.lock().unwrap();
+        f.clock_deposits = 1000;
+        f.clock_collects = 1000;
+    }
+    let mut s = session(&relay, &faults, &mut store, clock.clone());
+    let tried = faults.lock().unwrap().deposits_seen;
+    assert!(s.poll(&mut store).await.unwrap_err().clock_skew().is_some());
+    assert_eq!(faults.lock().unwrap().deposits_seen, tried, "the ahead check stopped it, not a hold");
+    assert_eq!(s.outbox_len(), 1, "kept");
+    assert!(s.take_dropped().is_empty(), "not dropped");
+    clock.ticks.store(0, std::sync::atomic::Ordering::SeqCst);
+    {
+        let mut f = faults.lock().unwrap();
+        f.clock_deposits = 0;
+        f.clock_collects = 0;
+    }
+    s.poll(&mut store).await.unwrap();
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.outbox_len(), 0);
+    assert_eq!(vault_receive(&mut vault).await.id, id);
+}
+
+/// #107 (review M2): the relay took this clock earlier in the run; then,
+/// with a message held, the clock jumps ten minutes back (a sleep, a VM
+/// restore). The earlier confirmation is stale: the entry is kept, not
+/// dropped.
+#[tokio::test(start_paused = true)]
+async fn a_stale_clock_confirmation_drops_nothing() {
+    let (relay, _vault, faults, mut store) = paired().await;
+    let clock = Ticking::new();
+    let mut s = session(&relay, &faults, &mut store, clock.clone());
+    // Held by the relay's own 503 (a hold a good collect doesn't release).
+    faults.lock().unwrap().server_errors = 1;
+    s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+    assert_eq!(s.outbox_len(), 1, "held");
+    // The relay takes this clock (a good collect) while the entry is held.
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.outbox_len(), 1, "still held");
+    clock.ticks.store(-600, std::sync::atomic::Ordering::SeqCst);
+    {
+        let mut f = faults.lock().unwrap();
+        f.clock_deposits = 1000;
+        f.clock_collects = 1000;
+    }
+    // Past the hold, so the flush reaches the entry.
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    let tried = faults.lock().unwrap().deposits_seen;
+    assert!(s.poll(&mut store).await.unwrap_err().clock_skew().is_some());
+    assert_eq!(faults.lock().unwrap().deposits_seen, tried, "not deposited");
+    assert_eq!(s.outbox_len(), 1, "kept");
+    assert!(s.take_dropped().is_empty(), "not dropped");
+}
+
+/// #107: a collect refused for the clock fails at once with the clock
+/// error (no amount without a `Date`), and the next good one clears it.
+#[tokio::test]
+async fn a_clock_refused_collect_says_so() {
+    let (relay, _vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    faults.lock().unwrap().clock_collects = 1;
+    let e = s.poll(&mut store).await.unwrap_err();
+    assert_eq!(e.clock_skew(), Some(None));
+    assert_eq!(s.clock_refused(), Some(None));
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.clock_refused(), None);
+}
+
 /// token_revoked: this device was unlinked; nothing more is sent.
 #[tokio::test]
 async fn a_revoked_device_stops_sending() {

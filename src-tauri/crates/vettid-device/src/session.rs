@@ -211,6 +211,18 @@ pub enum SessionError {
     BadExp,
 }
 
+impl SessionError {
+    /// The relay refused this computer's clock (`timestamp_stale`, #107):
+    /// `Some`, with the relay's `Date` (Unix seconds) if it gave one.
+    /// SECURITY: that date is for telling the person only.
+    pub fn clock_skew(&self) -> Option<Option<i64>> {
+        match self {
+            Self::Relay(RelayError::ClockSkew { server_date }) => Some(*server_date),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -272,10 +284,25 @@ pub struct Session<T: Transport, C: Clock> {
     /// the outbox for about the size of the step.
     hold_until: Option<tokio::time::Instant>,
     /// The hold came only from failing to reach the relay (a connect or
-    /// transport error, no `retry_after`): released once a collect gets
-    /// through (#86). A hold from the relay's own answer (a 5xx, a 429) is
-    /// kept, so the outbox backoff still spaces those out.
+    /// transport error, no `retry_after`), or from the relay refusing this
+    /// computer's clock (#107): released once a collect gets through (#86).
+    /// A hold from the relay's own answer (a 5xx, a 429) is kept, so the
+    /// outbox backoff still spaces those out.
     hold_releasable: bool,
+    /// The relay refused this computer's clock (#107): `Some` after its
+    /// last signed call was refused as `timestamp_stale`, with how far this
+    /// clock seemed to be from the relay's (seconds, local minus relay) when
+    /// the answer had a `Date`. Cleared by the next signed call the relay
+    /// takes. In memory only. SECURITY: display only, never used to adjust
+    /// a timestamp or a check.
+    clock_refused: Option<Option<i64>>,
+    /// The relay has just taken a signed call from this clock (#107, reviews
+    /// A and M2): the collect right before the flush at the end of a poll,
+    /// or a deposit earlier in the same flush. Cleared before every other
+    /// flush, so a confirmation never carries over to a later moment (the
+    /// clock can jump back over a sleep). Only then is this clock trusted
+    /// to judge an outbox entry stamped ahead of it (see `flush`).
+    clock_confirmed: bool,
     /// See [`COLLECT_BACKOFF`].
     collect_backoff: std::time::Duration,
     /// The last collect failed: the next one doesn't long-poll (`wait`
@@ -372,6 +399,8 @@ impl<T: Transport, C: Clock> Session<T, C> {
             dirty: false,
             hold_until: None,
             hold_releasable: false,
+            clock_refused: None,
+            clock_confirmed: false,
             collect_backoff: COLLECT_BACKOFF,
             probe_next: false,
             outbox_backoff: OUTBOX_BACKOFF,
@@ -482,6 +511,52 @@ impl<T: Transport, C: Clock> Session<T, C> {
     /// expired): the caller tells the person they weren't sent.
     pub fn take_dropped(&mut self) -> Vec<String> {
         std::mem::take(&mut self.dropped)
+    }
+
+    /// Drop the outbox entries of `kind` still waiting to be sent, and
+    /// report them (as [`Session::take_dropped`] does). For a request whose
+    /// wait has ended (#107, lead decision a): sent later, it would reach
+    /// the owner as a stale prompt for something the person was told
+    /// failed. Returns how many were dropped.
+    pub fn withdraw_held(&mut self, store: &mut impl Persist, kind: &str) -> Result<usize, SessionError> {
+        let (held, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.state.outbox).into_iter().partition(|e| e.kind == kind);
+        self.state.outbox = keep;
+        if held.is_empty() {
+            return Ok(0);
+        }
+        let n = held.len();
+        for e in held {
+            self.lost(e);
+        }
+        self.save(store)?;
+        Ok(n)
+    }
+
+    /// Whether the relay refused this computer's clock on this session's
+    /// last signed call (#107): `None` if not; `Some(offset)` if it did,
+    /// with how far this clock seemed to be from the relay's (seconds, local
+    /// minus relay) when that is known. For telling the person only.
+    pub fn clock_refused(&self) -> Option<Option<i64>> {
+        self.clock_refused
+    }
+
+    /// Follow one signed relay call's outcome for [`Session::clock_refused`]:
+    /// `None` for a success (the relay took the clock), else its error.
+    /// Other errors leave it as it was: they say nothing about the clock.
+    fn note_clock(&mut self, failed: Option<&RelayError>) {
+        match failed {
+            None => {
+                self.clock_refused = None;
+                self.clock_confirmed = true;
+            }
+            Some(RelayError::ClockSkew { server_date }) => {
+                // SECURITY: display only; the relay's `Date` adjusts nothing.
+                let offset = server_date.map(|d| self.clock.now().timestamp() - d);
+                self.clock_refused = Some(offset);
+                self.clock_confirmed = false;
+            }
+            Some(_) => {}
+        }
     }
 
     /// The `type`s of outbox entries whose deposit failed in a way after
@@ -677,6 +752,8 @@ impl<T: Transport, C: Clock> Session<T, C> {
         // Stored: a temporary failure or a store error after the deposit
         // doesn't change the answer. Only a refusal does: the device was
         // removed, and this message won't go (it is reported as dropped).
+        // #107 (review M2): no relay call just took this clock.
+        self.clock_confirmed = false;
         match self.flush(store).await {
             Err(SessionError::Refused) => Err(SessionError::Refused),
             _ => Ok(id),
@@ -728,7 +805,9 @@ impl<T: Transport, C: Clock> Session<T, C> {
         }
         let to = &self.state.vault.relay;
         let token = Token::from_received(self.state.vault_token.to_string());
-        match self.transport.deposit(&to.url, &to.mailbox, &token, &env).await {
+        let sent = self.transport.deposit(&to.url, &to.mailbox, &token, &env).await;
+        self.note_clock(sent.as_ref().err().map(|d| &d.error));
+        match sent {
             Ok(_) => Ok(inner.id),
             Err(d) if d.possibly_delivered && !d.error.retryable() => Ok(inner.id),
             Err(d) => Err(SessionError::Relay(d.error)),
@@ -835,6 +914,8 @@ impl<T: Transport, C: Clock> Session<T, C> {
     /// - any 429 (rate limited, or a quota that the vault frees later,
     ///   §8.6), a 5xx, a transport error: it and the rest stay, and the
     ///   outbox waits a backoff;
+    /// - `timestamp_stale` (this computer's clock, #107): it and the rest
+    ///   stay; the backoff is released once a collect gets through;
     /// - another client error: dropped, and reported;
     /// - older than [`OUTBOX_MAX_AGE`], or past its `exp`: dropped unsent,
     ///   and reported.
@@ -851,13 +932,35 @@ impl<T: Transport, C: Clock> Session<T, C> {
         let mut changed = false;
         let mut temporary = None;
         while let Some(e) = self.state.outbox.first().cloned() {
+            // #107 (review H1): stamped more than 5 min ahead of this clock.
+            // If the relay has taken this clock since (`clock_confirmed`),
+            // the entry was stamped while the clock ran ahead: the vault
+            // would reject its `ts` (§8.4) after the relay took it, so it
+            // would be lost unseen. Dropped here, and reported. Otherwise
+            // (review A) it is this clock that may be behind, for now (a
+            // dual-boot start before the time sync): neither sent nor
+            // dropped; it waits, and is judged once the relay takes a call.
+            // The vault's 5 min, not the relay's 90 s: with a clock up to
+            // 90 s off, an entry 5 to 6.5 min ahead might still have been
+            // taken, but it is reported, never lost unseen (the safe side).
+            if e.created - now > MAX_CLOCK_SKEW_FUTURE {
+                if !self.clock_confirmed {
+                    break;
+                }
+                self.state.outbox.remove(0);
+                self.lost(e);
+                changed = true;
+                continue;
+            }
             if now - e.created > OUTBOX_MAX_AGE || e.exp.is_some_and(|x| now > x) {
                 self.state.outbox.remove(0);
                 self.lost(e);
                 changed = true;
                 continue;
             }
-            let taken = match self.transport.deposit(&to.url, &to.mailbox, &token, &e.payload).await {
+            let sent = self.transport.deposit(&to.url, &to.mailbox, &token, &e.payload).await;
+            self.note_clock(sent.as_ref().err().map(|d| &d.error));
+            let taken = match sent {
                 Ok(_) => {
                     if let Some(t) = self.tracked.iter_mut().find(|t| t.payload == e.payload) {
                         t.deposited = true;
@@ -875,6 +978,14 @@ impl<T: Transport, C: Clock> Session<T, C> {
                     RelayError::Relay { status: 429, retry_after, .. } => {
                         let wait = retry_after.map(|s| TimeDelta::seconds(s.min(3600) as i64));
                         temporary = Some((d.error.clone(), wait, false));
+                        break;
+                    }
+                    // #107: this computer's clock, refused by the relay. Not
+                    // the message's fault: it and the rest stay, and go out
+                    // once a signed call gets through again (the hold is
+                    // released then, as for an unreachable relay).
+                    RelayError::ClockSkew { .. } => {
+                        temporary = Some((d.error.clone(), None, true));
                         break;
                     }
                     err if err.retryable() => {
@@ -939,13 +1050,19 @@ impl<T: Transport, C: Clock> Session<T, C> {
     }
 
     async fn poll_batch(&mut self, store: &mut impl Persist, wait_secs: u64) -> Result<Vec<Inner>, SessionError> {
+        // #107 (review M2): an earlier confirmation may be stale (the clock
+        // can jump back over a sleep); only this poll's own collect counts,
+        // for the flush after it.
+        self.clock_confirmed = false;
         match self.flush(store).await {
             Ok(()) | Err(SessionError::Relay(_)) | Err(SessionError::Refused) => {}
             Err(e) => return Err(e),
         }
         let started = tokio::time::Instant::now();
         let wait = if self.probe_next { 0 } else { wait_secs };
-        let msgs = match self.transport.collect(&self.state.relay_url, wait, POLL_MAX).await {
+        let collected = self.transport.collect(&self.state.relay_url, wait, POLL_MAX).await;
+        self.note_clock(collected.as_ref().err());
+        let msgs = match collected {
             Ok(m) => m,
             Err(e) => {
                 self.probe_next = true;
@@ -1012,6 +1129,8 @@ impl<T: Transport, C: Clock> Session<T, C> {
             // Best effort: what isn't acked comes again, and is a duplicate.
             let _ = self.transport.ack(&self.state.relay_url, id).await;
         }
+        // Right after a collect the relay took: this clock is confirmed for
+        // this flush (#107).
         let flushed = self.flush(store).await;
         // The inbox events not yet returned (stored, so not lost) come
         // first, then the batch's other events.

@@ -124,6 +124,11 @@ const PAIR_UNDER_WAY_NOTICE: &str =
 /// What a failed pairing tells the person. The SAS mismatch and the
 /// timeout keep the engine's own texts (`vettid_device::display`).
 fn pair_notice(e: &PairError, store: Option<&CredentialError>) -> String {
+    // #107 (review M2): the relay refused this computer's clock, the most
+    // likely first-run cause; the relay's Date is for the notice only.
+    if let Some(date) = e.clock_skew() {
+        return link::pair_clock_notice(link::clock_offset(date));
+    }
     match e {
         PairError::Code(_) | PairError::NotForDesktop | PairError::Expired => link::PAIR_CODE_NOTICE.into(),
         PairError::AlreadyPaired => link::PAIR_ALREADY_NOTICE.into(),
@@ -703,7 +708,12 @@ fn session_info(snap: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> Result<S
         seconds_remaining: until.map_or(0, |t| (t - now).num_seconds().max(0)),
         is_active: active,
         // Not while an end is pending: that one's state is shown (#80, L3).
-        notice: (snap.stale_at(now) && !active && !snap.end_pending).then(|| link::STALE_NOTICE.to_string()),
+        // #107: when the relay refused this computer's clock, that's why
+        // nothing is confirmed: say so, not "hasn't heard from your vault".
+        notice: match snap.clock_refused {
+            Some(offset) if !active && !snap.end_pending => Some(link::clock_notice(offset)),
+            _ => (snap.stale_at(now) && !active && !snap.end_pending).then(|| link::STALE_NOTICE.to_string()),
+        },
         end_pending: snap.end_pending,
         end_confirmed: snap.end_settled == Some(link::EndSettled::Confirmed),
         // With no end pending: what to say unless the end was confirmed. An
@@ -1121,6 +1131,13 @@ fn end_notice<T: vettid_device::transport::Transport, C: vettid_device::pairing:
         Ok(EndOutcome::Replaced) => Some(link::END_REPLACED_NOTICE.to_string()),
         Err(_) if l.refused() => Some(link::REFUSED_NOTICE.to_string()),
         Err(vettid_device::access::AccessError::EndUnconfirmed) => Some(link::END_UNCONFIRMED_NOTICE.to_string()),
+        // #107 (review M1): the end is stored and kept being sent, but it
+        // can't go through until the clock is right: say that, not "couldn't
+        // reach your vault".
+        Err(vettid_device::access::AccessError::Session(s)) if s.clock_skew().is_some() => {
+            log::warn!("end_session: not confirmed: {}", s);
+            Some(link::end_clock_notice(link::clock_offset(s.clock_skew().flatten())))
+        }
         Err(e) => {
             log::warn!("end_session: not confirmed: {}", e);
             if l.session.access_end().is_some() {
@@ -1762,6 +1779,39 @@ mod tests {
         assert_eq!(state.resets_finished.load(SeqCst), 2);
     }
 
+    /// #107 (review M2): a pairing the relay refused for this computer's
+    /// clock says so, also when its keys couldn't be removed; other relay
+    /// failures keep the general notice.
+    #[test]
+    fn a_pairing_refused_for_the_clock_names_it() {
+        use vettid_relay::client::RelayError;
+        let skew = RelayError::ClockSkew { server_date: None };
+        assert_eq!(pair_notice(&PairError::Relay(skew.clone()), None), link::pair_clock_notice(None));
+        assert_eq!(pair_notice(&PairError::NotSent(skew.clone()), None), link::pair_clock_notice(None));
+        assert_eq!(pair_notice(&PairError::NotCleared(Box::new(PairError::Relay(skew))), None), link::pair_clock_notice(None));
+        assert_eq!(pair_notice(&PairError::Relay(RelayError::Connect), None), link::PAIR_FAILED_NOTICE);
+        assert!(link::pair_clock_notice(None).starts_with("Not paired. This computer's clock"));
+        assert!(link::end_clock_notice(Some(600)).starts_with("This computer's clock is off by about 10 minutes."));
+        assert!(link::end_clock_notice(None).contains("may still be open"));
+        assert!(!link::end_clock_notice(None).contains("try again"), "it keeps trying on its own");
+    }
+
+    /// #107: while the relay refuses this computer's clock, the session
+    /// info's notice says so (in place of "hasn't heard from your vault"),
+    /// unless a session is live or an end is pending.
+    #[test]
+    fn session_info_names_a_refused_clock() {
+        let now = chrono::Utc::now();
+        let refused = Snapshot { link_open: true, clock_refused: Some(Some(300)), stale: true, ..Default::default() };
+        assert_eq!(session_info(&refused, now).unwrap().notice, Some(link::clock_notice(Some(300))));
+        let unknown = Snapshot { clock_refused: Some(None), ..refused.clone() };
+        assert_eq!(session_info(&unknown, now).unwrap().notice, Some(link::clock_notice(None)));
+        let ending = Snapshot { end_pending: true, ..refused.clone() };
+        assert_eq!(session_info(&ending, now).unwrap().notice, None);
+        let fine = Snapshot { clock_refused: None, ..refused };
+        assert_ne!(session_info(&fine, now).unwrap().notice, Some(link::clock_notice(Some(300))));
+    }
+
     /// The session info comes from the snapshot: live up to `live_until`
     /// only, and "not unlocked" without a link.
     #[test]
@@ -1779,6 +1829,7 @@ mod tests {
             reachable: true,
             refused: false,
             stale: false,
+            clock_refused: None,
             end_pending: false,
             end_settled: None,
             end_seen: false,

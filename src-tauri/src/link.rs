@@ -101,6 +101,60 @@ pub const ACCESS_NOT_CONFIRMED_NOTICE: &str = "This desktop couldn't confirm the
 pub const REQUEST_FAILED_NOTICE: &str = "Your vault didn't give this desktop access. Try again.";
 /// NEW TEXT (owner approval needed): the relay or the vault didn't answer.
 pub const UNREACHABLE_NOTICE: &str = "This desktop couldn't reach your vault. Try again.";
+
+/// Where this computer's clock is set, for [`clock_notice`] (#107).
+#[cfg(target_os = "windows")]
+const CLOCK_SETTINGS: &str = "in Settings, Time & language, Date & time, turn on Set time automatically";
+#[cfg(target_os = "macos")]
+const CLOCK_SETTINGS: &str = "in System Settings, General, Date & Time, turn on Set time and date automatically";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const CLOCK_SETTINGS: &str = "in your computer's date and time settings, turn on automatic time";
+
+/// Owner-approved text (#107, 2026-11-06): the relay refused this
+/// computer's clock (`timestamp_stale`, more than 90 s off). `offset` is how
+/// far off it seemed (seconds, from the relay's `Date`; display only),
+/// rounded to whole minutes, or whole hours from 90 minutes; over a day it
+/// says "more than a day"; unknown, it names no amount.
+pub fn clock_notice(offset: Option<i64>) -> String {
+    format!("{} Set it to the correct time ({CLOCK_SETTINGS}), then try again.", clock_how(offset))
+}
+
+/// [`clock_notice`]'s first sentence: how far off the clock is.
+fn clock_how(offset: Option<i64>) -> String {
+    match offset.map(i64::unsigned_abs) {
+        Some(s) if s >= 86_400 => "This computer's clock is off by more than a day.".to_string(),
+        // From 90 minutes, whole hours.
+        Some(s) if s >= 5_400 => format!("This computer's clock is off by about {} hours.", (s + 1_800) / 3_600),
+        Some(s) => match (s + 30) / 60 {
+            0 | 1 => "This computer's clock is off by about a minute.".to_string(),
+            n => format!("This computer's clock is off by about {n} minutes."),
+        },
+        None => "This computer's clock seems to be wrong.".to_string(),
+    }
+}
+
+/// How far this computer's clock is from the relay's `Date` (seconds, local
+/// minus relay), for [`clock_notice`] only (#107). SECURITY: display only.
+pub fn clock_offset(server_date: Option<i64>) -> Option<i64> {
+    server_date.map(|d| Utc::now().timestamp() - d)
+}
+
+/// Owner-approved text (#107, 2026-11-06): pairing failed because the
+/// relay refused this computer's clock.
+pub fn pair_clock_notice(offset: Option<i64>) -> String {
+    format!("Not paired. {}", clock_notice(offset))
+}
+
+/// Owner-approved text (#107, 2026-11-06): End session couldn't be sent
+/// because the relay refused this computer's clock. The end is kept and
+/// sent again (as with [`END_NOT_SENT_NOTICE`]), so the session may still
+/// be open meanwhile. No "try again": it keeps trying on its own.
+pub fn end_clock_notice(offset: Option<i64>) -> String {
+    format!(
+        "{} Set it to the correct time ({CLOCK_SETTINGS}). Until then this desktop can't end the session, so it may still be open. It keeps trying while it runs; you can also end it on your phone.",
+        clock_how(offset)
+    )
+}
 /// NEW TEXT (owner approval needed): the ordering rule (§6.8 "Ending")
 /// holds the request back.
 pub const END_PENDING_NOTICE: &str = "Your vault hasn't confirmed this desktop's last End session yet, so it can't ask for a new one. Try again in a minute.";
@@ -205,6 +259,10 @@ pub struct Snapshot {
     /// The access session is current as far as this desktop knows, but the
     /// vault hasn't confirmed it for [`STALE_AFTER`]: not shown as live.
     pub stale: bool,
+    /// The relay refused this computer's clock on the last signed call
+    /// (#107): `Some`, with how far it seemed to be off (seconds, local
+    /// minus relay) when known. Cleared by the next call the relay takes.
+    pub clock_refused: Option<Option<i64>>,
     /// An End session the vault hasn't answered yet (#80): one under way,
     /// or a stored unanswered end that the refresh keeps sending. Shown as
     /// "Ending your session…", never as ended.
@@ -436,6 +494,9 @@ fn answered(e: &AccessError) -> bool {
 pub fn access_notice(e: &AccessError, store: Option<&CredentialError>) -> String {
     match e {
         AccessError::Session(SessionError::Refused) => REFUSED_NOTICE.into(),
+        // #107: the relay refused this computer's clock; not "couldn't
+        // reach". The relay's Date is for the notice only.
+        AccessError::Session(s) if s.clock_skew().is_some() => clock_notice(clock_offset(s.clock_skew().flatten())),
         AccessError::Session(SessionError::Relay(_) | SessionError::TimedOut) => UNREACHABLE_NOTICE.into(),
         AccessError::Session(SessionError::Store(_)) => store.and_then(plain_store_notice).unwrap_or_else(|| NOT_SAVED_NOTICE.into()),
         AccessError::EndUnconfirmed => END_PENDING_NOTICE.into(),
@@ -1012,6 +1073,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
             reachable: self.reachable,
             refused,
             stale,
+            clock_refused: self.session.clock_refused(),
             end_pending: self.session.access_end().is_some(),
             end_settled: self.end_settled.clone(),
             end_seen: self.end_seen,
@@ -1452,6 +1514,28 @@ mod tests {
         assert!(!Snapshot::default().active_at(now));
         assert!(!s.without_session().active_at(now));
         assert!(s.without_session().link_open);
+    }
+
+    /// #107: the clock notice rounds to whole minutes, says "more than a
+    /// day" past a day, names no amount when it isn't known, and replaces
+    /// "couldn't reach your vault" for a `timestamp_stale`.
+    #[test]
+    fn a_refused_clock_is_named_not_unreachable() {
+        let lead = |n: &str| format!("This computer's clock is off by {n}. Set it to the correct time ({CLOCK_SETTINGS}), then try again.");
+        assert_eq!(clock_notice(Some(95)), lead("about 2 minutes"));
+        assert_eq!(clock_notice(Some(-600)), lead("about 10 minutes"), "behind or ahead alike");
+        assert_eq!(clock_notice(Some(89)), lead("about a minute"));
+        assert_eq!(clock_notice(Some(5_399)), lead("about 90 minutes"));
+        assert_eq!(clock_notice(Some(5_400)), lead("about 2 hours"));
+        assert_eq!(clock_notice(Some(86_399)), lead("about 24 hours"));
+        assert_eq!(clock_notice(Some(-86_400)), lead("more than a day"));
+        assert_eq!(clock_notice(None), format!("This computer's clock seems to be wrong. Set it to the correct time ({CLOCK_SETTINGS}), then try again."));
+        let skew = |d| AccessError::Session(SessionError::Relay(vettid_relay::client::RelayError::ClockSkew { server_date: d }));
+        assert_eq!(access_notice(&skew(None), None), clock_notice(None));
+        let n = access_notice(&skew(Some(Utc::now().timestamp() - 1200)), None);
+        assert!(n.starts_with("This computer's clock is off by about 20 minutes."), "{n}");
+        // Other relay failures are as before.
+        assert_eq!(access_notice(&AccessError::Session(SessionError::Relay(vettid_relay::client::RelayError::Connect)), None), UNREACHABLE_NOTICE);
     }
 
     /// Before any `vault.status` there is no baseline: nothing is live.

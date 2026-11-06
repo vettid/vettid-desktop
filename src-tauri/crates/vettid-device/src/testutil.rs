@@ -64,6 +64,11 @@ pub(crate) struct Faults {
     pub(crate) server_errors: usize,
     /// Answer this many deposits 429 rate_limited, without retry_after.
     pub(crate) rate_limited: usize,
+    /// Answer this many deposits, then this many collects, 401
+    /// timestamp_stale (#107), with the relay's `Date` given.
+    pub(crate) clock_deposits: usize,
+    pub(crate) clock_collects: usize,
+    pub(crate) clock_date: Option<i64>,
     pub(crate) deposits_seen: usize,
 }
 
@@ -118,6 +123,10 @@ impl Transport for Mem {
                 let error = RelayError::Relay { status: 429, code: "rate_limited".into(), retry_after: None, quota: None };
                 return Err(DepositError { error, possibly_delivered: false });
             }
+            if f.clock_deposits > 0 {
+                f.clock_deposits -= 1;
+                return Err(DepositError { error: RelayError::ClockSkew { server_date: f.clock_date }, possibly_delivered: false });
+            }
         }
         let id = new_ulid(Utc::now()).unwrap();
         let mut r = self.relay.lock().unwrap();
@@ -139,6 +148,10 @@ impl Transport for Mem {
             if f.collects > 0 {
                 f.collects -= 1;
                 return Err(RelayError::Transport);
+            }
+            if f.clock_collects > 0 {
+                f.clock_collects -= 1;
+                return Err(RelayError::ClockSkew { server_date: f.clock_date });
             }
             f.long_poll
         };

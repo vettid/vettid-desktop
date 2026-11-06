@@ -112,6 +112,19 @@ pub enum PairError {
     NotCleared(Box<PairError>),
 }
 
+impl PairError {
+    /// The relay refused this computer's clock (`timestamp_stale`, #107):
+    /// `Some`, with the relay's `Date` (Unix seconds) if it gave one.
+    /// SECURITY: that date is for telling the person only.
+    pub fn clock_skew(&self) -> Option<Option<i64>> {
+        match self {
+            Self::Relay(RelayError::ClockSkew { server_date }) | Self::NotSent(RelayError::ClockSkew { server_date }) => Some(*server_date),
+            Self::NotCleared(inner) => inner.clock_skew(),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for PairError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

@@ -991,7 +991,24 @@ impl Access {
             Some(n) => Builder::new().uint("seconds", u64::from(n)).finish(),
             None => "{}".into(),
         };
-        let answer = s.request(store, TYPE_REQUEST, &body, self.timeout).await?;
+        // #107 (lead review): with an `exp`, so a copy that outlives its wait
+        // (stored in the outbox across a restart) can't reach the phone as a
+        // stale prompt: the flush drops it unsent, and the vault would drop
+        // it too. The same margin as `vault.status`, so a clock behind by
+        // what the relay allows doesn't expire it on arrival.
+        let answer = match s.request_expiring(store, TYPE_REQUEST, &body, self.timeout, self.timeout + STATUS_EXP_MARGIN).await {
+            Ok(a) => a,
+            Err(e) => {
+                // #107 (lead decision a): the wait ended. A request still
+                // held in the outbox (the relay refused this computer's
+                // clock, or couldn't be reached) is dropped and reported, so
+                // no stale prompt reaches the phone once it gets through. If
+                // that can't be stored, say so (the stored copy still
+                // expires by its `exp`).
+                s.withdraw_held(store, TYPE_REQUEST)?;
+                return Err(e.into());
+            }
+        };
         // Refused while held (§3.6.3): the vault is held.
         self.learn_held_answer(&answer);
         Ok((parse_request_answer(&answer)?, answer.ts))
