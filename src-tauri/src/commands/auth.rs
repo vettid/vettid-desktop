@@ -438,7 +438,7 @@ pub struct UnlockResponse {
 
 /// What the person is told when the saved pairing could not be opened for
 /// a reason without a plain notice of its own. The detail goes to the log
-/// only. NEW TEXT (owner approval needed, #97): the failure may pass, so
+/// only. Owner-approved text (#97, 2026-11-06): the failure may pass, so
 /// quitting and reopening comes first; closing the window only hides the
 /// app, hence "Quit" from the tray icon's menu.
 const UNLOCK_FAILED_NOTICE: &str = "This desktop couldn't open its saved pairing. Quit VettID Desktop and open it again: right-click its icon in the system tray or menu bar and choose Quit, or sign out of your computer and back in. If it keeps happening, remove this desktop on your phone; then, in Settings, open Danger zone and choose Log out this desktop, and pair again.";
