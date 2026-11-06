@@ -43,7 +43,12 @@ chacha20poly1305 = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
 hmac = "0.12"
-argon2 = "0.5"
+# `zeroize`: Argon2 wipes its initial and final hashes (the passphrase
+# protector, #13, wipes the working memory it hands it).
+argon2 = { version = "0.5", features = ["zeroize"] }
+# The passphrase is normalized to NFC before any use, as the vault and the
+# apps do (VAULT-MESSAGING §11.14.7, "One form"; #13).
+unicode-normalization = "0.1"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 
@@ -168,3 +173,9 @@ devtools = ["tauri/devtools"]
 # audio/video flows — useful for testing the call UX without paying the
 # webrtc-rs compile cost (~5–10 min on a clean build).
 webrtc = ["dep:webrtc", "dep:async-trait", "dep:cpal", "dep:opus", "dep:bytes"]
+
+# Argon2id at the passphrase protector's 64 MiB (#13) takes minutes per call
+# unoptimized, so debug and test builds optimize it. Release builds are
+# optimized anyway; nothing else changes.
+[profile.dev.package.argon2]
+opt-level = 3

@@ -149,7 +149,9 @@ fn save_error(e: ProtectorError) -> CredentialError {
     match e {
         ProtectorError::NoneAvailable => CredentialError::NoProtector,
         ProtectorError::Failing { by, .. } => CredentialError::NotProtected { by },
-        ProtectorError::WontOpen(_) | ProtectorError::NotRemoved { .. } => CredentialError::IoError(e.to_string()),
+        ProtectorError::WontOpen(_) | ProtectorError::NotRemoved { .. } | ProtectorError::NotThisSecret { .. } => {
+            CredentialError::IoError(e.to_string())
+        }
     }
 }
 
@@ -159,6 +161,9 @@ fn load_error(e: ProtectorError) -> (CredentialError, StoreError) {
     log::warn!("device store: {}", e);
     match e {
         ProtectorError::Failing { by, .. } => (CredentialError::NotOpened { by }, StoreError::Io),
+        // The passphrase given doesn't open it (#13): kept, and the person
+        // can try again. Item 4 gives it its own notice.
+        ProtectorError::NotThisSecret { by } => (CredentialError::NotOpened { by }, StoreError::Io),
         ProtectorError::WontOpen(_) => (CredentialError::Unreadable, StoreError::Corrupt),
         ProtectorError::NoneAvailable | ProtectorError::NotRemoved { .. } => (CredentialError::IoError(e.to_string()), StoreError::Io),
     }
