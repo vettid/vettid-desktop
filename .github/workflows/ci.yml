@@ -199,3 +199,31 @@ jobs:
           tar -xzf gl.tgz gitleaks
       - name: scan full history
         run: ./gitleaks git --redact --verbose .
+
+  macos:
+    # The Apple silicon app, signed ad-hoc (no secrets here), then checked by
+    # scripts/macos-verify.sh in its ad-hoc mode: entitlements equal to
+    # src-tauri/entitlements.plist, hardened runtime, arm64 only, no stray
+    # dylib. The Developer ID signature and notarization are done on the
+    # owner's Mac (docs/MACOS-RELEASE.md), not here.
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-apple-darwin
+          rustup default stable
+      - name: tauri CLI
+        run: cargo install tauri-cli --version '^2' --locked
+      - run: npm ci
+      - name: build, ad-hoc sign, make the DMG, verify
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+        run: scripts/macos-release.sh --sign-only
+      - name: verify the app too
+        run: scripts/macos-verify.sh --adhoc "src-tauri/target/aarch64-apple-darwin/release/bundle/macos/VettID Desktop.app"
