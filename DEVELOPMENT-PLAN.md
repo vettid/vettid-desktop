@@ -418,7 +418,7 @@ count and notification deep-linking deferred.
 **Goal**: Full settings management.
 
 **Status**: Settings has Appearance (light/dark/auto theme with localStorage
-persistence), Security (lock now button), Network (live NATS state + last
+persistence), Security (lock now button; removed 2026-11-06, #76), Network (live NATS state + last
 error). Change-passphrase flow deferred — needs re-encrypt + new
 credential file write that stays atomic.
 

@@ -12,7 +12,8 @@
 
 **Owner decision of 2026-11-05** (thread 01M6PHX9DKPAXGKRPNQ6HX7V8V):
 **the desktop never locks the vault.** Locking is available only from the
-phone. The desktop's "Lock" stays this desktop's own lock (#76), and the
+phone. The desktop's "Lock" stays this desktop's own lock (#76; superseded
+2026-11-06, see below), and the
 desktop never sends `vault.lock`. VAULT-MESSAGING §3.6.5 and §10.2 say a
 desktop may lock; the lead writes the erratum ("desktops don't lock the
 vault, owner decision 2026-11-05"). *Since 2026-11-06 (owner decision,
