@@ -27,7 +27,8 @@
  */
 export function declinedStep(notice, session, expiresAt, nowSecs) {
   if (!notice || nowSecs >= notice.until) return { show: null, next: null };
-  const same = session === 'active' && expiresAt != null && expiresAt > 0 && expiresAt <= notice.until;
+  // One second of slack: two reads of the same session's end can differ by a second (its sub-second part).
+  const same = session === 'active' && expiresAt != null && expiresAt > 0 && expiresAt <= notice.until + 1;
   if (same) return { show: notice.text, next: notice.seen ? notice : { ...notice, seen: true } };
   if (session === 'active' && !notice.seen) return { show: null, next: null };
   return { show: null, next: notice.seen ? null : notice };

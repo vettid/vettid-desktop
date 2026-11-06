@@ -16,6 +16,8 @@ test('#96: shown while the session is active and before its end', () => {
   assert.equal(again.next, r.next, 'unchanged once seen, so the app writes nothing');
   // The vault's own end, learned later, is earlier: still that session.
   assert.equal(declinedStep(r.next, 'active', until - 120, 951).show, 'Declined.');
+  // A second later on another read (its sub-second part): still that session.
+  assert.equal(declinedStep(r.next, 'active', until + 1, 952).show, 'Declined.');
 });
 
 test('#96: waits, hidden, until the app reads the live session', () => {
@@ -28,10 +30,11 @@ test('#96: waits, hidden, until the app reads the live session', () => {
 test('#96: never shown for another session (a later or unknown end)', () => {
   // Not yet shown, and the session that becomes active ends later: a new one. Dropped.
   assert.deepEqual(declinedStep(fresh, 'active', until + 600, 900), { show: null, next: null });
+  assert.deepEqual(declinedStep(fresh, 'active', until + 2, 900), { show: null, next: null });
   assert.deepEqual(declinedStep(fresh, 'active', null, 900), { show: null, next: null });
   assert.deepEqual(declinedStep(fresh, 'active', 0, 900), { show: null, next: null });
   // Already shown, then the active session's end moves later: gone for good.
-  assert.deepEqual(declinedStep({ ...fresh, seen: true }, 'active', until + 1, 900), { show: null, next: null });
+  assert.deepEqual(declinedStep({ ...fresh, seen: true }, 'active', until + 2, 900), { show: null, next: null });
 });
 
 test('#96: gone for good once the session stops being active after it was shown', () => {
