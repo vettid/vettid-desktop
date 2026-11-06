@@ -450,11 +450,14 @@ credential file write that stays atomic.
 ### Phase 9: macOS Build, Packaging & Distribution ✅ (signing/notarization need cert)
 **Goal**: Ship a signed, notarized, Apple Silicon `.dmg` that installs cleanly on Macs running macOS 12+ (`aarch64` only — see Target Platforms above for the Intel decision).
 
-**Status**: 9.1–9.5 done. `aarch64-apple-darwin` `.app` builds clean with
-1024×1024 master `.icns`, Info.plist privacy strings, entitlements file,
-and Tauri v2 capabilities. 9.6 (code signing) and 9.7 (notarization) are
-config-ready — just need an Apple Developer cert plugged into
-`tauri.conf.json bundle.macOS.signingIdentity` and a notary API key for CI.
+**Status**: 9.1–9.5 done. `aarch64-apple-darwin` `.app` builds with
+1024×1024 master `.icns`, Info.plist privacy strings, a minimal hardened-runtime
+entitlements file and Tauri v2 capabilities. 9.6 (code signing) and 9.7
+(notarization) are scripted: `scripts/macos-release.sh` and
+`scripts/macos-verify.sh`, see `docs/MACOS-RELEASE.md`. They need the owner's
+Developer ID Application certificate and a notarytool profile (no signing
+identity is committed; it comes from `APPLE_SIGNING_IDENTITY`). CI checks an
+ad-hoc build only.
 
 This phase runs *in parallel* with the feature phases, not at the end. Get a basic dev build running on macOS as soon as Phase 1 is in flight; come back to signing/notarization once the app is feature-complete enough to share with testers.
 
@@ -470,15 +473,15 @@ Update `tauri.conf.json` `bundle` section:
 - `macOS.minimumSystemVersion`: `"12.0"` (covers ScreenCaptureKit + reasonable adoption)
 - `macOS.frameworks`: any required system frameworks (likely none for Phases 1–5; AVFoundation for Phase 6)
 - `macOS.entitlements`: path to `entitlements.plist` (see 9.4)
-- `macOS.signingIdentity`: `"Developer ID Application: <Team Name> (<Team ID>)"` — read from CI secret, not committed
+- `macOS.signingIdentity`: not in the config; `APPLE_SIGNING_IDENTITY` from the environment (never committed)
 - `icon`: include `.icns` alongside the existing `.png`/`.ico` set; generate from a 1024×1024 master via `iconutil`
 - Bundle identifier already correct: `com.vettid.desktop`
 
 #### 9.3 Info.plist additions
 Tauri generates the Info.plist at build time. Required keys (declared via `bundle.macOS.infoPlist`):
-- `NSCameraUsageDescription` — "VettID uses your camera for video calls."
+- `NSCameraUsageDescription` — "VettID uses your camera for video calls." (added with camera capture; not yet)
 - `NSMicrophoneUsageDescription` — "VettID uses your microphone for voice and video calls."
-- `NSScreenCaptureUsageDescription` — "VettID uses screen recording for sharing your screen during calls."
+- `NSScreenCaptureUsageDescription` — add with screen sharing, which is deferred (not in the code yet)
 - `LSMinimumSystemVersion` — `"12.0"`
 - `LSUIElement` — `false` for v1; consider `true` toggle in Settings for "menu-bar-only mode"
 - `NSAppTransportSecurity` — only relax if absolutely required; default is fine since vault traffic is over WSS
@@ -487,10 +490,9 @@ Tauri generates the Info.plist at build time. Required keys (declared via `bundl
 Create `src-tauri/entitlements.plist`:
 - `com.apple.security.app-sandbox`: `false` initially (sandboxing will require careful work around the credential store, IOKit access for fingerprinting, and screen-capture). Plan to enable in a follow-up phase.
 - Hardened Runtime entitlements (required for notarization):
-  - `com.apple.security.cs.allow-jit`: `true` (WebKit JIT)
-  - `com.apple.security.cs.allow-unsigned-executable-memory`: `true` (Tauri webview)
+  - No JIT or unsigned-memory entitlement: WKWebView's JIT runs in Apple's own WebContent process
   - `com.apple.security.device.audio-input`: `true`
-  - `com.apple.security.device.camera`: `true`
+  - `com.apple.security.device.camera`: `true` (added with camera capture; not yet)
   - `com.apple.security.network.client`: `true`
 
 #### 9.5 Single-arch build (Apple Silicon)
@@ -502,10 +504,10 @@ Create `src-tauri/entitlements.plist`:
 - Apple Developer Program enrollment required (~$99/yr) — out of scope for this plan but a prerequisite for distribution
 - Developer ID Application certificate installed in CI keychain (or use Keychain Access locally)
 - Sign with `--options runtime` for Hardened Runtime
-- Tauri does this automatically when `signingIdentity` is set in config
+- `scripts/macos-release.sh` signs (nested code first, then the app and the DMG) with `APPLE_SIGNING_IDENTITY`
 
 #### 9.7 Notarization
-- Submit signed `.dmg` to Apple's notary service via `notarytool` (replaces deprecated `altool`)
+- `scripts/macos-release.sh` submits the signed `.dmg` via `notarytool --keychain-profile` (replaces deprecated `altool`), staples, and runs `scripts/macos-verify.sh`
 - Requires App Store Connect API key (separate from Developer ID cert)
 - Staple ticket back to the .dmg with `xcrun stapler staple`
 - Verify with `spctl -a -t open --context context:primary-signature -v <path>`
