@@ -1,7 +1,7 @@
 # Staging checklist: the desktop on the relay (VAULT-PLAN V6 exit)
 
 A scripted run of the desktop against a **staging** vault, through the relay: the desktop pairs, opens a
-session, reads `vault.status`, ends the session, and is locked. The owner runs it with a phone on staging. The
+session, reads `vault.status`, ends the session, and sees the vault locked on the phone. The owner runs it with a phone on staging. The
 Windows test machine's session prepares it and records what the machine shows. Where this build's behaviour is
 uncertain, the step says **record** rather than asserting a result.
 
@@ -15,8 +15,9 @@ Use the relay lightly: no load and no repeated loops.
 a screenshot, an issue or a message.
 
 **What this build doesn't do yet.** It doesn't lock the **vault** itself (VAULT-MESSAGING §10.2 `vault.lock`
-isn't sent by the app), and it doesn't handle `vault.locking` or `vault.held`. Step 4 tests the desktop's own
-lock, and a lock made on the phone. Every vault operation other than the session answers "not available".
+isn't sent by the app), and it doesn't handle `vault.locking` or `vault.held`. It has no lock of its own either
+("Lock now" was removed, #76): End session is how its access stops. Step 4 tests a lock made on the phone.
+Every vault operation other than the session answers "not available".
 
 ## Before the run
 
@@ -76,17 +77,8 @@ Record each step in the table below: pass or fail, the time where asked, and wha
       "Ending your session…". It must never say the session ended. Turn the network on and keep the app
       running (don't Quit): within about 2 minutes, the phone no longer lists the session as active. The notice stays on the desktop; the phone is
       the check.
-4. **Lock.**
-   1. **The desktop's own lock:** in a live session, choose Lock now, and confirm with **Lock**.
-      - Expected: "Locking…", then "Start a new session" with no notice. The line "Locked. The next launch
-        auto-unlocks." may only flash before the screen changes.
-      - This lock is the desktop's alone: it sends nothing to the vault. Record what the phone shows; it is
-        expected to still list the desktop as active.
-      - Don't choose Start New Session now, and don't follow a notice that points to Log out. Record any notice
-        you see.
-      - Relaunch. Expected: if the session hasn't expired, it is shown live again with no approval, after the
-        desktop's `vault.status`. Record it.
-   2. **The vault locked on the phone:** in a live session, lock the vault on the phone, and note the time.
+4. **Lock.** The Session screen has no "Lock now" (#76): check that it isn't there.
+   1. **The vault locked on the phone:** in a live session, lock the vault on the phone, and note the time.
       - Expected: within about 3 minutes, the desktop stops showing the session as live and shows "Start a new
         session". The notice "This desktop hasn't heard from your vault for a few minutes…" may follow up to a
         minute later. Record both times.
@@ -122,8 +114,7 @@ workstation, for more than 3 minutes. On waking, the session must not be shown l
 | 2. No network at start; network back | | |
 | 3.1 End session | | |
 | 3.2 End session, no network; network back (seen on the phone) | | |
-| 4.1 Lock now: the phone's list; any notice; after relaunch | | |
-| 4.2 Vault locked on the phone: time until not shown live; after the unlock | | |
+| 4.1 Vault locked on the phone: time until not shown live; after the unlock | | |
 | 5. Log out | | |
 | 6. Uninstall with a pairing | | |
 | Optional: sleep or locked workstation | | |
