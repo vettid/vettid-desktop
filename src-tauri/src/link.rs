@@ -1991,23 +1991,28 @@ mod tests {
         (vault, link)
     }
 
-    /// #47: a restart never shows the last run's session as live. The link
-    /// a launch opens is `Link::new(session, store)` (as `Link::open`), and
-    /// nothing of the access session is kept on disk (only an unanswered
-    /// end, #80): it is not live before this run's own `vault.status`, and
-    /// not after it either if the vault ended the session meanwhile. Only a
-    /// status that names the session makes it live again.
+    /// #47: a restart never shows the last run's session as live. A launch
+    /// opens the session from the store (`Session::open`, then
+    /// `Link::new`, as `Link::open`), and nothing that makes a session live
+    /// is kept on disk (only an unanswered end, #80, and pending request
+    /// ids): it is not live, nor shown stale, before this run's own
+    /// `vault.status`, and not live after it if the vault ended the session
+    /// meanwhile. Only a status that names a session makes it live again.
     #[tokio::test]
     async fn a_restart_doesnt_show_the_last_runs_session_as_live() {
         let dir = tempfile::tempdir().unwrap();
         let (vault, link) = live(dir.path()).await;
-        // The restart: a new link on the same session and store.
-        let Link { session, store, .. } = link;
+        // The restart: the session opened again from what is stored.
+        let Link { mut store, .. } = link;
+        let t = vault.clone();
+        let session = Session::open(&mut store, move |_| t, SystemClock).expect("open").expect("paired");
         let mut link = Link::new(session, store);
         let now = Utc::now();
         let snap = link.snapshot(now);
         assert!(!snap.active_at(now), "not live before this run's vault.status");
-        assert_eq!((snap.session_id.as_deref(), snap.live_until), (None, None));
+        assert_eq!((snap.session_id.as_deref(), snap.live_until, snap.expires_at), (None, None, None));
+        assert!(!snap.stale, "nothing of the last run's session, not even as stale");
+        assert_eq!(snap.vault.state, VaultShown::Unknown);
 
         // The vault ended the session while this desktop was off.
         vault.set_session(None);
