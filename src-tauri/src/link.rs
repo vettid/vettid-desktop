@@ -110,7 +110,7 @@ const CLOCK_SETTINGS: &str = "in System Settings, General, Date & Time, turn on 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 const CLOCK_SETTINGS: &str = "in your computer's date and time settings, turn on automatic time";
 
-/// NEW TEXT (owner approval needed, #107): the relay refused this
+/// Owner-approved text (#107, 2026-11-06): the relay refused this
 /// computer's clock (`timestamp_stale`, more than 90 s off). `offset` is how
 /// far off it seemed (seconds, from the relay's `Date`; display only),
 /// rounded to whole minutes, or whole hours from 90 minutes; over a day it
@@ -139,13 +139,13 @@ pub fn clock_offset(server_date: Option<i64>) -> Option<i64> {
     server_date.map(|d| Utc::now().timestamp() - d)
 }
 
-/// NEW TEXT (owner approval needed, #107): pairing failed because the
+/// Owner-approved text (#107, 2026-11-06): pairing failed because the
 /// relay refused this computer's clock.
 pub fn pair_clock_notice(offset: Option<i64>) -> String {
     format!("Not paired. {}", clock_notice(offset))
 }
 
-/// NEW TEXT (owner approval needed, #107): End session couldn't be sent
+/// Owner-approved text (#107, 2026-11-06): End session couldn't be sent
 /// because the relay refused this computer's clock. The end is kept and
 /// sent again (as with [`END_NOT_SENT_NOTICE`]), so the session may still
 /// be open meanwhile. No "try again": it keeps trying on its own.
