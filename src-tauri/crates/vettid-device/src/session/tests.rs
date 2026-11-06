@@ -111,6 +111,31 @@ async fn a_request_gets_its_response() {
     assert_eq!(later.iter().map(|i| i.kind.as_str()).collect::<Vec<_>>(), ["test.event"]);
 }
 
+/// #106: a request's wait ends after its own timeout of monotonic time,
+/// whatever the wall clock does. Here the clock is frozen, as a clock that
+/// keeps being set back looks to the wait: the old wall-clock deadline never
+/// came, and the wait went on until something else ended it (the guard
+/// below). Time is paused, so empty long-polls pass at once.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_clock_doesnt_stretch_a_request() {
+    #[derive(Clone)]
+    struct Frozen(DateTime<Utc>);
+    impl Clock for Frozen {
+        fn now(&self) -> DateTime<Utc> {
+            self.0
+        }
+    }
+    let (relay, _vault, faults, mut store) = paired().await;
+    // Empty collects wait, as a relay's long-poll does, so paused time moves.
+    faults.lock().unwrap().long_poll = true;
+    let mut s = Session::open(&mut store, mem(&relay, &faults), Frozen(Utc::now())).unwrap().unwrap();
+    let start = tokio::time::Instant::now();
+    let got = tokio::time::timeout(std::time::Duration::from_secs(600), s.request(&mut store, "test.ask", "{}", TimeDelta::seconds(30))).await;
+    assert!(matches!(got, Ok(Err(SessionError::TimedOut))), "ended by its own timeout: {got:?}");
+    let waited = start.elapsed();
+    assert!(waited >= std::time::Duration::from_secs(30) && waited <= std::time::Duration::from_secs(60), "{waited:?}");
+}
+
 /// Both dedupe layers (§8.2), and §8.1's rule for unrequested responses.
 #[tokio::test]
 async fn duplicates_and_strays_are_dropped() {
