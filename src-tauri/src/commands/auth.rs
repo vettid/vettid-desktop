@@ -225,7 +225,7 @@ pub async fn register(
             *state.is_registered.write().await = false;
             Ok(RegisterResponse::failed(store::LOGGED_OUT_MEANWHILE_NOTICE))
         }
-        // A lock or End session meanwhile: the pairing is saved, the
+        // An End session meanwhile: the pairing is saved, the
         // session not shown.
         None => Ok(RegisterResponse::paired_without_session(link::PAIRED_NO_ACCESS_NOTICE)),
     }
@@ -238,7 +238,7 @@ pub async fn register(
 async fn install(state: &AppState, link: Link, since: WipeEpoch, mark: ResetMark) -> Option<Snapshot> {
     let mut slot = state.link.lock().await;
     if store::wipe_epoch() != since || overtaken_by_reset(state, mark) {
-        log::warn!("a log-out, lock or End session overlapped this; staying locked");
+        log::warn!("a log-out or End session overlapped this; not opened");
         return None;
     }
     let now = chrono::Utc::now();
@@ -446,7 +446,7 @@ const UNLOCK_FAILED_NOTICE: &str = "This desktop couldn't open its saved pairing
 pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String> {
     // #30: first. A log-out from here on means nothing stays unlocked.
     let since = store::wipe_epoch();
-    // #43: likewise a lock or End session, including one under way now.
+    // #43: likewise an End session, including one under way now.
     let mark = reset_mark(&state);
 
     // One opening at a time, from this check to the install below (two
@@ -718,13 +718,24 @@ pub(crate) async fn check_vault_now(state: &AppState) -> bool {
 /// (`session:requested`), and wait for the answer until the request
 /// lapses. Success only once `vault.status` shows the new session.
 ///
-/// A lock, log-out or End session meanwhile stops the wait (checked
+/// A log-out or End session meanwhile stops the wait (checked
 /// between polls).
 #[tauri::command]
 pub async fn extend_session(app: AppHandle, state: State<'_, AppState>) -> Result<RegisterResponse, String> {
+    let requested = || {
+        let _ = app.emit(ACCESS_REQUESTED_EVENT, ());
+    };
+    Ok(extend_with(&state, requested).await)
+}
+
+/// [`extend_session`]'s work; `requested` tells the frontend the phone is
+/// asked. With no link open (a launch whose unlock failed) nothing is sent,
+/// the phone isn't asked and nothing is shown as live, even if the vault's
+/// session is (#76).
+async fn extend_with(state: &AppState, requested: impl FnOnce()) -> RegisterResponse {
     // #33: never overlaps End session; see AppState::session_op.
     let _session_op = state.session_op.lock().await;
-    let mark = reset_mark(&state);
+    let mark = reset_mark(state);
     // As in end_access: a refused device's mailbox rechecks aren't waited for.
     // This reads the snapshot before taking the link, so a collect that has
     // just begun (or a refusal found since) can still be waited out once.
@@ -735,21 +746,18 @@ pub async fn extend_session(app: AppHandle, state: State<'_, AppState>) -> Resul
     }
     let mut slot = state.link.lock().await;
     let Some(link) = slot.as_mut() else {
-        return Ok(RegisterResponse::failed(UNLOCK_FAILED_NOTICE));
+        return RegisterResponse::failed(UNLOCK_FAILED_NOTICE);
     };
-    let requested = || {
-        let _ = app.emit(ACCESS_REQUESTED_EVENT, ());
-    };
-    let result = link.request_access(requested, || overtaken_by_reset(&state, mark)).await;
+    let result = link.request_access(requested, || overtaken_by_reset(state, mark)).await;
     if link.unlinked() {
         let link = slot.take().expect("checked above");
-        return Ok(RegisterResponse::failed(erase_unlinked(&state, link).await));
+        return RegisterResponse::failed(erase_unlinked(state, link).await);
     }
     let now = chrono::Utc::now();
     let snap = link.snapshot(now);
     // A reset that started meanwhile has cleared what the UI shows, and
     // shows its own result.
-    let overtaken = overtaken_by_reset(&state, mark);
+    let overtaken = overtaken_by_reset(state, mark);
     if !overtaken {
         state.publish(snap.clone());
         if link.keep_refreshing(now) {
@@ -760,10 +768,10 @@ pub async fn extend_session(app: AppHandle, state: State<'_, AppState>) -> Resul
         log::info!("extend_session: no session: {:?}", f);
     }
     let failure = link.store.take_failure();
-    Ok(extend_response(result, overtaken, &snap, now, failure.as_ref()))
+    extend_response(result, overtaken, &snap, now, failure.as_ref())
 }
 
-/// What Start New Session answers. Review LOW 5: a lock, log-out or End
+/// What Start New Session answers. Review LOW 5: a log-out or End
 /// session that overtook it (even after the grant) means it is not shown
 /// live: the person is told it stopped.
 fn extend_response(
@@ -938,7 +946,7 @@ async fn log_out(
     // A Start New Session waiting for the phone stops (it checks this).
     begin_reset(state);
     state.publish(Snapshot::default());
-    // Review LOW 6: the refresh first, as lock does, so the bound goes to
+    // Review LOW 6: the refresh first, so the bound goes to
     // the end itself. Stopped mid-operation, it may leave the link's memory
     // part way through a status read (on disk it is as after a crash): the
     // link is used once more, for the end, then dropped.
@@ -1003,7 +1011,7 @@ async fn end_access(state: &AppState) -> EndSessionResponse {
     // Not live from here on, whatever the vault answers.
     state.publish(state.snapshot().without_session());
     // #80 (review L1): whether this end still waits, read from the link
-    // while it is held, not from a later snapshot a lock may have reset.
+    // while it is held, not from a later snapshot a reset may have cleared.
     let mut end_pending = false;
     let notice = {
         // #33: no Start New Session runs while this does; one under way
@@ -1112,26 +1120,6 @@ pub struct EndSessionResponse {
     /// The end is still waiting for the vault (#80): the UI keeps showing it
     /// as pending. False when nothing stays pending (answered, or no link).
     pub end_pending: bool,
-}
-
-/// Lock: drop the link from memory (its keys wipe themselves). The
-/// pairing stays saved; the next unlock opens it again.
-#[tauri::command]
-pub async fn lock(state: State<'_, AppState>) -> Result<bool, String> {
-    lock_memory(&state).await;
-    Ok(true)
-}
-
-/// [`lock`]'s work.
-async fn lock_memory(state: &AppState) {
-    begin_reset(state);
-    state.publish(Snapshot::default());
-    // The link is dropped below: stopping its refresh mid-operation leaves
-    // nothing half done in memory (what is stored is as after a crash).
-    state.stop_refresh();
-    drop(state.link.lock().await.take());
-    state.publish(Snapshot::default());
-    finish_reset(state);
 }
 
 /// Whether `get_status` reports this desktop as paired: known in memory
@@ -1269,13 +1257,13 @@ mod tests {
         dropped
     }
 
-    /// Every session-ending path stops the background refresh: lock,
-    /// log-out and End session each end its task and empty the slot, and
+    /// Every session-ending path stops the background refresh: log-out
+    /// and End session each end its task and empty the slot, and
     /// nothing is shown as live or unlocked afterwards.
     #[tokio::test]
-    async fn lock_logout_and_end_session_stop_the_refresh() {
+    async fn logout_and_end_session_stop_the_refresh() {
         use std::sync::atomic::Ordering;
-        for which in ["lock", "logout", "end session"] {
+        for which in ["logout", "end session"] {
             let state = AppState::new();
             let live = Snapshot {
                 link_open: true,
@@ -1287,7 +1275,6 @@ mod tests {
             state.publish(live);
             let dropped = tracked_task(&state);
             match which {
-                "lock" => lock_memory(&state).await,
                 "logout" => {
                     let r = log_out(&state, None, |_| false, LOGOUT_END_BOUND).await;
                     assert!(!r.revoke_sent && !r.local_wiped);
@@ -1539,6 +1526,29 @@ mod tests {
         assert_eq!(r.error.as_deref(), Some(link::ACCESS_NOT_CONFIRMED_NOTICE));
     }
 
+    /// #76: Start New Session with no link open (a launch whose unlock
+    /// failed) asks nothing of the phone, opens nothing and shows nothing
+    /// as live, whatever the vault's session is: it doesn't reopen the
+    /// saved pairing (that would show a still-live session with no phone).
+    /// Limit: this drives the no-link branch with no vault and no saved
+    /// pairing. A change that makes Start New Session open the saved
+    /// pairing would need its own test against a paired store with a live
+    /// session; this one might still pass.
+    #[tokio::test]
+    async fn start_new_session_without_a_link_shows_nothing() {
+        let state = AppState::new();
+        let mut asked = false;
+        let r = extend_with(&state, || asked = true).await;
+        assert!(!asked, "the phone isn't asked");
+        assert!(!r.success);
+        assert!(r.session_id.is_none() && r.expires_at.is_none());
+        assert_eq!(r.error.as_deref(), Some(UNLOCK_FAILED_NOTICE));
+        assert!(state.link.lock().await.is_none(), "nothing was opened");
+        let snap = state.snapshot();
+        assert!(!snap.link_open && !snap.active_at(chrono::Utc::now()));
+        assert!(session_info(&snap, chrono::Utc::now()).is_err(), "nothing to show");
+    }
+
     /// LOW 6: logout stops the refresh before it waits for the link, so a
     /// refresh holding the link doesn't eat the bound.
     #[tokio::test]
@@ -1627,11 +1637,10 @@ mod tests {
     async fn every_reset_is_counted() {
         use std::sync::atomic::Ordering::SeqCst;
         let state = AppState::new();
-        lock_memory(&state).await;
         log_out(&state, None, |_| false, LOGOUT_END_BOUND).await;
         end_access(&state).await;
-        assert_eq!(state.resets_started.load(SeqCst), 3);
-        assert_eq!(state.resets_finished.load(SeqCst), 3);
+        assert_eq!(state.resets_started.load(SeqCst), 2);
+        assert_eq!(state.resets_finished.load(SeqCst), 2);
     }
 
     /// The session info comes from the snapshot: live up to `live_until`

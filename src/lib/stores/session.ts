@@ -303,21 +303,21 @@ export async function refreshSessionFromBackend(): Promise<void> {
   } catch {
     if (readIsStale(seq, endSeq)) return;
     if (!readOrder.accept(readNo, null)) return;
-    // No link open (this desktop's own Lock, or before its unlock): no
+    // No link open (before its unlock, or after one that failed): no
     // vault state; the screen is the one the app always showed there.
     vaultStore.set(null);
     scheduleDecayRead(null);
     // No link: nothing is known of an end; its notice isn't touched.
     applyEndState(null);
     // `get_session_info` throws "not unlocked" when AppState has no
-    // credentials in memory — which happens right after end_session,
-    // lock, or logout, AND on a fresh launch before auto-unlock has
+    // credentials in memory — which happens right after end_session
+    // or logout, AND on a fresh launch before auto-unlock has
     // run. Previously the catch silently swallowed this, leaving the
     // store stuck on its previous state (active → user clicks End
     // session → store still says active → routing doesn't flip).
     //
     // Disambiguate by asking get_status whether we're even registered:
-    //   - registered but locked → state: 'expired' (lock screen path)
+    //   - registered but not open → state: 'expired' (Start-a-new-session path)
     //   - not registered → state: 'inactive' (pair screen path)
     try {
       const status = await invoke<{ is_registered: boolean }>('get_status');
