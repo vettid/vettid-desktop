@@ -485,16 +485,19 @@ The events go to the machine's Application log, so a management tool or an admin
 non-elevated process can start one as another account but can't wait on it, so the test waited for a result file.
 
 **Run in Windows Sandbox, without a console** (2026-11-06, #72, owner decision "a"). This was a clean Windows 11
-Pro 10.0.26300 Sandbox with networking off, so nothing reached the relay or a vault. It had no Visual C++
-runtime and no other apps. A temporary standard account (Users only, given "Log on as a batch job") ran every
-case as a one-off scheduled task: no console and no interactive logon, close to how a management agent
-starts a user-context install. The SYSTEM cases were scheduled tasks as SYSTEM. The scripts ran with
+Pro 10.0.26300 Sandbox with networking off, so nothing reached the relay or a vault. It had no other apps, and
+no Visual C++ runtime (not checked directly; the `0xC0000135` exit below is the evidence). A temporary standard
+account (Users only, given "Log on as a batch job") ran every case as a one-off scheduled task: no console and
+no signed-in session. A management agent's user-context run instead uses the signed-in person's own token, in
+their session, so this was a harsher case, not the same one. It doesn't change "The person must be signed in"
+above. The SYSTEM cases were scheduled tasks as SYSTEM. The scripts ran with
 `-NoProfile -NonInteractive -ExecutionPolicy Bypass -File`, under the 32-bit host
 (`SysWOW64\WindowsPowerShell`, as Intune's agent uses) or the 64-bit one. A dummy `device.enc` (64 fixed bytes,
 no keys) stood in for a pairing. Each uninstall started 15 s or more after the install. The debug installer was
-built from `dfc539a`; "with #113" means built with `STATIC_VCRUNTIME=true`, which #113 makes the default:
+built from `dfc539a`; "after #113" means built with `STATIC_VCRUNTIME=true`, which main now sets
+(`.cargo/config.toml` and `src-tauri/build.rs`; see "Build"):
 
-| Case | Without #113 | With #113 |
+| Case | Before #113 | After #113 |
 |---|---|---|
 | `setup.exe /S` (user) | 0; product key in the user's hive | the same |
 | Detection, 64- and 32-bit host (user) | "program True, pairing files True" | the same |
@@ -504,17 +507,19 @@ built from `dfc539a`; "with #113" means built with `STATIC_VCRUNTIME=true`, whic
 | `uninstall-vettid.ps1`, 32-bit host (user) | **2, event 1001**; program gone, pairing kept, still detected | **0**; program and pairing gone, not detected |
 | `uninstall-vettid.ps1` again (user) | 2, no new event | 0; the leftover `uninstall.exe` and the empty folder removed |
 | Program gone, dummy pairing left: the script (32-bit), then detection | 2, no event; detected | the same |
-| Fresh install, nothing paired, `uninstall-vettid.ps1` (64-bit) | **2, event 1001** | **0**; not detected |
+| Fresh install, nothing paired, `uninstall-vettid.ps1` (64-bit) | **2, event 1001**; not detected | **0**; not detected |
 
-**Without #113 the uninstall never succeeds on such a PC (#112).** `vettid-desktop.exe` imported
-`VCRUNTIME140.dll` and `VCRUNTIME140_1.dll`. Without the Visual C++ runtime it exits `0xC0000135` (DLL not
-found) before doing anything, so the wipe doesn't run and the uninstaller reports 1001, even with nothing
-paired. That is fail-secure (the pairing is kept and nothing says it's gone), but it never gets to 0. The app's
-window doesn't open either. Tempe has the runtime through Visual Studio, which is why the 2026-11-04 run
-didn't show this.
+**Before #113 the uninstall never succeeded on such a PC (#112).** `vettid-desktop.exe` imported
+`VCRUNTIME140.dll` and `VCRUNTIME140_1.dll`. Without the Visual C++ runtime it exited `0xC0000135` (DLL not
+found) before doing anything, so the wipe didn't run and the uninstaller reported 1001, even with nothing
+paired. That is fail-secure (the pairing is kept and nothing says it's gone), but it never got to 0. The app
+couldn't open its window either, for the same reason (inferred: the Sandbox runs were non-interactive). Tempe
+has the runtime through Visual Studio, which is why the 2026-11-04 run didn't show this.
 
-**Scheduled task versus secondary logon:** the same `CredDeleteW` call on the absent legacy entry gave
-`ERROR_NOT_FOUND` (1168) in both, so Credential Manager behaves the same in a batch logon.
+**Scheduled task versus secondary logon:** to rule out the batch logon as the cause of those 1001s, the same
+`CredDeleteW` call the wipe makes, on the absent legacy entry, was run in both. It gave `ERROR_NOT_FOUND` (1168)
+in both, so deleting an absent entry, which is what an unpaired wipe does, works the same in a batch logon.
+Reading or writing a stored entry in a batch logon wasn't tested.
 
 Still not tested: Intune and ConfigMgr themselves, and an interactive session of the standard account.
 
