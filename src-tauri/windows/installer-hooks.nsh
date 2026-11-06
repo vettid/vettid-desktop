@@ -227,7 +227,8 @@ Var VettidWipe
 ; A Warning with the text in $7, source "VettID Desktop", in the Application
 ; log: event ID 1001 for an uninstall whose pairing couldn't be removed or
 ; confirmed, 1002 for an uninstall refused because another account ran it,
-; 1003 for an uninstall that couldn't delete the program itself.
+; 1003 for an uninstall that couldn't delete the program itself, 1004 for an
+; uninstall that stopped before it finished (un.onUninstFailed, below).
 ; The source isn't registered (that needs an administrator), so Event Viewer
 ; says the event's description isn't found and shows the text as the
 ; event's data. `Get-WinEvent -LogName Application -FilterXPath
@@ -247,6 +248,21 @@ Var VettidWipe
     System::Call 'advapi32::DeregisterEventSource(p r4)'
   ${EndIf}
 !macroend
+
+; #74: an uninstall that stops part way exits with 2 and wrote no event: an
+; `Abort` in Section Uninstall, most likely the template's own
+; CheckIfAppIsRunning (in NSIS_HOOK_PREUNINSTALL above, and again in the
+; template after it) when the app is running and can't be closed, or the
+; person cancels. NSIS calls un.onUninstFailed then, silent (/S) included;
+; not after `Quit` (the 1002 refusal above, which writes its own event), and
+; not after a finished uninstall (checked in a test uninstaller, makensis
+; 3.11). The template doesn't define it. Nothing is claimed removed: the
+; program, the uninstaller and the saved pairing may all still be there.
+Function un.onUninstFailed
+  ; NEW TEXT (owner approval needed).
+  StrCpy $7 "VettID Desktop's uninstall stopped before it finished, so nothing was confirmed removed: the program and this desktop's saved pairing may still be on this computer. This usually means VettID Desktop was running and couldn't be closed. Close it, then uninstall again."
+  !insertmacro VETTID_REPORT_EVENT 1004
+FunctionEnd
 
 !macro NSIS_HOOK_POSTUNINSTALL
   ${If} $VettidWipe != ""
