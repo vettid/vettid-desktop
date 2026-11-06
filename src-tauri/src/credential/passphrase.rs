@@ -33,17 +33,19 @@
 //! `zeroize` feature wipes its initial and final hashes), the Argon2id
 //! output, the wrap key, the decrypted key buffer, and the cipher's key (on
 //! drop, by `chacha20poly1305`). Not zeroized, a residual risk: Argon2's
-//! stack temporaries while it runs, and the HMAC state inside `hkdf` (hmac
-//! 0.12 doesn't wipe it). Nothing here logs a secret. The passphrase
+//! stack temporaries while it runs, the HMAC state inside `hkdf` (hmac
+//! 0.12 doesn't wipe it), and the NFC normalizer's small internal buffers
+//! (of a few characters). Nothing here logs a secret. The passphrase
 //! reaches Rust as a webview string, which can't be zeroized there (§4
 //! accepts that).
 //!
 //! **Errors.** A wrapped key of the wrong shape, another format or
 //! parameters out of bounds "won't open" (they never will). A seal that
-//! doesn't open with the passphrase given is "failing" instead: a wrong
-//! passphrase and a changed file look the same, and the person is asked
-//! again, never told to re-pair because of a typo (review M2; the text
-//! comes with the UI, item 4).
+//! doesn't open with the passphrase given is its own answer,
+//! `NotThisSecret`: a wrong passphrase and a changed file look the same, and
+//! the person is asked again, never told to re-pair because of a typo
+//! (review M2, lead review; the text comes with the UI, item 4). Running out
+//! of memory or random bytes is `Failing`.
 
 // Wired into `Protectors` by the passphrase UI (#13 item 4), which removes
 // this.
@@ -199,8 +201,8 @@ impl Protector for Passphrase {
     }
 
     /// A wrong passphrase and a changed header look the same (the seal
-    /// doesn't open): "failing", so the person can try again and the file
-    /// is kept (see the module doc). The parameters are checked against the
+    /// doesn't open): `NotThisSecret`, so the person can try again and the
+    /// file is kept (see the module doc). The parameters are checked against the
     /// floor and the ceiling before Argon2id runs.
     fn unwrap(&self, wrapped: &[u8]) -> Result<DataKey, ProtectorError> {
         if wrapped.len() != WRAPPED_LEN {
@@ -219,7 +221,7 @@ impl Protector for Passphrase {
         let cipher = XChaCha20Poly1305::new_from_slice(&*wk).map_err(|e| failing("cipher", e))?;
         let mut plain = cipher
             .decrypt(XNonce::from_slice(nonce), Payload { msg: sealed, aad: head })
-            .map_err(|_| failing("open", "it doesn't open with this passphrase (a wrong passphrase, or the file was changed)"))?;
+            .map_err(|_| ProtectorError::NotThisSecret { by: NAME })?;
         if plain.len() != KEY_LEN {
             plain.zeroize();
             return Err(ProtectorError::WontOpen("a data key of the wrong length".into()));
@@ -300,13 +302,13 @@ mod tests {
         }
     }
 
-    /// A seal that doesn't open with this passphrase: "failing", so the
+    /// A seal that doesn't open with this passphrase: its own answer, so the
     /// person is asked again and the file kept (never "won't open", which
     /// would tell them to re-pair).
     fn not_this_passphrase(r: Result<DataKey, ProtectorError>, what: &str) {
         match r {
-            Err(ProtectorError::Failing { by, .. }) => assert_eq!(by, NAME, "{what}"),
-            other => panic!("{what}: expected failing, got {:?}", other.map(|_| "a key")),
+            Err(ProtectorError::NotThisSecret { by }) => assert_eq!(by, NAME, "{what}"),
+            other => panic!("{what}: expected not this secret, got {:?}", other.map(|_| "a key")),
         }
     }
 

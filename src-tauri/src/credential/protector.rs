@@ -60,6 +60,12 @@ pub(crate) enum ProtectorError {
     WontOpen(String),
     /// A key kept outside the file couldn't be confirmed gone.
     NotRemoved { what: &'static str, detail: String },
+    /// The secret the person gave (the passphrase, #13) doesn't open the
+    /// key: a wrong one, or a changed file, which can't be told apart. The
+    /// file is kept and the person can try again; never "won't open", which
+    /// would tell them to re-pair.
+    #[cfg_attr(not(test), allow(dead_code))] // the passphrase protector is wired in by #13 item 4
+    NotThisSecret { by: &'static str },
 }
 
 impl std::fmt::Display for ProtectorError {
@@ -69,6 +75,7 @@ impl std::fmt::Display for ProtectorError {
             ProtectorError::Failing { by, detail } => write!(f, "{by} failed: {detail}"),
             ProtectorError::WontOpen(detail) => write!(f, "the data key doesn't open: {detail}"),
             ProtectorError::NotRemoved { what, detail } => write!(f, "{what} not removed: {detail}"),
+            ProtectorError::NotThisSecret { by } => write!(f, "{by} doesn't open the data key"),
         }
     }
 }
