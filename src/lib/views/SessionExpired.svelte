@@ -3,7 +3,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { onDestroy } from 'svelte';
   import { noticeOf } from '../tooSoon.js';
-  import { activateSession, sessionNotice, bannerNotice, endPending, vaultStore, askToEnd, endBusy } from '../stores/session';
+  import { activateSession, sessionNotice, declinedNotice, endPending, vaultStore, askToEnd, endBusy } from '../stores/session';
   import { vaultScreen, endOffered } from '../vaultState.js';
 
   // #77: the vault's lock and hold (§3.2-§3.4). Held, locked or unknown,
@@ -55,8 +55,8 @@
         errorMessage = noticeOf(result, 'Extension failed');
         // #96: declined while the current session is live. The app moves on
         // to Connections, which unmounts this screen and its notice, so the
-        // banner shows it too.
-        if (result.continues_until) bannerNotice.set(errorMessage);
+        // app's own banner for it shows it there.
+        if (result.continues_until) declinedNotice.set({ text: errorMessage, until: result.continues_until, seen: false });
       }
     } catch (e: any) {
       step = 'error';

@@ -37,13 +37,14 @@ export const sessionStore = writable<SessionState>(initialState);
 export const sessionNotice = writable<string | null>(null);
 
 /**
- * A notice for the app's banner, which stays up across a change of screen
- * until dismissed (#96): the phone declined a new session while the current
- * one is live, and the app then moves from the Start-a-new-session screen to
- * Connections, which would drop a notice kept on that screen. App.svelte
- * takes it and clears it.
+ * The phone declined a new session while the current one is live (#96):
+ * the notice and the time it names (unix seconds). The app then moves from
+ * the Start-a-new-session screen to Connections, which would drop a notice
+ * kept on that screen, so App.svelte shows it in its own banner, by the
+ * rule in `declined.js` (only while that session is active and before its
+ * time; gone for good after).
  */
-export const bannerNotice = writable<string | null>(null);
+export const declinedNotice = writable<{ text: string; until: number; seen: boolean } | null>(null);
 
 /**
  * An End session the vault hasn't answered yet (#80), from the backend:
