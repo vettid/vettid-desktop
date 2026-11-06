@@ -179,7 +179,7 @@ pub struct Reach {
 pub(crate) const DOMAIN_NOTICE: &str =
     "This computer is joined to your organization's domain. An administrator of that domain may be able to open this desktop's saved pairing.";
 
-/// NEW TEXT (owner approval needed, #13): Settings, when this computer is
+/// Owner-approved text (#13, 2026-11-06): Settings, when this computer is
 /// joined to an organization's Microsoft Entra ID. It claims only what §4
 /// says of any administrator: they can run code as the user while the user
 /// is logged on.
