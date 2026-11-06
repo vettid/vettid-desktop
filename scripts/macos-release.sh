@@ -83,6 +83,30 @@ run() {
 
 cd "$REPO_ROOT"
 
+# The source the build starts from: its commit and its state (tracked changes
+# and untracked files alike; Vite reads .env* files). Checked again at the end,
+# and recorded beside the DMG for scripts/macos-publish.sh.
+SRC_COMMIT="$(git rev-parse HEAD)"
+SRC_STATUS="$(git status --porcelain)"
+
+# Writes <dmg>.commit once the DMG is final: the commit, whether the tree was
+# clean, whether it is the calls build, and the DMG's sha256. Refuses if the
+# checkout moved or changed during the build.
+record() {
+    [[ "$DRY" -eq 0 ]] || return 0
+    if [[ "$(git rev-parse HEAD)" != "$SRC_COMMIT" || "$(git status --porcelain)" != "$SRC_STATUS" ]]; then
+        echo "ERROR: the checkout changed during the build; the DMG can't be tied to one commit. Build again." >&2
+        rm -f "$DMG.commit"
+        exit 1
+    fi
+    {
+        echo "commit=$SRC_COMMIT"
+        if [[ -z "$SRC_STATUS" ]]; then echo "clean=yes"; else echo "clean=no"; fi
+        echo "calls=$CALLS"
+        echo "sha256=$(shasum -a 256 "$DMG" | cut -d' ' -f1)"
+    } > "$DMG.commit"
+}
+
 # 1. The app bundle. Tauri is told no identity (the variable is not passed on),
 #    so it signs ad-hoc; the real signature is made below, after the optional
 #    provisioning profile is in the bundle.
@@ -149,10 +173,8 @@ if [[ "$DRY" -eq 0 ]]; then
     trap 'rm -rf "$stage"' EXIT
     ditto "$APP" "$stage/$(basename "$APP")"
     ln -s /Applications "$stage/Applications"
+    rm -f "$DMG.commit"
     hdiutil create -quiet -volname "VettID Desktop" -srcfolder "$stage" -format UDZO -fs HFS+ "$DMG"
-    # The commit the DMG was built from, and whether the tree had changes then
-    # (scripts/macos-publish.sh tags that commit and refuses a dirty build).
-    { git rev-parse HEAD; git diff --quiet HEAD && echo clean || echo dirty; } > "$DMG.commit"
 else
     echo "+ hdiutil create ... \"$DMG\""
 fi
@@ -162,6 +184,7 @@ run codesign "${sign_opts[@]}" "$DMG"
 if [[ "$SIGN_ONLY" -eq 1 ]]; then
     echo "==> --sign-only: not notarized"
     run "$REPO_ROOT/scripts/macos-verify.sh" --adhoc "$DMG"
+    record
     echo "DMG: $DMG"
     exit 0
 fi
@@ -192,4 +215,5 @@ run xcrun stapler staple "$DMG"
 # 6. Verify.
 echo "==> Verifying"
 run "$REPO_ROOT/scripts/macos-verify.sh" "$DMG"
+record
 echo "DMG: $DMG"

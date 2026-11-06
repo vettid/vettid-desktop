@@ -75,7 +75,7 @@ or bundle and sign the library.
 
 ## Publishing (GitHub Releases)
 
-Releases are published on GitHub. `macos-release.sh` records the commit it built from beside the DMG (`<dmg>.commit`); publish from any checkout:
+Releases are published on GitHub. `macos-release.sh` records, beside the DMG (`<dmg>.commit`), the commit it built from, whether that tree was clean (untracked files included), whether it was the `--calls` build, and the DMG's sha256. It refuses if the checkout changed during the build. Publish from any checkout:
 
 ```sh
 VETTID_TEAM_ID=<team> scripts/macos-publish.sh            # the DMG macos-release.sh made
@@ -84,7 +84,8 @@ VETTID_TEAM_ID=<team> scripts/macos-publish.sh <path.dmg> # or a given one
 
 The script:
 - runs the full check (`macos-verify.sh`, team included) and stops if anything fails;
-- refuses a DMG built from a tree with local changes, or from a commit that isn't on GitHub's `main`;
+- refuses a DMG built from a tree with local changes, from a commit that isn't on GitHub's `main`, or that isn't the file recorded at build time;
+- verifies, hashes and uploads one copy of the DMG, and reads the version from the recorded commit;
 - creates a **draft** release tagged `v<UTC yyyymmdd-HHMMSS>-macos`, as the earlier releases are, at the commit the DMG was built from;
 - attaches the DMG as `VettID-Desktop-<version>-macos-arm64.dmg` and a `SHA256SUMS.txt`.
 
