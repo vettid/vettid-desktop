@@ -302,7 +302,12 @@ pub fn write_string(out: &mut String, s: &str) {
             '\t' => out.push_str("\\t"),
             '\u{8}' => out.push_str("\\b"),
             '\u{c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            // #100: the digits are written in place, with no temporary.
+            c if (c as u32) < 0x20 => {
+                out.push_str("\\u00");
+                out.push(hex_digit(c as u32 >> 4));
+                out.push(hex_digit(c as u32 & 0xf));
+            }
             '\u{2028}' => out.push_str("\\u2028"),
             '\u{2029}' => out.push_str("\\u2029"),
             c => out.push(c),
@@ -311,10 +316,36 @@ pub fn write_string(out: &mut String, s: &str) {
     out.push('"');
 }
 
+/// A lower-case hexadecimal digit for `d` (0 to 15).
+fn hex_digit(d: u32) -> char {
+    char::from_digit(d, 16).expect("a digit below 16")
+}
+
+/// The length of `s` as [`write_string`] writes it, quotes included.
+pub fn escaped_len(s: &str) -> usize {
+    2 + s
+        .chars()
+        .map(|c| match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            c if (c as u32) < 0x20 => 6,
+            '\u{2028}' | '\u{2029}' => 6,
+            c => c.len_utf8(),
+        })
+        .sum::<usize>()
+}
+
 /// Writes a compact JSON object with members in call order. `Debug`
 /// prints nothing of what was written (it may be secret).
+///
+/// What it writes may be secret (#60, #100): the buffer is wiped when the
+/// builder is dropped, and it never grows by reallocation in place. Before
+/// each write it makes room for exactly what follows; if there isn't any,
+/// it moves to a bigger buffer and wipes the old one ([`Builder::reserve`]).
+/// [`Builder::with_capacity`] still avoids even that copy. A builder dropped
+/// by a panic is wiped only if the panic unwinds: don't build with
+/// `panic = "abort"`.
 pub struct Builder {
-    out: String,
+    out: Zeroizing<String>,
     first: bool,
 }
 
@@ -333,45 +364,69 @@ impl Default for Builder {
 impl Builder {
     /// Start an object.
     pub fn new() -> Self {
-        Builder { out: String::from("{"), first: true }
+        Self::with_capacity(64)
     }
 
-    /// Start an object with room for `n` bytes, so that a builder of
-    /// secrets that stays within it never reallocates (a reallocation
-    /// leaves an unwiped copy behind).
+    /// Start an object with room for `n` bytes, so that a builder that
+    /// stays within it never moves its buffer.
     pub fn with_capacity(n: usize) -> Self {
-        let mut out = String::with_capacity(n);
+        let mut out = Zeroizing::new(String::with_capacity(n.max(1)));
         out.push('{');
         Builder { out, first: true }
     }
 
+    /// Room for `extra` more bytes. Without it, the text moves to a buffer
+    /// at least twice as large and the old one is wiped as it drops: a
+    /// `String` growing in place would free it unwiped.
+    fn reserve(&mut self, extra: usize) {
+        let need = self.out.len() + extra;
+        if need <= self.out.capacity() {
+            return;
+        }
+        let mut bigger = Zeroizing::new(String::with_capacity(need.max(self.out.capacity() * 2)));
+        bigger.push_str(&self.out);
+        self.out = bigger;
+    }
+
     fn name(&mut self, n: &str) {
+        self.reserve(escaped_len(n) + 2);
+        let cap = self.out.capacity();
         if !self.first {
             self.out.push(',');
         }
         self.first = false;
         write_string(&mut self.out, n);
         self.out.push(':');
+        // If `escaped_len` ever falls behind `write_string` (a new escape),
+        // the buffer would have grown in place, unwiped: caught here.
+        debug_assert_eq!(cap, self.out.capacity(), "escaped_len short of write_string");
     }
 
     /// A string member.
     pub fn string(mut self, n: &str, v: &str) -> Self {
         self.name(n);
+        self.reserve(escaped_len(v));
+        let cap = self.out.capacity();
         write_string(&mut self.out, v);
+        debug_assert_eq!(cap, self.out.capacity(), "escaped_len short of write_string");
         self
     }
 
     /// An integer member.
     pub fn uint(mut self, n: &str, v: u64) -> Self {
         self.name(n);
-        self.out.push_str(&v.to_string());
+        let digits = v.to_string();
+        self.reserve(digits.len());
+        self.out.push_str(&digits);
         self
     }
 
     /// A boolean member.
     pub fn bool(mut self, n: &str, v: bool) -> Self {
         self.name(n);
-        self.out.push_str(if v { "true" } else { "false" });
+        let text = if v { "true" } else { "false" };
+        self.reserve(text.len());
+        self.out.push_str(text);
         self
     }
 
@@ -380,6 +435,7 @@ impl Builder {
     /// no other copy is made. Base64 needs no JSON escape.
     pub fn base64(mut self, n: &str, v: &[u8]) -> Self {
         self.name(n);
+        self.reserve(2 + v.len().div_ceil(3) * 4);
         self.out.push('"');
         // 48 bytes encode to 64 characters with no padding: only the last
         // chunk can be padded, as in one encoding of the whole.
@@ -396,14 +452,22 @@ impl Builder {
     /// it.
     pub fn raw(mut self, n: &str, v: &str) -> Self {
         self.name(n);
+        self.reserve(v.len());
         self.out.push_str(v);
         self
     }
 
-    /// Close the object.
+    /// Close the object. The text is moved out, not copied.
     pub fn finish(mut self) -> String {
+        self.reserve(1);
         self.out.push('}');
-        self.out
+        std::mem::take(&mut *self.out)
+    }
+
+    /// The capacity of the buffer, for tests.
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.out.capacity()
     }
 }
 
@@ -820,6 +884,41 @@ mod tests {
             // asked for, not what the allocator gave, so this is exact.
             assert_eq!(s.capacity(), raw.len() - 2, "{raw}: allocated once, at the raw length");
         }
+    }
+
+    /// #100: `escaped_len` is exactly what `write_string` writes, for every
+    /// control character, the two separators, quotes, backslashes and
+    /// multi-byte characters; control characters are escaped as before,
+    /// in lower case.
+    #[test]
+    fn escaped_len_is_what_write_string_writes() {
+        let mut all: String = (0u32..0x20).map(|c| char::from_u32(c).unwrap()).collect();
+        all.push_str("\"\\a\u{e9}\u{1f600}\u{2028}\u{2029}z");
+        for s in [String::new(), "plain".to_string(), all] {
+            let mut out = String::new();
+            write_string(&mut out, &s);
+            assert_eq!(escaped_len(&s), out.len(), "{s:?}");
+        }
+        let mut out = String::new();
+        write_string(&mut out, "\u{1f}\u{0}\u{1b}");
+        assert_eq!(out, "\"\\u001f\\u0000\\u001b\"");
+    }
+
+    /// #100: a builder sized for its output never moves its buffer; one
+    /// that starts too small moves (wiping the old buffer) and writes the
+    /// same text.
+    #[test]
+    fn a_builder_moves_only_when_it_must() {
+        let secret = "s\n".repeat(3000);
+        let key = [7u8; 1000];
+        let build = |b: Builder| b.string("s", &secret).base64("k", &key).uint("n", u64::MAX).bool("t", true).raw("r", "[1]").finish();
+        let want = build(Builder::with_capacity(1 << 16));
+        let exact = build(Builder::with_capacity(want.len()));
+        assert_eq!(exact, want);
+        assert_eq!(exact.capacity(), want.len(), "sized exactly: never moved");
+        let small = Builder::new();
+        assert_eq!(small.capacity(), 64);
+        assert_eq!(build(small), want, "grown by moving: the same text");
     }
 
     #[test]
