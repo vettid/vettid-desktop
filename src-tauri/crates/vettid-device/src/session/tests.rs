@@ -251,6 +251,28 @@ async fn a_clock_refusal_holds_the_outbox_and_says_so() {
     assert_eq!(vault_receive(&mut vault).await.id, id);
 }
 
+/// #107 (review H1): held while this clock ran ten minutes ahead, then the
+/// clock is set right. Its `ts` is now more than 5 min in the future, which
+/// the vault would reject after the relay took it: it is dropped and
+/// reported instead, never deposited.
+#[tokio::test]
+async fn a_message_held_under_a_clock_ahead_is_reported_not_sent() {
+    let (relay, _vault, faults, mut store) = paired().await;
+    let clock = Ticking::new();
+    let mut s = session(&relay, &faults, &mut store, clock.clone());
+    clock.ticks.store(600, std::sync::atomic::Ordering::SeqCst);
+    faults.lock().unwrap().clock_deposits = 1;
+    s.send(&mut store, "test.ping", "{}", false).await.unwrap();
+    assert_eq!(s.outbox_len(), 1, "held");
+    let tried = faults.lock().unwrap().deposits_seen;
+    clock.ticks.store(0, std::sync::atomic::Ordering::SeqCst);
+    s.poll(&mut store).await.unwrap();
+    s.poll(&mut store).await.unwrap();
+    assert_eq!(s.outbox_len(), 0);
+    assert_eq!(s.take_dropped(), vec!["test.ping".to_string()], "reported");
+    assert_eq!(faults.lock().unwrap().deposits_seen, tried, "never deposited");
+}
+
 /// #107: a collect refused for the clock fails at once with the clock
 /// error (no amount without a `Date`), and the next good one clears it.
 #[tokio::test]

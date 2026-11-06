@@ -128,6 +128,29 @@ pub fn clock_notice(offset: Option<i64>) -> String {
     };
     format!("{how} Set it to the correct time ({CLOCK_SETTINGS}), then try again.")
 }
+
+/// How far this computer's clock is from the relay's `Date` (seconds, local
+/// minus relay), for [`clock_notice`] only (#107). SECURITY: display only.
+pub fn clock_offset(server_date: Option<i64>) -> Option<i64> {
+    server_date.map(|d| Utc::now().timestamp() - d)
+}
+
+/// NEW TEXT (owner approval needed, #107): pairing failed because the
+/// relay refused this computer's clock.
+pub fn pair_clock_notice(offset: Option<i64>) -> String {
+    format!("Not paired. {}", clock_notice(offset))
+}
+
+/// NEW TEXT (owner approval needed, #107): End session couldn't be sent
+/// because the relay refused this computer's clock. The end is kept and
+/// sent again (as with [`END_NOT_SENT_NOTICE`]), so the session may still
+/// be open meanwhile.
+pub fn end_clock_notice(offset: Option<i64>) -> String {
+    format!(
+        "{} Until then this desktop can't end the session, so it may still be open. It keeps trying while it runs; you can also end it on your phone.",
+        clock_notice(offset)
+    )
+}
 /// NEW TEXT (owner approval needed): the ordering rule (§6.8 "Ending")
 /// holds the request back.
 pub const END_PENDING_NOTICE: &str = "Your vault hasn't confirmed this desktop's last End session yet, so it can't ask for a new one. Try again in a minute.";
@@ -469,9 +492,7 @@ pub fn access_notice(e: &AccessError, store: Option<&CredentialError>) -> String
         AccessError::Session(SessionError::Refused) => REFUSED_NOTICE.into(),
         // #107: the relay refused this computer's clock; not "couldn't
         // reach". The relay's Date is for the notice only.
-        AccessError::Session(s) if s.clock_skew().is_some() => {
-            clock_notice(s.clock_skew().flatten().map(|d| Utc::now().timestamp() - d))
-        }
+        AccessError::Session(s) if s.clock_skew().is_some() => clock_notice(clock_offset(s.clock_skew().flatten())),
         AccessError::Session(SessionError::Relay(_) | SessionError::TimedOut) => UNREACHABLE_NOTICE.into(),
         AccessError::Session(SessionError::Store(_)) => store.and_then(plain_store_notice).unwrap_or_else(|| NOT_SAVED_NOTICE.into()),
         AccessError::EndUnconfirmed => END_PENDING_NOTICE.into(),

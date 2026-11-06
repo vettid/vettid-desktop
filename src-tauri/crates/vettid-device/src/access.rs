@@ -991,7 +991,17 @@ impl Access {
             Some(n) => Builder::new().uint("seconds", u64::from(n)).finish(),
             None => "{}".into(),
         };
-        let answer = s.request(store, TYPE_REQUEST, &body, self.timeout).await?;
+        let answer = match s.request(store, TYPE_REQUEST, &body, self.timeout).await {
+            Ok(a) => a,
+            Err(e) => {
+                // #107 (lead decision a): the wait ended. A request still
+                // held in the outbox (the relay refused this computer's
+                // clock, or couldn't be reached) is dropped and reported, so
+                // no stale prompt reaches the phone once it gets through.
+                let _ = s.withdraw_held(store, TYPE_REQUEST);
+                return Err(e.into());
+            }
+        };
         // Refused while held (§3.6.3): the vault is held.
         self.learn_held_answer(&answer);
         Ok((parse_request_answer(&answer)?, answer.ts))

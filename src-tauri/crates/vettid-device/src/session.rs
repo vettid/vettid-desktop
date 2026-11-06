@@ -285,8 +285,9 @@ pub struct Session<T: Transport, C: Clock> {
     hold_until: Option<tokio::time::Instant>,
     /// The hold came only from failing to reach the relay (a connect or
     /// transport error, no `retry_after`), or from the relay refusing this
-    /// computer's clock (#107): released once a collect gets through (#86). A hold from the relay's own answer (a 5xx, a 429) is
-    /// kept, so the outbox backoff still spaces those out.
+    /// computer's clock (#107): released once a collect gets through (#86).
+    /// A hold from the relay's own answer (a 5xx, a 429) is kept, so the
+    /// outbox backoff still spaces those out.
     hold_releasable: bool,
     /// The relay refused this computer's clock (#107): `Some` after its
     /// last signed call was refused as `timestamp_stale`, with how far this
@@ -502,6 +503,25 @@ impl<T: Transport, C: Clock> Session<T, C> {
     /// expired): the caller tells the person they weren't sent.
     pub fn take_dropped(&mut self) -> Vec<String> {
         std::mem::take(&mut self.dropped)
+    }
+
+    /// Drop the outbox entries of `kind` still waiting to be sent, and
+    /// report them (as [`Session::take_dropped`] does). For a request whose
+    /// wait has ended (#107, lead decision a): sent later, it would reach
+    /// the owner as a stale prompt for something the person was told
+    /// failed. Returns how many were dropped.
+    pub fn withdraw_held(&mut self, store: &mut impl Persist, kind: &str) -> Result<usize, SessionError> {
+        let (held, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.state.outbox).into_iter().partition(|e| e.kind == kind);
+        self.state.outbox = keep;
+        if held.is_empty() {
+            return Ok(0);
+        }
+        let n = held.len();
+        for e in held {
+            self.lost(e);
+        }
+        self.save(store)?;
+        Ok(n)
     }
 
     /// Whether the relay refused this computer's clock on this session's
@@ -898,7 +918,12 @@ impl<T: Transport, C: Clock> Session<T, C> {
         let mut changed = false;
         let mut temporary = None;
         while let Some(e) = self.state.outbox.first().cloned() {
-            if now - e.created > OUTBOX_MAX_AGE || e.exp.is_some_and(|x| now > x) {
+            // #107 (review H1): stamped while this clock ran ahead, and the
+            // clock was set right since: the vault would reject its `ts`
+            // (more than 5 min in the future, §8.4) after the relay took
+            // it, so it would be lost unseen. Dropped here, and reported.
+            let from_the_future = e.created - now > MAX_CLOCK_SKEW_FUTURE;
+            if now - e.created > OUTBOX_MAX_AGE || e.exp.is_some_and(|x| now > x) || from_the_future {
                 self.state.outbox.remove(0);
                 self.lost(e);
                 changed = true;
