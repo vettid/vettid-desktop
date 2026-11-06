@@ -586,15 +586,30 @@ pub(super) mod tests {
 
     impl Swtpm {
         pub(in crate::credential) fn start() -> Swtpm {
-            let _one_at_a_time = STARTING.lock().unwrap_or_else(|e| e.into_inner());
             let state = tempfile::tempdir().unwrap();
+            let (child, port) = Self::spawn(state.path());
+            Swtpm { child, port, _state: state }
+        }
+
+        /// A power cycle (#13): this swtpm stopped and started again on
+        /// the same state (its seeds and persistent objects), on new ports.
+        fn restart(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let (child, port) = Self::spawn(self._state.path());
+            self.child = child;
+            self.port = port;
+        }
+
+        fn spawn(state: &std::path::Path) -> (Child, u16) {
+            let _one_at_a_time = STARTING.lock().unwrap_or_else(|e| e.into_inner());
             for _ in 0..5 {
                 let port = free_port_pair();
                 let mut child = Command::new("swtpm")
                     .args(["socket", "--tpm2"])
                     .args(["--server", &format!("type=tcp,port={port}")])
                     .args(["--ctrl", &format!("type=tcp,port={}", port + 1)])
-                    .args(["--tpmstate", &format!("dir={}", state.path().display())])
+                    .args(["--tpmstate", &format!("dir={}", state.display())])
                     .args(["--flags", "not-need-init,startup-clear"])
                     .spawn()
                     .expect("swtpm (apt install swtpm)");
@@ -614,7 +629,7 @@ pub(super) mod tests {
                 // swtpm's, not another's.
                 std::thread::sleep(Duration::from_millis(100));
                 if up && matches!(child.try_wait(), Ok(None)) {
-                    return Swtpm { child, port, _state: state };
+                    return (child, port);
                 }
                 let _ = child.kill();
                 let _ = child.wait();
@@ -756,6 +771,84 @@ pub(super) mod tests {
             other => panic!("expected won't open, got {:?}", other.map(|_| "a key")),
         }
         assert_eq!(*first.protector().unwrap(&wrapped).unwrap(), key(5), "it still opens where it was sealed");
+    }
+
+    /// Make the template primary persistent at the SRK handle, as
+    /// provisioning tools do.
+    fn persist_srk(tpm: &Swtpm) {
+        use tss_esapi::interface_types::dynamic_handles::Persistent;
+        use tss_esapi::interface_types::resource_handles::Provision;
+        let mut ctx = tpm.context();
+        let primary = Tpm::template_primary(&mut ctx).unwrap();
+        let handle = PersistentTpmHandle::new(SRK_HANDLE).unwrap();
+        ctx.execute_with_nullauth_session(|c| c.evict_control(Provision::Owner, primary.into(), Persistent::Persistent(handle))).unwrap();
+    }
+
+    fn wont_open(p: &Tpm, wrapped: &[u8], what: &str) {
+        match p.unwrap(wrapped) {
+            Err(ProtectorError::WontOpen(_)) | Err(ProtectorError::Failing { .. }) => {}
+            other => panic!("{what}: expected a refusal, got {:?}", other.map(|_| "a key")),
+        }
+    }
+
+    /// #13: a power cycle (the same TPM state, restarted) changes nothing:
+    /// keys sealed under the template primary and under the persistent SRK
+    /// both open again.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it"]
+    fn tpm_a_power_cycle_reopens() {
+        let mut tpm = Swtpm::start();
+        let under_template = tpm.protector().wrap(&key(10)).unwrap();
+        persist_srk(&tpm);
+        let under_srk = tpm.protector().wrap(&key(11)).unwrap();
+        assert_eq!((under_template[1], under_srk[1]), (PARENT_TEMPLATE, PARENT_PERSISTENT));
+        tpm.restart();
+        let p = tpm.protector();
+        assert_eq!(p.availability(), Availability::Present);
+        assert_eq!(*p.unwrap(&under_template).unwrap(), key(10));
+        assert_eq!(*p.unwrap(&under_srk).unwrap(), key(11));
+    }
+
+    /// #13: the persistent SRK evicted after the seal, and nothing put in
+    /// its place: the key sealed under it is refused. It never falls back
+    /// to the template primary, and the TPM is still present, not absent.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it"]
+    fn tpm_a_gone_srk_wont_open() {
+        use tss_esapi::interface_types::dynamic_handles::Persistent;
+        use tss_esapi::interface_types::resource_handles::Provision;
+        let tpm = Swtpm::start();
+        persist_srk(&tpm);
+        let p = tpm.protector();
+        let wrapped = p.wrap(&key(12)).unwrap();
+        assert_eq!(wrapped[1], PARENT_PERSISTENT);
+        let handle = PersistentTpmHandle::new(SRK_HANDLE).unwrap();
+        let mut ctx = tpm.context();
+        let srk = ctx.execute_without_session(|c| c.tr_from_tpm_public(TpmHandle::Persistent(handle))).unwrap();
+        ctx.execute_with_nullauth_session(|c| c.evict_control(Provision::Owner, srk, Persistent::Persistent(handle))).unwrap();
+        drop(ctx);
+        assert_eq!(p.availability(), Availability::Present);
+        wont_open(&p, &wrapped, "SRK gone");
+    }
+
+    /// #13: the TPM cleared (TPM2_Clear: a new owner seed) after the seals:
+    /// keys sealed under either parent are refused, and the TPM is present,
+    /// so this is a load failure (the person re-pairs), never "absent".
+    #[test]
+    #[ignore = "needs swtpm; CI runs it"]
+    fn tpm_a_cleared_tpm_wont_open() {
+        use tss_esapi::handles::AuthHandle;
+        let tpm = Swtpm::start();
+        let under_template = tpm.protector().wrap(&key(13)).unwrap();
+        persist_srk(&tpm);
+        let under_srk = tpm.protector().wrap(&key(14)).unwrap();
+        let mut ctx = tpm.context();
+        ctx.execute_with_nullauth_session(|c| c.clear(AuthHandle::Lockout)).unwrap();
+        drop(ctx);
+        let p = tpm.protector();
+        assert_eq!(p.availability(), Availability::Present);
+        wont_open(&p, &under_template, "cleared, template");
+        wont_open(&p, &under_srk, "cleared, persistent");
     }
 
     /// An owner hierarchy with an auth value set: the TPM is there, so that
