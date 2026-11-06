@@ -11,6 +11,7 @@ on:
     paths:
       - "src-tauri/**"
       - ".cargo/**"
+      - "scripts/windows/check-no-vcruntime.ps1"
       - ".github/workflows/windows.yml"
 
 permissions:
@@ -73,13 +74,5 @@ jobs:
         run: |
           cargo build --manifest-path src-tauri/Cargo.toml --locked
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $exe = 'src-tauri/target/debug/vettid-desktop.exe'
-          # DLL names in the import tables are ASCII. MSVCP is the C++ runtime,
-          # which a C++ dependency built with /MD would bring in.
-          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
-          $found = @([regex]::Matches($text, '(?i)(vcruntime|msvcp)\d+[_\w]*\.dll') | ForEach-Object Value | Sort-Object -Unique)
-          if ($found.Count -gt 0) {
-            Write-Output "::error::$exe imports $($found -join ', '): it would not start on a PC without the Visual C++ runtime (#112)"
-            exit 1
-          }
-          Write-Output "$exe imports no VCRUNTIME or MSVCP DLL"
+          ./scripts/windows/check-no-vcruntime.ps1 src-tauri/target/debug/vettid-desktop.exe
+          exit $LASTEXITCODE

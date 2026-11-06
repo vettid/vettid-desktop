@@ -3,8 +3,10 @@
 # PC without the Visual C++ runtime it doesn't start: the app doesn't open and
 # the uninstaller's wipe can't run (exit 2, event 1001, the pairing kept).
 # tauri-build reads this in its "msvc" arm (static_vcruntime, for debug
-# builds too); other targets ignore it. Here, not in a workflow, so every
-# build from this repo gets it: local, CI and release.
+# builds too); other targets ignore it. src-tauri/build.rs sets it as well,
+# because cargo finds this file from the current directory only.
+# Servicing: Windows Update doesn't patch a static VC runtime. Release builds
+# need a current MSVC toolset (docs/WINDOWS-TESTING.md, "Build").
 [env]
 # force: a STATIC_VCRUNTIME already in the environment can't turn it off.
 STATIC_VCRUNTIME = { value = "true", force = true }
