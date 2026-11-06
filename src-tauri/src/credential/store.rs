@@ -995,39 +995,64 @@ mod wipe_marker {
     fn write_at(path: &Path, w: &Wiping) -> std::io::Result<()> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let open_existing = std::fs::OpenOptions::new().read(true).custom_flags(UNTRUSTED_OPEN).open(path);
-        let existing_ours = match &open_existing {
-            Ok(f) => ours(f),
-            Err(_) => false,
-        };
-        let exists = !matches!(&open_existing, Err(e) if e.kind() == std::io::ErrorKind::NotFound);
-        drop(open_existing);
-        if exists && !existing_ours {
-            match std::fs::remove_file(path) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-                _ => {}
+        // One handle, opened read-write without following a symlink or
+        // blocking, checked with `ours`, and only then emptied and written
+        // (round-4 review): the file checked is the file written.
+        let existing = std::fs::OpenOptions::new().read(true).write(true).custom_flags(UNTRUSTED_OPEN).open(path);
+        let mut f = match existing {
+            Ok(f) if ours(&f) => {
+                f.set_len(0)?;
+                f
             }
-        }
-        // A marker of ours is rewritten in place; otherwise a new file is
-        // made with O_EXCL (lead review), so nothing raced into place
-        // meanwhile is ever truncated or written: the create fails instead.
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).mode(0o600).custom_flags(UNTRUSTED_OPEN);
-        if existing_ours {
-            opts.truncate(true);
-        } else {
-            opts.create_new(true);
-        }
-        let mut f = opts.open(path)?;
-        if !ours(&f) {
-            return Err(std::io::Error::other("the marker isn't this user's own file"));
-        }
+            other => {
+                // Not ours (a FIFO, another user's file, a hard link, a
+                // symlink, one others can write), or absent: whatever is
+                // there is removed, and a new file is made with O_EXCL, so
+                // nothing raced into place meanwhile is ever written: the
+                // create fails instead.
+                let exists = !matches!(&other, Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+                drop(other);
+                if exists {
+                    match std::fs::remove_file(path) {
+                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                        _ => {}
+                    }
+                }
+                create_marker(path)?
+            }
+        };
         f.write_all(encode(w).as_bytes())?;
         f.sync_all()?;
         if let Some(parent) = path.parent() {
             std::fs::File::open(parent)?.sync_all()?;
         }
         Ok(())
+    }
+
+    /// A new marker file: `O_EXCL` (`create_new`), so it fails with
+    /// `AlreadyExists` rather than opening anything already at `path`;
+    /// `0600`, no symlink followed, never blocking; checked with `ours`.
+    #[cfg(unix)]
+    fn create_marker(path: &Path) -> std::io::Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(UNTRUSTED_OPEN).open(path)?;
+        if !ours(&f) {
+            return Err(std::io::Error::other("the marker isn't this user's own file"));
+        }
+        Ok(f)
+    }
+
+    /// Round-4 review: a new marker is never made over something already
+    /// there (a file raced into place keeps its bytes, and the create fails).
+    #[cfg(all(unix, test))]
+    #[test]
+    fn a_new_marker_never_opens_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.wipe-pending");
+        std::fs::write(&path, b"someone else's").unwrap();
+        let e = create_marker(&path).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"someone else's");
     }
 
     /// Both places; an error if either is still there.
@@ -2104,6 +2129,31 @@ pub(crate) mod tests {
         assert_eq!(first, unknown);
         assert_eq!(mode, 0o700, "made private");
         assert_eq!(second, unknown, "still not trusted after the repair");
+    }
+
+    /// Round-4 review: a marker that passes every check of `ours` (0600,
+    /// one link, this user's, saying "secret-service") but sat in a folder
+    /// open to others (so someone could have renamed it into place) reads
+    /// as "nothing known" after the repair too: the repair resets it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_genuine_looking_marker_in_an_open_folder_is_reset() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = tempfile::tempdir().unwrap();
+        let shared = state.path().join("vettid-desktop-wipe");
+        fs::create_dir(&shared).unwrap();
+        wipe_marker::set_fallback_for_tests(Some(state.path().to_path_buf()));
+        let dir = Path::new("/nonexistent-parent-for-test/vettid-desktop");
+        let marker = wipe_marker::fallback_path_for_tests(dir).unwrap();
+        fs::write(&marker, "vettid-desktop-wipe-v1\nsecret-service\n0\n").unwrap();
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
+        let first = wipe_marker::read(dir);
+        let second = wipe_marker::read(dir);
+        wipe_marker::set_fallback_for_tests(None);
+        let unknown = Some(super::super::protector::Wiping::unknown());
+        assert_eq!(first, unknown);
+        assert_eq!(second, unknown, "reset by the repair, not trusted on the second read");
     }
 
     /// #13 (lead review): a FIFO where the marker goes neither hangs a read
