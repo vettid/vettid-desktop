@@ -833,6 +833,24 @@ mod wipe_marker {
         Ok(())
     }
 
+    /// `dir` made `0700` through a handle opened without following a
+    /// symlink (`O_DIRECTORY|O_NOFOLLOW`), checked on that handle (a folder,
+    /// this user's) and changed with `fchmod`: no path is followed between
+    /// the check and the change. False if it isn't this user's folder.
+    #[cfg(unix)]
+    fn make_private(dir: &Path) -> std::io::Result<bool> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(dir)?;
+        let m = f.metadata()?;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        if !m.file_type().is_dir() || m.uid() != me {
+            return Ok(false);
+        }
+        f.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        Ok(true)
+    }
+
     /// The fallback marker, if any (review: read only from a private
     /// folder). A folder that's there but not private gives "nothing known",
     /// so the sweep stays full: a marker someone else could have written
@@ -844,24 +862,18 @@ mod wipe_marker {
         match std::fs::symlink_metadata(dir) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => Some(Wiping::unknown()),
-            Ok(m) => match private_folder(dir) {
+            Ok(_) => match private_folder(dir) {
                 Ok(()) => read_at(&path),
                 Err(_) => {
                     // Lead review (Opus L1): a folder of ours left open to
                     // others is made private again, so later log-outs can
                     // trust what this build writes there. What is in it now
-                    // may not be ours: "nothing known" this time, and the
-                    // wipe that follows rewrites the marker.
-                    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-                    // SAFETY: geteuid has no preconditions.
-                    let me = unsafe { libc::geteuid() };
-                    if m.file_type().is_dir() && m.uid() == me {
-                        match std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
-                            Ok(()) => log::warn!("Credential store: the wipe marker's fallback folder was open to others; made private"),
-                            Err(e) => log::warn!("Credential store: the wipe marker's fallback folder is open to others and couldn't be made private: {e}"),
-                        }
-                    } else {
-                        log::warn!("Credential store: the wipe marker's fallback folder isn't this user's private folder; not used");
+                    // may not be ours: "nothing known" this time, and a file
+                    // that isn't ours is never trusted later either (`ours`).
+                    match make_private(dir) {
+                        Ok(true) => log::warn!("Credential store: the wipe marker's fallback folder was open to others; made private"),
+                        Ok(false) => log::warn!("Credential store: the wipe marker's fallback folder isn't this user's folder; not used"),
+                        Err(e) => log::warn!("Credential store: the wipe marker's fallback folder is open to others and couldn't be made private: {e}"),
                     }
                     Some(Wiping::unknown())
                 }
@@ -899,11 +911,27 @@ mod wipe_marker {
         }
     }
 
+    /// A marker this build could have written: an open file (checked on the
+    /// handle, not the path) that is a regular file, this user's, with one
+    /// link (lead review: never a FIFO, a device, a hard link or another
+    /// user's file, whatever a folder once open to others holds).
+    #[cfg(unix)]
+    fn ours(f: &std::fs::File) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        f.metadata().is_ok_and(|m| m.file_type().is_file() && m.uid() == me && m.nlink() == 1)
+    }
+
+    /// Opened without following a symlink and without blocking (a FIFO
+    /// can't hang the wipe under the writer lock), then checked with
+    /// [`ours`]; anything else is "nothing known", so the sweep stays full.
     #[cfg(unix)]
     fn read_at(path: &Path) -> Option<Wiping> {
         use std::io::Read;
         use std::os::unix::fs::OpenOptionsExt;
-        match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path) {
+        match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path) {
+            Ok(f) if !ours(&f) => Some(Wiping::unknown()),
             Ok(f) => {
                 let mut text = String::new();
                 Some(match f.take(256).read_to_string(&mut text) {
@@ -939,17 +967,36 @@ mod wipe_marker {
         }
     }
 
+    /// Something at `path` that isn't [`ours`] (a FIFO, another user's
+    /// file, a hard link, a symlink) is removed first; then the marker is
+    /// created without following a symlink or blocking, and checked again on
+    /// its handle before it is written (lead review).
     #[cfg(unix)]
     fn write_at(path: &Path, w: &Wiping) -> std::io::Result<()> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+        let open_existing = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path);
+        let foreign = match &open_existing {
+            Ok(f) => !ours(f),
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        };
+        drop(open_existing);
+        if foreign {
+            match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?;
+        if !ours(&f) {
+            return Err(std::io::Error::other("the marker isn't this user's own file"));
+        }
         f.write_all(encode(w).as_bytes())?;
         f.sync_all()?;
         if let Some(parent) = path.parent() {
@@ -2019,9 +2066,50 @@ pub(crate) mod tests {
         wipe_marker::set_fallback_for_tests(Some(state.path().to_path_buf()));
         let forged = wipe_marker::fallback_path_for_tests(&dir).unwrap();
         fs::write(&forged, "vettid-desktop-wipe-v1\ntpm\n0\n").unwrap();
-        let read = wipe_marker::read(&dir);
+        // Another user's file can't be made without root: a second link to
+        // it stands in for "not this build's own file".
+        fs::hard_link(&forged, state.path().join("elsewhere")).unwrap();
+        let first = wipe_marker::read(&dir);
+        let mode = fs::metadata(&shared).unwrap().permissions().mode() & 0o777;
+        // After the repair the folder is private, but the planted file is
+        // still not trusted (lead review M1): read twice.
+        let second = wipe_marker::read(&dir);
+        wipe_marker::set_fallback_for_tests(None);
+        let unknown = Some(super::super::protector::Wiping::unknown());
+        assert_eq!(first, unknown);
+        assert_eq!(mode, 0o700, "made private");
+        assert_eq!(second, unknown, "still not trusted after the repair");
+    }
+
+    /// #13 (lead review): a FIFO where the marker goes neither hangs a read
+    /// nor a write (`O_NONBLOCK`), reads as "nothing known", and is replaced
+    /// by a real marker when one is written.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_planted_fifo_marker_doesnt_hang_and_isnt_trusted() {
+        let state = tempfile::tempdir().unwrap();
+        wipe_marker::set_fallback_for_tests(Some(state.path().to_path_buf()));
+        let dir = Path::new("/nonexistent-parent-for-test/vettid-desktop");
+        let fifo = wipe_marker::fallback_path_for_tests(dir).unwrap();
+        fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(fifo.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo has no other preconditions.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let read = wipe_marker::read(dir);
+        // The marker can't go next to a folder whose parent doesn't exist,
+        // so it goes to the fallback place, replacing the FIFO.
+        let written = wipe_marker::write(dir, &super::super::protector::Wiping { sealed_by: Some("secret-service".into()), legacy: false });
+        let after = wipe_marker::read(dir);
+        let is_file = fs::symlink_metadata(&fifo).map(|m| m.file_type().is_file()).unwrap_or(false);
         wipe_marker::set_fallback_for_tests(None);
         assert_eq!(read, Some(super::super::protector::Wiping::unknown()));
+        assert!(written.is_ok(), "{written:?}");
+        assert!(is_file);
+        assert_eq!(after.and_then(|w| w.sealed_by).as_deref(), Some("secret-service"));
     }
 
     /// #13 (review M1): retiring an earlier build's `connection.enc` when no
