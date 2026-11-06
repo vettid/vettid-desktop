@@ -93,7 +93,13 @@ if [[ "$CALLS" -eq 1 ]]; then
 fi
 echo "==> Building the app"
 if [[ "$DRY" -eq 0 ]]; then
-    env -u APPLE_SIGNING_IDENTITY -u APPLE_CERTIFICATE -u APPLE_CERTIFICATE_PASSWORD "${build[@]}"
+    if ! env -u APPLE_SIGNING_IDENTITY -u APPLE_CERTIFICATE -u APPLE_CERTIFICATE_PASSWORD "${build[@]}"; then
+        echo "ERROR: the build failed. If rustc said \"can't find crate for\" a *_derive or macro crate, a" >&2
+        echo "       proc-macro was linked with a mis-aligned string table: check that .cargo/config.toml's" >&2
+        echo "       aarch64-apple-darwin linker (scripts/macos-cc) is in use, and remove the target" >&2
+        echo "       directory's release/ folder before trying again (docs/MACOS-RELEASE.md)." >&2
+        exit 1
+    fi
 else
     echo "+ ${build[*]}"
 fi
