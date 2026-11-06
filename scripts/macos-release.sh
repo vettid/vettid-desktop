@@ -16,6 +16,9 @@
 #                             by name or by the 40-hex SHA-1 of the certificate
 #                             (use the SHA-1 when a renewed certificate sits
 #                             beside the old one: `security find-identity -v -p codesigning`)
+#   VETTID_TEAM_ID            the team the signature must carry (checked by the
+#                             verification). Derived from the "(TEAMID)" of a
+#                             name identity; required with a SHA-1 identity
 #   VETTID_NOTARY_PROFILE     notarytool keychain profile (default: vettid-notary)
 #   VETTID_PROVISION_PROFILE  optional path to a provisioning profile; embedded
 #                             as Contents/embedded.provisionprofile before
@@ -59,6 +62,15 @@ if [[ "$IDENTITY" != "-" && "$IDENTITY" != Developer\ ID\ Application:* && ! "$I
     echo "ERROR: APPLE_SIGNING_IDENTITY must be a \"Developer ID Application: ...\" name or a 40-hex SHA-1." >&2
     exit 1
 fi
+# The team the signature must carry: VETTID_TEAM_ID, else the "(TEAMID)" of a
+# Developer ID name. A SHA-1 identity names no team.
+TEAM="${VETTID_TEAM_ID:-}"
+if [[ -z "$TEAM" && "$IDENTITY" =~ \(([A-Z0-9]{10})\)$ ]]; then TEAM="${BASH_REMATCH[1]}"; fi
+if [[ "$IDENTITY" != "-" && -z "$TEAM" ]]; then
+    echo "ERROR: with a SHA-1 identity, VETTID_TEAM_ID (the 10-character team) is required." >&2
+    exit 1
+fi
+export VETTID_TEAM_ID="$TEAM"
 if [[ -n "$PROVISION" && ! -f "$PROVISION" ]]; then
     echo "ERROR: VETTID_PROVISION_PROFILE does not name a file." >&2
     exit 1
@@ -155,8 +167,12 @@ except Exception: print("")' "$1"; }
     subid="$(field id)"
     echo "notarization: $status (submission $subid)"
     if [[ "$status" != "Accepted" ]]; then
-        echo "ERROR: not accepted. See why with:" >&2
-        echo "  xcrun notarytool log $subid --keychain-profile \"$PROFILE\"" >&2
+        if [[ -z "$subid" ]]; then
+            echo "ERROR: no submission was made (see the notarytool output above)." >&2
+        else
+            echo "ERROR: not accepted. See why with:" >&2
+            echo "  xcrun notarytool log $subid --keychain-profile \"$PROFILE\"" >&2
+        fi
         exit 1
     fi
 else

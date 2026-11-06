@@ -28,6 +28,12 @@ notarizes but does not re-sign: the signature a member installs is VettID's.
    ambiguous: use the certificate's 40-hex SHA-1 instead
    (`security find-identity -v -p codesigning`).
 
+The verification pins the signing team: the app's and the DMG's
+`TeamIdentifier` must equal `VETTID_TEAM_ID` (never committed). The release
+script derives it from the "(TEAMID)" in a name identity. With a SHA-1
+identity, set it yourself: `export VETTID_TEAM_ID=<10 characters>`. The full
+`macos-verify.sh` fails without it; `--adhoc` skips the check.
+
 ## Release
 
 ```bash
@@ -70,7 +76,8 @@ or bundle and sign the library.
 ## Entitlements
 
 `src-tauri/entitlements.plist` is the one list: the signing uses it and the
-verification compares against it. Each entry has its reason in the file.
+verification compares against it. Each entry has its reason in the file. The camera entitlement and
+`NSCameraUsageDescription` are not there: they come back with camera capture.
 Adding one is a one-line change there.
 
 ## Later: the Keychain protector (`keychain-access-groups`)

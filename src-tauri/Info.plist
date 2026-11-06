@@ -2,8 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>NSCameraUsageDescription</key>
-	<string>VettID uses your camera for video calls with your connections.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>VettID uses your microphone for voice and video calls with your connections.</string>
 	<key>LSUIElement</key>

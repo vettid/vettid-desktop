@@ -13,6 +13,10 @@
 #   stamps only the DMG); the app inside is not, and `spctl --type execute`
 #   on it finds its ticket online. A bare .app is checked for its own staple.
 #
+#   The team: the app's and the DMG's TeamIdentifier must equal
+#   $VETTID_TEAM_ID (not committed; scripts/macos-release.sh derives it
+#   from the identity). The full check fails when it is not set.
+#
 #   --adhoc   for an ad-hoc signed build (CI): skips the Developer ID,
 #             Gatekeeper and staple checks; all the others still run.
 set -euo pipefail
@@ -35,6 +39,17 @@ ok()  { echo "ok    $*"; }
 bad() { echo "FAIL  $*"; fail=1; }
 check() { local what="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$what"; else bad "$what"; fi; }
 
+TEAM="${VETTID_TEAM_ID:-}"
+if [[ "$ADHOC" -eq 0 && -z "$TEAM" ]]; then
+    echo "FAIL  VETTID_TEAM_ID is not set: the full check pins the signing team" >&2
+    exit 1
+fi
+team_check() {
+    local what="$1" path="$2" got
+    got="$(codesign -dvv "$path" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+    if [[ "$got" == "$TEAM" ]]; then ok "$what team is the expected one"; else bad "$what TeamIdentifier is not the expected team"; fi
+}
+
 mnt=""; actual=""; ISDMG=0
 cleanup() {
     if [[ -n "$mnt" ]]; then hdiutil detach -quiet "$mnt" 2>/dev/null || true; rmdir "$mnt" 2>/dev/null || true; fi
@@ -46,6 +61,7 @@ APP="$TARGET"
 if [[ "$TARGET" == *.dmg ]]; then
     ISDMG=1
     check "dmg signature" codesign --verify --strict "$TARGET"
+    if [[ "$ADHOC" -eq 0 ]]; then team_check "dmg" "$TARGET"; fi
     if [[ "$ADHOC" -eq 0 ]]; then
         check "dmg Gatekeeper (spctl --type open)" spctl --assess --type open --context context:primary-signature "$TARGET"
         check "dmg stapled" xcrun stapler validate "$TARGET"
@@ -62,6 +78,7 @@ info="$(codesign -dvv "$APP" 2>&1 || true)"
 if grep -E '^CodeDirectory .*flags=.*\(.*runtime' <<< "$info" >/dev/null; then ok "hardened runtime"; else bad "hardened runtime flag missing"; fi
 
 if [[ "$ADHOC" -eq 0 ]]; then
+    team_check "app" "$APP"
     if grep -q '^Authority=Developer ID Application:' <<< "$info"; then ok "Developer ID authority"; else bad "no Developer ID Application authority"; fi
     check "app Gatekeeper (spctl --type execute)" spctl --assess --type execute "$APP"
     if [[ "$ISDMG" -eq 0 ]]; then check "app stapled" xcrun stapler validate "$APP"; fi
@@ -97,8 +114,26 @@ done < <(find "$APP/Contents" -type f -print0)
 if [[ "$arch_bad" -eq 0 ]]; then ok "arm64 only"; else bad "not arm64 only"; fi
 
 # Linked libraries of every Mach-O: system paths, or inside the bundle. An
-# @rpath entry must resolve through an LC_RPATH inside the bundle to a library
-# that exists under Contents/Frameworks.
+# @executable_path or @loader_path path is resolved (the first against
+# Contents/MacOS, the second against the Mach-O's own directory) and must
+# stay inside the app and exist. An @rpath entry must resolve through an
+# LC_RPATH of the same kind to a library under Contents/Frameworks.
+resolve() {  # resolve <mach-o> <path>: prints ok | escapes | missing
+    python3 -I - "$APP" "$1" "$2" <<'PY'
+import os, sys
+app, f, p = (os.path.realpath(sys.argv[1]), sys.argv[2], sys.argv[3])
+if p.startswith('@executable_path/'):
+    base, rest = os.path.join(app, 'Contents', 'MacOS'), p[len('@executable_path/'):]
+elif p.startswith('@loader_path/'):
+    base, rest = os.path.dirname(os.path.realpath(f)), p[len('@loader_path/'):]
+else:
+    print('escapes'); sys.exit()
+r = os.path.realpath(os.path.join(base, rest))
+if r != app and not r.startswith(app + os.sep): print('escapes')
+elif not os.path.exists(r): print('missing')
+else: print('ok')
+PY
+}
 dyl_bad=0
 while IFS= read -r -d '' f; do
     file "$f" | grep -q 'Mach-O' || continue
@@ -106,13 +141,18 @@ while IFS= read -r -d '' f; do
     while IFS= read -r rp; do
         [[ -z "$rp" ]] && continue
         case "$rp" in
-            @executable_path/*|@loader_path/*) ;;
+            @executable_path/*|@loader_path/*)
+                # the directory itself may be missing in a bundle without Frameworks
+                if [[ "$(resolve "$f" "$rp")" == escapes ]]; then echo "        $f: rpath leaves the bundle: $rp"; dyl_bad=1; fi ;;
             *) echo "        $f: rpath outside the bundle: $rp"; dyl_bad=1 ;;
         esac
     done <<< "$rpaths"
     while IFS= read -r lib; do
         case "$lib" in
-            /usr/lib/*|/System/*|@executable_path/*|@loader_path/*) ;;
+            /usr/lib/*|/System/*) ;;
+            @executable_path/*|@loader_path/*)
+                r="$(resolve "$f" "$lib")"
+                if [[ "$r" != ok ]]; then echo "        $f: $lib ($r)"; dyl_bad=1; fi ;;
             @rpath/*)
                 if [[ ! -e "$APP/Contents/Frameworks/${lib#@rpath/}" ]]; then
                     echo "        $f: $lib is not under Contents/Frameworks"; dyl_bad=1

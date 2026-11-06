@@ -223,7 +223,7 @@ jobs:
         with:
           workspaces: src-tauri
       - name: tauri CLI
-        run: command -v cargo-tauri || cargo install tauri-cli --version '^2' --locked
+        run: command -v cargo-tauri || cargo install tauri-cli --version '=2.10.1' --locked
       - run: npm ci
       - name: build, ad-hoc sign, make the DMG, verify (the DMG and the app in it)
         env:

@@ -479,7 +479,7 @@ Update `tauri.conf.json` `bundle` section:
 
 #### 9.3 Info.plist additions
 Tauri generates the Info.plist at build time. Required keys (declared via `bundle.macOS.infoPlist`):
-- `NSCameraUsageDescription` — "VettID uses your camera for video calls."
+- `NSCameraUsageDescription` — "VettID uses your camera for video calls." (added with camera capture; not yet)
 - `NSMicrophoneUsageDescription` — "VettID uses your microphone for voice and video calls."
 - `NSScreenCaptureUsageDescription` — add with screen sharing, which is deferred (not in the code yet)
 - `LSMinimumSystemVersion` — `"12.0"`
@@ -492,7 +492,7 @@ Create `src-tauri/entitlements.plist`:
 - Hardened Runtime entitlements (required for notarization):
   - No JIT or unsigned-memory entitlement: WKWebView's JIT runs in Apple's own WebContent process
   - `com.apple.security.device.audio-input`: `true`
-  - `com.apple.security.device.camera`: `true`
+  - `com.apple.security.device.camera`: `true` (added with camera capture; not yet)
   - `com.apple.security.network.client`: `true`
 
 #### 9.5 Single-arch build (Apple Silicon)

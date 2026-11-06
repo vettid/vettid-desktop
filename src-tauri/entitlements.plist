@@ -7,7 +7,8 @@
 	the signed app against THIS file and fails on any difference, so it is
 	the one place to add or remove an entitlement.
 
-	Not granted, on purpose: network.client (it matters only under the App
+	Not granted, on purpose: device.camera (camera capture is deferred, src/webrtc/mod.rs;
+	it comes back with it), network.client (it matters only under the App
 	Sandbox, which is off; outgoing connections need nothing under the hardened
 	runtime), allow-jit, allow-unsigned-executable-memory,
 	allow-dyld-environment-variables, disable-library-validation (WKWebView
@@ -19,9 +20,6 @@
 	-->
 	<!-- The microphone of the calls (cpal, behind the webrtc feature). -->
 	<key>com.apple.security.device.audio-input</key>
-	<true/>
-	<!-- Video calls (camera capture is still to come, see src/webrtc/mod.rs). -->
-	<key>com.apple.security.device.camera</key>
 	<true/>
 </dict>
 </plist>
