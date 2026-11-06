@@ -106,7 +106,7 @@ echo "==> Signing the app"
 if [[ "$DRY" -eq 0 ]]; then
     # Frameworks, nested apps and several executables need bundle signing,
     # deepest first. The app has none today; refuse rather than sign them wrongly.
-    nested="$(find "$APP/Contents" \( -name '*.framework' -o -name '*.app' -o -name '*.xpc' \) -prune -print | head -3)"
+    nested="$(find "$APP/Contents" \( -name '*.framework' -o -name '*.app' -o -name '*.xpc' \) -prune -print -quit)"
     nmain="$(find "$APP/Contents/MacOS" -type f | wc -l | tr -d ' ')"
     if [[ -n "$nested" || "$nmain" -ne 1 ]]; then
         echo "ERROR: the bundle has a framework, nested app, XPC service or more than one executable in Contents/MacOS;" >&2
@@ -146,9 +146,13 @@ if [[ "$SIGN_ONLY" -eq 1 ]]; then
 fi
 echo "==> Notarizing (profile: $PROFILE)"
 if [[ "$DRY" -eq 0 ]]; then
-    result="$(xcrun notarytool submit "$DMG" --keychain-profile "$PROFILE" --wait --output-format json)"
-    status="$(printf '%s' "$result" | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')"
-    subid="$(printf '%s' "$result" | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')"
+    # An Invalid result or a network error exits non-zero: carry on to the status check, which says what to do.
+    result="$(xcrun notarytool submit "$DMG" --keychain-profile "$PROFILE" --wait --output-format json)" || true
+    field() { printf '%s' "$result" | python3 -I -c 'import json,sys
+try: print(json.load(sys.stdin).get(sys.argv[1], ""))
+except Exception: print("")' "$1"; }
+    status="$(field status)"
+    subid="$(field id)"
     echo "notarization: $status (submission $subid)"
     if [[ "$status" != "Accepted" ]]; then
         echo "ERROR: not accepted. See why with:" >&2
