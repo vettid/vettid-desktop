@@ -225,6 +225,9 @@ jobs:
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           workspaces: src-tauri
+          # Bumped with the aarch64-apple-darwin linker (.cargo/config.toml), so that no
+          # proc-macro linked before it is reused.
+          prefix-key: v1-macos-linker
       - name: tauri CLI
         run: command -v cargo-tauri || cargo install tauri-cli --version '=2.10.1' --locked
       - run: npm ci

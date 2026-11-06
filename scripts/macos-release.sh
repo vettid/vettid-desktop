@@ -150,6 +150,9 @@ if [[ "$DRY" -eq 0 ]]; then
     ditto "$APP" "$stage/$(basename "$APP")"
     ln -s /Applications "$stage/Applications"
     hdiutil create -quiet -volname "VettID Desktop" -srcfolder "$stage" -format UDZO -fs HFS+ "$DMG"
+    # The commit the DMG was built from, and whether the tree had changes then
+    # (scripts/macos-publish.sh tags that commit and refuses a dirty build).
+    { git rev-parse HEAD; git diff --quiet HEAD && echo clean || echo dirty; } > "$DMG.commit"
 else
     echo "+ hdiutil create ... \"$DMG\""
 fi
