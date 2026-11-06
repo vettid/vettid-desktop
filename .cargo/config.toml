@@ -10,3 +10,17 @@
 [env]
 # force: a STATIC_VCRUNTIME already in the environment can't turn it off.
 STATIC_VCRUNTIME = { value = "true", force = true }
+
+# macOS (Apple silicon): link without chained fixups. With a deployment target of
+# 12.0 or later (Tauri sets it from bundle.macOS.minimumSystemVersion), the linker
+# of Xcode 27.0 (ld-27037.1, and the Command Line Tools' ld-27106.1) can place the
+# string table of a dylib at an offset that isn't 8-byte aligned, depending on the
+# lengths of the build paths. macOS then refuses to load it ("mis-aligned LINKEDIT
+# string pool"), so rustc can't load the proc-macros it just built (E0463 "can't
+# find crate for zeroize_derive"). Without chained fixups the linker writes the
+# older, aligned layout; macOS 12 and later load both. A linker wrapper, not
+# rustflags: with --target, target rustflags don't reach the proc-macros and build
+# scripts, but the target's linker does (the host is the same triple). Drop it once
+# a fixed Xcode is the oldest one in use (docs/MACOS-RELEASE.md).
+[target.aarch64-apple-darwin]
+linker = "scripts/macos-cc"

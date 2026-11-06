@@ -1,0 +1,5 @@
+#!/bin/sh
+# The linker for aarch64-apple-darwin (.cargo/config.toml): the system's cc,
+# without chained fixups, around the Xcode 27 linker's mis-aligned string table.
+# Named without an "ld" suffix, so that rustc drives it as a C compiler.
+exec cc -Wl,-no_fixup_chains "$@"
