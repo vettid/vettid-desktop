@@ -769,6 +769,11 @@ mod wipe_marker {
     /// or `~/.local/state`, then `vettid-desktop-wipe/`, a folder made
     /// `0700`. Tests use none unless they set one ([`set_fallback_for_tests`]),
     /// so they never write to the developer's real state folder.
+    ///
+    /// The place follows the environment at launch: a later launch with
+    /// another `XDG_STATE_HOME` won't see a marker left here. Then a key
+    /// left in the Secret Service (whose file is already gone) is skipped
+    /// only if the keyring is locked; accepted, as the rarer case.
     #[cfg(unix)]
     fn fallback_path(config_dir: &Path) -> Option<PathBuf> {
         #[cfg(test)]
@@ -805,6 +810,14 @@ mod wipe_marker {
             Err(e) => return Err(e),
             Ok(_) => {}
         }
+        private_folder(dir)
+    }
+
+    /// A real folder (not a symlink), this user's, not open to the group or
+    /// others: else an error.
+    #[cfg(unix)]
+    fn private_folder(dir: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
         let m = std::fs::symlink_metadata(dir)?;
         // SAFETY: geteuid has no preconditions.
         let me = unsafe { libc::geteuid() };
@@ -812,6 +825,24 @@ mod wipe_marker {
             return Err(std::io::Error::other("the fallback folder isn't this user's private folder"));
         }
         Ok(())
+    }
+
+    /// The fallback marker, if any (review: read only from a private
+    /// folder). A folder that's there but not private gives "nothing known",
+    /// so the sweep stays full: a marker someone else could have written
+    /// must never narrow it.
+    #[cfg(unix)]
+    fn read_fallback(config_dir: &Path) -> Option<Wiping> {
+        let path = fallback_path(config_dir)?;
+        let dir = path.parent()?;
+        match std::fs::symlink_metadata(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => Some(Wiping::unknown()),
+            Ok(_) => match private_folder(dir) {
+                Ok(()) => read_at(&path),
+                Err(_) => Some(Wiping::unknown()),
+            },
+        }
     }
 
     #[cfg(all(unix, test))]
@@ -837,7 +868,7 @@ mod wipe_marker {
     #[cfg(unix)]
     pub(super) fn read(config_dir: &Path) -> Option<Wiping> {
         let here = path(config_dir).and_then(|p| read_at(&p));
-        let there = fallback_path(config_dir).and_then(|p| read_at(&p));
+        let there = read_fallback(config_dir);
         match (here, there) {
             (Some(a), Some(b)) => Some(a.and(b)),
             (a, b) => a.or(b),
@@ -1959,6 +1990,39 @@ pub(crate) mod tests {
         wipe_marker::set_fallback_for_tests(None);
         assert!(root || written.is_err(), "not written to a folder others can write");
         assert_eq!(fs::read_dir(&shared).unwrap().count(), 0);
+        // A marker someone else put there (saying "tpm") isn't believed: it
+        // reads as "nothing known", so the sweep stays full.
+        wipe_marker::set_fallback_for_tests(Some(state.path().to_path_buf()));
+        let forged = wipe_marker::fallback_path_for_tests(&dir).unwrap();
+        fs::write(&forged, "vettid-desktop-wipe-v1\ntpm\n0\n").unwrap();
+        let read = wipe_marker::read(&dir);
+        wipe_marker::set_fallback_for_tests(None);
+        assert_eq!(read, Some(super::super::protector::Wiping::unknown()));
+    }
+
+    /// #13 (review M1): retiring an earlier build's `connection.enc` when no
+    /// marker can be written keeps it (an error), so a restart still knows
+    /// an earlier format was here and log-out sweeps for its key.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_legacy_pairing_is_kept_when_its_removal_cant_be_recorded() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("parent");
+        let dir = parent.join("vettid-desktop");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(CREDENTIAL_FILE), b"{}").unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
+        let r = remove_legacy_pairing(&dir);
+        let kept = dir.join(CREDENTIAL_FILE).exists();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        PENDING_WIPES.lock().unwrap().remove(&dir);
+        if !root {
+            assert!(r.is_err());
+            assert!(kept, "kept until its removal can be recorded");
+        }
     }
 
     /// No known folder, or a relative one, is refused: never the current
