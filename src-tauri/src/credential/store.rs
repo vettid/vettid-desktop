@@ -987,10 +987,12 @@ mod wipe_marker {
         }
     }
 
-    /// Something at `path` that isn't [`ours`] (a FIFO, another user's
-    /// file, a hard link, a symlink) is removed first; then the marker is
-    /// created without following a symlink or blocking, and checked again on
-    /// its handle before it is written (lead review).
+    /// A marker that is [`ours`] is emptied and rewritten through the same
+    /// handle that passed the check. Anything else at `path` (a FIFO,
+    /// another user's file, a hard link, a symlink, one others can write) is
+    /// removed, and a new marker is made with `O_EXCL` ([`create_marker`]),
+    /// without following a symlink or blocking, and checked again on its
+    /// handle before it is written (lead reviews).
     #[cfg(unix)]
     fn write_at(path: &Path, w: &Wiping) -> std::io::Result<()> {
         use std::io::Write;
@@ -2149,10 +2151,16 @@ pub(crate) mod tests {
         fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
         let first = wipe_marker::read(dir);
+        let mode = fs::metadata(&shared).unwrap().permissions().mode() & 0o777;
+        let text = fs::read_to_string(&marker).unwrap();
         let second = wipe_marker::read(dir);
         wipe_marker::set_fallback_for_tests(None);
         let unknown = Some(super::super::protector::Wiping::unknown());
         assert_eq!(first, unknown);
+        // The repair ran (so the second read went through it, not the
+        // "not private" branch), and rewrote the marker as "nothing known".
+        assert_eq!(mode, 0o700, "made private");
+        assert_eq!(text, "vettid-desktop-wipe-v1\n?\n1\n", "reset");
         assert_eq!(second, unknown, "reset by the repair, not trusted on the second read");
     }
 
