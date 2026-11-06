@@ -63,6 +63,12 @@ pub struct AppState {
     pub resets_started: Arc<std::sync::atomic::AtomicU64>,
     pub resets_finished: Arc<std::sync::atomic::AtomicU64>,
 
+    /// The notice `unlock` gave when the saved pairing couldn't be opened
+    /// (#97), so Start New Session repeats it, which may be the more specific
+    /// advice for a failure that passes ("sign out and back in"), rather
+    /// than a generic one. Cleared once a link is installed.
+    pub unlock_notice: Arc<std::sync::Mutex<Option<String>>>,
+
     /// Currently active WebRTC call session, if any. Only one call at a time
     /// — multi-call (call-waiting) would warrant a HashMap keyed by call_id,
     /// but the Android app is single-call and we follow that model.
@@ -98,6 +104,7 @@ impl AppState {
             session_op: Arc::new(Mutex::new(())),
             resets_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             resets_finished: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            unlock_notice: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "webrtc")]
             active_call: Arc::new(Mutex::new(None)),
         }

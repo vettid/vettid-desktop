@@ -160,6 +160,8 @@ pub async fn register(
         log::warn!("register: refused, a pairing is already under way");
         return Ok(RegisterResponse::failed(PAIR_UNDER_WAY_NOTICE));
     };
+    // #97: a new pairing; an earlier launch's notice was about the old one.
+    set_unlock_notice(&state, None);
     let config_dir = store::default_config_dir().map_err(|e| e.to_string())?;
     // Checked before pairing starts, so a folder another account can open,
     // or a protector that fails or isn't there (#13), is refused before the
@@ -254,6 +256,8 @@ async fn install(state: &AppState, link: Link, since: WipeEpoch, mark: ResetMark
     // background (§6.8: after vault.status).
     let end_pending = link.session.access_end().is_some();
     *slot = Some(link);
+    // #97: opened, so an earlier launch's "couldn't open" no longer applies.
+    set_unlock_notice(state, None);
     state.publish(snap.clone());
     // With the link locked: an old refresh isn't mid-operation.
     if keep {
@@ -269,6 +273,9 @@ async fn install(state: &AppState, link: Link, since: WipeEpoch, mark: ResetMark
 /// and say what happened.
 async fn erase_unlinked(state: &AppState, link: Link) -> String {
     state.publish(Snapshot::default());
+    // #97: the vault removed this desktop; an earlier "couldn't open, the
+    // pairing is kept" no longer applies.
+    set_unlock_notice(state, None);
     if link.erase() {
         *state.is_registered.write().await = false;
         link::UNLINKED_ERASED_NOTICE.into()
@@ -431,8 +438,24 @@ pub struct UnlockResponse {
 
 /// What the person is told when the saved pairing could not be opened for
 /// a reason without a plain notice of its own. The detail goes to the log
-/// only.
-const UNLOCK_FAILED_NOTICE: &str = "This desktop couldn't open its saved pairing. If this keeps happening, remove this desktop on your phone; then, in Settings, open Danger zone and choose Log out this desktop, and pair again.";
+/// only. Owner-approved text (#97, 2026-11-06): the failure may pass, so
+/// quitting and reopening comes first; closing the window only hides the
+/// app, hence "Quit" from the tray icon's menu.
+const UNLOCK_FAILED_NOTICE: &str = "This desktop couldn't open its saved pairing. Quit VettID Desktop and open it again: right-click its icon in the system tray or menu bar and choose Quit, or sign out of your computer and back in. If it keeps happening, remove this desktop on your phone; then, in Settings, open Danger zone and choose Log out this desktop, and pair again.";
+
+/// Start New Session's notice when no pairing is open (#97): the launch's
+/// own unlock notice if it gave one, else [`UNLOCK_FAILED_NOTICE`].
+fn unlock_failed_notice(state: &AppState) -> String {
+    state.unlock_notice.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| UNLOCK_FAILED_NOTICE.to_string())
+}
+
+/// Keep (or, with `None`, forget) the unlock notice Start New Session
+/// repeats (#97). Forgotten whenever it may no longer be true: each open
+/// attempt, a pairing that opens, a log-out, an erase after the vault
+/// removed this desktop, a new pairing.
+fn set_unlock_notice(state: &AppState, notice: Option<String>) {
+    *state.unlock_notice.lock().unwrap_or_else(|e| e.into_inner()) = notice;
+}
 
 /// Open the saved pairing: the device state, sealed under a data key that
 /// a protector wraps (DPAPI on Windows, the keyring elsewhere; no user
@@ -467,6 +490,9 @@ pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String
     if let Some(r) = already_open(&state.pairing, &state.link, state.snapshot().link_open).await {
         return Ok(r);
     }
+    // #97: a fresh attempt; what an earlier one said is set again below only
+    // if this one fails the same way.
+    set_unlock_notice(&state, None);
 
     let config_dir = match store::default_config_dir() {
         Ok(dir) => dir,
@@ -488,6 +514,17 @@ pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String
         Err((e, failure)) => {
             log::warn!("unlock: saved pairing could not be opened: {}", e);
             let notice = failure.as_ref().and_then(link::plain_store_notice).unwrap_or_else(|| UNLOCK_FAILED_NOTICE.to_string());
+            // #97: Start New Session repeats it, unless a log-out wiped the
+            // pairing meanwhile ("the pairing is kept" would be false) or a
+            // new pairing has started (the notice is about the old one).
+            // Checked under the notice's lock: log-out and register clear
+            // it after they change what's checked, so either order ends
+            // right.
+            let mut kept = state.unlock_notice.lock().unwrap_or_else(|e| e.into_inner());
+            if store::wipe_epoch() == since && state.pairing.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                *kept = Some(notice.clone());
+            }
+            drop(kept);
             return Ok(UnlockResponse { unlocked: false, notice: Some(notice) });
         }
     };
@@ -752,7 +789,10 @@ async fn extend_with(state: &AppState, requested: impl FnOnce()) -> RegisterResp
     }
     let mut slot = state.link.lock().await;
     let Some(link) = slot.as_mut() else {
-        return RegisterResponse::failed(UNLOCK_FAILED_NOTICE);
+        // #97: what this launch's unlock said, if anything (it may be the
+        // specific advice for a failure that passes), else the general one.
+        // Nothing is opened here (#94/#76).
+        return RegisterResponse::failed(unlock_failed_notice(state));
     };
     let result = link.request_access(requested, || overtaken_by_reset(state, mark)).await;
     if link.unlinked() {
@@ -991,6 +1031,7 @@ async fn log_out(
     drop(slot.take());
     drop(slot);
     *state.is_registered.write().await = false;
+    set_unlock_notice(state, None);
     state.publish(Snapshot::default());
     finish_reset(state);
     LogoutResponse {
@@ -1598,6 +1639,33 @@ mod tests {
         let snap = state.snapshot();
         assert!(!snap.link_open && !snap.active_at(chrono::Utc::now()));
         assert!(session_info(&snap, chrono::Utc::now()).is_err(), "nothing to show");
+    }
+
+    /// #97: with no link open, Start New Session repeats what this launch's
+    /// unlock said (it may be the specific advice for a failure that
+    /// passes), and still asks and opens nothing. The general notice says
+    /// to quit and reopen first.
+    #[tokio::test]
+    async fn start_new_session_repeats_the_launchs_unlock_notice() {
+        let state = AppState::new();
+        let specific = "This desktop couldn't open its saved pairing with the keyring just now.";
+        *state.unlock_notice.lock().unwrap() = Some(specific.to_string());
+        let mut asked = false;
+        let r = extend_with(&state, || asked = true).await;
+        assert!(!asked && !r.success);
+        assert_eq!(r.error.as_deref(), Some(specific));
+        assert!(state.link.lock().await.is_none(), "nothing was opened");
+        *state.unlock_notice.lock().unwrap() = None;
+        assert_eq!(unlock_failed_notice(&state), UNLOCK_FAILED_NOTICE);
+        assert!(UNLOCK_FAILED_NOTICE.contains("Quit VettID Desktop") && UNLOCK_FAILED_NOTICE.contains("open it again"));
+        // A log-out forgets it, whether or not its wipe is confirmed: the
+        // pairing it spoke of may be gone.
+        for wiped in [true, false] {
+            set_unlock_notice(&state, Some(specific.to_string()));
+            *state.is_registered.write().await = true;
+            log_out(&state, None, move |_| wiped, LOGOUT_END_BOUND).await;
+            assert_eq!(unlock_failed_notice(&state), UNLOCK_FAILED_NOTICE, "wiped {wiped}");
+        }
     }
 
     /// LOW 6: logout stops the refresh before it waits for the link, so a
