@@ -254,6 +254,8 @@ async fn install(state: &AppState, link: Link, since: WipeEpoch, mark: ResetMark
     // background (§6.8: after vault.status).
     let end_pending = link.session.access_end().is_some();
     *slot = Some(link);
+    // #97: opened, so an earlier launch's "couldn't open" no longer applies.
+    *state.unlock_notice.lock().unwrap_or_else(|e| e.into_inner()) = None;
     state.publish(snap.clone());
     // With the link locked: an old refresh isn't mid-operation.
     if keep {
@@ -431,8 +433,16 @@ pub struct UnlockResponse {
 
 /// What the person is told when the saved pairing could not be opened for
 /// a reason without a plain notice of its own. The detail goes to the log
-/// only.
-const UNLOCK_FAILED_NOTICE: &str = "This desktop couldn't open its saved pairing. If this keeps happening, remove this desktop on your phone; then, in Settings, open Danger zone and choose Log out this desktop, and pair again.";
+/// only. NEW TEXT (owner approval needed, #97): the failure may pass, so
+/// quitting and reopening comes first; closing the window only hides the
+/// app, hence "Quit" from the tray icon's menu.
+const UNLOCK_FAILED_NOTICE: &str = "This desktop couldn't open its saved pairing. Quit VettID Desktop (Quit is in the menu of its icon in the system tray or menu bar) and open it again. If this keeps happening, remove this desktop on your phone; then, in Settings, open Danger zone and choose Log out this desktop, and pair again.";
+
+/// Start New Session's notice when no pairing is open (#97): the launch's
+/// own unlock notice if it gave one, else [`UNLOCK_FAILED_NOTICE`].
+fn unlock_failed_notice(state: &AppState) -> String {
+    state.unlock_notice.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| UNLOCK_FAILED_NOTICE.to_string())
+}
 
 /// Open the saved pairing: the device state, sealed under a data key that
 /// a protector wraps (DPAPI on Windows, the keyring elsewhere; no user
@@ -488,6 +498,8 @@ pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String
         Err((e, failure)) => {
             log::warn!("unlock: saved pairing could not be opened: {}", e);
             let notice = failure.as_ref().and_then(link::plain_store_notice).unwrap_or_else(|| UNLOCK_FAILED_NOTICE.to_string());
+            // #97: Start New Session repeats it.
+            *state.unlock_notice.lock().unwrap_or_else(|e| e.into_inner()) = Some(notice.clone());
             return Ok(UnlockResponse { unlocked: false, notice: Some(notice) });
         }
     };
@@ -752,7 +764,10 @@ async fn extend_with(state: &AppState, requested: impl FnOnce()) -> RegisterResp
     }
     let mut slot = state.link.lock().await;
     let Some(link) = slot.as_mut() else {
-        return RegisterResponse::failed(UNLOCK_FAILED_NOTICE);
+        // #97: what this launch's unlock said, if anything (it may be the
+        // specific advice for a failure that passes), else the general one.
+        // Nothing is opened here (#94/#76).
+        return RegisterResponse::failed(unlock_failed_notice(state));
     };
     let result = link.request_access(requested, || overtaken_by_reset(state, mark)).await;
     if link.unlinked() {
@@ -1598,6 +1613,25 @@ mod tests {
         let snap = state.snapshot();
         assert!(!snap.link_open && !snap.active_at(chrono::Utc::now()));
         assert!(session_info(&snap, chrono::Utc::now()).is_err(), "nothing to show");
+    }
+
+    /// #97: with no link open, Start New Session repeats what this launch's
+    /// unlock said (it may be the specific advice for a failure that
+    /// passes), and still asks and opens nothing. The general notice says
+    /// to quit and reopen first.
+    #[tokio::test]
+    async fn start_new_session_repeats_the_launchs_unlock_notice() {
+        let state = AppState::new();
+        let specific = "This desktop couldn't open its saved pairing with the keyring just now.";
+        *state.unlock_notice.lock().unwrap() = Some(specific.to_string());
+        let mut asked = false;
+        let r = extend_with(&state, || asked = true).await;
+        assert!(!asked && !r.success);
+        assert_eq!(r.error.as_deref(), Some(specific));
+        assert!(state.link.lock().await.is_none(), "nothing was opened");
+        *state.unlock_notice.lock().unwrap() = None;
+        assert_eq!(unlock_failed_notice(&state), UNLOCK_FAILED_NOTICE);
+        assert!(UNLOCK_FAILED_NOTICE.contains("Quit VettID Desktop") && UNLOCK_FAILED_NOTICE.contains("open it again"));
     }
 
     /// LOW 6: logout stops the refresh before it waits for the link, so a

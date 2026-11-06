@@ -121,7 +121,9 @@
       await refreshRegistration();
     } catch (e) {
       console.warn('Auto-unlock failed:', e);
-      pairingNotice = "This desktop couldn't open its saved pairing. If this keeps happening, remove this desktop on your phone and pair again.";
+      // NEW TEXT (owner approval needed, #97): the same as the backend's
+      // UNLOCK_FAILED_NOTICE (quit and reopen first).
+      pairingNotice = "This desktop couldn't open its saved pairing. Quit VettID Desktop (Quit is in the menu of its icon in the system tray or menu bar) and open it again. If this keeps happening, remove this desktop on your phone; then, in Settings, open Danger zone and choose Log out this desktop, and pair again.";
     }
   }
 
