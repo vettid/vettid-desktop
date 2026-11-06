@@ -164,7 +164,7 @@ impl Inner {
         self.validate(mode)?;
         // The body may be secret (a held inner, #60): its compacted copy is
         // wiped, and the builder is sized once for everything, so it never
-        // reallocates (each reallocation would leave a copy of the body).
+        // moves its buffer (#100: a move is wiped, but costs a copy).
         let body = Zeroizing::new(if self.body.is_empty() {
             "{}".to_string()
         } else {
@@ -195,7 +195,7 @@ impl Inner {
             }
         }
         let out = b.raw("body", &body).finish();
-        debug_assert!(out.len() <= cap, "marshal_capacity too small: a regrowth left a copy");
+        debug_assert!(out.len() <= cap, "marshal_capacity too small: the builder moved its buffer");
         Ok(out)
     }
 

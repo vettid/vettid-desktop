@@ -327,8 +327,8 @@ fn list<T>(o: &Object<'_>, n: &str, f: impl Fn(&Object<'_>) -> Result<T, StoreEr
 }
 
 impl DeviceState {
-    /// Room enough for the stored form, so its builders never reallocate
-    /// (a reallocation would leave an unwiped copy of the secrets).
+    /// Room enough for the stored form, so its builders never move their
+    /// buffer (#100: a move is wiped, but costs a copy and a wipe).
     fn capacity(&self) -> usize {
         let outbox: usize = self.outbox.iter().map(|o| o.payload.len() * 4 / 3 + o.kind.len() + 96).sum();
         let kinds: usize = self.asked_kinds.iter().map(|(k, v)| k.len() + v.len() + 8).sum();
@@ -471,8 +471,8 @@ impl DeviceState {
                 .raw("inbox", &inbox)
                 .finish(),
         );
-        // The builder never outgrew its capacity, so it left no unwiped
-        // copy behind.
+        // The estimate held, so the builder never moved its buffer (a move
+        // would be wiped; this checks the estimate, not safety).
         debug_assert!(out.len() <= capacity, "state of {} bytes, capacity {capacity}", out.len());
         out
     }
