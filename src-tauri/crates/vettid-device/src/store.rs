@@ -365,7 +365,7 @@ impl DeviceState {
                 Zeroizing::new(
                     Builder::with_capacity(EPOCH_JSON + 256 + init.len())
                         .raw("pending", &epoch_json(&r.pending))
-                        .base64("th", &r.th)
+                        .base64("th", &r.th[..])
                         .base64("verify_ik", r.verify_ik.as_bytes())
                         .base64("sender", r.sender.as_bytes())
                         .string("since", &format_ts(r.since))
@@ -519,7 +519,7 @@ impl DeviceState {
         let awaiting = list(&o, "awaiting", |r| {
             let state = ResponderState {
                 pending: parse_epoch(&r.object("pending", 1).map_err(c)?, 1)?,
-                th: *key32(r, "th")?,
+                th: key32(r, "th")?,
                 verify_ik: verifying(r, "verify_ik")?,
                 sender: verifying(r, "sender")?,
                 since: time(r, "since")?,

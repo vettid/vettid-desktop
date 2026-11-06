@@ -91,7 +91,8 @@ impl std::fmt::Debug for RekeyConfig {
 pub struct Responder {
     /// The new epoch, not yet established: inactive, this side's role.
     pending: Option<Epoch>,
-    th: [u8; 32],
+    /// The transcript hash, kept wiped (#100).
+    th: Zeroizing<[u8; 32]>,
     /// `sig_I` must verify under this (`from.ik`).
     verify_ik: VerifyingKey,
     /// `hs.fin`'s collect `sender` must be this (`from.relay.pk`).
@@ -112,7 +113,8 @@ impl std::fmt::Debug for Responder {
 pub struct ResponderState {
     /// The pending epoch (inactive, role responder).
     pub pending: EpochState,
-    pub th: [u8; 32],
+    /// The transcript hash, kept wiped (#100).
+    pub th: Zeroizing<[u8; 32]>,
     pub verify_ik: VerifyingKey,
     pub sender: VerifyingKey,
     pub since: DateTime<Utc>,
@@ -228,7 +230,7 @@ pub(super) fn answer_rekey_with(
     let padded = Zeroizing::new(resp_inner.encode(Mode::Sealed)?);
     let out = sealer.seal(&padded)?;
     let pending = Epoch::new(&sched, Role::Responder, chosen, cfg.policy, cfg.now);
-    Ok((Responder { pending: Some(pending), th: t, verify_ik: body.from.ik, sender: body.from.relay.pk, since: cfg.now }, out))
+    Ok((Responder { pending: Some(pending), th: Zeroizing::new(t), verify_ik: body.from.ik, sender: body.from.relay.pk, since: cfg.now }, out))
 }
 
 impl Responder {
@@ -270,7 +272,7 @@ impl Responder {
     /// The stored form, while waiting.
     pub fn snapshot(&self) -> Result<ResponderState, HandshakeError> {
         let pending = self.pending.as_ref().ok_or(HandshakeError::Done)?.snapshot();
-        Ok(ResponderState { pending, th: self.th, verify_ik: self.verify_ik, sender: self.sender, since: self.since })
+        Ok(ResponderState { pending, th: self.th.clone(), verify_ik: self.verify_ik, sender: self.sender, since: self.since })
     }
 
     /// A waiting responder from its stored form, at `now`. Refused unless
