@@ -226,7 +226,7 @@ const POLL_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 pub fn plain_store_notice(e: &CredentialError) -> Option<String> {
     use CredentialError::*;
     match e {
-        Unreadable | NoProtector | NotProtected { .. } | NotOpened { .. } | LegacyNotRemoved | NoConfigDir | ParentNotPrivate
+        Unreadable | NoProtector | NotProtected { .. } | NotOpened { .. } | WrongPassphrase | LegacyNotRemoved | NoConfigDir | ParentNotPrivate
         | ParentIsLink | NotPrivate | LoggedOutMeanwhile => Some(e.to_string()),
         _ => None,
     }

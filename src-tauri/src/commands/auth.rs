@@ -3,12 +3,14 @@ use std::sync::OnceLock;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::credential::device_store::{self, DeviceStore};
+use crate::credential::passphrase::{self, Passphrase, Weakness};
 use crate::credential::store::{self, CredentialError, WipeEpoch};
 use crate::link::{self, Link, Snapshot};
 use crate::state::AppState;
 use vettid_device::access::EndOutcome;
 use vettid_device::pairing::{PairError, SystemClock};
 use vettid_device::transport::Http;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Serialize)]
 pub struct AuthStatus {
@@ -44,6 +46,28 @@ pub struct RegisterRequest {
     /// The desktop pairing code the member's phone shows (VAULT-MESSAGING
     /// §6.4: a link or the QR's text), pasted as it is.
     pub invite_code: String,
+    /// The passphrase the person chose (#13 item 4), sent only after
+    /// `needs_passphrase`: used only when every other protector is absent.
+    #[serde(default)]
+    pub passphrase: Option<PassphraseInput>,
+}
+
+/// A passphrase from the webview (#13 item 4), moved into a buffer wiped on
+/// drop as it is read. `Debug` shows nothing of it. The webview's own copy
+/// and the IPC layer's parse of the request can't be wiped (DESKTOP-REWORK-PLAN
+/// §4 accepts that).
+pub struct PassphraseInput(Zeroizing<String>);
+
+impl<'de> Deserialize<'de> for PassphraseInput {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        String::deserialize(d).map(|s| PassphraseInput(Zeroizing::new(s)))
+    }
+}
+
+impl std::fmt::Debug for PassphraseInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PassphraseInput(..)")
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -68,6 +92,13 @@ pub struct RegisterResponse {
     /// is live (#96), and this is when that one ends, as the session timer
     /// shows it, for the frontend to name in the computer's own locale.
     pub continues_until: Option<i64>,
+    /// This computer can't protect a pairing on its own (#13 item 4): ask for
+    /// a passphrase and send it with the code. Nothing was sent to the vault.
+    pub needs_passphrase: bool,
+    /// The passphrase sent is refused: the rule's reason (`short`,
+    /// `repeated`, `common`, `guessable`, `too_long`). Nothing was sent to
+    /// the vault.
+    pub weak_passphrase: Option<&'static str>,
 }
 
 impl RegisterResponse {
@@ -81,11 +112,23 @@ impl RegisterResponse {
             paired_without_session: false,
             retry_at: None,
             continues_until: None,
+            needs_passphrase: false,
+            weak_passphrase: None,
         }
     }
 
     fn paired_without_session(error: impl Into<String>) -> Self {
         RegisterResponse { paired_without_session: true, ..Self::failed(error) }
+    }
+
+    /// Every other protector is absent: a passphrase is needed (#13 item 4).
+    fn needs_passphrase() -> Self {
+        RegisterResponse { needs_passphrase: true, ..Self::failed(PASSPHRASE_NEEDED_NOTICE) }
+    }
+
+    /// The passphrase sent is refused, with the reason.
+    fn weak_passphrase(w: Weakness) -> Self {
+        RegisterResponse { needs_passphrase: true, weak_passphrase: Some(w.reason()), ..Self::failed(weak_notice(w)) }
     }
 
     /// A live session, from `snap` (which must be active).
@@ -99,6 +142,8 @@ impl RegisterResponse {
             paired_without_session: false,
             retry_at: None,
             continues_until: None,
+            needs_passphrase: false,
+            weak_passphrase: None,
         }
     }
 }
@@ -153,7 +198,7 @@ fn pair_notice(e: &PairError, store: Option<&CredentialError>) -> String {
 pub async fn register(
     app: AppHandle,
     state: State<'_, AppState>,
-    request: RegisterRequest,
+    mut request: RegisterRequest,
 ) -> Result<RegisterResponse, String> {
     // #30: first, before anything that waits. A log-out from here on means
     // this pairing is not saved.
@@ -172,7 +217,20 @@ pub async fn register(
     // or a protector that fails or isn't there (#13), is refused before the
     // vault ever lists this desktop.
     store::ensure_config_dir_since(&config_dir, since).map_err(|e| e.to_string())?;
-    device_store::protection_ready().map_err(|e| e.to_string())?;
+    // #13 item 4: the passphrase only when every other protector is absent;
+    // one that is present and fails stops pairing with its reason. A
+    // passphrase sent when it isn't needed is dropped unused (wiped).
+    let passphrase = if device_store::needs_passphrase().map_err(|e| e.to_string())? {
+        // The rule can take a second or two on a long passphrase: on a
+        // blocking thread, not the async runtime's.
+        let given = request.passphrase.take();
+        match tokio::task::spawn_blocking(move || pairing_passphrase(given)).await.map_err(|e| e.to_string())? {
+            Ok(p) => Some(p),
+            Err(r) => return Ok(r),
+        }
+    } else {
+        None
+    };
 
     // The code is read as it is (it holds base64): only surrounding
     // whitespace from a paste is dropped.
@@ -182,7 +240,10 @@ pub async fn register(
     }
     let name = collect_device_fingerprint().hostname;
 
-    let mut store = DeviceStore::new(&config_dir, since);
+    let mut store = match passphrase {
+        Some(p) => DeviceStore::with_passphrase(&config_dir, since, p),
+        None => DeviceStore::new(&config_dir, since),
+    };
     // Until the first save (the pending pairing, stored by start): no unlock
     // opens the store meanwhile. After it, the pairing count keeps unlock
     // away.
@@ -244,6 +305,33 @@ pub async fn register(
     }
 }
 
+/// The passphrase for a new pairing (#13 item 4): `needs_passphrase` if none
+/// was sent, the rule's reason if it's refused (`passphrase::strong_enough`).
+fn pairing_passphrase(given: Option<PassphraseInput>) -> Result<Passphrase, RegisterResponse> {
+    let Some(PassphraseInput(p)) = given else {
+        return Err(RegisterResponse::needs_passphrase());
+    };
+    passphrase::strong_enough(&p).map_err(RegisterResponse::weak_passphrase)?;
+    Ok(Passphrase::new(p))
+}
+
+/// NEW TEXT (#13 item 4, owner approval needed; the lead's draft 1): shown
+/// when this computer can't protect the pairing on its own.
+const PASSPHRASE_NEEDED_NOTICE: &str =
+    "This computer can't protect the pairing on its own. Choose a passphrase. You'll enter it each time VettID Desktop starts.";
+
+/// NEW TEXT (#13 item 4, owner approval needed): one per reason the rule
+/// refuses a passphrase.
+fn weak_notice(w: Weakness) -> &'static str {
+    match w {
+        Weakness::Short => "Use at least 12 characters.",
+        Weakness::Repeated => "Don't use one character over and over.",
+        Weakness::Common => "That passphrase is on a list of common passwords. Choose another.",
+        Weakness::Guessable => "That passphrase would be easy to guess. Add words or characters that don't follow a pattern, a name or a common word.",
+        Weakness::TooLong => "That passphrase is too long. Use a shorter one.",
+    }
+}
+
 /// Put `link` in place as the open pairing and show what it knows, unless
 /// a log-out (since `since`) or a reset (since `mark`) happened meanwhile:
 /// then it is dropped (its keys wipe themselves) and `None` returned. The
@@ -263,6 +351,8 @@ async fn install(state: &AppState, link: Link, since: WipeEpoch, mark: ResetMark
     *slot = Some(link);
     // #97: opened, so an earlier launch's "couldn't open" no longer applies.
     set_unlock_notice(state, None);
+    // #13 item 4: opened, so no wait before a passphrase.
+    state.passphrase_tries.lock().unwrap_or_else(|e| e.into_inner()).reset();
     state.publish(snap.clone());
     // With the link locked: an old refresh isn't mid-operation.
     if keep {
@@ -432,13 +522,18 @@ fn unquote(s: &str) -> String {
     }
 }
 
-/// Result of [`unlock`].
-#[derive(Debug, Serialize)]
+/// Result of [`unlock`] and [`unlock_with_passphrase`].
+#[derive(Debug, Default, Serialize)]
 pub struct UnlockResponse {
     pub unlocked: bool,
     /// Plain text to show the person when the saved pairing could not be
     /// opened.
     pub notice: Option<String>,
+    /// The saved pairing is sealed by a passphrase (#13 item 4): ask for it
+    /// and call `unlock_with_passphrase`.
+    pub needs_passphrase: bool,
+    /// Seconds before the next passphrase may be tried, after a wrong one.
+    pub retry_after_secs: Option<u64>,
 }
 
 /// What the person is told when the saved pairing could not be opened for
@@ -478,6 +573,25 @@ fn set_unlock_notice(state: &AppState, notice: Option<String>) {
 /// carries a plain notice for the person, and the detail goes to the log.
 #[tauri::command]
 pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String> {
+    open_saved(&state, None).await
+}
+
+/// [`unlock`] with the passphrase the person entered (#13 item 4), for a
+/// saved pairing it sealed. A wrong one (or a damaged file, which answers the
+/// same) keeps the pairing and starts a wait before the next try: 1, 2, 4…
+/// up to 30 s (`state::PassphraseTries`); after five in a row the notice
+/// adds that the file may be damaged.
+#[tauri::command]
+pub async fn unlock_with_passphrase(state: State<'_, AppState>, passphrase: PassphraseInput) -> Result<UnlockResponse, String> {
+    open_saved(&state, Some(passphrase)).await
+}
+
+/// Seconds, rounded up.
+fn whole_secs(d: std::time::Duration) -> u64 {
+    d.as_secs() + u64::from(d.subsec_nanos() > 0)
+}
+
+async fn open_saved(state: &AppState, given: Option<PassphraseInput>) -> Result<UnlockResponse, String> {
     // #30: first. A log-out from here on means nothing stays unlocked.
     let since = store::wipe_epoch();
     // #43: likewise an End session, including one under way now.
@@ -487,7 +601,7 @@ pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String
     // unlocks can't both open the store), and none while a pairing is under
     // way.
     let Some(_opening) = begin_opening(&state.pairing, &state.opening).await else {
-        return Ok(UnlockResponse { unlocked: false, notice: None });
+        return Ok(UnlockResponse { unlocked: false, notice: None, ..Default::default() });
     };
     // Review MEDIUM 3: open already, or a pairing under way: the store is
     // left alone. A busy link (a Start New Session waiting for the phone)
@@ -501,23 +615,48 @@ pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String
 
     let config_dir = match store::default_config_dir() {
         Ok(dir) => dir,
-        Err(e) => return Ok(UnlockResponse { unlocked: false, notice: Some(e.to_string()) }),
+        Err(e) => return Ok(UnlockResponse { unlocked: false, notice: Some(e.to_string()), ..Default::default() }),
     };
 
     if let Some(notice) = retire_legacy_pairing(&config_dir) {
-        return Ok(UnlockResponse { unlocked: false, notice: Some(notice.to_string()) });
+        return Ok(UnlockResponse { unlocked: false, notice: Some(notice.to_string()), ..Default::default() });
     }
     if !device_store::exists(&config_dir) {
         // Not paired: nothing to open and nothing to say.
-        return Ok(UnlockResponse { unlocked: false, notice: None });
+        return Ok(UnlockResponse { unlocked: false, notice: None, ..Default::default() });
     }
 
-    let mut link = match Link::open(DeviceStore::new(&config_dir, since)) {
+    // #13 item 4: a pairing the passphrase sealed opens only with it, and
+    // not before the wait after a wrong one is over. A passphrase sent for
+    // a pairing it didn't seal is dropped unused (wiped).
+    let passphrase = if device_store::sealed_by_passphrase(&config_dir) {
+        let Some(PassphraseInput(p)) = given else {
+            return Ok(UnlockResponse { needs_passphrase: true, ..Default::default() });
+        };
+        let wait = state.passphrase_tries.lock().unwrap_or_else(|e| e.into_inner()).wait_left(std::time::Instant::now());
+        if let Some(wait) = wait {
+            return Ok(UnlockResponse { needs_passphrase: true, retry_after_secs: Some(whole_secs(wait)), ..Default::default() });
+        }
+        Some(Passphrase::new(p))
+    } else {
+        None
+    };
+    let store = match passphrase {
+        Some(p) => DeviceStore::with_passphrase(&config_dir, since, p),
+        None => DeviceStore::new(&config_dir, since),
+    };
+
+    let mut link = match Link::open(store) {
         Ok(Some(l)) => l,
         // A pairing interrupted before the owner approved it was removed.
-        Ok(None) => return Ok(UnlockResponse { unlocked: false, notice: None }),
+        Ok(None) => return Ok(UnlockResponse { unlocked: false, notice: None, ..Default::default() }),
         Err((e, failure)) => {
             log::warn!("unlock: saved pairing could not be opened: {}", e);
+            // #13 item 4: a wrong passphrase. Not kept for Start New Session:
+            // the launch screen asks again.
+            if matches!(failure, Some(CredentialError::WrongPassphrase)) {
+                return Ok(wrong_passphrase(state));
+            }
             let notice = failure.as_ref().and_then(link::plain_store_notice).unwrap_or_else(|| UNLOCK_FAILED_NOTICE.to_string());
             // #97: Start New Session repeats it, unless a log-out wiped the
             // pairing meanwhile ("the pairing is kept" would be false) or a
@@ -530,7 +669,7 @@ pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String
                 *kept = Some(notice.clone());
             }
             drop(kept);
-            return Ok(UnlockResponse { unlocked: false, notice: Some(notice) });
+            return Ok(UnlockResponse { unlocked: false, notice: Some(notice), ..Default::default() });
         }
     };
     if let Err(e) = link.read_status().await {
@@ -539,22 +678,35 @@ pub async fn unlock(state: State<'_, AppState>) -> Result<UnlockResponse, String
     }
     if link.unlinked() {
         let notice = erase_unlinked(&state, link).await;
-        return Ok(UnlockResponse { unlocked: false, notice: Some(notice) });
+        return Ok(UnlockResponse { unlocked: false, notice: Some(notice), ..Default::default() });
     }
     // HIGH 1: a device the vault's mailbox refuses (§8.6) opens, with no
     // session, and says so (Log out is the way on).
     let refused = link.refused();
     if install(&state, link, since, mark).await.is_none() {
-        return Ok(UnlockResponse { unlocked: false, notice: None });
+        return Ok(UnlockResponse { unlocked: false, notice: None, ..Default::default() });
     }
     *state.is_registered.write().await = true;
     if refused {
-        return Ok(UnlockResponse { unlocked: true, notice: Some(link::REFUSED_NOTICE.to_string()) });
+        return Ok(UnlockResponse { unlocked: true, notice: Some(link::REFUSED_NOTICE.to_string()), ..Default::default() });
     }
 
     // Warn (never refuse) when another account can open the saved
     // pairing's folder or file (#24).
-    Ok(UnlockResponse { unlocked: true, notice: store::privacy_warning(&config_dir).map(str::to_string) })
+    Ok(UnlockResponse { unlocked: true, notice: store::privacy_warning(&config_dir).map(str::to_string), ..Default::default() })
+}
+
+/// A wrong passphrase at unlock: count it, start the wait, and say so (after
+/// five in a row, that the file may be damaged).
+fn wrong_passphrase(state: &AppState) -> UnlockResponse {
+    let mut tries = state.passphrase_tries.lock().unwrap_or_else(|e| e.into_inner());
+    let wait = tries.wrong(std::time::Instant::now());
+    let mut notice = store::WRONG_PASSPHRASE_NOTICE.to_string();
+    if tries.wrong_in_a_row() >= crate::state::MAYBE_DAMAGED_AFTER {
+        notice.push(' ');
+        notice.push_str(store::MAYBE_DAMAGED_NOTICE);
+    }
+    UnlockResponse { notice: Some(notice), needs_passphrase: true, retry_after_secs: Some(whole_secs(wait)), ..Default::default() }
 }
 
 /// Counts a pairing under way while it lives (see `AppState::pairing`).
@@ -610,14 +762,14 @@ async fn already_open<T: vettid_device::transport::Transport, C: vettid_device::
     busy_unlocked: bool,
 ) -> Option<UnlockResponse> {
     if pairing.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-        return Some(UnlockResponse { unlocked: false, notice: None });
+        return Some(UnlockResponse { unlocked: false, notice: None, ..Default::default() });
     }
     let Ok(slot) = link.try_lock() else {
-        return Some(UnlockResponse { unlocked: busy_unlocked, notice: None });
+        return Some(UnlockResponse { unlocked: busy_unlocked, notice: None, ..Default::default() });
     };
     let l = slot.as_ref()?;
     let notice = l.refused().then(|| link::REFUSED_NOTICE.to_string());
-    Some(UnlockResponse { unlocked: true, notice })
+    Some(UnlockResponse { unlocked: true, notice, ..Default::default() })
 }
 
 /// Review LOW 11: remove an earlier build's pairing (`connection.enc`)
@@ -2012,5 +2164,59 @@ mod tests {
         drop(held);
         assert!(!wiped, "a pairing still on disk must not be reported as wiped");
         assert!(path.exists());
+    }
+
+    fn input(s: &str) -> Option<PassphraseInput> {
+        Some(PassphraseInput(Zeroizing::new(s.to_string())))
+    }
+
+    /// #13 item 4: register asks for a passphrase, refuses a weak one with
+    /// its reason, and takes a strong one, before anything reaches the vault.
+    #[test]
+    fn pairing_needs_a_strong_passphrase() {
+        let r = pairing_passphrase(None).unwrap_err();
+        assert!(r.needs_passphrase && !r.success && r.weak_passphrase.is_none());
+        assert_eq!(r.error.as_deref(), Some(PASSPHRASE_NEEDED_NOTICE));
+        for (pw, w) in [
+            ("short", Weakness::Short),
+            ("zzzzzzzzzzzzzzzz", Weakness::Repeated),
+            ("Password1234", Weakness::Common),
+            ("qwertyuiopasdf", Weakness::Guessable),
+        ] {
+            let r = pairing_passphrase(input(pw)).unwrap_err();
+            assert_eq!(r.weak_passphrase, Some(w.reason()), "{pw}");
+            assert!(r.needs_passphrase && !r.success);
+            assert_eq!(r.error.as_deref(), Some(weak_notice(w)));
+        }
+        assert!(pairing_passphrase(input("violet-Kestrel-91-moss")).is_ok());
+    }
+
+    /// The passphrase never shows in a request's `Debug`, and is optional.
+    #[test]
+    fn the_passphrase_never_shows() {
+        let req: RegisterRequest = serde_json::from_str(r#"{"invite_code":"x","passphrase":"violet-Kestrel-91-moss"}"#).unwrap();
+        assert!(req.passphrase.is_some());
+        assert!(!format!("{req:?}").contains("Kestrel"));
+        let req: RegisterRequest = serde_json::from_str(r#"{"invite_code":"x"}"#).unwrap();
+        assert!(req.passphrase.is_none());
+    }
+
+    /// Wrong passphrases at unlock: a growing wait, and after five in a row,
+    /// the line that the file may be damaged.
+    #[test]
+    fn wrong_passphrases_wait_longer() {
+        let state = AppState::new();
+        let mut waits = Vec::new();
+        for n in 1..=6 {
+            let r = wrong_passphrase(&state);
+            assert!(!r.unlocked && r.needs_passphrase);
+            let notice = r.notice.unwrap();
+            assert!(notice.starts_with(store::WRONG_PASSPHRASE_NOTICE));
+            assert_eq!(notice.contains(store::MAYBE_DAMAGED_NOTICE), n >= 5, "try {n}");
+            waits.push(r.retry_after_secs.unwrap());
+        }
+        assert_eq!(waits, [1, 2, 4, 8, 16, 30]);
+        assert_eq!(whole_secs(std::time::Duration::from_millis(1001)), 2);
+        assert_eq!(whole_secs(std::time::Duration::from_secs(3)), 3);
     }
 }

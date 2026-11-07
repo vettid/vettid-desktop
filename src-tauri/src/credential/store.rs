@@ -66,6 +66,11 @@ pub const UNREADABLE_NOTICE: &str =
 /// have a password, or a libtss2 library may be missing), so the advice is
 /// to retry and then whoever manages the computer.
 fn not_protected_notice(by: &str) -> String {
+    // NEW TEXT (#13 item 4, owner approval needed): the passphrase fails
+    // only for want of memory or random bytes; signing out won't matter.
+    if by == super::passphrase::NAME {
+        return format!("This desktop couldn't lock its pairing with {by}, so nothing was saved. If your phone lists this desktop, remove it there. Then quit VettID Desktop, open it again, and pair again.");
+    }
     if by == super::protector::TPM_NAME {
         return format!("This desktop couldn't lock its pairing with {by}, so nothing was saved. If your phone lists this desktop, remove it there. Then try pairing again. If it keeps happening, whoever manages this computer needs to check its TPM and the TPM software: the TPM may be busy or set up with a password this desktop can't use, or a library this desktop needs may be missing.");
     }
@@ -79,11 +84,27 @@ fn not_protected_notice(by: &str) -> String {
 /// NEW TEXT (#13, Linux, owner approval needed): for the TPM, "restart this
 /// desktop" in place of signing out.
 fn not_opened_notice(by: &str) -> String {
+    // NEW TEXT (#13 item 4, owner approval needed): as above; a wrong
+    // passphrase is `WRONG_PASSPHRASE_NOTICE`, not this.
+    if by == super::passphrase::NAME {
+        return format!("This desktop couldn't open its saved pairing with {by} just now. The pairing is kept. Quit VettID Desktop and open it again: right-click its icon in the system tray or menu bar and choose Quit.");
+    }
     if by == super::protector::TPM_NAME {
         return format!("This desktop couldn't open its saved pairing with {by} just now. The pairing is kept. Restart this desktop to try again. If it keeps happening, remove this desktop on your phone; then, in Settings, open Danger zone and choose Log out this desktop, and pair again.");
     }
     format!("This desktop couldn't open its saved pairing with {by} just now. The pairing is kept. Sign out of your computer and back in to try again. If it keeps happening, remove this desktop on your phone; then, in Settings, open Danger zone and choose Log out this desktop, and pair again.")
 }
+
+/// NEW TEXT (#13 item 4, owner approval needed; the lead's draft 5): the
+/// passphrase entered doesn't open the saved pairing. The launch screen
+/// shows the wait before the next try with it.
+pub const WRONG_PASSPHRASE_NOTICE: &str = "That passphrase doesn't open this desktop's saved pairing. Try again.";
+
+/// NEW TEXT (#13 item 4, owner approval needed; the lead's text 9): added to
+/// [`WRONG_PASSPHRASE_NOTICE`] after five wrong tries in a row, since a
+/// damaged file answers the same as a wrong passphrase.
+pub const MAYBE_DAMAGED_NOTICE: &str =
+    "If you're sure it's right, the saved pairing may be damaged: in Settings, open Danger zone and choose Log out this desktop, and pair again.";
 
 /// NEW TEXT (owner approval needed): shown when this computer offers no
 /// protector at all (#13). Not reachable on Windows or macOS (each has one
@@ -193,6 +214,10 @@ pub enum CredentialError {
     /// The protector `by` is present but couldn't open the saved pairing,
     /// which is kept (#13).
     NotOpened { by: &'static str },
+    /// The passphrase entered doesn't open the saved pairing, which is kept
+    /// (#13): a wrong one, or a damaged file, which can't be told apart.
+    /// Displays [`WRONG_PASSPHRASE_NOTICE`].
+    WrongPassphrase,
     /// The earlier format's device file or key couldn't be confirmed
     /// deleted. Displays [`LEGACY_NOT_REMOVED_NOTICE`].
     LegacyNotRemoved,
@@ -229,6 +254,7 @@ impl fmt::Display for CredentialError {
             CredentialError::NoProtector => f.write_str(NO_PROTECTOR_NOTICE),
             CredentialError::NotProtected { by } => f.write_str(&not_protected_notice(by)),
             CredentialError::NotOpened { by } => f.write_str(&not_opened_notice(by)),
+            CredentialError::WrongPassphrase => f.write_str(WRONG_PASSPHRASE_NOTICE),
             CredentialError::LegacyNotRemoved => f.write_str(LEGACY_NOT_REMOVED_NOTICE),
             CredentialError::NoConfigDir => f.write_str(NO_CONFIG_DIR_NOTICE),
             CredentialError::ParentNotPrivate => f.write_str(PARENT_NOT_PRIVATE_NOTICE),
