@@ -113,6 +113,21 @@ while IFS= read -r -d '' f; do
 done < <(find "$APP/Contents" -type f -print0)
 if [[ "$arch_bad" -eq 0 ]]; then ok "arm64 only"; else bad "not arm64 only"; fi
 
+# The string table of every library or bundle in the app starts at an 8-byte
+# aligned offset: macOS refuses to load one that doesn't ("mis-aligned LINKEDIT
+# string pool"), which the Xcode 27 linker can write with chained fixups
+# (.cargo/config.toml). The main executable isn't held to it (it launches either way).
+align_bad=0
+nlib=0
+while IFS= read -r -d '' f; do
+    if file -b "$f" | grep -qE 'Mach-O.*(dynamically linked shared library|bundle)'; then
+        nlib=$((nlib + 1))
+        stroff="$(otool -l "$f" | awk '/LC_SYMTAB/{s=1} s&&/stroff/&&!d{print $2; d=1}')"
+        if [[ -n "$stroff" && $((stroff % 8)) -ne 0 ]]; then echo "        $f: string table at $stroff"; align_bad=1; fi
+    fi
+done < <(find "$APP/Contents" -type f -print0)
+if [[ "$align_bad" -eq 0 ]]; then ok "string tables of libraries aligned ($nlib checked)"; else bad "a library string table is not 8-byte aligned"; fi
+
 # Linked libraries of every Mach-O: system paths, or inside the bundle. An
 # @executable_path or @loader_path path is resolved (the first against
 # Contents/MacOS, the second against the Mach-O's own directory) and must
