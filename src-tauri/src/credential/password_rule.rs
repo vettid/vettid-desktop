@@ -313,7 +313,9 @@ impl<'r> Cx<'r> {
 /// 1 if they are the same; the product of the character classes' sizes of
 /// the differing characters (10 for a digit, 26 for a letter, 33 for other
 /// ASCII, 100 otherwise) if they differ in one or two places; else infinite.
-/// Compared in place; nothing is copied.
+/// Which places differ isn't charged (up to C(len, 2) choices): that only
+/// makes a variant cheaper, so the rule refuses more. Compared in place;
+/// nothing is copied.
 fn variant_cost(seen: &[char], unit: &[char]) -> f64 {
     let mut cost = 1.0;
     let mut differ = 0;
