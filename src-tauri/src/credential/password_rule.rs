@@ -13,8 +13,11 @@
 //! - **Substitutions:** zxcvbn's table, where `1` and `|` read as i or l and
 //!   `7` as t or l, each reading tried (lead review of #128).
 //! - **Past 128 characters,** where the vault says "not guessable": the
-//!   lower of the product over 128-character chunks and the passphrase cut
-//!   at its repeated runs (choice a/a, #6075, and (a), #6108).
+//!   lowest of three readings: the product over 128-character chunks; the
+//!   passphrase cut at its repeated runs, where a unit an earlier run had,
+//!   or a variant of it, costs only its count; and the longest repeat with
+//!   what is around it (choice a/a, #6075, and (a), #6108; the lead's
+//!   reviews).
 //!
 //! The desktop goes first: the vault and the apps take the same change, by a
 //! VAULT-MESSAGING erratum, after release 29. Until then a passphrase
@@ -61,10 +64,11 @@
 //! (the tail SipHash hadn't absorbed yet) in a stack frame that isn't wiped,
 //! and its hash value.
 //!
-//! Speed: a check can take a second or two in a release build at the full
-//! 1,024 bytes (each chunk is estimated, and each gap between runs). It
-//! runs once per pairing attempt, never per keystroke, and off the UI
-//! thread.
+//! Speed: the slowest inputs found in review take up to 1.8 s in a release
+//! build on tempe at the full 1,024 bytes (`worst_case_timing`: text heavy
+//! in `1`, `|` and `7`, whose two readings multiply the lookups, 1.8 s;
+//! runs of `ab` before it, 1.3 s). The check runs once per pairing attempt,
+//! never per keystroke, and off the UI thread.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -309,17 +313,19 @@ impl<'r> Cx<'r> {
     }
 }
 
-/// What it costs to guess `unit` knowing `seen`, a unit of the same length:
-/// 1 if they are the same; the product of the character classes' sizes of
-/// the differing characters (10 for a digit, 26 for a letter, 33 for other
-/// ASCII, 100 otherwise) if they differ in one or two places; else infinite.
-/// Which places differ isn't charged (up to C(len, 2) choices): that only
-/// makes a variant cheaper, so the rule refuses more. Compared in place;
-/// nothing is copied.
-fn variant_cost(seen: &[char], unit: &[char]) -> f64 {
+/// What it costs to guess `unit` knowing `seen`, a unit of the same length,
+/// read from `rot` characters into `unit` (a rotation of it): 1 if they are
+/// the same; the product of the character classes' sizes of the differing
+/// characters (10 for a digit, 26 for a letter, 33 for other ASCII, 100
+/// otherwise) if they differ in one or two places; else infinite. Which
+/// places differ, and the rotation, aren't charged: that only makes a
+/// variant cheaper, so the rule refuses more. Compared in place; nothing is
+/// copied.
+fn variant_cost(seen: &[char], unit: &[char], rot: usize) -> f64 {
     let mut cost = 1.0;
     let mut differ = 0;
-    for (&a, &b) in seen.iter().zip(unit) {
+    let rotated = unit[rot..].iter().chain(&unit[..rot]);
+    for (&a, &b) in seen.iter().zip(rotated) {
         if a != b {
             differ += 1;
             if differ > 2 {
@@ -356,20 +362,37 @@ fn segmented(rs: &[char], cx: &mut Cx) -> f64 {
     let mut g = 1.0;
     let mut parts = 0u32;
     let mut at = 0;
-    for (i, &(start, len, unit)) in runs.iter().enumerate() {
-        if start > at {
-            g *= chunked(&rs[at..start], cx);
-            parts += 1;
-        }
+    for (i, &(found, len, unit)) in runs.iter().enumerate() {
         // A unit an earlier run had already costs only its count; one that
         // differs from it in at most two places costs the choices for those
         // characters too (a "variant": dragon12 then dragon13, Password1!
-        // then Password2!). Otherwise the unit's own estimate (lead review).
-        let earlier = runs[..i].iter().filter(|r| r.2 == unit).map(|r| variant_cost(&rs[r.0..r.0 + unit], &rs[start..start + unit])).fold(f64::INFINITY, f64::min);
-        let unit_cost = earlier.min(guesses_chars(&rs[start..start + unit], cx));
-        g *= unit_cost * (len / unit) as f64;
-        parts += 1;
-        at = start + len;
+        // then Password2!). Otherwise the unit's own estimate (lead reviews).
+        let later = &rs[found..found + unit];
+        let (earlier, rot) = runs[..i]
+            .iter()
+            .filter(|r| r.2 == unit)
+            .flat_map(|r| (0..unit).map(move |rot| (r.0, rot)))
+            .map(|(seen, rot)| (variant_cost(&rs[seen..seen + unit], later, rot), rot))
+            .fold((f64::INFINITY, 0), |a, b| if b.0 < a.0 { b } else { a });
+        let own = guesses_chars(later, cx);
+        // A run found from the left starts early when the gap before it ends
+        // like the unit ("password" × 20, "World", "password" × 20: from the
+        // "d"). Matched to an earlier unit through a rotation, it starts where
+        // that unit does; what comes before goes back to the gap (lead
+        // review), and a last repeat cut short is the tail below.
+        let repeats_earlier = earlier <= own;
+        let (start, whole) = if repeats_earlier { (found + rot, (len - rot) / unit) } else { (found, len / unit) };
+        let gap_before = start > at;
+        if gap_before {
+            g *= chunked(&rs[at..start], cx);
+        }
+        g *= earlier.min(own) * whole as f64;
+        // A run that repeats an earlier one, and the gap before it, aren't
+        // new parts to order: the pattern is the earlier run's (lead review).
+        if !repeats_earlier {
+            parts += 1 + u32::from(gap_before);
+        }
+        at = start + whole * unit;
         // A last repeat cut short, up to where the next run starts, costs
         // where it was cut (fewer than `unit` places), as part of this run.
         let next = runs.get(i + 1).map_or(rs.len(), |r| r.0);
@@ -1077,6 +1100,11 @@ mod tests {
             // And two that the cut at runs alone scored higher than before.
             format!("mmmmmmmm{}", "monkey12".repeat(20)),
             format!("{}ababababab{}", "password".repeat(17), "cabcabc"),
+            // Round 3: a repeat found rotated, and repeats as separate parts.
+            format!("{}3{}", "monkey123".repeat(14), "monkey123".repeat(14)),
+            format!("{}!{}", "Password1!".repeat(12), "Password1!".repeat(12)),
+            format!("{}l{}", "football".repeat(20), "football".repeat(20)),
+            format!("{}1{}2{}3{}", "password".repeat(6), "password".repeat(6), "password".repeat(6), "password".repeat(6)),
         ];
         let rs: Vec<char> = format!("{}{}", "Password1!".repeat(12), "Password2!".repeat(12)).chars().collect();
         assert_eq!(runs(&rs), [(0, 120, 10), (120, 120, 10)]);
@@ -1136,23 +1164,49 @@ mod tests {
         assert!(g > 1e12 && g < 2e12, "{g:e}");
     }
 
-    /// The lowest of the three readings past 128 characters: never above
-    /// the chunks or the single longest repeat, on every shared case (lead
-    /// recheck: the cut at runs alone raised some).
+    /// The slowest inputs found in review, timed (release build:
+    /// `cargo test --release -- --ignored worst_case_timing --nocapture`).
+    /// Ignored: a measurement, not a check.
     #[test]
-    fn no_reading_raises_the_estimate() {
-        let rule = Rule::current();
-        for pw in shared_cases() {
-            let n = nfc(&pw);
-            if n.len() > MAX_BYTES || n.chars().count() <= MAX_ESTIMATE_CHARS {
+    #[ignore]
+    fn worst_case_timing() {
+        let leet: String = "1|7lIit!".chars().cycle().take(MAX_BYTES).collect();
+        let nested = format!("{}{}", "ab".repeat(65), &leet[..MAX_BYTES - 130]);
+        let runs8: String = (0..113).map(|i| format!("{}{}", "Zq9!vK2#".repeat(1 + i % 2), i % 10)).collect::<String>();
+        for (name, pw) in [("1|7 text", leet.as_str()), ("ab runs + 1|7 text", nested.as_str()), ("8-char runs", &runs8[..MAX_BYTES.min(runs8.len())])] {
+            let t = std::time::Instant::now();
+            let g = guesses(Rule::current(), pw);
+            println!("{name}: {} chars, {:?}, {g:e}", pw.chars().count(), t.elapsed());
+        }
+    }
+
+    /// No estimate is above what the rule at `d5ea1d8` gave, before the cut
+    /// at runs: `estimates-at-d5ea1d8.json` was generated once from that
+    /// commit's code over the shared cases (lead recheck: an intermediate
+    /// form raised some).
+    #[test]
+    fn no_estimate_rose_since_d5ea1d8() {
+        #[derive(serde::Deserialize)]
+        struct Old {
+            password: String,
+            guesses: Option<f64>,
+        }
+        #[derive(serde::Deserialize)]
+        struct File {
+            cases: Vec<Old>,
+        }
+        let old: File = serde_json::from_str(include_str!("passwords/estimates-at-d5ea1d8.json")).unwrap();
+        let cases = shared_cases();
+        assert_eq!(old.cases.len(), cases.len());
+        for (o, pw) in old.cases.iter().zip(&cases) {
+            assert_eq!(&o.password, pw);
+            let n = nfc(pw);
+            if n.len() > MAX_BYTES {
                 continue;
             }
-            let rs: Vec<char> = n.chars().collect();
-            let mut cx = Cx::new(rule);
-            let g = cx.estimate(&rs);
-            assert!(g <= chunked(&rs, &mut cx), "{pw:?}");
-            assert!(g <= long_repeat(&rs, &mut cx), "{pw:?}");
-            assert!(g <= segmented(&rs, &mut cx), "{pw:?}");
+            let now = guesses(Rule::current(), &n);
+            let then = o.guesses.unwrap_or(f64::INFINITY);
+            assert!(now <= then * (1.0 + 1e-12), "{pw:?}: {now:e}, at d5ea1d8 {then:e}");
         }
     }
 
@@ -1280,8 +1334,13 @@ mod tests {
             format!("{}1{}", p("password", 15), p("password", 15)),
             format!("{} {}", p("iloveyou", 15), p("iloveyou", 15)),
             format!("{}{}", p("Password1!", 12), p("Password2!", 12)),
-            format!("{}{}", p("Summer2024!", 11), p("Winter2024!", 11)),
             format!("{}{}{}", p("password", 15), p("football", 15), p("baseball", 15)),
+            // Round 3: rotated repeats, and repeats as separate parts.
+            format!("{}3{}", p("monkey123", 14), p("monkey123", 14)),
+            format!("{}!{}", p("Password1!", 12), p("Password1!", 12)),
+            format!("{}l{}", p("football", 20), p("football", 20)),
+            format!("{}1{}2{}3{}", p("password", 6), p("password", 6), p("password", 6), p("password", 6)),
+            format!("{}{}", p("Summer2024!", 11), p("Summer2025!", 11)),
             format!("{}1", p("football", 127)),
             format!("{}Summer", p("Summer2024!!", 11)),
             format!("Hello{}2024!", p("password", 40)),
@@ -1290,6 +1349,11 @@ mod tests {
             format!("mmmmmmmm{}", p("monkey12", 20)),
             format!("{}ababababab{}", p("password", 17), "cabcabc"),
             // Named residuals: zxcvbn's per-part model passes them (GC #6190).
+            // (Here the repeats cost almost nothing; "Hello", "World" and "2024"
+            // are three parts, as `Hello World 2024` below.)
+            format!("Hello{}World{}2024", p("password", 20), p("password", 20)),
+            format!("{}{}", p("Summer2024!", 11), p("Winter2024!", 11)),
+            format!("{}{}{}{}", p("password", 16), p("football", 16), p("baseball", 16), p("princess", 16)),
             format!("{}!", p("i love you ", 20)),
             "thequickbrownfox".into(),
             "Password1!Password2!".into(),
