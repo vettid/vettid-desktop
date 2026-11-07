@@ -289,19 +289,61 @@ impl<'r> Cx<'r> {
     }
 }
 
-/// A long passphrase that is one unit of at most 128 characters repeated
-/// (the last repeat may be cut short): the unit's estimate times the number
-/// of whole repeats, times the estimate of the cut-short part. Chunks alone
-/// would score each repeat afresh ("word × N", review Medium; the owner's
-/// choice (a), GC #6108). Infinite when it isn't one.
+/// A long passphrase scored around its longest repeated stretch
+/// ([`longest_run`]): the stretch as one repeat, times the estimates of what
+/// comes before and after it, times the orderings of those parts. Chunks
+/// alone would score each repeat afresh ("word × N", review Medium; the
+/// owner's choice (a), GC #6108; extended, in the recheck, to a repeat with
+/// anything before or after it, which only refuses more). Infinite when
+/// there's no repeated stretch.
 fn long_repeat(rs: &[char], cx: &mut Cx) -> f64 {
-    let n = rs.len();
-    let Some(u) = (1..=MAX_ESTIMATE_CHARS.min(n / 2)).find(|&u| (u..n).all(|i| rs[i] == rs[i - u])) else {
+    let Some((start, len, unit)) = longest_run(rs) else {
         return f64::INFINITY;
     };
-    let rest = n % u;
-    let tail = if rest == 0 { 1.0 } else { guesses_chars(&rs[..rest], cx) };
-    guesses_chars(&rs[..u], cx) * (n / u) as f64 * tail
+    let run = &rs[start..start + len];
+    // The unit, the number of whole repeats, and for a last repeat cut short
+    // where it was cut (at most the unit's length).
+    let cut = if len % unit == 0 { 1.0 } else { unit as f64 };
+    let mut g = guesses_chars(&run[..unit], cx) * (len / unit) as f64 * cut;
+    let mut parts = 1.0;
+    for piece in [&rs[..start], &rs[start + len..]] {
+        if !piece.is_empty() {
+            g *= cx.estimate(piece);
+            parts += 1.0;
+        }
+    }
+    // 1, 2 or 6 orderings of one, two or three parts.
+    g * if parts == 3.0 { 6.0 } else { parts }
+}
+
+/// The longest stretch of `rs` that is one unit of at most 128 characters
+/// repeated at least twice (the last repeat may be cut short): its start,
+/// its length and the unit's length; the shortest unit among equals. Found
+/// in one pass per unit length (at most 128 × n comparisons).
+fn longest_run(rs: &[char]) -> Option<(usize, usize, usize)> {
+    let n = rs.len();
+    let mut best: Option<(usize, usize, usize)> = None;
+    for unit in 1..=MAX_ESTIMATE_CHARS.min(n / 2) {
+        let mut j = unit;
+        while j < n {
+            if rs[j] != rs[j - unit] {
+                j += 1;
+                continue;
+            }
+            // rs[j..k] each equal the character a unit back: the stretch
+            // rs[j - unit..k] has period `unit`.
+            let mut k = j;
+            while k < n && rs[k] == rs[k - unit] {
+                k += 1;
+            }
+            let (start, len) = (j - unit, k - j + unit);
+            if len >= 2 * unit && best.is_none_or(|(_, l, _)| len > l) {
+                best = Some((start, len, unit));
+            }
+            j = k;
+        }
+    }
+    best
 }
 
 // --- the estimator (password.go "the estimator") ---
@@ -778,7 +820,24 @@ mod tests {
     /// chunk by chunk (GC #6108); a varied long passphrase is unchanged.
     #[test]
     fn long_repeats_are_refused() {
-        let cases = ["password".repeat(50), "football".repeat(128), "Summer2024!!".repeat(12), format!("{}pass", "password".repeat(20))];
+        let p50 = "password".repeat(50);
+        let cases = [
+            p50.clone(),
+            "football".repeat(128),
+            "Summer2024!!".repeat(12),
+            format!("{}pass", "password".repeat(20)),
+            // The recheck's: a repeat with something before, after or inside it.
+            format!("{p50}1"),
+            format!("X{p50}"),
+            format!("{}1{}", "password".repeat(25), "password".repeat(25)),
+            format!("{}1", "football".repeat(127)),
+            format!("{}Summer", "Summer2024!!".repeat(11)),
+        ];
+        // Not refused, and not for the repeat: the unit alone scores 3e15
+        // (zxcvbn's cost per part; see `four_common_words_still_pass`).
+        let love = format!("{}!", "i love you ".repeat(20));
+        assert!(guesses(Rule::current(), "i love you ") > APP_FLOOR);
+        assert_eq!(check(&love), Ok(()));
         for pw in &cases {
             let g = guesses(Rule::current(), pw);
             assert_eq!(check(pw), Err(Weakness::Guessable), "{} chars: {g:e}", pw.chars().count());
@@ -787,9 +846,16 @@ mod tests {
         let varied: String = (0..40).map(|i| format!("{}{}", words[(i * 7 + i / 10) % words.len()], i)).collect::<Vec<_>>().join("-");
         assert!(varied.len() > 256);
         assert_eq!(check(&varied), Ok(()), "{:e}", guesses(Rule::current(), &varied));
-        let random: String = "Zq9!vK2#mP8".chars().cycle().take(300).collect();
-        assert_eq!(long_repeat(&random.chars().collect::<Vec<_>>(), &mut Cx::new(Rule::current())).is_finite(), true, "period 17");
+        // A strong unit, repeated, is still strong.
+        let random: String = "Zq9!vK2#mP8@wL5$x".chars().cycle().take(300).collect();
+        let rs: Vec<char> = random.chars().collect();
+        assert_eq!(longest_run(&rs), Some((0, 300, 17)));
         assert_eq!(check(&random), Ok(()));
+        // The longest run: start, length, unit.
+        let rs: Vec<char> = "xyabababab-z".chars().collect();
+        assert_eq!(longest_run(&rs), Some((2, 8, 2)));
+        let rs: Vec<char> = "abcdefgh".chars().collect();
+        assert_eq!(longest_run(&rs), None);
     }
 
     /// What the model still passes, as zxcvbn's does: four dictionary words
@@ -818,9 +884,11 @@ mod tests {
         let rest = guesses(Rule::current(), &seventeen[128..]);
         assert!(g.is_finite() && g < APP_FLOOR, "{g:e}");
         assert!(g <= first * rest, "the lower of the chunks and the repeat");
-        let half = format!("{}{}", "Tq8#vLm2!pRz-violet".repeat(7), "Kestrel-91-moss-glacier".repeat(1));
-        let (a, b) = half.split_at(half.char_indices().nth(128).unwrap().0);
-        assert_eq!(guesses(Rule::current(), &half), guesses(Rule::current(), a) * guesses(Rule::current(), b), "no repeat: the chunks");
+        // 200 different characters: nothing repeats, so the chunks decide.
+        let distinct: String = (0..200).map(|i| char::from_u32(0x4E00 + i).unwrap()).collect();
+        assert_eq!(longest_run(&distinct.chars().collect::<Vec<_>>()), None);
+        let (a, b) = distinct.split_at(distinct.char_indices().nth(128).unwrap().0);
+        assert_eq!(guesses(Rule::current(), &distinct), guesses(Rule::current(), a) * guesses(Rule::current(), b), "no repeat: the chunks");
         assert_eq!(guesses(Rule::vault(), &seventeen), f64::INFINITY, "the vault's rule at 5deefac");
         let long: String = "Zq9!vK2#mP8@wL5$x".chars().cycle().take(300).collect();
         assert!(guesses(Rule::current(), &long).is_finite());
