@@ -31,8 +31,17 @@
 //! `is_uppercase` also counts Other_Uppercase; it is only used for a
 //! dictionary match, and a dictionary match needs every character to lower
 //! to ASCII, where the two agree.
+//!
+//! SECURITY (review M1): the check makes one copy of the passphrase, its
+//! characters in a buffer wiped on drop; the matchers compare the
+//! substrings in place, through iterators, with the lists' entries, and copy
+//! nothing of them. The guess counts the estimator keeps are not secret.
+//!
+//! Speed: at most 128 characters are estimated (more counts as not
+//! guessable, as in the vault), in well under a second in a release build;
+//! the check runs once per pairing attempt, not per keystroke.
 
-use std::collections::HashMap;
+use zeroize::Zeroizing;
 use std::sync::OnceLock;
 
 /// The apps' guessability floor (the vault's is 10¹⁰).
@@ -71,9 +80,13 @@ impl Weakness {
 const COMMON_LIST: &str = include_str!("passwords/common-passwords.txt");
 const WORD_LIST: &str = include_str!("passwords/estimator-words.txt");
 
+/// A list's entries, each with its rank. Compared character by character,
+/// so a check makes no copy of the passphrase (review M1).
+type List = Vec<(Vec<char>, u32)>;
+
 struct Lists {
-    common: HashMap<String, u32>,
-    words: HashMap<String, u32>,
+    common: List,
+    words: List,
 }
 
 fn lists() -> &'static Lists {
@@ -83,8 +96,8 @@ fn lists() -> &'static Lists {
 
 /// One entry per line, trimmed; blank lines and `#` comments skipped; the
 /// rank is the entry's position, the first one kept (`loadList`).
-fn load_list(text: &str) -> HashMap<String, u32> {
-    let mut m = HashMap::new();
+fn load_list(text: &str) -> List {
+    let mut list: List = Vec::new();
     let mut rank = 0;
     for line in text.lines() {
         let w = line.trim();
@@ -92,9 +105,17 @@ fn load_list(text: &str) -> HashMap<String, u32> {
             continue;
         }
         rank += 1;
-        m.entry(w.to_string()).or_insert(rank);
+        let w: Vec<char> = w.chars().collect();
+        if !list.iter().any(|(e, _)| *e == w) {
+            list.push((w, rank));
+        }
     }
-    m
+    list
+}
+
+/// The rank of the entry equal to `candidate`, if any.
+fn rank_of(list: &List, len: usize, candidate: impl Iterator<Item = char> + Clone) -> Option<u32> {
+    list.iter().find(|(w, _)| w.len() == len && w.iter().copied().eq(candidate.clone())).map(|&(_, r)| r)
 }
 
 /// Checks a passphrase already normalized to NFC (`passphrase::nfc`) against
@@ -108,17 +129,18 @@ fn check_at(nfc: &str, floor: f64) -> Result<(), Weakness> {
     if nfc.len() > MAX_BYTES {
         return Err(Weakness::TooLong);
     }
-    let rs: Vec<char> = nfc.chars().collect();
+    // SECURITY: the only copy of the passphrase made here, wiped on drop.
+    let rs: Zeroizing<Vec<char>> = Zeroizing::new(nfc.chars().collect());
     if rs.len() < MIN_CHARS {
         return Err(Weakness::Short);
     }
     if rs[1..].iter().all(|&c| c == rs[0]) {
         return Err(Weakness::Repeated);
     }
-    if lists().common.contains_key(&nfc.to_ascii_lowercase()) {
+    if rank_of(&lists().common, rs.len(), rs.iter().map(|c| c.to_ascii_lowercase())).is_some() {
         return Err(Weakness::Common);
     }
-    if guesses(nfc) < floor {
+    if guesses_chars(&rs) < floor {
         return Err(Weakness::Guessable);
     }
     Ok(())
@@ -195,24 +217,26 @@ fn leet(c: char) -> Option<char> {
     })
 }
 
-fn rev(rs: &[char]) -> String {
-    rs.iter().rev().collect()
+/// The better (lower) rank of `candidate` in the common list and the words.
+fn either_list(l: &Lists, n: usize, candidate: impl Iterator<Item = char> + Clone) -> Option<u32> {
+    [rank_of(&l.common, n, candidate.clone()), rank_of(&l.words, n, candidate)].into_iter().flatten().min()
 }
 
+/// The dictionary match: the substring in lower case, reversed, with
+/// substitutions undone, and both. Go builds each form as a string; here
+/// each is an iterator over `sub`, compared with the lists' entries, so no
+/// copy of the passphrase is made (review M1).
 fn dict_guesses(sub: &[char]) -> f64 {
     let l = lists();
+    let n = sub.len();
     let mut best = f64::INFINITY;
-    let mut try_word = |s: &str, factor: f64| {
-        if let Some(&r) = l.common.get(s) {
-            best = best.min(r as f64 * factor);
-        }
-        if let Some(&r) = l.words.get(s) {
+    let mut try_word = |rank: Option<u32>, factor: f64| {
+        if let Some(r) = rank {
             best = best.min(r as f64 * factor);
         }
     };
-    let lowered: Vec<char> = sub.iter().map(|&c| lower(c)).collect();
     let mut up = 1.0;
-    if lowered != sub {
+    if sub.iter().any(|&c| lower(c) != c) {
         up = 2.0; // a capital first letter or all caps
         let first_cap = sub[0].is_uppercase() && sub[1..].iter().all(|&c| lower(c) == c);
         let all_caps = sub.iter().all(|&c| upper(c) == c);
@@ -220,15 +244,17 @@ fn dict_guesses(sub: &[char]) -> f64 {
             up = 2f64.powf(sub.iter().filter(|c| c.is_uppercase()).count() as f64);
         }
     }
-    let s: String = lowered.iter().collect();
-    try_word(&s, up);
-    try_word(&rev(&lowered), 2.0 * up);
-    let subs = lowered.iter().filter(|&&c| leet(c).is_some()).count();
+    try_word(either_list(l, n, sub.iter().map(|&c| lower(c))), up);
+    try_word(either_list(l, n, sub.iter().rev().map(|&c| lower(c))), 2.0 * up);
+    let subs = sub.iter().filter(|&&c| leet(lower(c)).is_some()).count();
     if subs > 0 {
-        let ul: Vec<char> = lowered.iter().map(|&c| leet(c).unwrap_or(c)).collect();
+        let unleet = |c: char| {
+            let c = lower(c);
+            leet(c).unwrap_or(c)
+        };
         let f = up * 2f64.powf(subs as f64);
-        try_word(&ul.iter().collect::<String>(), f);
-        try_word(&rev(&ul), 2.0 * f);
+        try_word(either_list(l, n, sub.iter().map(move |&c| unleet(c))), f);
+        try_word(either_list(l, n, sub.iter().rev().map(move |&c| unleet(c))), 2.0 * f);
     }
     best
 }
@@ -259,30 +285,32 @@ fn sequence_guesses(rs: &[char]) -> f64 {
 
 /// The keyboard rows and the columns, read either way. The second row ends
 /// with a backslash, added here so this file has no escapes in it.
-fn keyboard_rows() -> &'static [String; 10] {
-    static ROWS: OnceLock<[String; 10]> = OnceLock::new();
+fn keyboard_rows() -> &'static [Vec<char>; 10] {
+    static ROWS: OnceLock<[Vec<char>; 10]> = OnceLock::new();
     ROWS.get_or_init(|| {
         let backslash = char::from(92u8);
         let rows = [
-            "`1234567890-=".to_string(),
-            format!("qwertyuiop[]{backslash}"),
-            "asdfghjkl;'".to_string(),
-            "zxcvbnm,./".to_string(),
-            "1qaz2wsx3edc4rfv5tgb6yhn7ujm8ik,9ol.0p;/".to_string(),
+            "`1234567890-=".chars().collect::<Vec<_>>(),
+            "qwertyuiop[]".chars().chain([backslash]).collect(),
+            "asdfghjkl;'".chars().collect(),
+            "zxcvbnm,./".chars().collect(),
+            "1qaz2wsx3edc4rfv5tgb6yhn7ujm8ik,9ol.0p;/".chars().collect(),
         ];
-        let back = rows.clone().map(|r| r.chars().rev().collect::<String>());
+        let back = rows.clone().map(|r| r.into_iter().rev().collect::<Vec<_>>());
         let [a, b, c, d, e] = rows;
         let [f, g, h, i, j] = back;
         [a, f, b, g, c, h, d, i, e, j]
     })
 }
 
+/// A run along a row or column: the substring in lower case is a
+/// contiguous part of one (Go's `strings.Contains`), compared in place.
 fn keyboard_guesses(rs: &[char]) -> f64 {
     if rs.len() < 4 {
         return f64::INFINITY;
     }
-    let s: String = rs.iter().map(|&c| lower(c)).collect();
-    if keyboard_rows().iter().any(|row| row.contains(&s)) {
+    let on_a_row = keyboard_rows().iter().any(|row| row.windows(rs.len()).any(|w| w.iter().zip(rs).all(|(&k, &c)| k == lower(c))));
+    if on_a_row {
         94.0 * 4.6 * rs.len() as f64
     } else {
         f64::INFINITY
@@ -355,14 +383,17 @@ fn match_guesses(sub: &[char]) -> f64 {
     g.max(floor)
 }
 
-/// How many guesses a well-informed attacker needs (`Guesses`): the cheapest
-/// cover of the passphrase by at most 12 matched or brute-forced parts, times
-/// the orderings of that many parts.
-pub(crate) fn guesses(s: &str) -> f64 {
-    let rs: Vec<char> = s.chars().collect();
+/// `Guesses` over a string (the tests).
+#[cfg(test)]
+fn guesses(s: &str) -> f64 {
+    let rs: Zeroizing<Vec<char>> = Zeroizing::new(s.chars().collect());
     guesses_chars(&rs)
 }
 
+/// How many guesses a well-informed attacker needs (`Guesses`): the cheapest
+/// cover of the passphrase by at most 12 matched or brute-forced parts, times
+/// the orderings of that many parts. Works on the caller's characters and
+/// copies none of them.
 fn guesses_chars(rs: &[char]) -> f64 {
     let n = rs.len();
     if n == 0 {
@@ -404,6 +435,7 @@ mod tests {
 
     const COMMON_SHA256: &str = "c51ddc947e4f10f7e3adc4912c2a4d90cb7483cec564261e17bc151189db223f";
     const WORDS_SHA256: &str = "19b0f9e404b1aeaec1366d69cd3f040f5762099c35c902e927137b5b489514ff";
+    const VERDICTS_SHA256: &str = "09540a0c78b03fb03cfdee762066a9f1171419d2958798b5b4cf054f7dda66a5";
 
     fn nfc(s: &str) -> String {
         crate::credential::passphrase::nfc(s).to_string()
@@ -413,6 +445,7 @@ mod tests {
     fn the_lists_are_the_vaults() {
         assert_eq!(hex::encode(Sha256::digest(COMMON_LIST)), COMMON_SHA256, "common-passwords.txt changed");
         assert_eq!(hex::encode(Sha256::digest(WORD_LIST)), WORDS_SHA256, "estimator-words.txt changed");
+        assert_eq!(hex::encode(Sha256::digest(include_str!("passwords/verdicts.json"))), VERDICTS_SHA256, "verdicts.json changed");
         assert_eq!(lists().common.len(), 20);
         assert_eq!(lists().words.len(), 43);
     }
@@ -524,6 +557,17 @@ mod tests {
         assert_eq!(upper('\u{1F88}'), '\u{1F88}');
         assert_eq!(upper('\u{1FB3}'), '\u{1FBC}');
         assert_eq!(upper('a'), 'A');
+        // Titlecase, and characters Rust counts as upper case where Go's Lu
+        // doesn't (circled letters, Roman numerals): they lower to no ASCII
+        // letter, so they never reach a dictionary match.
+        assert_eq!((lower('\u{1C5}'), upper('\u{1C5}')), ('\u{1C6}', '\u{1C4}'));
+        assert_eq!(lower('\u{24B6}'), '\u{24D0}');
+        assert_eq!(lower('\u{2160}'), '\u{2170}');
+        let circled: Vec<char> = "PASSWORD".chars().map(|c| char::from_u32(0x24B6 + (c as u32 - 'A' as u32)).unwrap()).collect();
+        assert_eq!(dict_guesses(&circled), f64::INFINITY, "circled PASSWORD isn't the word");
+        assert_eq!(dict_guesses(&"PassWord".chars().collect::<Vec<_>>()), 4.0, "rank 1, two capitals");
+        assert_eq!(dict_guesses(&"DROWSSAP".chars().collect::<Vec<_>>()), 4.0, "rank 1, reversed, all caps");
+        assert_eq!(dict_guesses(&"p@ssw0rd".chars().collect::<Vec<_>>()), 4.0, "rank 1, two substitutions");
     }
 
     /// The longest passphrase the estimator looks at (128 characters) is
