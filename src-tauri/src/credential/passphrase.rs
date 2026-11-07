@@ -243,6 +243,13 @@ pub(crate) use super::password_rule::Weakness;
 /// The vault's password rule, at the apps' floor (`password_rule`), judged
 /// in NFC, the form that is used (lead decision).
 pub(crate) fn strong_enough(passphrase: &str) -> Result<(), Weakness> {
+    // Refused before NFC when NFC couldn't bring it under the limit (it
+    // shortens UTF-8 to a third at most: three Hangul jamo of three bytes
+    // each compose to one syllable of three), so a huge paste isn't
+    // normalized first (lead review).
+    if passphrase.len() > 3 * super::password_rule::MAX_BYTES {
+        return Err(Weakness::TooLong);
+    }
     super::password_rule::check(&nfc(passphrase))
 }
 
@@ -410,5 +417,19 @@ mod tests {
         assert_eq!(strong_enough("qwertyuiopasdf"), Err(Weakness::Guessable));
         assert_eq!(strong_enough("correct horse battery staple"), Ok(()));
         assert_eq!(strong_enough("glacier mango tuesday piano"), Ok(()), "no capitals or digits needed");
+    }
+
+    /// The length limit before NFC never refuses what NFC would bring under
+    /// 1,024 bytes: Hangul, decomposed, is three times as long.
+    #[test]
+    fn the_length_before_nfc() {
+        use unicode_normalization::UnicodeNormalization;
+        assert_eq!(strong_enough(&"x".repeat(3 * 1024 + 1)), Err(Weakness::TooLong));
+        // 341 syllables with a final consonant: 1,023 bytes in NFC, 3,069 in NFD.
+        let syllables: String = (0..341).map(|i| char::from_u32(0xAC01 + 28 * (i % 399)).unwrap()).collect();
+        let decomposed: String = syllables.nfd().collect();
+        assert_eq!((syllables.len(), decomposed.len()), (1023, 3069));
+        assert_ne!(strong_enough(&decomposed), Err(Weakness::TooLong));
+        assert_eq!(strong_enough(&decomposed), strong_enough(&syllables));
     }
 }
