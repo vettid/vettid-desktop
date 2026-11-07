@@ -51,8 +51,10 @@
 //! SECURITY (review M1): the check keeps the passphrase's characters in one
 //! buffer, and spells each candidate it looks up into one other, both wiped
 //! on drop and sized once, so neither reallocates (`Cx`). Nothing else holds
-//! any of it. The guess counts the estimator keeps are not secret. Residual:
-//! the hash of a candidate, computed for a lookup, isn't wiped.
+//! any of it. The guess counts the estimator keeps are not secret.
+//! Residual: hashing a candidate for a lookup leaves up to 7 of its bytes
+//! (the tail SipHash hadn't absorbed yet) in a stack frame that isn't wiped,
+//! and its hash value.
 //!
 //! Speed: each chunk of at most 128 characters is estimated in well under a
 //! second in a release build (a passphrase has at most 8 chunks); the check
@@ -198,7 +200,7 @@ fn check_at(nfc: &str, rule: &Rule, floor: f64) -> Result<(), Weakness> {
     }
     // SECURITY: the passphrase's characters, wiped on drop; with the lookup
     // buffer below, the only copies the check makes.
-    let rs: Zeroizing<Vec<char>> = Zeroizing::new(nfc.chars().collect());
+    let rs = chars_of(nfc);
     if rs.len() < MIN_CHARS {
         return Err(Weakness::Short);
     }
@@ -213,6 +215,15 @@ fn check_at(nfc: &str, rule: &Rule, floor: f64) -> Result<(), Weakness> {
         return Err(Weakness::Guessable);
     }
     Ok(())
+}
+
+/// The characters of `s` in a buffer wiped on drop, allocated once at its
+/// final size (UTF-8 has at least one byte per character), so filling it
+/// never reallocates and leaves no copy behind (review High).
+fn chars_of(s: &str) -> Zeroizing<Vec<char>> {
+    let mut v = Zeroizing::new(Vec::with_capacity(s.len()));
+    v.extend(s.chars());
+    v
 }
 
 /// A check under way: its rule and the one buffer the lookups spell the
@@ -564,7 +575,7 @@ mod tests {
 
     /// `Guesses` of a whole passphrase under `rule`.
     fn guesses(rule: &Rule, s: &str) -> f64 {
-        let rs: Zeroizing<Vec<char>> = Zeroizing::new(s.chars().collect());
+        let rs = chars_of(s);
         Cx::new(rule).estimate(&rs)
     }
 
@@ -815,11 +826,21 @@ mod tests {
         // zxcvbn's lists: "password" is rank 2 of its passwords (and rank 1
         // of VettID's words, which wins).
         assert_eq!(dict(Rule::current(), "password"), 1.0);
-        assert_eq!(dict(Rule::current(), "Harry"), 2.0 * (zxcvbn_rank("harry") as f64));
+        // The first entries of zxcvbn's surnames and female names: rank 1,
+        // times 2 for the capital.
+        assert_eq!(dict(Rule::current(), "Smith"), 2.0);
+        assert_eq!(dict(Rule::current(), "Mary"), 2.0);
+        assert_eq!(dict(Rule::current(), "nosuchwordzz"), f64::INFINITY);
     }
 
-    fn zxcvbn_rank(w: &str) -> u32 {
-        *Rule::current().dict.get(w).unwrap()
+    /// The passphrase's characters are allocated once, at their final size.
+    #[test]
+    fn the_characters_never_reallocate() {
+        for s in ["violet-Kestrel-91-moss", "密码密码密码", "😀😁😂🤣", ""] {
+            let v = chars_of(s);
+            assert_eq!(v.capacity(), s.len(), "{s}");
+            assert!(v.len() <= v.capacity());
+        }
     }
 
     /// The lookup buffer is sized once and never grows (so no copy of the
