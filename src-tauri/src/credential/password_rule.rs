@@ -126,7 +126,9 @@ enum Long {
     #[cfg_attr(not(test), allow(dead_code))]
     Infinite,
     /// The product of the estimates of consecutive 128-character chunks, or
-    /// the whole string as one repeat if that is lower ([`long_repeat`]).
+    /// the passphrase scored around a repeat longer than a chunk if that is
+    /// lower ([`long_repeat`]). Length alone never makes it strong; a product
+    /// of strong chunks can still overflow to infinity, which is right.
     Chunked,
 }
 
@@ -297,7 +299,11 @@ impl<'r> Cx<'r> {
 /// anything before or after it, which only refuses more). Infinite when
 /// there's no repeated stretch.
 fn long_repeat(rs: &[char], cx: &mut Cx) -> f64 {
-    let Some((start, len, unit)) = longest_run(rs) else {
+    // Only a stretch longer than a chunk: a shorter one is scored inside a
+    // chunk already (`repeat_guesses`). Each level of `estimate` then takes
+    // more than 128 characters away, so there are at most 7 (recheck: with
+    // short runs, the levels were n/2 and a 1,024-character paste took 31 s).
+    let Some((start, len, unit)) = longest_run(rs).filter(|&(_, len, _)| len > MAX_ESTIMATE_CHARS) else {
         return f64::INFINITY;
     };
     let run = &rs[start..start + len];
@@ -832,6 +838,7 @@ mod tests {
             format!("{}1{}", "password".repeat(25), "password".repeat(25)),
             format!("{}1", "football".repeat(127)),
             format!("{}Summer", "Summer2024!!".repeat(11)),
+            format!("Hello{}2024!", "password".repeat(40)),
         ];
         // Not refused, and not for the repeat: the unit alone scores 3e15
         // (zxcvbn's cost per part; see `four_common_words_still_pass`).
@@ -856,6 +863,13 @@ mod tests {
         assert_eq!(longest_run(&rs), Some((2, 8, 2)));
         let rs: Vec<char> = "abcdefgh".chars().collect();
         assert_eq!(longest_run(&rs), None);
+        // Runs no longer than a chunk aren't used (scored inside the chunks),
+        // so a paste of short runs doesn't recurse (recheck: 31 s at 1,024
+        // characters when it did).
+        let pairs: String = (0..512).map(|i| char::from_u32(0x4E00 + i).unwrap()).flat_map(|c| [c, c]).collect();
+        let rs: Vec<char> = pairs.chars().collect();
+        assert_eq!(longest_run(&rs).map(|(_, len, _)| len), Some(2));
+        assert_eq!(long_repeat(&rs, &mut Cx::new(Rule::current())), f64::INFINITY);
     }
 
     /// What the model still passes, as zxcvbn's does: four dictionary words
