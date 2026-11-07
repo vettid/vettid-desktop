@@ -143,6 +143,19 @@ pub fn protection_ready() -> Result<(), CredentialError> {
     Protectors::system().ready().map_err(save_error)
 }
 
+/// Whether pairing needs a passphrase (#13 item 4): every other protector
+/// is absent here. A present one that fails is an error, never this (it
+/// stops pairing with its reason; there is no fallback).
+pub fn needs_passphrase() -> Result<bool, CredentialError> {
+    Protectors::system().needs_passphrase().map_err(save_error)
+}
+
+/// Whether the saved pairing's header says the passphrase sealed it, read
+/// unauthenticated (nothing is decrypted): unlock then asks for it.
+pub fn sealed_by_passphrase(config_dir: &Path) -> bool {
+    what_is_sealed(config_dir).sealed_by.as_deref() == Some(super::passphrase::ID)
+}
+
 /// A protector's failure while saving, as the person is told it.
 fn save_error(e: ProtectorError) -> CredentialError {
     log::warn!("device store: {}", e);
@@ -162,8 +175,8 @@ fn load_error(e: ProtectorError) -> (CredentialError, StoreError) {
     match e {
         ProtectorError::Failing { by, .. } => (CredentialError::NotOpened { by }, StoreError::Io),
         // The passphrase given doesn't open it (#13): kept, and the person
-        // can try again. Item 4 gives it its own notice.
-        ProtectorError::NotThisSecret { by } => (CredentialError::NotOpened { by }, StoreError::Io),
+        // can try again.
+        ProtectorError::NotThisSecret { .. } => (CredentialError::WrongPassphrase, StoreError::Io),
         ProtectorError::WontOpen(_) => (CredentialError::Unreadable, StoreError::Corrupt),
         ProtectorError::NoneAvailable | ProtectorError::NotRemoved { .. } => (CredentialError::IoError(e.to_string()), StoreError::Io),
     }
@@ -195,6 +208,13 @@ impl DeviceStore {
     /// ([`store::wipe_epoch`], read before anything that could wait).
     pub fn new(config_dir: &Path, since: WipeEpoch) -> Self {
         Self::with_protectors(config_dir, Some(since), Protectors::system())
+    }
+
+    /// As [`DeviceStore::new`], with the passphrase the person entered
+    /// (#13 item 4): it seals a new pairing only when every other protector
+    /// is absent, and opens one its header says it sealed.
+    pub(crate) fn with_passphrase(config_dir: &Path, since: WipeEpoch, passphrase: super::passphrase::Passphrase) -> Self {
+        Self::with_protectors(config_dir, Some(since), Protectors::system_with_passphrase(Some(passphrase)))
     }
 
     pub(crate) fn with_protectors(config_dir: &Path, since: Option<WipeEpoch>, protectors: Protectors) -> Self {
@@ -719,7 +739,7 @@ pub(crate) mod tests {
             assert!(exists(&dir), "kept");
         }
         // Another format version or protector isn't opened at all.
-        for change in [|h: &mut Header| h.v = 3, |h: &mut Header| h.protector = "passphrase".into()] {
+        for change in [|h: &mut Header| h.v = 3, |h: &mut Header| h.protector = "not-a-protector".into()] {
             let mut f = SealedFile { header: good.header.clone(), ciphertext: good.ciphertext.clone() };
             change(&mut f.header);
             write_sealed(&dir, &f);
@@ -1101,5 +1121,64 @@ pub(crate) mod tests {
         s.clear().unwrap();
         assert!(!exists(&dir));
         assert_eq!(Behaviour::count(&b.legacy_removes), 1);
+    }
+
+    /// #13 item 4: with every other protector absent, the passphrase seals
+    /// the pairing; the right one opens it, a wrong one is its own answer
+    /// and keeps the file.
+    #[test]
+    fn a_pairing_sealed_by_the_passphrase() {
+        use crate::credential::passphrase::Passphrase;
+        let dir = tempfile::tempdir().unwrap();
+        let b = Arc::new(Behaviour::default());
+        Behaviour::set(&b.absent, true);
+        let with = |s: &str| testing::protectors(&b).and_passphrase(Passphrase::new(Zeroizing::new(s.to_string())));
+        let mut s = DeviceStore::with_protectors(dir.path(), None, with("violet-Kestrel-91-moss"));
+        s.save(b"state").unwrap();
+        assert!(sealed_by_passphrase(dir.path()));
+        assert_eq!(stored_key_protection(dir.path()), KeyProtection { protector: "passphrase", bound: false });
+        assert_eq!(Behaviour::count(&b.wraps), 0, "the absent protector wrapped nothing");
+
+        let mut wrong = DeviceStore::with_protectors(dir.path(), None, with("violet-Kestrel-91-mosS"));
+        assert_eq!(wrong.load().err(), Some(StoreError::Io), "may open later, with the right one");
+        assert!(matches!(wrong.take_failure(), Some(CredentialError::WrongPassphrase)));
+        assert!(exists(dir.path()), "kept");
+        assert_eq!(CredentialError::WrongPassphrase.to_string(), store::WRONG_PASSPHRASE_NOTICE);
+
+        let mut right = DeviceStore::with_protectors(dir.path(), None, with("violet-Kestrel-91-moss"));
+        assert_eq!(right.load().unwrap().as_deref().map(|v| v.as_slice()), Some(&b"state"[..]));
+        // The test protector present again: the file names its protector, so
+        // it still opens with the passphrase, and its saves stay under it.
+        Behaviour::set(&b.absent, false);
+        let mut again = DeviceStore::with_protectors(dir.path(), None, with("violet-Kestrel-91-moss"));
+        assert!(again.load().unwrap().is_some());
+        again.save(b"state 2").unwrap();
+        assert!(sealed_by_passphrase(dir.path()));
+        assert_eq!(Behaviour::count(&b.wraps), 0);
+    }
+
+    /// #13 item 4, end to end on a Linux machine where this account has no
+    /// TPM and no Secret Service (tempe's WSL): this platform's real
+    /// protectors, then the passphrase. Ignored: it depends on the machine;
+    /// run with `--ignored` where both are absent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn the_real_protectors_fall_back_to_the_passphrase() {
+        use crate::credential::passphrase::Passphrase;
+        assert!(needs_passphrase().unwrap(), "a TPM or a Secret Service is here: run where neither is");
+        let dir = tempfile::tempdir().unwrap();
+        let pass = |s: &str| Passphrase::new(Zeroizing::new(s.to_string()));
+        let mut s = DeviceStore::with_protectors(dir.path(), None, Protectors::system_with_passphrase(Some(pass("violet-Kestrel-91-moss"))));
+        s.save(b"state").unwrap();
+        assert!(sealed_by_passphrase(dir.path()));
+        let mut wrong = DeviceStore::with_protectors(dir.path(), None, Protectors::system_with_passphrase(Some(pass("violet-kestrel-91-moss"))));
+        assert_eq!(wrong.load().err(), Some(StoreError::Io));
+        assert!(matches!(wrong.take_failure(), Some(CredentialError::WrongPassphrase)));
+        let mut right = DeviceStore::with_protectors(dir.path(), None, Protectors::system_with_passphrase(Some(pass("violet-Kestrel-91-moss"))));
+        assert_eq!(right.load().unwrap().as_deref().map(|v| v.as_slice()), Some(&b"state"[..]));
+        // Without a passphrase, pairing would answer `needs_passphrase`: no
+        // other protector seals it.
+        assert!(matches!(Protectors::system().ready(), Err(ProtectorError::NoneAvailable)));
     }
 }

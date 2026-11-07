@@ -1,8 +1,7 @@
 //! The passphrase protector (#13 item 3; DESKTOP-REWORK-PLAN §4 "At-rest
-//! protectors", the owner's choice (c)): used only when no protector that
-//! binds the pairing to this computer is present. Engine only: the app
-//! wires it in with the passphrase UI (#13 item 4), so nothing chooses it
-//! yet.
+//! protectors", the owner's choice (c)): used only when every other
+//! protector is absent here (`Protectors::system_with_passphrase`, #13
+//! item 4).
 //!
 //! **The wrap.** Argon2id (RustCrypto `argon2`) turns the passphrase and a
 //! random 16-byte salt into 32 bytes; HKDF-SHA-256 with a label turns those
@@ -47,10 +46,6 @@
 //! (review M2, lead review; the text comes with the UI, item 4). Running out
 //! of memory or random bytes is `Failing`.
 
-// Wired into `Protectors` by the passphrase UI (#13 item 4), which removes
-// this.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use argon2::{Algorithm, Argon2, Block, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -93,6 +88,13 @@ const HKDF_INFO: &[u8] = b"vettid-desktop passphrase wrap v1";
 /// The protector, holding the passphrase the person entered.
 pub(crate) struct Passphrase {
     secret: Zeroizing<String>,
+}
+
+/// Shows nothing of the passphrase.
+impl std::fmt::Debug for Passphrase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Passphrase(..)")
+    }
 }
 
 impl Passphrase {

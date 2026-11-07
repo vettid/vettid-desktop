@@ -69,11 +69,59 @@ pub struct AppState {
     /// than a generic one. Cleared once a link is installed.
     pub unlock_notice: Arc<std::sync::Mutex<Option<String>>>,
 
+    /// Wrong passphrases at unlock, and the wait before the next try (#13
+    /// item 4; [`PassphraseTries`]).
+    pub passphrase_tries: Arc<std::sync::Mutex<PassphraseTries>>,
+
     /// Currently active WebRTC call session, if any. Only one call at a time
     /// — multi-call (call-waiting) would warrant a HashMap keyed by call_id,
     /// but the Android app is single-call and we follow that model.
     #[cfg(feature = "webrtc")]
     pub active_call: Arc<Mutex<Option<Arc<CallSession>>>>,
+}
+
+/// The longest wait between passphrase tries at unlock.
+pub const PASSPHRASE_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// After this many wrong passphrases in a row, unlock adds that the saved
+/// pairing may be damaged (a damaged file answers the same as a wrong
+/// passphrase).
+pub const MAYBE_DAMAGED_AFTER: u32 = 5;
+
+/// Wrong passphrases in a row at unlock, and when the next try may run (#13
+/// item 4): after each wrong one the wait doubles, 1, 2, 4, 8, 16 s, then 30 s
+/// each time; reset when a pairing opens. It lives in memory, so quitting
+/// resets it. That is a stated residual (lead review): it only slows guessing
+/// at the keyboard; Argon2id is what slows guessing at a copy of the file.
+#[derive(Debug, Default)]
+pub struct PassphraseTries {
+    wrong: u32,
+    next_at: Option<std::time::Instant>,
+}
+
+impl PassphraseTries {
+    /// How long until the next try may run, if it may not yet.
+    pub fn wait_left(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.next_at.and_then(|t| t.checked_duration_since(now)).filter(|d| !d.is_zero())
+    }
+
+    /// A wrong passphrase at `now`: the wait before the next try.
+    pub fn wrong(&mut self, now: std::time::Instant) -> std::time::Duration {
+        self.wrong = self.wrong.saturating_add(1);
+        let wait = std::time::Duration::from_secs(1 << (self.wrong - 1).min(5)).min(PASSPHRASE_WAIT_CAP);
+        self.next_at = Some(now + wait);
+        wait
+    }
+
+    /// Wrong passphrases in a row.
+    pub fn wrong_in_a_row(&self) -> u32 {
+        self.wrong
+    }
+
+    /// A pairing opened (or a new one was made): no wait.
+    pub fn reset(&mut self) {
+        *self = PassphraseTries::default();
+    }
 }
 
 /// How long the restarted refresh waits before its first round: nothing to
@@ -105,6 +153,7 @@ impl AppState {
             resets_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             resets_finished: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             unlock_notice: Arc::new(std::sync::Mutex::new(None)),
+            passphrase_tries: Arc::new(std::sync::Mutex::new(PassphraseTries::default())),
             #[cfg(feature = "webrtc")]
             active_call: Arc::new(Mutex::new(None)),
         }
@@ -161,5 +210,24 @@ mod tests {
         assert_eq!(first_wait(true, true), crate::link::REFUSED_RECHECK_EVERY, "an end can't be sent to it");
         assert_eq!(first_wait(true, false), Duration::ZERO);
         assert_eq!(first_wait(false, false), crate::link::REFRESH_EVERY);
+    }
+
+    #[test]
+    fn the_passphrase_wait_doubles_to_30_s() {
+        let t0 = std::time::Instant::now();
+        let mut t = PassphraseTries::default();
+        assert_eq!(t.wait_left(t0), None, "the first try doesn't wait");
+        let waits: Vec<u64> = (0..8).map(|_| t.wrong(t0).as_secs()).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(t.wrong_in_a_row(), 8);
+        assert_eq!(t.wait_left(t0), Some(Duration::from_secs(30)));
+        assert_eq!(t.wait_left(t0 + Duration::from_secs(29)), Some(Duration::from_secs(1)));
+        assert_eq!(t.wait_left(t0 + Duration::from_secs(30)), None);
+        for _ in 0..100 {
+            t.wrong(t0);
+        }
+        assert_eq!(t.wrong(t0), PASSPHRASE_WAIT_CAP, "no overflow");
+        t.reset();
+        assert_eq!((t.wrong_in_a_row(), t.wait_left(t0)), (0, None));
     }
 }

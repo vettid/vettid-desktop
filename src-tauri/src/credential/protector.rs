@@ -14,6 +14,10 @@
 //!   login keychain, until the keychain and passphrase protectors land).
 //!   The data key is the keyring entry itself, so the header's wrapped key
 //!   is empty. Not bound to this computer: Settings says so.
+//! - **Last, on every platform: the passphrase** (`super::passphrase`, the
+//!   owner's choice (c)), only when every protector above is absent, and
+//!   only with a passphrase the person entered
+//!   ([`Protectors::system_with_passphrase`]). Not bound to this computer.
 //!
 //! **Absent and failing are different.** A protector says it is absent
 //! only from a fixed, detected condition ([`Availability::Absent`]), never
@@ -64,7 +68,6 @@ pub(crate) enum ProtectorError {
     /// key: a wrong one, or a changed file, which can't be told apart. The
     /// file is kept and the person can try again; never "won't open", which
     /// would tell them to re-pair.
-    #[cfg_attr(not(test), allow(dead_code))] // the passphrase protector is wired in by #13 item 4
     NotThisSecret { by: &'static str },
 }
 
@@ -179,6 +182,7 @@ pub(crate) fn describe(id: &str) -> Option<(&'static str, bool)> {
         "dpapi" => Some(("dpapi", true)),
         "tpm" => Some(("tpm", true)),
         "secret-service" => Some(("secret-service", false)),
+        "passphrase" => Some(("passphrase", false)),
         // Linux has no keyring protector (a file of the build before this
         // one, sealed by it, is unreadable here: re-pair).
         #[cfg(not(target_os = "linux"))]
@@ -215,9 +219,37 @@ impl Protectors {
         }
     }
 
+    /// This platform's real protectors, then the passphrase the person
+    /// entered, if any: chosen only when every other one is absent, and
+    /// the only one that opens a file its header says it sealed (#13).
+    pub(crate) fn system_with_passphrase(passphrase: Option<super::passphrase::Passphrase>) -> Self {
+        let mut p = Self::system();
+        if let Some(pass) = passphrase {
+            p.ranked.push(Box::new(pass));
+        }
+        p
+    }
+
     #[cfg(test)]
     pub(crate) fn new(ranked: Vec<Box<dyn Protector>>, legacy: Box<dyn LegacyKey>) -> Self {
         Protectors { ranked, legacy }
+    }
+
+    /// As [`Protectors::system_with_passphrase`], over test protectors.
+    #[cfg(test)]
+    pub(crate) fn and_passphrase(mut self, passphrase: super::passphrase::Passphrase) -> Self {
+        self.ranked.push(Box::new(passphrase));
+        self
+    }
+
+    /// Whether every protector is absent, so pairing needs a passphrase
+    /// (#13): a present one that fails is its own answer, never this.
+    pub(crate) fn needs_passphrase(&self) -> Result<bool, ProtectorError> {
+        match self.ready() {
+            Ok(()) => Ok(false),
+            Err(ProtectorError::NoneAvailable) => Ok(true),
+            Err(e) => Err(e),
+        }
     }
 
     /// The best protector present. Only an absent one is passed over.
@@ -552,7 +584,27 @@ pub(crate) mod testing {
         assert_eq!(describe("keyring"), Some(("keyring", false)));
         #[cfg(target_os = "linux")]
         assert_eq!(describe("keyring"), None);
-        assert_eq!(describe("passphrase"), None);
+        assert_eq!(describe("passphrase"), Some(("passphrase", false)));
         assert_eq!(describe(""), None);
+    }
+
+    /// The passphrase is chosen only when every other protector is absent
+    /// (#13 item 4); one that is present and fails is never passed over.
+    #[test]
+    fn the_passphrase_only_when_every_other_is_absent() {
+        let b = Arc::new(Behaviour::default());
+        let pass = || crate::credential::passphrase::Passphrase::new(Zeroizing::new("violet-Kestrel-91-moss".to_string()));
+        let with = protectors(&b).and_passphrase(pass());
+        assert!(!protectors(&b).needs_passphrase().unwrap());
+        assert_eq!(with.choose().unwrap().id(), "test");
+        Behaviour::set(&b.fail_probe, true);
+        assert!(matches!(protectors(&b).needs_passphrase(), Err(ProtectorError::Failing { .. })), "failing isn't absent");
+        assert!(matches!(with.ready(), Err(ProtectorError::Failing { .. })), "no fallback to the passphrase");
+        Behaviour::set(&b.fail_probe, false);
+        Behaviour::set(&b.absent, true);
+        assert!(protectors(&b).needs_passphrase().unwrap());
+        assert!(matches!(protectors(&b).ready(), Err(ProtectorError::NoneAvailable)), "not without one");
+        assert_eq!(with.choose().unwrap().id(), "passphrase");
+        assert!(with.ready().is_ok());
     }
 }
