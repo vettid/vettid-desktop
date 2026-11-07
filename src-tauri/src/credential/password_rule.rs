@@ -301,9 +301,37 @@ impl<'r> Cx<'r> {
         }
         match self.rule.long {
             Long::Infinite => f64::INFINITY,
-            Long::Segmented => chunked(rs, self).min(segmented(rs, self)),
+            // The lowest of the three: each way of reading the passphrase
+            // only lowers the estimate, never raises it (lead review: the
+            // cut at runs alone raised some).
+            Long::Segmented => chunked(rs, self).min(segmented(rs, self)).min(long_repeat(rs, self)),
         }
     }
+}
+
+/// What it costs to guess `unit` knowing `seen`, a unit of the same length:
+/// 1 if they are the same; the product of the character classes' sizes of
+/// the differing characters (10 for a digit, 26 for a letter, 33 for other
+/// ASCII, 100 otherwise) if they differ in one or two places; else infinite.
+/// Compared in place; nothing is copied.
+fn variant_cost(seen: &[char], unit: &[char]) -> f64 {
+    let mut cost = 1.0;
+    let mut differ = 0;
+    for (&a, &b) in seen.iter().zip(unit) {
+        if a != b {
+            differ += 1;
+            if differ > 2 {
+                return f64::INFINITY;
+            }
+            cost *= match b {
+                '0'..='9' => 10.0,
+                'a'..='z' | 'A'..='Z' => 26.0,
+                c if c.is_ascii() => 33.0,
+                _ => 100.0,
+            };
+        }
+    }
+    cost
 }
 
 /// The product of the estimates of consecutive 128-character chunks.
@@ -331,7 +359,13 @@ fn segmented(rs: &[char], cx: &mut Cx) -> f64 {
             g *= chunked(&rs[at..start], cx);
             parts += 1;
         }
-        g *= guesses_chars(&rs[start..start + unit], cx) * (len / unit) as f64;
+        // A unit an earlier run had already costs only its count; one that
+        // differs from it in at most two places costs the choices for those
+        // characters too (a "variant": dragon12 then dragon13, Password1!
+        // then Password2!). Otherwise the unit's own estimate (lead review).
+        let earlier = runs[..i].iter().filter(|r| r.2 == unit).map(|r| variant_cost(&rs[r.0..r.0 + unit], &rs[start..start + unit])).fold(f64::INFINITY, f64::min);
+        let unit_cost = earlier.min(guesses_chars(&rs[start..start + unit], cx));
+        g *= unit_cost * (len / unit) as f64;
         parts += 1;
         at = start + len;
         // A last repeat cut short, up to where the next run starts, costs
@@ -416,6 +450,68 @@ fn first_run(rs: &[char], from: usize) -> Option<(usize, usize, usize)> {
     }
     best
 }
+
+/// A long passphrase scored around its longest repeated stretch
+/// ([`longest_run`]): the stretch as one repeat, times the estimates of what
+/// comes before and after it, times the orderings of those parts. Chunks
+/// alone would score each repeat afresh ("word × N", review Medium; the
+/// owner's choice (a), GC #6108; extended, in the recheck, to a repeat with
+/// anything before or after it, which only refuses more). Infinite when
+/// there's no repeated stretch.
+fn long_repeat(rs: &[char], cx: &mut Cx) -> f64 {
+    // Only a stretch longer than a chunk: a shorter one is scored inside a
+    // chunk already (`repeat_guesses`). Each level of `estimate` then takes
+    // more than 128 characters away, so there are at most 7 (recheck: with
+    // short runs, the levels were n/2 and a 1,024-character paste took 31 s).
+    let Some((start, len, unit)) = longest_run(rs).filter(|&(_, len, _)| len > MAX_ESTIMATE_CHARS) else {
+        return f64::INFINITY;
+    };
+    let run = &rs[start..start + len];
+    // The unit, the number of whole repeats, and for a last repeat cut short
+    // where it was cut (at most the unit's length).
+    let cut = if len % unit == 0 { 1.0 } else { unit as f64 };
+    let mut g = guesses_chars(&run[..unit], cx) * (len / unit) as f64 * cut;
+    let mut parts = 1.0;
+    for piece in [&rs[..start], &rs[start + len..]] {
+        if !piece.is_empty() {
+            g *= cx.estimate(piece);
+            parts += 1.0;
+        }
+    }
+    // 1, 2 or 6 orderings of one, two or three parts.
+    g * if parts == 3.0 { 6.0 } else { parts }
+}
+
+/// The longest stretch of `rs` that is one unit of at most 128 characters
+/// repeated at least twice (the last repeat may be cut short): its start,
+/// its length and the unit's length; the shortest unit among equals. Found
+/// in one pass per unit length (at most 128 × n comparisons).
+fn longest_run(rs: &[char]) -> Option<(usize, usize, usize)> {
+    let n = rs.len();
+    let mut best: Option<(usize, usize, usize)> = None;
+    for unit in 1..=MAX_ESTIMATE_CHARS.min(n / 2) {
+        let mut j = unit;
+        while j < n {
+            if rs[j] != rs[j - unit] {
+                j += 1;
+                continue;
+            }
+            // rs[j..k] each equal the character a unit back: the stretch
+            // rs[j - unit..k] has period `unit`.
+            let mut k = j;
+            while k < n && rs[k] == rs[k - unit] {
+                k += 1;
+            }
+            let (start, len) = (j - unit, k - j + unit);
+            if len >= 2 * unit && best.is_none_or(|(_, l, _)| len > l) {
+                best = Some((start, len, unit));
+            }
+            j = k;
+        }
+    }
+    best
+}
+
 
 // --- the estimator (password.go "the estimator") ---
 
@@ -972,22 +1068,20 @@ mod tests {
             format!("{}1{}", "password".repeat(15), "password".repeat(15)),
             format!("{} {}", "iloveyou".repeat(15), "iloveyou".repeat(15)),
             format!("{}{}{}", "password".repeat(15), "football".repeat(15), "baseball".repeat(15)),
+            // The lead's recheck: the same unit, or a variant of it, again.
+            format!("{}{}", "Password1!".repeat(12), "Password2!".repeat(12)),
+            format!("{}a{}", "monkey123".repeat(14), "monkey123".repeat(14)),
+            format!("{}{}{}", "dragon12".repeat(10), "dragon13".repeat(10), "dragon14".repeat(10)),
+            // And two that the cut at runs alone scored higher than before.
+            format!("mmmmmmmm{}", "monkey12".repeat(20)),
+            format!("{}ababababab{}", "password".repeat(17), "cabcabc"),
         ];
-        // Not refused, and not for the repeat: the unit alone scores 3e15
-        // (zxcvbn's cost per part; see `four_common_words_still_pass`).
-        let love = format!("{}!", "i love you ".repeat(20));
-        assert!(guesses(Rule::current(), "i love you ") > APP_FLOOR);
-        assert_eq!(check(&love), Ok(()));
-        // Not refused either: cut correctly into its two runs, but each unit
-        // is several parts (about 1e5 apiece), and two different units
-        // multiply past the floor. The same model.
-        let two = format!("{}{}", "Password1!".repeat(12), "Password2!".repeat(12));
-        let rs: Vec<char> = two.chars().collect();
+        let rs: Vec<char> = format!("{}{}", "Password1!".repeat(12), "Password2!".repeat(12)).chars().collect();
         assert_eq!(runs(&rs), [(0, 120, 10), (120, 120, 10)]);
-        assert_eq!(check(&two), Ok(()), "{:e}", guesses(Rule::current(), &two));
-        let seasons = format!("{}{}", "Summer2024!".repeat(11), "Winter2024!".repeat(11));
-        assert!(guesses(Rule::current(), "Summer2024!") > 1e7, "word, year, symbol: three parts");
-        assert_eq!(check(&seasons), Ok(()), "{:e}", guesses(Rule::current(), &seasons));
+        // The lead's recheck: no estimate above what the earlier forms gave.
+        let regressed = format!("{}ababababab{}", "password".repeat(17), "cabcabc");
+        // 1.454e9 at d5ea1d8; 1.8e11 when the cut at runs replaced it.
+        assert!(guesses(Rule::current(), &regressed) <= 1.4543e9, "{:e}", guesses(Rule::current(), &regressed));
         for pw in &cases {
             let g = guesses(Rule::current(), pw);
             assert_eq!(check(pw), Err(Weakness::Guessable), "{} chars: {g:e}", pw.chars().count());
@@ -1031,13 +1125,33 @@ mod tests {
         assert_eq!(dict(Rule::vault(), "he11o"), f64::INFINITY, "the vault reads 1 as i only");
     }
 
-    /// What the model still passes, as zxcvbn's does: four dictionary words
-    /// cost 4! and 10000^3 for the four parts (about 1e12 here).
+    /// Why the model's named residuals score high (they're in the shared
+    /// vectors; whether to accept them is the owner's question, GC #6190):
+    /// four dictionary words cost 4! and 10000³ for the four parts.
     #[test]
-    fn four_common_words_still_pass() {
+    fn the_cost_per_part() {
         let g = guesses(Rule::current(), "thequickbrownfox");
         assert!(g > 1e12 && g < 2e12, "{g:e}");
-        assert_eq!(check("thequickbrownfox"), Ok(()));
+    }
+
+    /// The lowest of the three readings past 128 characters: never above
+    /// the chunks or the single longest repeat, on every shared case (lead
+    /// recheck: the cut at runs alone raised some).
+    #[test]
+    fn no_reading_raises_the_estimate() {
+        let rule = Rule::current();
+        for pw in shared_cases() {
+            let n = nfc(&pw);
+            if n.len() > MAX_BYTES || n.chars().count() <= MAX_ESTIMATE_CHARS {
+                continue;
+            }
+            let rs: Vec<char> = n.chars().collect();
+            let mut cx = Cx::new(rule);
+            let g = cx.estimate(&rs);
+            assert!(g <= chunked(&rs, &mut cx), "{pw:?}");
+            assert!(g <= long_repeat(&rs, &mut cx), "{pw:?}");
+            assert!(g <= segmented(&rs, &mut cx), "{pw:?}");
+        }
     }
 
     #[test]
@@ -1169,8 +1283,15 @@ mod tests {
             format!("{}1", p("football", 127)),
             format!("{}Summer", p("Summer2024!!", 11)),
             format!("Hello{}2024!", p("password", 40)),
+            format!("{}a{}", p("monkey123", 14), p("monkey123", 14)),
+            format!("{}{}{}", p("dragon12", 10), p("dragon13", 10), p("dragon14", 10)),
+            format!("mmmmmmmm{}", p("monkey12", 20)),
+            format!("{}ababababab{}", p("password", 17), "cabcabc"),
+            // Named residuals: zxcvbn's per-part model passes them (GC #6190).
             format!("{}!", p("i love you ", 20)),
             "thequickbrownfox".into(),
+            "Password1!Password2!".into(),
+            "passwordfootballbaseballprincess".into(),
             "Mike.Jones.1990".into(),
             "i love my dog".into(),
             "Tr0ub4dor&3xx".into(),
