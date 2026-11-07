@@ -125,7 +125,8 @@ enum Long {
     /// Not guessable (the vault at `5deefac`; kept for its vectors).
     #[cfg_attr(not(test), allow(dead_code))]
     Infinite,
-    /// The product of the estimates of consecutive 128-character chunks.
+    /// The product of the estimates of consecutive 128-character chunks, or
+    /// the whole string as one repeat if that is lower ([`long_repeat`]).
     Chunked,
 }
 
@@ -280,9 +281,27 @@ impl<'r> Cx<'r> {
         }
         match self.rule.long {
             Long::Infinite => f64::INFINITY,
-            Long::Chunked => rs.chunks(MAX_ESTIMATE_CHARS).map(|c| guesses_chars(c, self)).product(),
+            Long::Chunked => {
+                let chunks: f64 = rs.chunks(MAX_ESTIMATE_CHARS).map(|c| guesses_chars(c, self)).product();
+                chunks.min(long_repeat(rs, self))
+            }
         }
     }
+}
+
+/// A long passphrase that is one unit of at most 128 characters repeated
+/// (the last repeat may be cut short): the unit's estimate times the number
+/// of whole repeats, times the estimate of the cut-short part. Chunks alone
+/// would score each repeat afresh ("word × N", review Medium; the owner's
+/// choice (a), GC #6108). Infinite when it isn't one.
+fn long_repeat(rs: &[char], cx: &mut Cx) -> f64 {
+    let n = rs.len();
+    let Some(u) = (1..=MAX_ESTIMATE_CHARS.min(n / 2)).find(|&u| (u..n).all(|i| rs[i] == rs[i - u])) else {
+        return f64::INFINITY;
+    };
+    let rest = n % u;
+    let tail = if rest == 0 { 1.0 } else { guesses_chars(&rs[..rest], cx) };
+    guesses_chars(&rs[..u], cx) * (n / u) as f64 * tail
 }
 
 // --- the estimator (password.go "the estimator") ---
@@ -755,6 +774,24 @@ mod tests {
         }
     }
 
+    /// Past 128 characters, a repeated word is scored as one repeat, not
+    /// chunk by chunk (GC #6108); a varied long passphrase is unchanged.
+    #[test]
+    fn long_repeats_are_refused() {
+        let cases = ["password".repeat(50), "football".repeat(128), "Summer2024!!".repeat(12), format!("{}pass", "password".repeat(20))];
+        for pw in &cases {
+            let g = guesses(Rule::current(), pw);
+            assert_eq!(check(pw), Err(Weakness::Guessable), "{} chars: {g:e}", pw.chars().count());
+        }
+        let words = ["violet", "Kestrel", "moss", "glacier", "mango", "tuesday", "piano", "plinth", "ostrich", "vapor"];
+        let varied: String = (0..40).map(|i| format!("{}{}", words[(i * 7 + i / 10) % words.len()], i)).collect::<Vec<_>>().join("-");
+        assert!(varied.len() > 256);
+        assert_eq!(check(&varied), Ok(()), "{:e}", guesses(Rule::current(), &varied));
+        let random: String = "Zq9!vK2#mP8".chars().cycle().take(300).collect();
+        assert_eq!(long_repeat(&random.chars().collect::<Vec<_>>(), &mut Cx::new(Rule::current())).is_finite(), true, "period 17");
+        assert_eq!(check(&random), Ok(()));
+    }
+
     /// What the model still passes, as zxcvbn's does: four dictionary words
     /// cost 4! and 10000^3 for the four parts (about 1e12 here).
     #[test]
@@ -780,7 +817,10 @@ mod tests {
         let first = guesses(Rule::current(), &seventeen[..128]);
         let rest = guesses(Rule::current(), &seventeen[128..]);
         assert!(g.is_finite() && g < APP_FLOOR, "{g:e}");
-        assert_eq!(g, first * rest);
+        assert!(g <= first * rest, "the lower of the chunks and the repeat");
+        let half = format!("{}{}", "Tq8#vLm2!pRz-violet".repeat(7), "Kestrel-91-moss-glacier".repeat(1));
+        let (a, b) = half.split_at(half.char_indices().nth(128).unwrap().0);
+        assert_eq!(guesses(Rule::current(), &half), guesses(Rule::current(), a) * guesses(Rule::current(), b), "no repeat: the chunks");
         assert_eq!(guesses(Rule::vault(), &seventeen), f64::INFINITY, "the vault's rule at 5deefac");
         let long: String = "Zq9!vK2#mP8@wL5$x".chars().cycle().take(300).collect();
         assert!(guesses(Rule::current(), &long).is_finite());
