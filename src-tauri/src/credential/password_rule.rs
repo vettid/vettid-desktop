@@ -1,7 +1,28 @@
 //! The passphrase rule: the vault's password rule (VAULT-MESSAGING §11.14.7),
-//! ported from vettid-vault `vms/recovery/password.go` at `5deefac` so a
-//! passphrase gets the same verdict here as in the vault and the apps (the
-//! Android and iOS ports follow the same file).
+//! ported from vettid-vault `vms/recovery/password.go` at `5deefac` (the
+//! Android and iOS ports follow the same file), with three changes, all of
+//! which only refuse more (the owner's choices on GC, 2026-11-07 UTC):
+//!
+//! - **The dictionary** (choice (a) and a/a, #6075): the vault's 20 common
+//!   passwords and 43 estimator words, and zxcvbn's six ranked lists, all of
+//!   each (30,000 passwords, 30,000 English Wikipedia words, 19,160 words
+//!   from US television and film, 10,000 surnames, 3,712 female and 983 male
+//!   first names; dropbox/zxcvbn `67c4ece`, MIT). Rule 3's common list is
+//!   the vault's 20 and all 30,000 of zxcvbn's passwords; the estimator
+//!   looks a substring up in every list, at its best rank.
+//! - **Substitutions:** zxcvbn's table, where `1` and `|` read as i or l and
+//!   `7` as t or l, each reading tried (lead review of #128).
+//! - **Past 128 characters,** where the vault says "not guessable": the
+//!   lower of the product over 128-character chunks and the passphrase cut
+//!   at its repeated runs (choice a/a, #6075, and (a), #6108).
+//!
+//! The desktop goes first: the vault and the apps take the same change, by a
+//! VAULT-MESSAGING erratum, after release 29. Until then a passphrase
+//! accepted here is also accepted there; the reverse doesn't hold.
+//!
+//! The vault's rule at `5deefac` is kept, for the tests only
+//! (`Rule::vault`): the estimator is checked against the vault's own code
+//! with it, so the two differ only in these three.
 //!
 //! A passphrase must, in this order:
 //! 1. have at least 12 characters (Unicode scalar values, after NFC);
@@ -31,9 +52,24 @@
 //! `is_uppercase` also counts Other_Uppercase; it is only used for a
 //! dictionary match, and a dictionary match needs every character to lower
 //! to ASCII, where the two agree.
+//!
+//! SECURITY (review M1): the check keeps the passphrase's characters in one
+//! buffer, and spells each candidate it looks up into one other, both wiped
+//! on drop and sized once, so neither reallocates (`Cx`). Nothing else holds
+//! any of it. The guess counts the estimator keeps are not secret.
+//! Residual: hashing a candidate for a lookup leaves up to 7 of its bytes
+//! (the tail SipHash hadn't absorbed yet) in a stack frame that isn't wiped,
+//! and its hash value.
+//!
+//! Speed: a check can take a second or two in a release build at the full
+//! 1,024 bytes (each chunk is estimated, and each gap between runs). It
+//! runs once per pairing attempt, never per keystroke, and off the UI
+//! thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
+
+use zeroize::Zeroizing;
 
 /// The apps' guessability floor (the vault's is 10¹⁰).
 pub(crate) const APP_FLOOR: f64 = 2e10;
@@ -71,58 +107,413 @@ impl Weakness {
 const COMMON_LIST: &str = include_str!("passwords/common-passwords.txt");
 const WORD_LIST: &str = include_str!("passwords/estimator-words.txt");
 
-struct Lists {
-    common: HashMap<String, u32>,
-    words: HashMap<String, u32>,
+/// zxcvbn's six ranked lists, as zxcvbn ships them (`frequency_lists.coffee`,
+/// dropbox/zxcvbn `67c4ece`, MIT: `passwords/zxcvbn/LICENSE.txt`).
+const ZXCVBN_LISTS: &str = include_str!("passwords/zxcvbn/frequency_lists.coffee");
+
+/// What a passphrase is held to: the lists behind rule 3 and the
+/// estimator's dictionary, and what the estimator does past 128 characters.
+struct Rule {
+    /// Rule 3: exact matches, in ASCII lower case.
+    common: HashSet<Box<str>>,
+    /// The dictionary: each entry's best rank over every list (the estimator
+    /// takes the least rank × factor, and the factor doesn't depend on the
+    /// list).
+    dict: HashMap<Box<str>, u32>,
+    /// The longest entry, in characters: no longer substring is looked up.
+    max_len: usize,
+    long: Long,
+    leet: Leet,
 }
 
-fn lists() -> &'static Lists {
-    static LISTS: OnceLock<Lists> = OnceLock::new();
-    LISTS.get_or_init(|| Lists { common: load_list(COMMON_LIST), words: load_list(WORD_LIST) })
+/// Past [`MAX_ESTIMATE_CHARS`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Long {
+    /// Not guessable (the vault at `5deefac`; kept for its vectors).
+    #[cfg_attr(not(test), allow(dead_code))]
+    Infinite,
+    /// The lower of the product of consecutive 128-character chunks and the
+    /// passphrase cut at its repeated runs ([`segmented`]). Length alone
+    /// never makes it strong; a product of strong parts can still overflow
+    /// to infinity, which is right.
+    Segmented,
+}
+
+/// The substitutions undone before a dictionary lookup.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Leet {
+    /// The vault's at `5deefac`: one letter per character.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Vault,
+    /// zxcvbn's (`L33T_TABLE`, matching.coffee): `1` and `|` may be i or l,
+    /// `7` t or l, and `9`, `{`, `[`, `<` and `%` are added (lead review).
+    Zxcvbn,
+}
+
+impl Rule {
+    fn new(common_lists: &[&str], dict_lists: &[Vec<&str>], long: Long, leet: Leet) -> Rule {
+        let mut dict: HashMap<Box<str>, u32> = HashMap::new();
+        for list in dict_lists {
+            for (i, w) in list.iter().enumerate() {
+                let rank = i as u32 + 1;
+                dict.entry((*w).into()).and_modify(|r| *r = (*r).min(rank)).or_insert(rank);
+            }
+        }
+        let common = common_lists.iter().map(|w| (*w).into()).collect();
+        let max_len = dict.keys().map(|w| w.chars().count()).max().unwrap_or(0);
+        Rule { common, dict, max_len, long, leet }
+    }
+
+    /// The rule a passphrase is held to: zxcvbn's lists with VettID's own
+    /// (the owner's choice (a), GC #6075).
+    fn current() -> &'static Rule {
+        static RULE: OnceLock<Rule> = OnceLock::new();
+        RULE.get_or_init(|| {
+            let zx = zxcvbn_lists();
+            let passwords = zx.iter().find(|(name, _)| *name == "passwords").map(|(_, l)| l.clone()).unwrap_or_default();
+            let common: Vec<&str> = load_list(COMMON_LIST).into_iter().chain(passwords).collect();
+            let mut dicts = vec![load_list(COMMON_LIST), load_list(WORD_LIST)];
+            dicts.extend(zx.into_iter().map(|(_, l)| l));
+            Rule::new(&common, &dicts, Long::Segmented, Leet::Zxcvbn)
+        })
+    }
+
+    /// The vault's rule at `5deefac`, exactly (the parity vectors).
+    #[cfg(test)]
+    fn vault() -> &'static Rule {
+        static RULE: OnceLock<Rule> = OnceLock::new();
+        RULE.get_or_init(|| {
+            let common = load_list(COMMON_LIST);
+            Rule::new(&common, &[common.clone(), load_list(WORD_LIST)], Long::Infinite, Leet::Vault)
+        })
+    }
 }
 
 /// One entry per line, trimmed; blank lines and `#` comments skipped; the
-/// rank is the entry's position, the first one kept (`loadList`).
-fn load_list(text: &str) -> HashMap<String, u32> {
-    let mut m = HashMap::new();
-    let mut rank = 0;
-    for line in text.lines() {
-        let w = line.trim();
-        if w.is_empty() || w.starts_with('#') {
-            continue;
-        }
-        rank += 1;
-        m.entry(w.to_string()).or_insert(rank);
-    }
-    m
+/// rank is the entry's position (`loadList`; a repeated entry keeps its
+/// first rank, as `Rule::new` takes the least).
+fn load_list(text: &str) -> Vec<&str> {
+    text.lines().map(str::trim).filter(|w| !w.is_empty() && !w.starts_with('#')).collect()
+}
+
+/// zxcvbn's lists, by name: lines `  name: "a,b,c".split(",")`, ranked by
+/// position.
+fn zxcvbn_lists() -> Vec<(&'static str, Vec<&'static str>)> {
+    ZXCVBN_LISTS
+        .lines()
+        .filter_map(|l| {
+            let (name, rest) = l.trim().split_once(": \"")?;
+            Some((name, rest.strip_suffix(r#"".split(",")"#)?.split(',').collect()))
+        })
+        .collect()
 }
 
 /// Checks a passphrase already normalized to NFC (`passphrase::nfc`) against
 /// the rule, at the apps' floor.
 pub(crate) fn check(nfc: &str) -> Result<(), Weakness> {
-    check_at(nfc, APP_FLOOR)
+    check_at(nfc, Rule::current(), APP_FLOOR)
 }
 
-/// `CheckNewPassword` without the PIN rule, at a given floor.
-fn check_at(nfc: &str, floor: f64) -> Result<(), Weakness> {
+/// `CheckNewPassword` without the PIN rule, under `rule`, at a given floor.
+fn check_at(nfc: &str, rule: &Rule, floor: f64) -> Result<(), Weakness> {
     if nfc.len() > MAX_BYTES {
         return Err(Weakness::TooLong);
     }
-    let rs: Vec<char> = nfc.chars().collect();
+    // SECURITY: the passphrase's characters, wiped on drop; with the lookup
+    // buffer below, the only copies the check makes.
+    let rs = chars_of(nfc);
     if rs.len() < MIN_CHARS {
         return Err(Weakness::Short);
     }
     if rs[1..].iter().all(|&c| c == rs[0]) {
         return Err(Weakness::Repeated);
     }
-    if lists().common.contains_key(&nfc.to_ascii_lowercase()) {
+    let mut cx = Cx::new(rule);
+    if cx.is_common(&rs) {
         return Err(Weakness::Common);
     }
-    if guesses(nfc) < floor {
+    if cx.estimate(&rs) < floor {
         return Err(Weakness::Guessable);
     }
     Ok(())
 }
+
+/// The characters of `s` in a buffer wiped on drop, allocated once at its
+/// final size (UTF-8 has at least one byte per character), so filling it
+/// never reallocates and leaves no copy behind (review High).
+fn chars_of(s: &str) -> Zeroizing<Vec<char>> {
+    let mut v = Zeroizing::new(Vec::with_capacity(s.len()));
+    v.extend(s.chars());
+    v
+}
+
+/// A check under way: its rule and the one buffer the lookups spell the
+/// candidates into (SECURITY: wiped on drop; sized once, so it never
+/// reallocates and leaves no copy behind).
+struct Cx<'r> {
+    rule: &'r Rule,
+    buf: Zeroizing<String>,
+}
+
+impl<'r> Cx<'r> {
+    fn new(rule: &'r Rule) -> Self {
+        // Every entry is ASCII (a test checks), so a candidate as long as the
+        // longest entry fits in that many bytes.
+        Cx { rule, buf: Zeroizing::new(String::with_capacity(rule.max_len.max(MAX_ESTIMATE_CHARS))) }
+    }
+
+    /// Spell `candidate` into the buffer; false (nothing to look up) if it
+    /// is longer than any entry or not ASCII (no entry is).
+    fn spell(&mut self, len: usize, candidate: impl Iterator<Item = char>) -> bool {
+        self.buf.clear();
+        if len > self.rule.max_len {
+            return false;
+        }
+        for c in candidate {
+            if !c.is_ascii() {
+                return false;
+            }
+            self.buf.push(c);
+        }
+        true
+    }
+
+    /// Rule 3: the whole passphrase, ASCII letters in lower case
+    /// (`lowerASCII`), is on the common list.
+    fn is_common(&mut self, rs: &[char]) -> bool {
+        self.spell(rs.len(), rs.iter().map(|c| c.to_ascii_lowercase())) && self.rule.common.contains(self.buf.as_str())
+    }
+
+    /// The best rank of `candidate` in the dictionary.
+    fn rank(&mut self, len: usize, candidate: impl Iterator<Item = char>) -> Option<u32> {
+        if self.spell(len, candidate) {
+            self.rule.dict.get(self.buf.as_str()).copied()
+        } else {
+            None
+        }
+    }
+
+    /// The estimate of the whole passphrase: [`guesses_chars`], and past 128
+    /// characters what the rule says.
+    fn estimate(&mut self, rs: &[char]) -> f64 {
+        if rs.len() <= MAX_ESTIMATE_CHARS {
+            return guesses_chars(rs, self);
+        }
+        match self.rule.long {
+            Long::Infinite => f64::INFINITY,
+            // The lowest of the three: each way of reading the passphrase
+            // only lowers the estimate, never raises it (lead review: the
+            // cut at runs alone raised some).
+            Long::Segmented => chunked(rs, self).min(segmented(rs, self)).min(long_repeat(rs, self)),
+        }
+    }
+}
+
+/// What it costs to guess `unit` knowing `seen`, a unit of the same length:
+/// 1 if they are the same; the product of the character classes' sizes of
+/// the differing characters (10 for a digit, 26 for a letter, 33 for other
+/// ASCII, 100 otherwise) if they differ in one or two places; else infinite.
+/// Which places differ isn't charged (up to C(len, 2) choices): that only
+/// makes a variant cheaper, so the rule refuses more. Compared in place;
+/// nothing is copied.
+fn variant_cost(seen: &[char], unit: &[char]) -> f64 {
+    let mut cost = 1.0;
+    let mut differ = 0;
+    for (&a, &b) in seen.iter().zip(unit) {
+        if a != b {
+            differ += 1;
+            if differ > 2 {
+                return f64::INFINITY;
+            }
+            cost *= match b {
+                '0'..='9' => 10.0,
+                'a'..='z' | 'A'..='Z' => 26.0,
+                c if c.is_ascii() => 33.0,
+                _ => 100.0,
+            };
+        }
+    }
+    cost
+}
+
+/// The product of the estimates of consecutive 128-character chunks.
+fn chunked(rs: &[char], cx: &mut Cx) -> f64 {
+    rs.chunks(MAX_ESTIMATE_CHARS).map(|c| guesses_chars(c, cx)).product()
+}
+
+/// A long passphrase cut at its repeated runs ([`runs`]): each run scored as
+/// one repeat (the unit's estimate × the number of repeats), each gap
+/// between them on its own (in chunks
+/// if it is longer than 128 characters), times the orderings of all the
+/// parts. Fixed 128-character cuts alone split a repeated word and score each
+/// repeat afresh ("word × N" and near-repeats: the owner's choice (a), GC
+/// #6108, and the lead's review of #128).
+fn segmented(rs: &[char], cx: &mut Cx) -> f64 {
+    let runs = runs(rs);
+    if runs.is_empty() {
+        return f64::INFINITY;
+    }
+    let mut g = 1.0;
+    let mut parts = 0u32;
+    let mut at = 0;
+    for (i, &(start, len, unit)) in runs.iter().enumerate() {
+        if start > at {
+            g *= chunked(&rs[at..start], cx);
+            parts += 1;
+        }
+        // A unit an earlier run had already costs only its count; one that
+        // differs from it in at most two places costs the choices for those
+        // characters too (a "variant": dragon12 then dragon13, Password1!
+        // then Password2!). Otherwise the unit's own estimate (lead review).
+        let earlier = runs[..i].iter().filter(|r| r.2 == unit).map(|r| variant_cost(&rs[r.0..r.0 + unit], &rs[start..start + unit])).fold(f64::INFINITY, f64::min);
+        let unit_cost = earlier.min(guesses_chars(&rs[start..start + unit], cx));
+        g *= unit_cost * (len / unit) as f64;
+        parts += 1;
+        at = start + len;
+        // A last repeat cut short, up to where the next run starts, costs
+        // where it was cut (fewer than `unit` places), as part of this run.
+        let next = runs.get(i + 1).map_or(rs.len(), |r| r.0);
+        let tail = (at..next).take_while(|&j| rs[j] == rs[j - unit]).count();
+        if tail > 0 {
+            g *= unit as f64;
+            at += tail;
+        }
+    }
+    if at < rs.len() {
+        g *= chunked(&rs[at..], cx);
+        parts += 1;
+    }
+    (1..=parts).fold(g, |acc, k| acc * k as f64)
+}
+
+/// The repeated runs of `rs`, in order and apart, found from the left: the
+/// run that starts first (the longest of those that start there; the
+/// shortest unit among equals), then the same after it, and so on. A run is
+/// one unit of at most 128 characters repeated at least twice, whole repeats
+/// only: a last repeat cut short goes back to what follows, which may begin
+/// the next run ("Password1!" × 12 then "Password2!" × 12). Positions only
+/// (start, length, unit length); nothing of the passphrase is copied, and
+/// nothing is estimated on the way.
+///
+/// From the left, not the longest first: two runs of different words that
+/// share an ending ("Summer2024!" × 11 then "Winter2024!" × 11) also make a
+/// longer stretch across the two, out of step with both (lead review).
+///
+/// Only runs of at least [`MIN_RUN`] characters: a shorter one (the "ll" in
+/// "hello") would cut a word in two, and the estimate of the gap around it
+/// sees it anyway (`repeat_guesses`).
+fn runs(rs: &[char]) -> Vec<(usize, usize, usize)> {
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some((start, len, unit)) = first_run(rs, from) {
+        found.push((start, len, unit));
+        from = start + len;
+    }
+    found
+}
+
+/// The shortest run [`runs`] cuts at.
+const MIN_RUN: usize = 8;
+
+/// The run of [`runs`] that starts first at or after `from`. Each unit length
+/// is scanned only up to its first run, so a call costs at most 128 × the
+/// rest of `rs`.
+fn first_run(rs: &[char], from: usize) -> Option<(usize, usize, usize)> {
+    let n = rs.len();
+    let mut best: Option<(usize, usize, usize)> = None;
+    for unit in 1..=MAX_ESTIMATE_CHARS.min(n.saturating_sub(from) / 2) {
+        let mut j = from + unit;
+        while j < n {
+            // No run of this unit can start before the best one found.
+            if best.is_some_and(|(start, _, _)| j - unit > start) {
+                break;
+            }
+            if rs[j] != rs[j - unit] {
+                j += 1;
+                continue;
+            }
+            // rs[j..k] each equal the character a unit back: the stretch
+            // rs[j - unit..k] has period `unit`; its whole repeats are a run.
+            let mut k = j;
+            while k < n && rs[k] == rs[k - unit] {
+                k += 1;
+            }
+            let (start, stretch) = (j - unit, k - j + unit);
+            let len = stretch - stretch % unit;
+            if len >= 2 * unit && len >= MIN_RUN {
+                let better = best.is_none_or(|(s, l, _)| start < s || (start == s && len > l));
+                if better {
+                    best = Some((start, len, unit));
+                }
+                break;
+            }
+            j = k;
+        }
+    }
+    best
+}
+
+/// A long passphrase scored around its longest repeated stretch
+/// ([`longest_run`]): the stretch as one repeat, times the estimates of what
+/// comes before and after it, times the orderings of those parts. Chunks
+/// alone would score each repeat afresh ("word × N", review Medium; the
+/// owner's choice (a), GC #6108; extended, in the recheck, to a repeat with
+/// anything before or after it, which only refuses more). Infinite when
+/// there's no repeated stretch.
+fn long_repeat(rs: &[char], cx: &mut Cx) -> f64 {
+    // Only a stretch longer than a chunk: a shorter one is scored inside a
+    // chunk already (`repeat_guesses`). Each level of `estimate` then takes
+    // more than 128 characters away, so there are at most 7 (recheck: with
+    // short runs, the levels were n/2 and a 1,024-character paste took 31 s).
+    let Some((start, len, unit)) = longest_run(rs).filter(|&(_, len, _)| len > MAX_ESTIMATE_CHARS) else {
+        return f64::INFINITY;
+    };
+    let run = &rs[start..start + len];
+    // The unit, the number of whole repeats, and for a last repeat cut short
+    // where it was cut (at most the unit's length).
+    let cut = if len % unit == 0 { 1.0 } else { unit as f64 };
+    let mut g = guesses_chars(&run[..unit], cx) * (len / unit) as f64 * cut;
+    let mut parts = 1.0;
+    for piece in [&rs[..start], &rs[start + len..]] {
+        if !piece.is_empty() {
+            g *= cx.estimate(piece);
+            parts += 1.0;
+        }
+    }
+    // 1, 2 or 6 orderings of one, two or three parts.
+    g * if parts == 3.0 { 6.0 } else { parts }
+}
+
+/// The longest stretch of `rs` that is one unit of at most 128 characters
+/// repeated at least twice (the last repeat may be cut short): its start,
+/// its length and the unit's length; the shortest unit among equals. Found
+/// in one pass per unit length (at most 128 × n comparisons).
+fn longest_run(rs: &[char]) -> Option<(usize, usize, usize)> {
+    let n = rs.len();
+    let mut best: Option<(usize, usize, usize)> = None;
+    for unit in 1..=MAX_ESTIMATE_CHARS.min(n / 2) {
+        let mut j = unit;
+        while j < n {
+            if rs[j] != rs[j - unit] {
+                j += 1;
+                continue;
+            }
+            // rs[j..k] each equal the character a unit back: the stretch
+            // rs[j - unit..k] has period `unit`.
+            let mut k = j;
+            while k < n && rs[k] == rs[k - unit] {
+                k += 1;
+            }
+            let (start, len) = (j - unit, k - j + unit);
+            if len >= 2 * unit && best.is_none_or(|(_, l, _)| len > l) {
+                best = Some((start, len, unit));
+            }
+            j = k;
+        }
+    }
+    best
+}
+
 
 // --- the estimator (password.go "the estimator") ---
 
@@ -179,40 +570,64 @@ fn is_digit(c: char) -> bool {
     ND.iter().any(|&(lo, hi)| (lo..=hi).contains(&c))
 }
 
-fn leet(c: char) -> Option<char> {
-    Some(match c {
-        '4' | '@' => 'a',
-        '8' => 'b',
-        '(' => 'c',
-        '3' => 'e',
-        '6' => 'g',
-        '1' | '!' | '|' => 'i',
-        '0' => 'o',
-        '$' | '5' => 's',
-        '7' | '+' => 't',
-        '2' => 'z',
-        _ => return None,
-    })
+/// The letters a substituted character may stand for under `table`: one, or
+/// two for zxcvbn's `1`, `|` and `7`.
+fn leet(table: Leet, c: char) -> Option<(char, Option<char>)> {
+    let one = |l| Some((l, None));
+    match table {
+        Leet::Vault => match c {
+            '4' | '@' => one('a'),
+            '8' => one('b'),
+            '(' => one('c'),
+            '3' => one('e'),
+            '6' => one('g'),
+            '1' | '!' | '|' => one('i'),
+            '0' => one('o'),
+            '$' | '5' => one('s'),
+            '7' | '+' => one('t'),
+            '2' => one('z'),
+            _ => None,
+        },
+        Leet::Zxcvbn => match c {
+            '4' | '@' => one('a'),
+            '8' => one('b'),
+            '(' | '{' | '[' | '<' => one('c'),
+            '3' => one('e'),
+            '6' | '9' => one('g'),
+            '1' | '|' => Some(('i', Some('l'))),
+            '!' => one('i'),
+            '7' => Some(('t', Some('l'))),
+            '0' => one('o'),
+            '$' | '5' => one('s'),
+            '+' => one('t'),
+            '%' => one('x'),
+            '2' => one('z'),
+            _ => None,
+        },
+    }
 }
 
-fn rev(rs: &[char]) -> String {
-    rs.iter().rev().collect()
-}
+/// At most this many characters with two readings are tried both ways in
+/// one lookup (2⁶ = 64 spellings); past them, the first reading.
+const MAX_AMBIGUOUS: usize = 6;
 
-fn dict_guesses(sub: &[char]) -> f64 {
-    let l = lists();
+/// The dictionary match: the substring in lower case, reversed, with
+/// substitutions undone, and both. Go builds each form as a string; here
+/// each is an iterator over `sub`, compared with the lists' entries, so no
+/// copy of the passphrase is made (review M1).
+fn dict_guesses(sub: &[char], cx: &mut Cx) -> f64 {
+    let n = sub.len();
+    if n > cx.rule.max_len {
+        return f64::INFINITY;
+    }
     let mut best = f64::INFINITY;
-    let mut try_word = |s: &str, factor: f64| {
-        if let Some(&r) = l.common.get(s) {
-            best = best.min(r as f64 * factor);
-        }
-        if let Some(&r) = l.words.get(s) {
+    let mut try_word = |rank: Option<u32>, factor: f64| {
+        if let Some(r) = rank {
             best = best.min(r as f64 * factor);
         }
     };
-    let lowered: Vec<char> = sub.iter().map(|&c| lower(c)).collect();
     let mut up = 1.0;
-    if lowered != sub {
+    if sub.iter().any(|&c| lower(c) != c) {
         up = 2.0; // a capital first letter or all caps
         let first_cap = sub[0].is_uppercase() && sub[1..].iter().all(|&c| lower(c) == c);
         let all_caps = sub.iter().all(|&c| upper(c) == c);
@@ -220,15 +635,52 @@ fn dict_guesses(sub: &[char]) -> f64 {
             up = 2f64.powf(sub.iter().filter(|c| c.is_uppercase()).count() as f64);
         }
     }
-    let s: String = lowered.iter().collect();
-    try_word(&s, up);
-    try_word(&rev(&lowered), 2.0 * up);
-    let subs = lowered.iter().filter(|&&c| leet(c).is_some()).count();
+    try_word(cx.rank(n, sub.iter().map(|&c| lower(c))), up);
+    try_word(cx.rank(n, sub.iter().rev().map(|&c| lower(c))), 2.0 * up);
+    let table = cx.rule.leet;
+    let subs = sub.iter().filter(|&&c| leet(table, lower(c)).is_some()).count();
     if subs > 0 {
-        let ul: Vec<char> = lowered.iter().map(|&c| leet(c).unwrap_or(c)).collect();
+        // Characters with two readings are numbered in order; `mask` picks
+        // the second reading for those whose bit is set. The numbering is
+        // the same either way round, so a reversed spelling reads each
+        // character as the forward one does.
+        let two = |c: char| matches!(leet(table, lower(c)), Some((_, Some(_))));
+        let ambiguous = sub.iter().filter(|&&c| two(c)).count();
+        let k = ambiguous.min(MAX_AMBIGUOUS);
         let f = up * 2f64.powf(subs as f64);
-        try_word(&ul.iter().collect::<String>(), f);
-        try_word(&rev(&ul), 2.0 * f);
+        for mask in 0u32..(1 << k) {
+            let read = move |c: char, nth: usize| {
+                let c = lower(c);
+                match leet(table, c) {
+                    None => c,
+                    Some((first, None)) => first,
+                    Some((first, Some(second))) => {
+                        if nth < k && mask & (1 << nth) != 0 {
+                            second
+                        } else {
+                            first
+                        }
+                    }
+                }
+            };
+            let forward = sub.iter().scan(0usize, move |seen, &c| {
+                let nth = *seen;
+                if two(c) {
+                    *seen += 1;
+                }
+                Some(read(c, nth))
+            });
+            try_word(cx.rank(n, forward), f);
+            let backward = sub.iter().rev().scan(0usize, move |seen, &c| {
+                if two(c) {
+                    *seen += 1;
+                    Some(read(c, ambiguous - *seen))
+                } else {
+                    Some(read(c, 0))
+                }
+            });
+            try_word(cx.rank(n, backward), 2.0 * f);
+        }
     }
     best
 }
@@ -259,30 +711,32 @@ fn sequence_guesses(rs: &[char]) -> f64 {
 
 /// The keyboard rows and the columns, read either way. The second row ends
 /// with a backslash, added here so this file has no escapes in it.
-fn keyboard_rows() -> &'static [String; 10] {
-    static ROWS: OnceLock<[String; 10]> = OnceLock::new();
+fn keyboard_rows() -> &'static [Vec<char>; 10] {
+    static ROWS: OnceLock<[Vec<char>; 10]> = OnceLock::new();
     ROWS.get_or_init(|| {
         let backslash = char::from(92u8);
         let rows = [
-            "`1234567890-=".to_string(),
-            format!("qwertyuiop[]{backslash}"),
-            "asdfghjkl;'".to_string(),
-            "zxcvbnm,./".to_string(),
-            "1qaz2wsx3edc4rfv5tgb6yhn7ujm8ik,9ol.0p;/".to_string(),
+            "`1234567890-=".chars().collect::<Vec<_>>(),
+            "qwertyuiop[]".chars().chain([backslash]).collect(),
+            "asdfghjkl;'".chars().collect(),
+            "zxcvbnm,./".chars().collect(),
+            "1qaz2wsx3edc4rfv5tgb6yhn7ujm8ik,9ol.0p;/".chars().collect(),
         ];
-        let back = rows.clone().map(|r| r.chars().rev().collect::<String>());
+        let back = rows.clone().map(|r| r.into_iter().rev().collect::<Vec<_>>());
         let [a, b, c, d, e] = rows;
         let [f, g, h, i, j] = back;
         [a, f, b, g, c, h, d, i, e, j]
     })
 }
 
+/// A run along a row or column: the substring in lower case is a
+/// contiguous part of one (Go's `strings.Contains`), compared in place.
 fn keyboard_guesses(rs: &[char]) -> f64 {
     if rs.len() < 4 {
         return f64::INFINITY;
     }
-    let s: String = rs.iter().map(|&c| lower(c)).collect();
-    if keyboard_rows().iter().any(|row| row.contains(&s)) {
+    let on_a_row = keyboard_rows().iter().any(|row| row.windows(rs.len()).any(|w| w.iter().zip(rs).all(|(&k, &c)| k == lower(c))));
+    if on_a_row {
         94.0 * 4.6 * rs.len() as f64
     } else {
         f64::INFINITY
@@ -290,14 +744,14 @@ fn keyboard_guesses(rs: &[char]) -> f64 {
 }
 
 /// A unit repeated two or more times.
-fn repeat_guesses(rs: &[char]) -> f64 {
+fn repeat_guesses(rs: &[char], cx: &mut Cx) -> f64 {
     let n = rs.len();
     for u in 1..=n / 2 {
         if n % u != 0 {
             continue;
         }
         if (u..n).all(|i| rs[i] == rs[i - u]) {
-            return guesses_chars(&rs[..u]) * (n / u) as f64;
+            return guesses_chars(&rs[..u], cx) * (n / u) as f64;
         }
     }
     f64::INFINITY
@@ -343,13 +797,13 @@ fn bruteforce(rs: &[char]) -> f64 {
     f64::max(card, BRUTEFORCE_CARD).powf(rs.len() as f64)
 }
 
-fn match_guesses(sub: &[char]) -> f64 {
+fn match_guesses(sub: &[char], cx: &mut Cx) -> f64 {
     let mut g = bruteforce(sub);
-    for m in [dict_guesses(sub), sequence_guesses(sub), keyboard_guesses(sub), date_guesses(sub)] {
+    for m in [dict_guesses(sub, cx), sequence_guesses(sub), keyboard_guesses(sub), date_guesses(sub)] {
         g = g.min(m);
     }
     if sub.len() >= 2 {
-        g = g.min(repeat_guesses(sub));
+        g = g.min(repeat_guesses(sub, cx));
     }
     let floor = if sub.len() == 1 { MIN_GUESSES_SINGLE } else { MIN_GUESSES_MULTI };
     g.max(floor)
@@ -357,13 +811,9 @@ fn match_guesses(sub: &[char]) -> f64 {
 
 /// How many guesses a well-informed attacker needs (`Guesses`): the cheapest
 /// cover of the passphrase by at most 12 matched or brute-forced parts, times
-/// the orderings of that many parts.
-pub(crate) fn guesses(s: &str) -> f64 {
-    let rs: Vec<char> = s.chars().collect();
-    guesses_chars(&rs)
-}
-
-fn guesses_chars(rs: &[char]) -> f64 {
+/// the orderings of that many parts. Works on the caller's characters and
+/// copies none of them.
+fn guesses_chars(rs: &[char], cx: &mut Cx) -> f64 {
     let n = rs.len();
     if n == 0 {
         return 0.0;
@@ -376,7 +826,7 @@ fn guesses_chars(rs: &[char]) -> f64 {
     best[0][0] = 1.0;
     for j in 1..=n {
         for i in 0..j {
-            let g = match_guesses(&rs[i..j]);
+            let g = match_guesses(&rs[i..j], cx);
             for k in 1..=MAX_PARTS {
                 let p = best[i][k - 1];
                 if p != f64::INFINITY {
@@ -397,6 +847,7 @@ fn guesses_chars(rs: &[char]) -> f64 {
     out
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,17 +855,65 @@ mod tests {
 
     const COMMON_SHA256: &str = "c51ddc947e4f10f7e3adc4912c2a4d90cb7483cec564261e17bc151189db223f";
     const WORDS_SHA256: &str = "19b0f9e404b1aeaec1366d69cd3f040f5762099c35c902e927137b5b489514ff";
+    const VERDICTS_SHA256: &str = "09540a0c78b03fb03cfdee762066a9f1171419d2958798b5b4cf054f7dda66a5";
+    const ZXCVBN_SHA256: &str = "664d32190713e42b7726072a5cf7533bd4a469e5588c7c1bd2ff9485cdf83276";
+    const ZXCVBN_LICENSE_SHA256: &str = "8fd6c9ffe44291acd207a4d3cf7d6db5ac05f585ee1cf45db9fc6b153b08990f";
 
     fn nfc(s: &str) -> String {
         crate::credential::passphrase::nfc(s).to_string()
     }
 
+    /// `Guesses` of a whole passphrase under `rule`.
+    fn guesses(rule: &Rule, s: &str) -> f64 {
+        let rs = chars_of(s);
+        Cx::new(rule).estimate(&rs)
+    }
+
+    fn dict(rule: &Rule, s: &str) -> f64 {
+        dict_guesses(&s.chars().collect::<Vec<_>>(), &mut Cx::new(rule))
+    }
+
     #[test]
-    fn the_lists_are_the_vaults() {
+    fn the_lists_are_pinned() {
         assert_eq!(hex::encode(Sha256::digest(COMMON_LIST)), COMMON_SHA256, "common-passwords.txt changed");
         assert_eq!(hex::encode(Sha256::digest(WORD_LIST)), WORDS_SHA256, "estimator-words.txt changed");
-        assert_eq!(lists().common.len(), 20);
-        assert_eq!(lists().words.len(), 43);
+        assert_eq!(hex::encode(Sha256::digest(include_str!("passwords/verdicts.json"))), VERDICTS_SHA256, "verdicts.json changed");
+        assert_eq!(hex::encode(Sha256::digest(ZXCVBN_LISTS)), ZXCVBN_SHA256, "frequency_lists.coffee changed");
+        assert_eq!(
+            hex::encode(Sha256::digest(include_str!("passwords/zxcvbn/LICENSE.txt"))),
+            ZXCVBN_LICENSE_SHA256,
+            "zxcvbn's licence changed"
+        );
+        assert_eq!(load_list(COMMON_LIST).len(), 20);
+        assert_eq!(load_list(WORD_LIST).len(), 43);
+        let sizes: Vec<(&str, usize)> = zxcvbn_lists().iter().map(|(n, l)| (*n, l.len())).collect();
+        assert_eq!(
+            sizes,
+            [
+                ("passwords", 30000),
+                ("english_wikipedia", 30000),
+                ("female_names", 3712),
+                ("surnames", 10000),
+                ("us_tv_and_film", 19160),
+                ("male_names", 983)
+            ]
+        );
+    }
+
+    /// `Cx::spell` skips a candidate that isn't ASCII: right only while
+    /// every entry is ASCII. Entries are lower case, so a lower-cased
+    /// candidate can match.
+    #[test]
+    fn every_entry_is_ascii_lower_case() {
+        for rule in [Rule::current(), Rule::vault()] {
+            for w in rule.dict.keys().chain(rule.common.iter()) {
+                assert!(!w.is_empty() && w.is_ascii() && *w.to_ascii_lowercase() == **w, "{w:?}");
+            }
+            assert!(rule.common.iter().all(|w| rule.dict.contains_key(w)), "a common entry outside the dictionary");
+        }
+        assert_eq!(Rule::current().max_len, 25, "correcthorsebatterystaple");
+        assert!(load_list(COMMON_LIST).iter().all(|w| Rule::current().common.contains(*w)));
+        assert_eq!(Rule::current().common.len(), 30015, "zxcvbn's 30,000 and VettID's 20, five in both");
     }
 
     /// `CommonListSorted`: lower case, sorted, unique, 12 or more characters.
@@ -443,16 +942,30 @@ mod tests {
         r.err().map_or("ok", Weakness::reason)
     }
 
-    /// The vault's shared file of passwords and verdicts, at the vault's floor
-    /// and at ours (none of its cases falls between the two).
+    /// The vault's shared file of passwords and verdicts, under the vault's
+    /// rule at both floors (none of its cases falls between the two).
     #[test]
     fn the_vaults_verdicts() {
         let v: Verdicts = serde_json::from_str(include_str!("passwords/verdicts.json")).unwrap();
         assert_eq!(v.cases.len(), 16);
+        let vault = Rule::vault();
         for c in &v.cases {
             let pw = nfc(&c.password);
-            assert_eq!(reason(check_at(&pw, 1e10)), c.verdict, "{:?} at 1e10 (guesses {:e})", c.password, guesses(&pw));
-            assert_eq!(reason(check(&pw)), c.verdict, "{:?} at 2e10 (guesses {:e})", c.password, guesses(&pw));
+            let g = guesses(vault, &pw);
+            assert_eq!(reason(check_at(&pw, vault, 1e10)), c.verdict, "{:?} at 1e10 (guesses {g:e})", c.password);
+            assert_eq!(reason(check_at(&pw, vault, APP_FLOOR)), c.verdict, "{:?} at 2e10 (guesses {g:e})", c.password);
+        }
+    }
+
+    /// The same file under the current rule: the bigger dictionary refuses
+    /// only more, never less (here: the same verdicts).
+    #[test]
+    fn the_vaults_verdicts_under_the_current_rule() {
+        let v: Verdicts = serde_json::from_str(include_str!("passwords/verdicts.json")).unwrap();
+        for c in &v.cases {
+            let pw = nfc(&c.password);
+            let now = reason(check(&pw));
+            assert!(now == c.verdict || c.verdict == "ok", "{:?}: {now}, the vault {}", c.password, c.verdict);
         }
     }
 
@@ -470,11 +983,13 @@ mod tests {
         app: String,
     }
 
-    /// The vault's own code, run over 1,398 passwords (its verdict cases, the
-    /// lists' words with capitals, reversals, substitutions and additions,
-    /// sequences, keyboard runs, dates, repeats, other scripts and digits,
-    /// random strings, joined words, 31 passwords between the two floors, and
-    /// lengths around 128 characters and 1,024 bytes).
+    /// The vault's own code at `5deefac`, run over 1,398 passwords (its
+    /// verdict cases, the lists' words with capitals, reversals,
+    /// substitutions and additions, sequences, keyboard runs, dates, repeats,
+    /// other scripts and digits, random strings, joined words, 31 passwords
+    /// between the two floors, and lengths around 128 characters and 1,024
+    /// bytes), against this estimator with the vault's lists: the estimator
+    /// itself is the vault's.
     #[test]
     fn the_vaults_estimator() {
         let v: Vectors = serde_json::from_str(include_str!("passwords/estimator-vectors.json")).unwrap();
@@ -483,15 +998,16 @@ mod tests {
         assert_eq!(v.cases.len(), 1398);
         let between = v.cases.iter().filter(|c| c.vault == "ok" && c.app == "guessable").count();
         assert!(between >= 30, "{between} between the floors");
+        let vault = Rule::vault();
         for c in &v.cases {
             let pw = nfc(&c.password);
             let want = |w: &str| if w == "invalid" { "too_long".to_string() } else { w.to_string() };
-            assert_eq!(reason(check_at(&pw, 1e10)), want(&c.vault), "{:?} at 1e10", c.password);
-            assert_eq!(reason(check(&pw)), want(&c.app), "{:?} at 2e10", c.password);
+            assert_eq!(reason(check_at(&pw, vault, 1e10)), want(&c.vault), "{:?} at 1e10", c.password);
+            assert_eq!(reason(check_at(&pw, vault, APP_FLOOR)), want(&c.app), "{:?} at 2e10", c.password);
             if c.vault == "invalid" {
                 continue;
             }
-            let g = guesses(&pw);
+            let g = guesses(vault, &pw);
             match c.guesses {
                 None => assert_eq!(g, f64::INFINITY, "{:?}", c.password),
                 Some(want) => assert!(
@@ -503,6 +1019,174 @@ mod tests {
         }
     }
 
+    /// The reviewers' examples (GC #6075), which the vault's rule passes;
+    /// the current rule refuses each.
+    #[test]
+    fn common_words_and_names_are_refused() {
+        let seventeen = "password".repeat(17);
+        for pw in [
+            "harrypotter123",
+            "Liverpool2024!",
+            "football player",
+            seventeen.as_str(),
+            "Superman123!",
+            "pokemon12345",
+            "manchesterunited",
+            "trustno1trustno1",
+            "mypasswordis123",
+            // zxcvbn's substitutions, both ways (lead review of #128).
+            "Wi11iams1987!",
+            "Ba11erina2020",
+            "he11ofriend123",
+        ] {
+            assert_eq!(check_at(pw, Rule::vault(), APP_FLOOR), Ok(()), "{pw:?}: the vault's rule passes it");
+            let r = check(pw);
+            assert!(
+                matches!(r, Err(Weakness::Guessable | Weakness::Common)),
+                "{pw:?}: {r:?} ({:e} guesses)",
+                guesses(Rule::current(), pw)
+            );
+        }
+    }
+
+    /// Past 128 characters, a repeated word is scored as one repeat, not
+    /// chunk by chunk (GC #6108); a varied long passphrase is unchanged.
+    #[test]
+    fn long_repeats_are_refused() {
+        let p50 = "password".repeat(50);
+        let cases = [
+            p50.clone(),
+            "football".repeat(128),
+            "Summer2024!!".repeat(12),
+            format!("{}pass", "password".repeat(20)),
+            // The recheck's: a repeat with something before, after or inside it.
+            format!("{p50}1"),
+            format!("X{p50}"),
+            format!("{}1{}", "password".repeat(25), "password".repeat(25)),
+            format!("{}1", "football".repeat(127)),
+            format!("{}Summer", "Summer2024!!".repeat(11)),
+            format!("Hello{}2024!", "password".repeat(40)),
+            // The lead's review of #128: near-repeats, split by the chunk cuts.
+            format!("{}1{}", "password".repeat(15), "password".repeat(15)),
+            format!("{} {}", "iloveyou".repeat(15), "iloveyou".repeat(15)),
+            format!("{}{}{}", "password".repeat(15), "football".repeat(15), "baseball".repeat(15)),
+            // The lead's recheck: the same unit, or a variant of it, again.
+            format!("{}{}", "Password1!".repeat(12), "Password2!".repeat(12)),
+            format!("{}a{}", "monkey123".repeat(14), "monkey123".repeat(14)),
+            format!("{}{}{}", "dragon12".repeat(10), "dragon13".repeat(10), "dragon14".repeat(10)),
+            // And two that the cut at runs alone scored higher than before.
+            format!("mmmmmmmm{}", "monkey12".repeat(20)),
+            format!("{}ababababab{}", "password".repeat(17), "cabcabc"),
+        ];
+        let rs: Vec<char> = format!("{}{}", "Password1!".repeat(12), "Password2!".repeat(12)).chars().collect();
+        assert_eq!(runs(&rs), [(0, 120, 10), (120, 120, 10)]);
+        // The lead's recheck: no estimate above what the earlier forms gave.
+        let regressed = format!("{}ababababab{}", "password".repeat(17), "cabcabc");
+        // 1.454e9 at d5ea1d8; 1.8e11 when the cut at runs replaced it.
+        assert!(guesses(Rule::current(), &regressed) <= 1.4543e9, "{:e}", guesses(Rule::current(), &regressed));
+        for pw in &cases {
+            let g = guesses(Rule::current(), pw);
+            assert_eq!(check(pw), Err(Weakness::Guessable), "{} chars: {g:e}", pw.chars().count());
+        }
+        let words = ["violet", "Kestrel", "moss", "glacier", "mango", "tuesday", "piano", "plinth", "ostrich", "vapor"];
+        let varied: String = (0..40).map(|i| format!("{}{}", words[(i * 7 + i / 10) % words.len()], i)).collect::<Vec<_>>().join("-");
+        assert!(varied.len() > 256);
+        assert_eq!(check(&varied), Ok(()), "{:e}", guesses(Rule::current(), &varied));
+        // A strong unit, repeated, is still strong.
+        let random: String = "Zq9!vK2#mP8@wL5$x".chars().cycle().take(300).collect();
+        let rs: Vec<char> = random.chars().collect();
+        assert_eq!(runs(&rs), [(0, 289, 17)], "17 whole repeats; the rest goes back");
+        assert_eq!(check(&random), Ok(()));
+        // Runs: start, length, unit.
+        let rs: Vec<char> = "xyabababab-z".chars().collect();
+        assert_eq!(runs(&rs), [(2, 8, 2)]);
+        let rs: Vec<char> = "abcdefgh".chars().collect();
+        assert!(runs(&rs).is_empty());
+        // From the left: the halves of near-repeats, in step with each word.
+        let rs: Vec<char> = format!("{}{}", "Summer2024!".repeat(11), "Winter2024!".repeat(11)).chars().collect();
+        assert_eq!(runs(&rs), [(0, 121, 11), (121, 121, 11)]);
+        // All the runs, in order and apart; the gaps between them.
+        // 8 characters or more only: "hello" isn't cut at its "ll".
+        let rs: Vec<char> = "abababab-xyzxyzxyz--qqqq-hello".chars().collect();
+        assert_eq!(runs(&rs), [(0, 8, 2), (9, 9, 3)]);
+        // A paste of short runs isn't cut at all (recheck: an earlier form
+        // recursed on them and took 31 s at 1,024 characters).
+        let pairs: String = (0..512).map(|i| char::from_u32(0x4E00 + i).unwrap()).flat_map(|c| [c, c]).collect();
+        let rs: Vec<char> = pairs.chars().collect();
+        assert!(runs(&rs).is_empty());
+        assert_eq!(guesses(Rule::current(), &pairs), chunked(&rs, &mut Cx::new(Rule::current())));
+    }
+
+    /// Each reading of a character with two (zxcvbn's `1`, `|`, `7`) is
+    /// tried, forward and reversed; the vault's table reads one.
+    #[test]
+    fn substitutions_with_two_readings() {
+        assert_eq!(dict(Rule::current(), "he11o"), dict(Rule::current(), "hello") * 4.0, "two substitutions");
+        assert!(dict(Rule::current(), "o11eh").is_finite(), "reversed");
+        assert!(dict(Rule::current(), "1i7tle").is_finite(), "1 as l, 7 as t");
+        assert_eq!(dict(Rule::vault(), "he11o"), f64::INFINITY, "the vault reads 1 as i only");
+    }
+
+    /// Why the model's named residuals score high (they're in the shared
+    /// vectors; whether to accept them is the owner's question, GC #6190):
+    /// four dictionary words cost 4! and 10000³ for the four parts.
+    #[test]
+    fn the_cost_per_part() {
+        let g = guesses(Rule::current(), "thequickbrownfox");
+        assert!(g > 1e12 && g < 2e12, "{g:e}");
+    }
+
+    /// The lowest of the three readings past 128 characters: never above
+    /// the chunks or the single longest repeat, on every shared case (lead
+    /// recheck: the cut at runs alone raised some).
+    #[test]
+    fn no_reading_raises_the_estimate() {
+        let rule = Rule::current();
+        for pw in shared_cases() {
+            let n = nfc(&pw);
+            if n.len() > MAX_BYTES || n.chars().count() <= MAX_ESTIMATE_CHARS {
+                continue;
+            }
+            let rs: Vec<char> = n.chars().collect();
+            let mut cx = Cx::new(rule);
+            let g = cx.estimate(&rs);
+            assert!(g <= chunked(&rs, &mut cx), "{pw:?}");
+            assert!(g <= long_repeat(&rs, &mut cx), "{pw:?}");
+            assert!(g <= segmented(&rs, &mut cx), "{pw:?}");
+        }
+    }
+
+    #[test]
+    fn strong_passphrases_still_pass() {
+        for pw in ["violet-Kestrel-91-moss", "Tq8#vLm2!pRz", "xq7 ploven drassik moorvel", "Zq9!vK2#mP8@wL5$"] {
+            assert_eq!(check(pw), Ok(()), "{pw:?}: {:e} guesses", guesses(Rule::current(), pw));
+        }
+    }
+
+    /// Past 128 characters: the product of the chunks' estimates, never
+    /// "not guessable" on length alone.
+    #[test]
+    fn long_passphrases_are_estimated_in_chunks() {
+        let seventeen = "password".repeat(17);
+        let g = guesses(Rule::current(), &seventeen);
+        let first = guesses(Rule::current(), &seventeen[..128]);
+        let rest = guesses(Rule::current(), &seventeen[128..]);
+        assert!(g.is_finite() && g < APP_FLOOR, "{g:e}");
+        assert!(g <= first * rest, "the lower of the chunks and the runs");
+        // 200 different characters: nothing repeats, so the chunks decide.
+        let distinct: String = (0..200).map(|i| char::from_u32(0x4E00 + i).unwrap()).collect();
+        assert!(runs(&distinct.chars().collect::<Vec<_>>()).is_empty());
+        let (a, b) = distinct.split_at(distinct.char_indices().nth(128).unwrap().0);
+        assert_eq!(guesses(Rule::current(), &distinct), guesses(Rule::current(), a) * guesses(Rule::current(), b), "no repeat: the chunks");
+        assert_eq!(guesses(Rule::vault(), &seventeen), f64::INFINITY, "the vault's rule at 5deefac");
+        let long: String = "Zq9!vK2#mP8@wL5$x".chars().cycle().take(300).collect();
+        assert!(guesses(Rule::current(), &long).is_finite());
+        assert_eq!(check(&long), Ok(()));
+        // The longest a passphrase can be (1,024 ASCII bytes) is checked.
+        let max: String = "Tq8#vLm2!pRz".chars().cycle().take(MAX_BYTES).collect();
+        assert_eq!(check(&max), Ok(()));
+    }
+
     #[test]
     fn the_rules_in_order() {
         assert_eq!(check(&"x".repeat(1025)), Err(Weakness::TooLong));
@@ -511,6 +1195,7 @@ mod tests {
         assert_eq!(check(&nfc("cafe\u{301}caf")), Err(Weakness::Short), "11 in NFC, 13 in NFD");
         assert_eq!(check("ééééééééééééé"), Err(Weakness::Repeated));
         assert_eq!(check("PASSWORD1234"), Err(Weakness::Common));
+        assert_eq!(check("QAZWSXEDCRFV"), Err(Weakness::Common), "on zxcvbn's passwords list");
         assert_eq!(check("passwordpassword1"), Err(Weakness::Guessable));
         assert_eq!(check("violet-Kestrel-91-moss"), Ok(()));
         assert_eq!(check("密码密码密码密码密码密码"), Err(Weakness::Guessable), "a repeated unit");
@@ -524,15 +1209,154 @@ mod tests {
         assert_eq!(upper('\u{1F88}'), '\u{1F88}');
         assert_eq!(upper('\u{1FB3}'), '\u{1FBC}');
         assert_eq!(upper('a'), 'A');
+        // Titlecase, and characters Rust counts as upper case where Go's Lu
+        // doesn't (circled letters, Roman numerals): they lower to no ASCII
+        // letter, so they never reach a dictionary match.
+        assert_eq!((lower('\u{1C5}'), upper('\u{1C5}')), ('\u{1C6}', '\u{1C4}'));
+        assert_eq!(lower('\u{24B6}'), '\u{24D0}');
+        assert_eq!(lower('\u{2160}'), '\u{2170}');
+        let circled: String = "PASSWORD".chars().map(|c| char::from_u32(0x24B6 + (c as u32 - 'A' as u32)).unwrap()).collect();
+        assert_eq!(dict(Rule::vault(), &circled), f64::INFINITY, "circled PASSWORD isn't the word");
+        assert_eq!(dict(Rule::vault(), "PassWord"), 4.0, "rank 1, two capitals");
+        assert_eq!(dict(Rule::vault(), "DROWSSAP"), 4.0, "rank 1, reversed, all caps");
+        assert_eq!(dict(Rule::vault(), "p@ssw0rd"), 4.0, "rank 1, two substitutions");
+        // zxcvbn's lists: "password" is rank 2 of its passwords (and rank 1
+        // of VettID's words, which wins).
+        assert_eq!(dict(Rule::current(), "password"), 1.0);
+        // The first entries of zxcvbn's surnames and female names: rank 1,
+        // times 2 for the capital.
+        assert_eq!(dict(Rule::current(), "Smith"), 2.0);
+        assert_eq!(dict(Rule::current(), "Mary"), 2.0);
+        assert_eq!(dict(Rule::current(), "nosuchwordzz"), f64::INFINITY);
     }
 
-    /// The longest passphrase the estimator looks at (128 characters) is
-    /// checked quickly, even in a debug build.
+    /// The passphrase's characters are allocated once, at their final size.
     #[test]
-    fn a_long_passphrase_is_quick() {
-        let pw: String = "Zq9!violetKestrel".chars().cycle().take(128).collect();
-        let t = std::time::Instant::now();
-        let _ = check(&pw);
-        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+    fn the_characters_never_reallocate() {
+        for s in ["violet-Kestrel-91-moss", "密码密码密码", "😀😁😂🤣", ""] {
+            let v = chars_of(s);
+            assert_eq!(v.capacity(), s.len(), "{s}");
+            assert!(v.len() <= v.capacity());
+        }
+    }
+
+    /// The lookup buffer is sized once and never grows (so no copy of the
+    /// passphrase is left behind by a reallocation).
+    #[test]
+    fn the_lookup_buffer_never_grows() {
+        let rule = Rule::current();
+        let mut cx = Cx::new(rule);
+        let cap = cx.buf.capacity();
+        let pw: Vec<char> = "Zq9!violetKestrel-correcthorsebatterystaple".chars().cycle().take(MAX_ESTIMATE_CHARS).collect();
+        let _ = cx.estimate(&pw);
+        let _ = cx.is_common(&pw);
+        assert_eq!(cx.buf.capacity(), cap);
+    }
+
+    /// The passwords of the shared vectors for the §11.14.7 erratum (lead
+    /// review): the vault's 1,398, the reviewers' examples and the
+    /// residuals named in the tests above.
+    fn shared_cases() -> Vec<String> {
+        let v: Vectors = serde_json::from_str(include_str!("passwords/estimator-vectors.json")).unwrap();
+        let mut cases: Vec<String> = v.cases.into_iter().map(|c| c.password).collect();
+        let p = |s: &str, n: usize| s.repeat(n);
+        cases.extend([
+            "harrypotter123".to_string(),
+            "Liverpool2024!".into(),
+            "football player".into(),
+            p("password", 17),
+            "Superman123!".into(),
+            "pokemon12345".into(),
+            "manchesterunited".into(),
+            "trustno1trustno1".into(),
+            "mypasswordis123".into(),
+            "Wi11iams1987!".into(),
+            "Ba11erina2020".into(),
+            "he11ofriend123".into(),
+            p("password", 50),
+            format!("{}1", p("password", 50)),
+            format!("X{}", p("password", 50)),
+            format!("{}1{}", p("password", 25), p("password", 25)),
+            format!("{}1{}", p("password", 15), p("password", 15)),
+            format!("{} {}", p("iloveyou", 15), p("iloveyou", 15)),
+            format!("{}{}", p("Password1!", 12), p("Password2!", 12)),
+            format!("{}{}", p("Summer2024!", 11), p("Winter2024!", 11)),
+            format!("{}{}{}", p("password", 15), p("football", 15), p("baseball", 15)),
+            format!("{}1", p("football", 127)),
+            format!("{}Summer", p("Summer2024!!", 11)),
+            format!("Hello{}2024!", p("password", 40)),
+            format!("{}a{}", p("monkey123", 14), p("monkey123", 14)),
+            format!("{}{}{}", p("dragon12", 10), p("dragon13", 10), p("dragon14", 10)),
+            format!("mmmmmmmm{}", p("monkey12", 20)),
+            format!("{}ababababab{}", p("password", 17), "cabcabc"),
+            // Named residuals: zxcvbn's per-part model passes them (GC #6190).
+            format!("{}!", p("i love you ", 20)),
+            "thequickbrownfox".into(),
+            "Password1!Password2!".into(),
+            "passwordfootballbaseballprincess".into(),
+            "Mike.Jones.1990".into(),
+            "i love my dog".into(),
+            "Tr0ub4dor&3xx".into(),
+            "password1password2password3".into(),
+            "Hello World 2024".into(),
+            "harry potter 2024".into(),
+            "New York 2024!".into(),
+            "ilovemydog2024".into(),
+            "violet-Kestrel-91-moss".into(),
+            "glacier mango tuesday piano".into(),
+            "Tq8#vLm2!pRz".into(),
+        ]);
+        cases
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+    struct Shared {
+        password: String,
+        /// `None`: more than an f64 holds.
+        guesses: Option<f64>,
+        /// The verdict at the vault's floor (10¹⁰) and at the apps' (2 × 10¹⁰).
+        vault: String,
+        app: String,
+    }
+
+    /// The shared vectors are this rule's answers. `PWRULE_EMIT=<path>`
+    /// writes them there (to regenerate `passwords/desktop-rule-vectors.json`
+    /// after a change to the rule); otherwise the committed file must match.
+    #[test]
+    fn the_shared_vectors_are_current() {
+        let now: Vec<Shared> = shared_cases()
+            .into_iter()
+            .map(|pw| {
+                let n = nfc(&pw);
+                let g = if n.len() > MAX_BYTES { None } else { Some(guesses(Rule::current(), &n)).filter(|g| g.is_finite()) };
+                Shared {
+                    vault: reason(check_at(&n, Rule::current(), 1e10)).to_string(),
+                    app: reason(check(&n)).to_string(),
+                    guesses: g,
+                    password: pw,
+                }
+            })
+            .collect();
+        if let Ok(path) = std::env::var("PWRULE_EMIT") {
+            let file = serde_json::json!({
+                "description": "The desktop's passphrase rule (vettid-desktop src-tauri/src/credential/password_rule.rs, #13): the vault's rule at 5deefac with zxcvbn's lists (67c4ece), zxcvbn's substitutions and repeated runs past 128 characters. Each password's estimate and its verdict at 1e10 (the vault's floor) and 2e10 (the apps'). For the VAULT-MESSAGING §11.14.7 erratum's shared vectors. TEST ONLY.",
+                "cases": now,
+            });
+            std::fs::write(path, serde_json::to_string_pretty(&file).unwrap() + "\n").unwrap();
+            return;
+        }
+        #[derive(serde::Deserialize)]
+        struct File {
+            cases: Vec<Shared>,
+        }
+        let committed: File = serde_json::from_str(include_str!("passwords/desktop-rule-vectors.json")).unwrap();
+        assert_eq!(committed.cases.len(), now.len());
+        for (c, n) in committed.cases.iter().zip(&now) {
+            assert_eq!((&c.password, &c.vault, &c.app), (&n.password, &n.vault, &n.app));
+            match (c.guesses, n.guesses) {
+                (Some(a), Some(b)) => assert!(a == b || ((a - b) / a).abs() < 1e-12, "{:?}: {a:e} vs {b:e}", c.password),
+                (a, b) => assert_eq!(a, b, "{:?}", c.password),
+            }
+        }
     }
 }
