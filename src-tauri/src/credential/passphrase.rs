@@ -238,45 +238,12 @@ impl Protector for Passphrase {
     }
 }
 
-/// Why a passphrase is refused at pairing (AGENT-PLAN §1, "Passphrase
-/// strength rules"; the texts for these come with the UI, item 4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Weakness {
-    /// Fewer than 12 characters.
-    TooShort,
-    /// Fewer than 3 of: lower case, upper case, digits, other characters.
-    TooFewKinds,
-}
+pub(crate) use super::password_rule::Weakness;
 
-/// At least 12 characters (Unicode scalar values), and 3 of the 4 kinds:
-/// lower case, upper case, digits (`char::is_numeric`), anything else.
-/// Letters without case (CJK, Arabic, Hebrew, Thai), spaces and marks
-/// count as "anything else". The agent's earlier Go rule counted bytes, so
-/// this one is stricter on length for non-ASCII text, as AGENT-PLAN §1's
-/// "12 characters" says.
+/// The vault's password rule, at the apps' floor (`password_rule`), judged
+/// in NFC, the form that is used (lead decision).
 pub(crate) fn strong_enough(passphrase: &str) -> Result<(), Weakness> {
-    // Judged in NFC, the form that is used (lead decision).
-    let normalized = nfc(passphrase);
-    let passphrase: &str = &normalized;
-    if passphrase.chars().count() < 12 {
-        return Err(Weakness::TooShort);
-    }
-    let (mut lower, mut upper, mut digit, mut other) = (false, false, false, false);
-    for c in passphrase.chars() {
-        if c.is_lowercase() {
-            lower = true;
-        } else if c.is_uppercase() {
-            upper = true;
-        } else if c.is_numeric() {
-            digit = true;
-        } else {
-            other = true;
-        }
-    }
-    if [lower, upper, digit, other].iter().filter(|k| **k).count() < 3 {
-        return Err(Weakness::TooFewKinds);
-    }
-    Ok(())
+    super::password_rule::check(&nfc(passphrase))
 }
 
 #[cfg(test)]
@@ -431,23 +398,17 @@ mod tests {
         assert!(twelve.chars().count() > 12);
         assert_eq!(strong_enough(&twelve), Ok(()));
         let eleven: String = "ÄÖÜäöü12345".nfd().collect();
-        assert_eq!(strong_enough(&eleven), Err(Weakness::TooShort), "NFD's extra code points don't count");
+        assert_eq!(strong_enough(&eleven), Err(Weakness::Short), "NFD's extra code points don't count");
     }
 
     #[test]
     fn the_strength_rule() {
-        assert_eq!(strong_enough("Short1!"), Err(Weakness::TooShort));
-        assert_eq!(strong_enough("Aa1!Aa1!Aa1"), Err(Weakness::TooShort), "11 characters");
-        assert_eq!(strong_enough("alllowercaseletters"), Err(Weakness::TooFewKinds));
-        assert_eq!(strong_enough("lowercase and 123"), Ok(()), "lower, digits, spaces");
-        assert_eq!(strong_enough("UPPER lower words"), Ok(()), "upper, lower, spaces");
-        assert_eq!(strong_enough("lowercaseUPPERCASE"), Err(Weakness::TooFewKinds), "two kinds");
-        assert_eq!(strong_enough("Correct horse 9 battery"), Ok(()));
-        // Characters, not bytes: 12 non-ASCII characters count as 12.
-        assert_eq!(strong_enough("ÄÖÜäöü123456"), Ok(()));
-        assert_eq!(strong_enough("ÄÖÜäöü12345"), Err(Weakness::TooShort));
-        // Letters without case (here CJK) count as "anything else".
-        assert_eq!(strong_enough("密码密码密码密码密码a1"), Ok(()), "other, lower, digits");
-        assert_eq!(strong_enough("密码密码密码密码密码12"), Err(Weakness::TooFewKinds), "other, digits");
+        // The vault's rule (password_rule has the full checks); judged in NFC.
+        assert_eq!(strong_enough("Short1!"), Err(Weakness::Short));
+        assert_eq!(strong_enough("zzzzzzzzzzzzzzzz"), Err(Weakness::Repeated));
+        assert_eq!(strong_enough("Password1234"), Err(Weakness::Common));
+        assert_eq!(strong_enough("qwertyuiopasdf"), Err(Weakness::Guessable));
+        assert_eq!(strong_enough("correct horse battery staple"), Ok(()));
+        assert_eq!(strong_enough("glacier mango tuesday piano"), Ok(()), "no capitals or digits needed");
     }
 }
