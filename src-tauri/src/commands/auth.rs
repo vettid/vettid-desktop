@@ -630,12 +630,20 @@ async fn open_saved(state: &AppState, given: Option<PassphraseInput>) -> Result<
     // not before the wait after a wrong one is over. A passphrase sent for
     // a pairing it didn't seal is dropped unused (wiped).
     let passphrase = if device_store::sealed_by_passphrase(&config_dir) {
-        let Some(PassphraseInput(p)) = given else {
-            return Ok(UnlockResponse { needs_passphrase: true, ..Default::default() });
-        };
+        // The wait is said whether or not a passphrase came (review Low).
         let wait = state.passphrase_tries.lock().unwrap_or_else(|e| e.into_inner()).wait_left(std::time::Instant::now());
-        if let Some(wait) = wait {
-            return Ok(UnlockResponse { needs_passphrase: true, retry_after_secs: Some(whole_secs(wait)), ..Default::default() });
+        let asking = UnlockResponse { needs_passphrase: true, retry_after_secs: wait.map(whole_secs), ..Default::default() };
+        let Some(PassphraseInput(p)) = given else {
+            return Ok(asking);
+        };
+        if wait.is_some() {
+            return Ok(asking);
+        }
+        // One that no pairing could have been sealed with (see
+        // `passphrase::strong_enough`) is wrong without normalizing or
+        // hashing it (review Low).
+        if p.len() > 3 * crate::credential::password_rule::MAX_BYTES {
+            return Ok(wrong_passphrase(state));
         }
         Some(Passphrase::new(p))
     } else {
@@ -646,7 +654,10 @@ async fn open_saved(state: &AppState, given: Option<PassphraseInput>) -> Result<
         None => DeviceStore::new(&config_dir, since),
     };
 
-    let mut link = match Link::open(store) {
+    // Opening runs Argon2id for the passphrase (about a second): on a
+    // blocking thread, not the async runtime's (review Low).
+    let opened = tokio::task::spawn_blocking(move || Link::open(store)).await.map_err(|e| e.to_string())?;
+    let mut link = match opened {
         Ok(Some(l)) => l,
         // A pairing interrupted before the owner approved it was removed.
         Ok(None) => return Ok(UnlockResponse { unlocked: false, notice: None, ..Default::default() }),

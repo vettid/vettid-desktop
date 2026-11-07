@@ -108,7 +108,9 @@ pub const MAYBE_DAMAGED_NOTICE: &str =
 
 /// NEW TEXT (owner approval needed): shown when this computer offers no
 /// protector at all (#13). Not reachable on Windows or macOS (each has one
-/// that is never absent). The passphrase protector will take this case.
+/// that is never absent). Pairing asks for a passphrase instead
+/// (`needs_passphrase`, #13 item 4); this is shown only if nothing at all,
+/// not even that, could seal the pairing.
 #[cfg(not(target_os = "linux"))]
 pub const NO_PROTECTOR_NOTICE: &str =
     "This computer offers no way for this desktop to lock its pairing, so nothing was saved. If your phone lists this desktop, remove it there.";
