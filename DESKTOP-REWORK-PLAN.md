@@ -330,7 +330,7 @@ deviations marked below.
 - **Who:** Linux where this account can't use the TPM (`/dev/tpmrm0` missing, or owned by `root:tss`, as on many distributions) **and** no Secret Service is on the session bus: minimal or tiling window managers without GNOME Keyring or KWallet, headless or remote sessions, some VMs and containers, and a Flatpak build without a keyring. Windows (DPAPI) never reaches it, and macOS doesn't for now: the interim keyring is never absent. Once the data protection keychain replaces it, an unsigned or ad-hoc macOS build is refused too (the macOS row above).
 - **What they see:** the Linux no-protector notice, which names the two ways on: start a keyring service, or get access to the TPM.
 - **Why not a passphrase:** the file could be copied and guessed offline, and three review rounds showed that a typed passphrase's strength rule still passes weak phrases (Ground Control #6190). The owner chose a smaller surface over covering these few computers.
-- **Tracked in** the issue "The desktop can't pair on a computer with no protector".
+- **Tracked in** #131.
 
 **Done** (task 01M6EFHHANEEVAMCKH3WT7JM71):
 - **Round trips:** DPAPI (on the Windows test machine) and TPM (against `swtpm` in CI, if CI has it; otherwise on a Linux machine). (The passphrase's was dropped with it, 2026-11-09.)
