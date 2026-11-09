@@ -40,7 +40,6 @@ src-tauri/src/
 │                           #   query_audit, list_messages, list_secrets_catalog,
 │                           #   request_secret
 ├── crypto/
-│   ├── argon2.rs           # Argon2id key derivation (passphrase + platform key)
 │   ├── ecies.rs            # ECIES encrypt/decrypt with domain separation
 │   ├── encrypt.rs          # CryptoError, symmetric helpers
 │   ├── hkdf.rs             # HKDF-SHA256 key derivation
@@ -103,7 +102,6 @@ npm run check
 - **X25519** — Elliptic curve Diffie-Hellman for key exchange
 - **XChaCha20-Poly1305** — AEAD symmetric encryption
 - **HKDF-SHA256** — Key derivation with domain separation (`vettid-device-v1`, `vettid-connection-v1`)
-- **Argon2id** — Password hashing (t=3, m=64MB, p=4) matching OWASP recommendations
 
 ### Credential Binding
 The paired device's state (`device.enc`) is sealed under a random data key made at pairing, and that key is wrapped by a platform protector (DESKTOP-REWORK-PLAN §4 "At-rest protectors"). On Windows it is DPAPI for the user's account: a copy of the file alone doesn't open elsewhere, but a copy of the whole profile with the user's password does, and an administrator can unwrap it while the user is logged on. Another Windows account on the same computer can't open a copy of the file, even one it owns; that was tested with a second account standing in for another computer (`docs/WINDOWS-TESTING.md`, #13). On Linux it is the TPM 2.0 through `/dev/tpmrm0`: the data key is sealed under the storage root key, with no PCR policy and no auth value, so it opens only on this TPM, but root, or any user who can read the file and use the TPM (any process of this user included), can unseal it, and clearing the TPM loses the pairing. Many distributions give `/dev/tpmrm0` to `root:tss` only, and a Flatpak has none; without a TPM this user can use, the key is kept in the Secret Service (GNOME Keyring, KWallet), one item per pairing, which is not bound to the computer: a copy of the keyring file opens elsewhere with the login password. With neither, the desktop doesn't pair. The TPM protector links `libtss2` (esys, tctildr, mu, and the device TCTI at run time). On macOS, for now, the key is kept in the OS keyring, which is not bound to the computer. An old copy of the file recovered from a backup or the disk still opens for the same user on the same computer.
