@@ -232,33 +232,6 @@
     border-radius: 6px; color: var(--text); font-size: 1rem; outline: none;
   }
   .input:focus { border-color: var(--accent); }
-
-  /* Passphrase row: input + inline show/hide toggle. The first
-     passphrase input is wrapped so the toggle sits over its right
-     edge; the confirm input below keeps the same width since both
-     fields hide-or-show together when the toggle flips. */
-  .pw-row {
-    position: relative;
-    margin-bottom: 12px;
-  }
-  .pw-row .pw-input {
-    margin-bottom: 0;
-    padding-right: 64px;
-  }
-  .pw-toggle {
-    position: absolute;
-    right: 4px;
-    top: 50%;
-    transform: translateY(-50%);
-    background: transparent;
-    border: none;
-    color: var(--text-muted);
-    font: inherit;
-    font-size: 0.85rem;
-    padding: 6px 10px;
-    cursor: pointer;
-  }
-  .pw-toggle:hover { color: var(--text); }
   .btn { width: 100%; padding: 12px; border: none; border-radius: 6px;
          font-size: 1rem; cursor: pointer; margin-bottom: 8px; }
   .btn.primary { background: var(--accent); color: #1a1a1a; font-weight: 500; }
