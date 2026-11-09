@@ -905,7 +905,7 @@ mod tests {
         assert_eq!(
             hex::encode(Sha256::digest(include_str!("passwords/zxcvbn/LICENSE.txt"))),
             ZXCVBN_LICENSE_SHA256,
-            "zxcvbn's licence changed"
+            "zxcvbn's license changed"
         );
         assert_eq!(load_list(COMMON_LIST).len(), 20);
         assert_eq!(load_list(WORD_LIST).len(), 43);
