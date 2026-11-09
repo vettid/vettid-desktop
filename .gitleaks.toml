@@ -28,9 +28,10 @@ regexes = ['''^(checksum = "[0-9a-f]{64}"|name = "[A-Za-z0-9_.+-]+"|\s*"[A-Za-z0
 # The passphrase rule's word lists and test passwords (#13 item 4): the
 # vault's common-password list, its estimator words, its shared verdicts and
 # the vectors generated from its code, and zxcvbn's published lists. Every
-# "password" in them is a public test or dictionary entry, none a secret; the
-# tests pin each file by SHA-256. Scoped to the generic-api-key rule and to
-# this folder.
+# "password" in them is a public test or dictionary entry, none a secret.
+# Scoped to the generic-api-key rule and to this folder. The folder was
+# removed with the passphrase (owner decision, Ground Control #6503); this
+# stays because the scan reads the full history, where those files remain.
 [[allowlists]]
 description = "passphrase rule lists and test passwords (public)"
 targetRules = ["generic-api-key"]

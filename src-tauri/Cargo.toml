@@ -43,12 +43,8 @@ chacha20poly1305 = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
 hmac = "0.12"
-# `zeroize`: Argon2 wipes its initial and final hashes (the passphrase
-# protector, #13, wipes the working memory it hands it).
+# `zeroize`: Argon2 wipes its initial and final hashes (`crypto::argon2`).
 argon2 = { version = "0.5", features = ["zeroize"] }
-# The passphrase is normalized to NFC before any use, as the vault and the
-# apps do (VAULT-MESSAGING §11.14.7, "One form"; #13).
-unicode-normalization = "0.1"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 

@@ -11,7 +11,7 @@
 //!   (`super::secret_service`, the owner's choice (b)): one keyring item
 //!   per file, named by an id in the header. Not bound to this computer.
 //! - **macOS, for now: the OS keyring** through the `keyring` crate (the
-//!   login keychain, until the keychain and passphrase protectors land).
+//!   login keychain, until the keychain protector lands).
 //!   The data key is the keyring entry itself, so the header's wrapped key
 //!   is empty. Not bound to this computer: Settings says so.
 //!
@@ -23,7 +23,10 @@
 //! never absent. On Linux the TPM is absent when `/dev/tpmrm0` is missing
 //! or not usable by this user, and the Secret Service when there is no
 //! session bus or no `org.freedesktop.secrets` on it; with both absent,
-//! pairing is refused with the no-protector notice.
+//! pairing is refused with the no-protector notice. There is no fallback:
+//! the owner dropped the passphrase (Ground Control #6503), so such a
+//! computer can't pair (DESKTOP-REWORK-PLAN §4, "Computers with no
+//! protector").
 //!
 //! The legacy `master-key-v1` entry of the earlier format is only ever
 //! deleted here ([`LegacyKey`]); nothing reads it.
@@ -60,12 +63,6 @@ pub(crate) enum ProtectorError {
     WontOpen(String),
     /// A key kept outside the file couldn't be confirmed gone.
     NotRemoved { what: &'static str, detail: String },
-    /// The secret the person gave (the passphrase, #13) doesn't open the
-    /// key: a wrong one, or a changed file, which can't be told apart. The
-    /// file is kept and the person can try again; never "won't open", which
-    /// would tell them to re-pair.
-    #[cfg_attr(not(test), allow(dead_code))] // the passphrase protector is wired in by #13 item 4
-    NotThisSecret { by: &'static str },
 }
 
 impl std::fmt::Display for ProtectorError {
@@ -75,7 +72,6 @@ impl std::fmt::Display for ProtectorError {
             ProtectorError::Failing { by, detail } => write!(f, "{by} failed: {detail}"),
             ProtectorError::WontOpen(detail) => write!(f, "the data key doesn't open: {detail}"),
             ProtectorError::NotRemoved { what, detail } => write!(f, "{what} not removed: {detail}"),
-            ProtectorError::NotThisSecret { by } => write!(f, "{by} doesn't open the data key"),
         }
     }
 }

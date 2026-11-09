@@ -87,7 +87,7 @@ flows handle the "do something about it" cases.
 | Expired | `Session expired — start new session` | Open Start-Session takeover |
 | Phone unreachable | overlay on the active pill: `Phone offline` | Open Session menu + phone-status detail |
 
-> *Superseded in part (2026-11-04, #13): "passphrase or biometric" in the Locked row is the old credential-store unlock. A passphrase is now asked only at launch, and only when the protector is the passphrase one (§4 "At-rest protectors"); with a protector bound to this computer, launch asks nothing.*
+> *Superseded in part (2026-11-04, #13): "passphrase or biometric" in the Locked row is the old credential-store unlock. A passphrase is now asked only at launch, and only when the protector is the passphrase one (§4 "At-rest protectors"); with a protector bound to this computer, launch asks nothing.* *(2026-11-09, Ground Control #6503: the passphrase protector is dropped, so launch never asks for a passphrase.)*
 
 ---
 
@@ -261,7 +261,7 @@ deviations marked below.
 **Format.**
 - **The file:** one state file, `device.enc`, holding the device engine's `DeviceState`: its seeds, the vault record, tokens and the session keyring.
 - **Encryption:** it is sealed with XChaCha20-Poly1305 under a **random 256-bit data key**. The data key is **wrapped by a platform protector** and kept, wrapped, in the file's header.
-- **The header:** `{v, protector, wrapped_key, nonce, created_at, notice_shown}`. The passphrase protector adds the Argon2id salt and parameters, so the parameters can be raised later.
+- **The header:** `{v, protector, wrapped_key, nonce, created_at, notice_shown}`.
 - **Associated data:** the header bytes plus the label `vettid-desktop-device-v1`.
 - **When a key is made:** a new data key at each pairing.
 - **The file itself:** written to a temporary file, synced and renamed. It keeps the owner-only permissions checked at load: the DACL on Windows, 0700 for the folder and 0600 for the file elsewhere.
@@ -271,7 +271,7 @@ deviations marked below.
 - the #14 storage binding (a machine-id HMAC) from the associated data, so a machine without a readable machine id can pair.
 
 **Threat model: disk images and VM clones.**
-- A disk image alone doesn't open, except through the passphrase protector (with the passphrase) or Secret Service (with the login password). On Windows, DPAPI also opens from the profile if the attacker has the user's password (row below).
+- A disk image alone doesn't open, except through Secret Service (with the login password). On Windows, DPAPI also opens from the profile if the attacker has the user's password (row below).
 - A full clone with the vTPM state (or the user profile, for DPAPI) does open.
 - A running or suspended snapshot opens without any password.
 
@@ -288,7 +288,7 @@ deviations marked below.
 | macOS | **Data protection keychain** item, `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, not synchronizable, with `kSecUseDataProtectionKeychain = true` set on every call: without it SecItem silently uses the file-based login keychain, which ignores `ThisDeviceOnly`. The code calls `security-framework` directly, not `keyring`'s `apple-native`. It needs a `keychain-access-groups` entitlement, so only the **signed app bundle** (the owner's App ID and provisioning profile) can use it. A test reads the item back and checks that it is in the data protection keychain and `ThisDeviceOnly`. | This device only. Without the entitlement (an unsigned or ad-hoc build), the keychain is *absent* and the next protector is used, with the reason shown. |
 | Linux | **TPM 2.0** through `/dev/tpmrm0`: the data key sealed under a primary key in the storage hierarchy, with **no PCR policy** (so firmware and kernel updates don't lock the person out) and no authValue. The primary key is the persistent SRK at handle `0x81000001` if it exists, else one made with `CreatePrimary` from the standard SRK template. A storage hierarchy that has an auth value set is **failing**, not absent (the TPM is present): pairing stops with the reason. Built on `tss-esapi`, which makes `libtss2` a runtime dependency of the package. | This TPM only. Root, or any user who can read the file and use the TPM, including any process of this user, can unseal. Clearing the TPM loses the state: a load failure, so re-pair. Many distributions give `/dev/tpmrm0` to `root:tss` only, so an ordinary user often has no TPM. A Flatpak build has no `/dev/tpmrm0`, so it sees the TPM as absent. |
 | Linux, no TPM | **Secret Service** (GNOME Keyring or KWallet), the data key held as one item. **A deviation from AG3**, which has no such step; owner's choice (b) below. The code uses `sync-secret-service` alone (or the `secret-service` crate), not keyutils. In `keyring` 3.6.3, with `linux-native` and `sync-secret-service` both enabled, the default store is Secret Service and `keyutils` is only compiled in; keyutils would become a cache only with the `linux-native-sync-persistent` feature. | It opens on another machine given the keyring file and its login password. **Any process of the same user can read an unlocked collection.** It doesn't meet LEASH §3.4's "copying … MUST render them undecryptable". Settings says "not bound to this computer". |
-| Any, none of the above | **Passphrase**, asked at each launch. Owner's choice (c) below. **KDF:** Argon2id from RustCrypto `argon2` 0.5 (already a dependency), t=3, m=64 MiB, p=1, a 16-byte random salt: the password values of VAULT-MESSAGING §3.5.1 (§4.1 there is Suites; AGENT-PLAN gives no numbers of its own, only "at least the vault's"). The header carries t, m, p and the salt; a load refuses anything below t=1, m=8 MiB, the vault's own floor. **Wrap:** HKDF-SHA-256 with a label turns the Argon2id output into the wrap key, and XChaCha20-Poly1305 wraps the data key. **Strength rules** at pairing: at least 12 characters and 3 of 4 classes (AGENT-PLAN §1, "Passphrase strength rules"). | It opens anywhere with the passphrase. It doesn't meet LEASH §3.4, and Settings says "not bound to this computer". The passphrase is zeroized in Rust and never logged (it crosses IPC as a webview string that can't be zeroized). Wrong entries get a growing delay; that is only UX, since offline guessing is slowed only by Argon2id. A forgotten passphrase means re-pairing; there is no recovery. |
+| Any, none of the above | **None: pairing is refused**, before the vault lists the desktop, with the no-protector notice (`store::NO_PROTECTOR_NOTICE`). Owner's choice (c) below, changed on 2026-11-09: the passphrase protector is dropped. See "Computers with no protector". | Nothing is stored, so there is nothing to copy. |
 
 **Rules:**
 - **Absent and failing are different.** At pairing the desktop moves to the next protector only when the better one is *absent*, which means one of a fixed list of results:
@@ -315,7 +315,7 @@ deviations marked below.
 - **Status:** Settings shows the protector in use and whether the state is bound to this computer.
 - **No weaker test modes in member builds.**
   - **Test protectors** (fixed keys, the `swtpm` wiring) are `#[cfg(test)]` only. No build flag or environment variable selects a weaker protector in a build a member could run.
-  - **Logging:** a protector's error is logged by its code, never with key bytes or the passphrase.
+  - **Logging:** a protector's error is logged by its code, never with key bytes.
 
 **Owner's choices:**
 - **(b) Secret Service on Linux without a TPM.**
@@ -324,9 +324,16 @@ deviations marked below.
 - **(c) When no protector binds to this computer.**
   - *Passphrase (recommended):* as AG3.
   - *Refuse to pair:* keeps the desktop passwordless (§4). But then no macOS desktop can pair until the signed build exists, and, with (b) dropped, no Linux desktop without TPM access can either.
+  - **Decided 2026-11-04: passphrase** (GC, plan #67), then **changed 2026-11-09: refuse to pair** (Ground Control #6503, "a"). The passphrase protector and its strength rule (desktop #125, #127, #128, #129) are removed. (b) stands, and macOS keeps the OS keyring for now, so the refusal reaches only the computers below.
+
+**Computers with no protector** (the gap, 2026-11-09). Pairing is refused, and nothing is stored, when every protector is absent:
+- **Who:** Linux where this account can't use the TPM (`/dev/tpmrm0` missing, or owned by `root:tss`, as on many distributions) **and** no Secret Service is on the session bus: minimal or tiling window managers without GNOME Keyring or KWallet, headless or remote sessions, some VMs and containers, and a Flatpak build without a keyring. Windows (DPAPI) and macOS (the keyring) never reach it.
+- **What they see:** the Linux no-protector notice, which names the two ways on: start a keyring service, or get access to the TPM.
+- **Why not a passphrase:** the file could be copied and guessed offline, and three review rounds showed that a typed passphrase's strength rule still passes weak phrases (Ground Control #6190). The owner chose a smaller surface over covering these few computers.
+- **Tracked in** the issue "The desktop can't pair on a computer with no protector".
 
 **Done** (task 01M6EFHHANEEVAMCKH3WT7JM71):
-- **Round trips:** DPAPI (on the Windows test machine), TPM (against `swtpm` in CI, if CI has it; otherwise on a Linux machine) and the passphrase.
+- **Round trips:** DPAPI (on the Windows test machine) and TPM (against `swtpm` in CI, if CI has it; otherwise on a Linux machine). (The passphrase's was dropped with it, 2026-11-09.)
 - **Copy refusal:**
   - DPAPI: tested as a second Windows user, and on a second VM if one is available. The second user stands in for "another machine"; the README says so.
   - TPM: tested with a second `swtpm` instance.
@@ -409,7 +416,7 @@ model (lowest risk, biggest UX win); Phase 2 is the chrome (top bar
 
 > **Superseded in part (2026-11-04, #13):**
 > - **Key storage, the machine-bound fallback and the migration:** replaced by §4 "At-rest protectors". There's no migration of the old format (decision #2); an upgrade to a better protector later is a re-wrap within the new format (§4).
-> - **"Pairs without a passphrase prompt":** holds only where a protector binds to this computer (owner's choice (c)).
+> - **"Pairs without a passphrase prompt":** holds only where a protector binds to this computer (owner's choice (c)). *Since 2026-11-09 (Ground Control #6503) it holds everywhere: with no protector, pairing is refused instead (§4, "Computers with no protector").*
 
 - Add `keyring`-based encryption-key store
   (`secret-service` / `security-framework`); fallback to machine-
@@ -555,7 +562,8 @@ read receipts and delivery state matching Android.
 
 > **Note (2026-11-04):** the NATS items below are gone (#64). The
 > passphrase may return as a last-resort protector (§4 "At-rest
-> protectors", owner's choice (c)).
+> protectors", owner's choice (c)). *(2026-11-09: it doesn't; the owner
+> dropped it, Ground Control #6503.)*
 
 The post-Stage-2 pairing flow we just shipped works well — these
 parts of the existing stack stay:
@@ -569,7 +577,7 @@ parts of the existing stack stay:
 - Existing async-nats client + resilience options
 - Existing crypto stack (X25519 / XChaCha20-Poly1305 / HKDF /
   Argon2id — the latter only on the vault side now that desktop
-  goes passphraseless) *(Superseded, #13: Argon2id is back on the desktop for the passphrase protector, used only where no protector binds to this computer; §4.)*
+  goes passphraseless) *(Superseded, #13: Argon2id is back on the desktop for the passphrase protector, used only where no protector binds to this computer; §4. Superseded again, 2026-11-09, Ground Control #6503: the passphrase protector is dropped, and the desktop is passphraseless.)*
 - Settings → Network raw NATS state for debugging
 - Light/dark/auto theme support
 

@@ -87,7 +87,7 @@ fn not_opened_notice(by: &str) -> String {
 
 /// NEW TEXT (owner approval needed): shown when this computer offers no
 /// protector at all (#13). Not reachable on Windows or macOS (each has one
-/// that is never absent). The passphrase protector will take this case.
+/// that is never absent). There is no fallback (Ground Control #6503).
 #[cfg(not(target_os = "linux"))]
 pub const NO_PROTECTOR_NOTICE: &str =
     "This computer offers no way for this desktop to lock its pairing, so nothing was saved. If your phone lists this desktop, remove it there.";
@@ -96,7 +96,8 @@ pub const NO_PROTECTOR_NOTICE: &str =
 /// account can't use the TPM (`/dev/tpmrm0` missing or not permitted) and no
 /// Secret Service is on the session bus. Pairing is refused before the
 /// vault lists the desktop; the phone step covers a later save. Says only
-/// what the person can do now (the passphrase protector comes later).
+/// what the person can do; there is no fallback (the owner dropped the
+/// passphrase, Ground Control #6503).
 #[cfg(target_os = "linux")]
 pub const NO_PROTECTOR_NOTICE: &str =
     "This computer offers no way for this desktop to lock its pairing: your account can't use the computer's TPM, and this desktop couldn't find a keyring service, such as GNOME Keyring or KWallet. Nothing was saved. If your phone lists this desktop, remove it there. To pair, start your keyring service, or ask whoever manages this computer to give your account access to the TPM, then pair again.";
