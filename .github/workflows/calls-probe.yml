@@ -18,6 +18,10 @@ jobs:
         os: [ubuntu-26.04, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    env:
+      # audiopus_sys 0.2.2's bundled Opus asks for CMake < 3.5, which CMake 4
+      # refuses (Windows builds Opus from source); CMake's own suggested override.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     defaults:
       run:
         shell: bash
