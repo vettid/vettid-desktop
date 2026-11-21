@@ -18,22 +18,34 @@ fn main() {
 /// (NASM builds it). `.cargo/config.toml` sets `AWS_LC_SYS_USE_SYSTEM=0`,
 /// but a build run from outside the repo misses that file, and nothing sets
 /// `AWS_LC_SYS_PREBUILT_NASM=0` there (debug builds may use the prebuilt
-/// objects). A build script can't set another crate's build environment, so
+/// objects). Each is read the way aws-lc-sys reads it (aws_lc_env). A build script can't set another crate's build environment, so
 /// this only checks, and stops a release build that would get it wrong
 /// (docs/WINDOWS-TESTING.md "Build", docs/MACOS-RELEASE.md).
 fn aws_lc_release_guard() {
-    for v in ["AWS_LC_SYS_USE_SYSTEM", "AWS_LC_SYS_PREBUILT_NASM", "PROFILE"] {
-        println!("cargo:rerun-if-env-changed={v}");
-    }
+    let use_system = aws_lc_env("USE_SYSTEM");
+    let prebuilt_nasm = aws_lc_env("PREBUILT_NASM");
     if std::env::var("PROFILE").as_deref() != Ok("release") {
         return;
     }
-    if std::env::var("AWS_LC_SYS_USE_SYSTEM").as_deref() != Ok("0") {
+    if use_system.as_deref() != Some("0") {
         panic!("a release build needs AWS_LC_SYS_USE_SYSTEM=0 (aws-lc-sys must not link a system AWS-LC); build from the repo, or export it");
     }
     let windows_x64 = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
         && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64");
-    if windows_x64 && std::env::var("AWS_LC_SYS_PREBUILT_NASM").as_deref() != Ok("0") {
+    if windows_x64 && prebuilt_nasm.as_deref() != Some("0") {
         panic!("a Windows release build needs AWS_LC_SYS_PREBUILT_NASM=0 and NASM on PATH (aws-lc's assembly is built from source, not taken prebuilt): docs/WINDOWS-TESTING.md, \"Build\"");
     }
+}
+
+/// The value aws-lc-sys itself reads for `AWS_LC_SYS_<var>`: the
+/// target's own variable first (`AWS_LC_SYS_<var>_<target>`, the target
+/// in lower case with `-` as `_`), then the plain one. Checking only the
+/// plain one would let a target-suffixed variable override it unseen.
+fn aws_lc_env(var: &str) -> Option<String> {
+    let plain = format!("AWS_LC_SYS_{var}");
+    let target = std::env::var("TARGET").unwrap_or_default().to_lowercase().replace('-', "_");
+    let suffixed = format!("{plain}_{target}");
+    println!("cargo:rerun-if-env-changed={plain}");
+    println!("cargo:rerun-if-env-changed={suffixed}");
+    std::env::var(&suffixed).ok().or_else(|| std::env::var(&plain).ok())
 }

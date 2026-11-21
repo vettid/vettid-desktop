@@ -78,12 +78,14 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile nasm-setup.exe
           $got = (Get-FileHash nasm-setup.exe -Algorithm SHA256).Hash
           if ($got -ne $want) { throw "NASM installer SHA-256 $got, expected $want" }
-          Start-Process -FilePath .\nasm-setup.exe -ArgumentList '/S' -Wait
+          $p = Start-Process -FilePath .\nasm-setup.exe -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "NASM installer exit code $($p.ExitCode)" }
           Remove-Item nasm-setup.exe
           Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\NASM'
+      # This NASM, not another one on PATH.
       - name: NASM version (Windows)
         if: runner.os == 'Windows'
-        run: nasm -v
+        run: nasm -v | grep -F "NASM version 2.16.03 "
       - name: rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
