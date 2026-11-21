@@ -1,0 +1,23 @@
+# cargo-audit configuration, read by `cargo audit` from the repository root
+# (.github/workflows/vulns.yml).
+#
+# Every ignored advisory needs a line of the form
+#   # RUSTSEC-YYYY-NNNN expires YYYY-MM-DD
+# The scan's expiry check fails on an ignore without one, and on any ignore
+# still listed after its date.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0387 expires 2027-01-31
+    #
+    # crypto-bigint 0.5.5: timing variability in operations meant to be
+    # constant-time. It comes in through elliptic-curve 0.13 and p256 under
+    # webrtc 0.17 and dtls 0.17, in `--calls` builds only. It is reached
+    # there, narrowly: when a call's DTLS handshake uses P-256 ECDHE, the
+    # ephemeral key is generated through crypto-bigint. Call media does not
+    # rely on DTLS: each frame is encrypted with keys from `k_call`
+    # (PQC-MIGRATION row 5a). Kept by the owner's decisions of 2026-11-21
+    # (Ground Control #15594, #15608). The webrtc 0.21 upgrade (card #15596)
+    # removes it, and this entry with it.
+    "RUSTSEC-2026-0387",
+]

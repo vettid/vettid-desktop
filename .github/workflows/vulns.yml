@@ -5,7 +5,8 @@ name: vulns
 # - cargo audit v0.22.2 (RustSec; the release binary, checksum-verified)
 #   over src-tauri/Cargo.lock. It fails on a vulnerability advisory; crates
 #   that are unmaintained, unsound or yanked are listed as warnings, not
-#   failed.
+#   failed. An advisory is ignored only through .cargo/audit.toml, each
+#   with an expiry date that this workflow enforces.
 # - npm audit over the whole package-lock.json, devDependencies included:
 #   the front end is built from them (svelte compiles into the bundle; vite,
 #   rollup and postcss build it), so --omit=dev would skip what ships. It
@@ -44,6 +45,33 @@ jobs:
           mkdir ca
           tar -xzf ca.tgz -C ca
           install -m 0755 "$(find ca -type f -name cargo-audit)" "$RUNNER_TEMP/cargo-audit"
+      # .cargo/audit.toml may ignore an advisory only with a dated line
+      # "# RUSTSEC-YYYY-NNNN expires YYYY-MM-DD". An ignore without one,
+      # or one past its date, fails the scan. AUDIT_TODAY overrides the
+      # date, for testing only.
+      - name: ignored advisories have not expired (.cargo/audit.toml)
+        run: |
+          python3 - <<'EOF'
+          import datetime, os, re, sys, tomllib
+          path = ".cargo/audit.toml"
+          if not os.path.exists(path):
+              sys.exit(0)
+          text = open(path, encoding="utf-8").read()
+          ignored = tomllib.loads(text).get("advisories", {}).get("ignore", [])
+          today = os.environ.get("AUDIT_TODAY") or datetime.date.today().isoformat()
+          bad = False
+          for adv in ignored:
+              m = re.findall(r"^\s*#\s*" + re.escape(adv) + r"\s+expires\s+(\d{4}-\d{2}-\d{2})\s*$", text, re.M)
+              if len(m) != 1:
+                  print(f"::error::{adv} is ignored in {path} without exactly one 'expires YYYY-MM-DD' line")
+                  bad = True
+              elif m[0] < today:
+                  print(f"::error::the ignore of {adv} expired on {m[0]}: fix the advisory or renew the ignore by a reviewed change")
+                  bad = True
+              else:
+                  print(f"{adv}: ignored until {m[0]}")
+          sys.exit(1 if bad else 0)
+          EOF
       - name: cargo audit (src-tauri/Cargo.lock)
         run: '"$RUNNER_TEMP/cargo-audit" audit --file src-tauri/Cargo.lock'
 
