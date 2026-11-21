@@ -214,7 +214,10 @@ async fn request_answered_returns_the_answers_ts() {
     assert_eq!(a.request_answered(&mut s, &mut store, Some(59)).await, Err(AccessError::BadSeconds));
     assert_eq!(vault.waiting(), 0, "nothing sent");
 
-    let at = parse_ts("2026-11-03T12:00:00.000Z").unwrap();
+    // Relative to now: the session drops a message whose `ts` is older than
+    // SEEN_KEEP (16 days), so a fixed date stops arriving once it ages out.
+    // Through format_ts, so it has the wire's millisecond precision.
+    let at = parse_ts(&format_ts(Utc::now() - TimeDelta::minutes(5))).unwrap();
     let vault_side = async {
         let req = receive(&mut vault).await;
         assert_eq!(req.kind, TYPE_REQUEST);
