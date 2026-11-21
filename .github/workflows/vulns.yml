@@ -63,6 +63,11 @@ jobs:
           set +e
           npm audit --json > audit.json
           set -e
+          # A missing or malformed report is a failure, never a pass.
+          if ! jq -e '.metadata.vulnerabilities | (.high | numbers) and (.critical | numbers)' audit.json > /dev/null; then
+            echo "::error::npm audit produced no usable report"
+            exit 1
+          fi
           {
             echo '## npm audit (all dependencies)'
             echo
@@ -83,9 +88,11 @@ jobs:
           fi
 
   issue:
-    # One issue for all findings: opened, or commented on while open; a
-    # clean run closes it. A cancelled run reports nothing; a scan that
-    # could not run counts as a finding.
+    # One issue for all findings: opened, or commented on while open. A
+    # scan that fails reports a finding, including one that could not run
+    # (download, checksum, advisory database, a missing report all end as
+    # a failure). Only both scans passing closes the issue. Anything else
+    # (a cancelled run, a scan that hit its timeout) changes nothing.
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
     needs: [cargo-audit, npm-audit]
     runs-on: ubuntu-26.04
@@ -102,11 +109,15 @@ jobs:
           NPM: ${{ needs.npm-audit.result }}
         run: |
           what=""
-          if [ "$CARGO" != success ]; then
+          if [ "$CARGO" = failure ]; then
             what="$what"$'\n'"- cargo audit: a vulnerability advisory in src-tauri/Cargo.lock, or the scan could not run (the job log names it)."
           fi
-          if [ "$NPM" != success ]; then
+          if [ "$NPM" = failure ]; then
             what="$what"$'\n'"- npm audit: a high or critical advisory in package-lock.json, or the scan could not run (the job summary lists them)."
+          fi
+          if [ -z "$what" ] && { [ "$CARGO" != success ] || [ "$NPM" != success ]; }; then
+            echo "cargo audit: $CARGO, npm audit: $NPM; no finding to report and nothing to close"
+            exit 0
           fi
           title="security: dependency vulnerability scan findings"
           n=$(gh issue list --state open --search "in:title \"$title\"" --json number,title --jq "map(select(.title == \"$title\")) | .[0].number // empty")
