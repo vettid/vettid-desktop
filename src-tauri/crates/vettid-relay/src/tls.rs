@@ -1,4 +1,5 @@
-//! TLS for every HTTP client this crate builds.
+//! TLS for every HTTP client this crate builds, and rustls's process
+//! default for the rest of the app.
 //!
 //! rustls with the **aws-lc-rs** provider and its default key-exchange
 //! groups. A handshake offers the hybrid post-quantum `X25519MLKEM768`
@@ -6,10 +7,17 @@
 //! `secp384r1`, so a server without ML-KEM still connects with a classical
 //! group. There is no custom group list.
 //!
-//! The provider is passed to each configuration explicitly, never taken
-//! from rustls's process-wide default. A build that also compiles ring
-//! (the calls build, through dtls) has no automatic default, and reqwest
-//! would then fail to build a client.
+//! This crate's clients get the provider explicitly
+//! (`use_preconfigured_tls`), never from rustls's process default. The
+//! calls build also compiles ring, which dtls turns on in rustls, and
+//! with two providers compiled in rustls has no automatic default:
+//! anything that builds a rustls configuration without naming a provider
+//! then panics ("no process-level CryptoProvider available"). dtls does
+//! exactly that for its certificate verifiers, at every DTLS setup, and so
+//! would a plain `reqwest::Client::new()`. So the app also installs
+//! aws-lc-rs as the process default first thing at startup
+//! ([`install_default_provider`]). dtls's own record crypto stays on ring;
+//! only its certificate verifiers use the default.
 //!
 //! Otherwise the configuration is the one reqwest builds itself: rustls's
 //! safe default protocol versions (TLS 1.2 and 1.3), ALPN `http/1.1` (this
@@ -21,6 +29,17 @@ use std::sync::Arc;
 use rustls::{ClientConfig, RootCertStore};
 
 use crate::client::RelayError;
+
+/// Makes aws-lc-rs rustls's process-wide default provider, for code that
+/// builds a rustls configuration without naming one (dtls's certificate
+/// verifiers in the calls build; any plain `reqwest::Client::new()`).
+/// Call it first thing at startup, before anything uses TLS. Calling it
+/// again, or after a default is already installed, changes nothing.
+pub fn install_default_provider() {
+    // Err means a default is already installed: the first call's, or one
+    // installed before this (nothing in the app does that).
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
 
 /// The client configuration: aws-lc-rs, its default groups, `roots` as
 /// the only trust anchors.
@@ -52,9 +71,10 @@ pub fn public_builder() -> Result<reqwest::ClientBuilder, RelayError> {
     builder_with(public_roots())
 }
 
-/// A reqwest client builder for plain `http://` on loopback (the dev
-/// stack's control port, tests). Its TLS trusts nothing, so an `https://`
-/// request through it fails closed.
+/// **DEVELOPMENT ONLY** (`dev-relay`, and tests): a reqwest client builder
+/// for plain `http://` on loopback (the dev stack's control port). Its TLS
+/// trusts nothing, so an `https://` request through it fails closed.
+#[cfg(any(test, feature = "dev-relay"))]
 pub fn plain_http_builder() -> Result<reqwest::ClientBuilder, RelayError> {
     builder_with(RootCertStore::empty())
 }
@@ -63,20 +83,19 @@ pub fn plain_http_builder() -> Result<reqwest::ClientBuilder, RelayError> {
 mod tests {
     use super::*;
     use rustls::crypto::CryptoProvider;
-    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
     use rustls::{ClientConnection, NamedGroup, ServerConfig, ServerConnection};
 
-    /// The group a client with [`config`] negotiates with a server offering
-    /// only `server_groups` (all of aws-lc-rs's when `None`).
-    fn negotiate(server_groups: Option<Vec<NamedGroup>>) -> Result<NamedGroup, rustls::Error> {
-        // A TEST-ONLY CA and a leaf for `relay.test`, made fresh each run.
+    /// A TEST-ONLY CA and a leaf for `relay.test` signed by it, made fresh
+    /// each run: the CA's certificate, and the leaf's server configuration
+    /// offering only `server_groups` (all of aws-lc-rs's when `None`).
+    fn test_pki(server_groups: Option<Vec<NamedGroup>>) -> (CertificateDer<'static>, ServerConfig) {
         let ca_key = rcgen::KeyPair::generate().unwrap();
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let ca = ca_params.self_signed(&ca_key).unwrap();
         let leaf_key = rcgen::KeyPair::generate().unwrap();
         let leaf = rcgen::CertificateParams::new(vec!["relay.test".to_string()]).unwrap().signed_by(&leaf_key, &ca, &ca_key).unwrap();
-
         let mut server_provider = rustls::crypto::aws_lc_rs::default_provider();
         if let Some(groups) = server_groups {
             server_provider.kx_groups.retain(|g| groups.contains(&g.name()));
@@ -87,11 +106,16 @@ mod tests {
             .with_no_client_auth()
             .with_single_cert(vec![leaf.der().clone()], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())))
             .unwrap();
-        let mut roots = RootCertStore::empty();
-        roots.add(ca.der().clone()).unwrap();
-        let client_cfg = config(roots).unwrap();
+        (ca.der().clone(), server_cfg)
+    }
 
-        let mut client = ClientConnection::new(Arc::new(client_cfg), ServerName::try_from("relay.test").unwrap()).unwrap();
+    /// The group a client with [`config`] negotiates, in memory, with a
+    /// server offering only `server_groups`.
+    fn negotiate(server_groups: Option<Vec<NamedGroup>>) -> Result<NamedGroup, rustls::Error> {
+        let (ca, server_cfg) = test_pki(server_groups);
+        let mut roots = RootCertStore::empty();
+        roots.add(ca).unwrap();
+        let mut client = ClientConnection::new(Arc::new(config(roots).unwrap()), ServerName::try_from("relay.test").unwrap()).unwrap();
         let mut server = ServerConnection::new(Arc::new(server_cfg)).unwrap();
         for _ in 0..20 {
             let mut buf = Vec::new();
@@ -128,13 +152,13 @@ mod tests {
 
     #[test]
     fn the_provider_is_aws_lc_rs_not_the_process_default() {
-        // No process default is installed in this test binary, and the
+        // Nothing in this test binary installs a process default, and the
         // configuration still builds: it never asks for one.
         assert!(CryptoProvider::get_default().is_none());
         let c = config(RootCertStore::empty()).unwrap();
-        let aws = rustls::crypto::aws_lc_rs::default_provider();
-        assert_eq!(c.crypto_provider().cipher_suites.len(), aws.cipher_suites.len());
-        assert!(c.crypto_provider().cipher_suites.iter().zip(aws.cipher_suites.iter()).all(|(a, b)| a.suite() == b.suite()));
+        // ring's provider has no ML-KEM group; aws-lc-rs's does.
+        assert!(rustls::crypto::ring::default_provider().kx_groups.iter().all(|g| g.name() != NamedGroup::X25519MLKEM768));
+        assert!(c.crypto_provider().kx_groups.iter().any(|g| g.name() == NamedGroup::X25519MLKEM768));
         // reqwest takes it: every builder here builds a client.
         public_builder().unwrap().build().unwrap();
         plain_http_builder().unwrap().build().unwrap();
@@ -150,6 +174,34 @@ mod tests {
         assert_eq!(negotiate(Some(vec![NamedGroup::X25519])).unwrap(), NamedGroup::X25519);
         assert_eq!(negotiate(Some(vec![NamedGroup::secp256r1])).unwrap(), NamedGroup::secp256r1);
         assert_eq!(negotiate(Some(vec![NamedGroup::secp384r1])).unwrap(), NamedGroup::secp384r1);
+    }
+
+    /// Through reqwest, end to end over loopback: a server that offers
+    /// only X25519MLKEM768 answers a client built by [`builder_with`] (what
+    /// [`public_builder`] wraps; the test CA stands in for the web roots).
+    #[tokio::test]
+    async fn a_reqwest_client_connects_to_a_server_that_offers_only_x25519mlkem768() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (ca, server_cfg) = test_pki(Some(vec![NamedGroup::X25519MLKEM768]));
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let group = tls.get_ref().1.negotiated_key_exchange_group().map(|g| g.name());
+            let mut buf = [0u8; 4096];
+            let _ = tls.read(&mut buf).await.unwrap();
+            tls.write_all(b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n").await.unwrap();
+            let _ = tls.shutdown().await;
+            group
+        });
+        let mut roots = RootCertStore::empty();
+        roots.add(ca).unwrap();
+        let client = builder_with(roots).unwrap().resolve("relay.test", addr).build().unwrap();
+        let resp = client.get(format!("https://relay.test:{}/", addr.port())).send().await.unwrap();
+        assert_eq!(resp.status(), 204);
+        assert_eq!(server.await.unwrap(), Some(NamedGroup::X25519MLKEM768));
     }
 
     /// Live: the relay's TLS front, with the configuration the relay client

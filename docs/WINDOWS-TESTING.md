@@ -36,7 +36,10 @@ lists only `app`, `dmg`, `appimage` and `deb`.
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows/check-no-vcruntime.ps1 src-tauri/target/release/vettid-desktop.exe`
   must exit 0. CI checks the debug build the same way.
 - **TLS:** the relay client's TLS is rustls with aws-lc-rs (`vettid-relay/src/tls.rs`). `aws-lc-sys` builds its C
-  code with the MSVC compiler the build already needs, and uses prebuilt NASM objects, so NASM isn't needed.
+  code with the MSVC compiler the build already needs. Its assembly needs NASM: when NASM isn't installed it links
+  prebuilt objects shipped in the crate instead. CI (`windows.yml`) and release builds install NASM 2.16.3
+  (`choco install nasm --version=2.16.3`, then `C:\Program Files\NASM` on `PATH`) and set
+  `AWS_LC_SYS_PREBUILT_NASM=0`, so the assembly is built from source and a missing NASM stops the build.
 - **Servicing:** Windows Update doesn't patch a VC runtime linked into the program. A fix to it reaches members
   only with a rebuild, so build releases with a current MSVC toolset (an up-to-date Visual Studio Build Tools).
 

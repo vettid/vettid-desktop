@@ -50,12 +50,8 @@ zeroize = { version = "1", features = ["derive"] }
 # (VAULT-MESSAGING; crates/vettid-device). None of its development-only
 # features (dev-file-store, dev-relay) may be enabled here: CI checks.
 vettid-device = { path = "crates/vettid-device" }
-
-# HTTP
-# Use rustls-tls instead of native-tls so the app has a single TLS stack,
-# the one the relay client (crates/vettid-relay) uses. Saves a few MB of
-# binary too.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-no-provider"] }
+# rustls's process default (vettid_relay::tls::install_default_provider), set in run().
+vettid-relay = { path = "crates/vettid-relay" }
 
 # Hex encoding
 hex = "0.4"
@@ -153,7 +149,6 @@ tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 # A fake vault for the link's tests (src/link/fake.rs).
 vettid-vms = { path = "crates/vettid-vms" }
-vettid-relay = { path = "crates/vettid-relay" }
 ed25519-dalek = "2"
 
 [features]
