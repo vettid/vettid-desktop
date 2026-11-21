@@ -1,0 +1,198 @@
+name: vulns
+
+# Dependency vulnerability scan. It reports; it never changes a dependency.
+#
+# - cargo audit v0.22.2 (RustSec; the release binary, checksum-verified)
+#   over src-tauri/Cargo.lock. It fails on a vulnerability advisory; crates
+#   that are unmaintained, unsound or yanked are listed as warnings, not
+#   failed. An advisory is ignored only through .cargo/audit.toml, each
+#   with an expiry date that this workflow enforces.
+# - npm audit over the whole package-lock.json, devDependencies included:
+#   the front end is built from them (svelte compiles into the bundle; vite,
+#   rollup and postcss build it), so --omit=dev would skip what ships. It
+#   fails on a high or critical advisory; moderate and low are listed in
+#   the job summary.
+#
+# On pull requests, pushes to main, weekly and on demand. On main, a weekly
+# or on-demand run with a finding opens one issue labelled `security`, or
+# comments on the one already open; a clean run closes it.
+#
+# Actions are pinned by commit SHA (tag in the comment).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '29 6 * * 1' # Mondays, 06:29 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install cargo-audit v0.22.2 (checksum-verified)
+        run: |
+          curl -sSfLo ca.tgz https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz
+          echo "7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428  ca.tgz" | sha256sum -c -
+          mkdir ca
+          tar -xzf ca.tgz -C ca
+          install -m 0755 "$(find ca -type f -name cargo-audit)" "$RUNNER_TEMP/cargo-audit"
+      # .cargo/audit.toml may only ignore advisories, each with one dated
+      # line "# RUSTSEC-YYYY-NNNN expires YYYY-MM-DD" at most 400 days
+      # ahead. Any other setting (another advisory database, a severity
+      # threshold, a target filter) fails the scan, as do an ignore
+      # without a valid date and one past its date. AUDIT_TODAY overrides
+      # today's date, for testing only.
+      - name: audit config only ignores, with dates (.cargo/audit.toml)
+        run: |
+          python3 - <<'EOF'
+          import datetime, os, re, sys, tomllib
+          path = ".cargo/audit.toml"
+          if not os.path.exists(path):
+              sys.exit(0)
+          bad = []
+          def fail(msg):
+              print(f"::error::{msg}")
+              bad.append(msg)
+          text = open(path, encoding="utf-8").read()
+          try:
+              cfg = tomllib.loads(text)
+          except tomllib.TOMLDecodeError as e:
+              print(f"::error::{path} is not valid TOML: {e}")
+              sys.exit(1)
+          try:
+              today = datetime.date.fromisoformat(os.environ.get("AUDIT_TODAY") or datetime.date.today().isoformat())
+          except ValueError:
+              print("::error::AUDIT_TODAY is not a YYYY-MM-DD date")
+              sys.exit(1)
+          latest = today + datetime.timedelta(days=400)
+          if set(cfg) - {"advisories"}:
+              fail(f"{path} may only have an [advisories] table; it also has {sorted(set(cfg) - {'advisories'})}")
+          adv = cfg.get("advisories", {})
+          if not isinstance(adv, dict):
+              fail(f"`advisories` in {path} must be a table")
+              adv = {}
+          if set(adv) - {"ignore"}:
+              fail(f"[advisories] in {path} may only set `ignore`; it also sets {sorted(set(adv) - {'ignore'})}")
+          ignored = adv.get("ignore", [])
+          if not isinstance(ignored, list):
+              fail(f"`ignore` in {path} must be a list")
+              ignored = []
+          for a in ignored:
+              if not isinstance(a, str):
+                  fail(f"`ignore` entries in {path} must be strings; found {a!r}")
+                  continue
+              m = re.findall(r"^[ \t]*#[ \t]*" + re.escape(a) + r"[ \t]+expires[ \t]+(\S+)[ \t]*$", text, re.M)
+              if len(m) != 1:
+                  fail(f"{a} is ignored in {path} without exactly one 'expires YYYY-MM-DD' line")
+                  continue
+              try:
+                  if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", m[0]):
+                      raise ValueError
+                  until = datetime.date.fromisoformat(m[0])
+              except ValueError:
+                  fail(f"the expiry of {a} in {path} is not a valid YYYY-MM-DD date: {m[0]!r}")
+                  continue
+              if until < today:
+                  fail(f"the ignore of {a} expired on {until}: fix the advisory or renew the ignore by a reviewed change")
+              elif until > latest:
+                  fail(f"the ignore of {a} runs to {until}, more than 400 days ahead (latest {latest}): renew it nearer the time")
+              else:
+                  print(f"{a}: ignored until {until}")
+          sys.exit(1 if bad else 0)
+          EOF
+      - name: cargo audit (src-tauri/Cargo.lock)
+        run: '"$RUNNER_TEMP/cargo-audit" audit --file src-tauri/Cargo.lock'
+
+  npm-audit:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      # npm audit reads package-lock.json; no install needed.
+      - name: npm audit (all dependencies)
+        run: |
+          set +e
+          npm audit --json > audit.json
+          set -e
+          # A missing or malformed report is a failure, never a pass.
+          if ! jq -e '.metadata.vulnerabilities | (.high | numbers) and (.critical | numbers)' audit.json > /dev/null; then
+            echo "::error::npm audit produced no usable report"
+            exit 1
+          fi
+          {
+            echo '## npm audit (all dependencies)'
+            echo
+            echo '| Package | Severity | Advisory |'
+            echo '|---|---|---|'
+            jq -r '.vulnerabilities // {} | to_entries[]
+              | .key as $n | .value.severity as $s
+              | [.value.via[] | objects | "[\(.title)](\(.url))"] as $v
+              | select($v | length > 0)
+              | "| \($n) | \($s) | \($v | join("<br>")) |"' audit.json
+            echo
+            jq -r '"Totals: " + (.metadata.vulnerabilities | to_entries | map("\(.key) \(.value)") | join(", "))' audit.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          high=$(jq '.metadata.vulnerabilities.high + .metadata.vulnerabilities.critical' audit.json)
+          if [ "$high" -gt 0 ]; then
+            echo "::error::npm audit: $high high or critical advisories (see the job summary)"
+            exit 1
+          fi
+
+  issue:
+    # One issue for all findings: opened, or commented on while open. A
+    # scan that fails reports a finding, including one that could not run
+    # (download, checksum, advisory database, a missing report all end as
+    # a failure). Only both scans passing closes the issue. Anything else
+    # (a cancelled run, a scan that hit its timeout) changes nothing.
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    needs: [cargo-audit, npm-audit]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: open, update or close the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CARGO: ${{ needs.cargo-audit.result }}
+          NPM: ${{ needs.npm-audit.result }}
+        run: |
+          what=""
+          if [ "$CARGO" = failure ]; then
+            what="$what"$'\n'"- cargo audit: a vulnerability advisory in src-tauri/Cargo.lock, or the scan could not run (the job log names it)."
+          fi
+          if [ "$NPM" = failure ]; then
+            what="$what"$'\n'"- npm audit: a high or critical advisory in package-lock.json, or the scan could not run (the job summary lists them)."
+          fi
+          if [ -z "$what" ] && { [ "$CARGO" != success ] || [ "$NPM" != success ]; }; then
+            echo "cargo audit: $CARGO, npm audit: $NPM; no finding to report and nothing to close"
+            exit 0
+          fi
+          title="security: dependency vulnerability scan findings"
+          n=$(gh issue list --state open --search "in:title \"$title\"" --json number,title --jq "map(select(.title == \"$title\")) | .[0].number // empty")
+          if [ -n "$what" ]; then
+            if [ -n "$n" ]; then
+              gh issue comment "$n" --body "Found again: $RUN$what"
+            else
+              gh label create security --color B60205 --description "Security findings" 2>/dev/null || true
+              gh issue create --title "$title" --label security --body "The dependency vulnerability scan on main (.github/workflows/vulns.yml) found:$what"$'\n\n'"See $RUN."
+            fi
+          elif [ -n "$n" ]; then
+            gh issue close "$n" --comment "Clean on main: $RUN"
+          fi
