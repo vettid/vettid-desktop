@@ -41,6 +41,10 @@ scripts/macos-release.sh            # signaling only
 scripts/macos-release.sh --calls    # with WebRTC media (brew install opus pkg-config cmake)
 ```
 
+The relay client's TLS is aws-lc-rs: `aws-lc-sys` builds its own C source with the Xcode toolchain (no CMake or
+NASM). The script exports `AWS_LC_SYS_USE_SYSTEM=0`, so a Homebrew `aws-lc` is never linked instead, and
+`src-tauri/build.rs` stops a release build without it (for a build run by hand from outside the repo).
+
 It builds the app, signs it (hardened runtime, secure timestamp,
 `src-tauri/entitlements.plist`), makes and signs the DMG, notarizes it with
 `notarytool --wait`, staples the ticket and runs the verification. The DMG

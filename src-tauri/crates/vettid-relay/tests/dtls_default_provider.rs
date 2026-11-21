@@ -44,17 +44,22 @@ async fn dtls_needs_the_process_default_and_works_once_it_is_installed() {
 
     // 1. Without a default, dtls's verifier setup panics (the bug).
     let without = tokio::spawn(dtls_handshake()).await;
-    assert!(without.as_ref().is_err_and(|e| e.is_panic()), "expected dtls to panic without a process default, got {without:?}");
+    let panic = match without {
+        Err(e) if e.is_panic() => e.into_panic(),
+        other => panic!("expected dtls to panic without a process default, got {other:?}"),
+    };
+    let msg = panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+    assert!(msg.contains("CryptoProvider"), "the panic is rustls's missing provider: {msg}");
 
     // 2. With aws-lc-rs installed as the default, the handshake completes.
-    vettid_relay::tls::install_default_provider();
+    assert!(vettid_relay::tls::install_default_provider(), "the default offers X25519MLKEM768");
     let p = CryptoProvider::get_default().expect("installed");
     assert!(p.kx_groups.iter().any(|g| g.name() == NamedGroup::X25519MLKEM768), "the default is aws-lc-rs (ring's has no ML-KEM)");
     tokio::spawn(dtls_handshake()).await.expect("no panic").expect("the handshake completes");
 
     // 3. Installing again changes nothing, and code that names no provider
     //    now works: a plain reqwest client, a rustls verifier.
-    vettid_relay::tls::install_default_provider();
+    assert!(vettid_relay::tls::install_default_provider());
     assert!(std::ptr::eq(Arc::as_ptr(p), Arc::as_ptr(CryptoProvider::get_default().unwrap())));
     reqwest::Client::new();
     let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };

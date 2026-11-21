@@ -21,7 +21,7 @@ pub fn run() {
     // then has no automatic default; dtls builds its certificate verifiers
     // without naming a provider and would panic at every call's setup
     // (vettid_relay::tls).
-    vettid_relay::tls::install_default_provider();
+    let tls_default_ok = vettid_relay::tls::install_default_provider();
     // Initialize env_logger so `log::info!` / `log::warn!` calls across
     // the codebase actually surface. Defaults to `info` for our crate
     // and `warn` for noisy dependencies; users can override at launch
@@ -34,6 +34,9 @@ pub fn run() {
     )
     .format_timestamp_millis()
     .try_init();
+    if !tls_default_ok {
+        log::warn!("rustls's process default isn't aws-lc-rs (no X25519MLKEM768): another provider was installed first");
+    }
 
     tauri::Builder::default()
         // Single-instance plugin: must be registered first per its
