@@ -14,6 +14,15 @@ STATIC_VCRUNTIME = { value = "true", force = true }
 # system-installed AWS-LC it finds (for example a Homebrew `aws-lc`) instead
 # of building its own, which would change what ships. Always build it.
 AWS_LC_SYS_USE_SYSTEM = { value = "0", force = true }
+# Calls builds (`--features webrtc`): audiopus_sys 0.2.2, under opus 0.3, builds
+# its bundled Opus with CMake when no system libopus is found (Windows, or Linux
+# and macOS without libopus). That Opus declares cmake_minimum_required below
+# 3.5, which CMake 4 refuses ("Compatibility with CMake < 3.5 has been removed"),
+# so the build stops before compiling. This lets CMake configure it anyway.
+# audiopus_sys is the only crate here that runs CMake. Its last release is 0.2.2
+# (2021), so there is no update to take; opus 0.4 would move to opusic-sys,
+# which needs bindgen and libclang. Not forced: a value in the environment wins.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
 
 # macOS (Apple silicon): link without chained fixups. With a deployment target of
 # 12.0 or later (Tauri sets it from bundle.macOS.minimumSystemVersion), the linker

@@ -40,6 +40,10 @@ lists only `app`, `dmg`, `appimage` and `deb`.
   prebuilt objects shipped in the crate instead. CI (`windows.yml`) and release builds install NASM 2.16.3
   (`choco install nasm --version=2.16.3`, then `C:\Program Files\NASM` on `PATH`) and set
   `AWS_LC_SYS_PREBUILT_NASM=0`, so the assembly is built from source and a missing NASM stops the build.
+- **Calls (`--features webrtc`)** also need CMake, from the Visual Studio Build Tools or a standalone install.
+  There is no system libopus on Windows, so `audiopus_sys` builds its bundled Opus from source. That Opus asks
+  for CMake older than 3.5, which CMake 4 refuses; `.cargo/config.toml` sets `CMAKE_POLICY_VERSION_MINIMUM=3.5`
+  so it configures anyway. CI builds calls on Linux, Windows and macOS (`.github/workflows/calls.yml`).
 - **Servicing:** Windows Update doesn't patch a VC runtime linked into the program. A fix to it reaches members
   only with a rebuild, so build releases with a current MSVC toolset (an up-to-date Visual Studio Build Tools).
 

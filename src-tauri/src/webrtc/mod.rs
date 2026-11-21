@@ -24,10 +24,13 @@
 //! decrypts every RTP audio payload using AES-128-GCM in the LiveKit
 //! `FrameCryptor` wire format that Android's libwebrtc emits. The
 //! interceptor is registered on the API builder iff
-//! [`session::CallSession::new`] gets a `Some(CryptorConfig)`; the vault
-//! signaling path that delivers the per-call 32-byte shared secret to the
-//! desktop is still TODO, so today's callers pass `None` and calls go
-//! over transport SRTP only (Android-side reports MISSINGKEY).
+//! [`session::CallSession::new`] gets a `Some(CryptorConfig)`. Both call
+//! paths in `commands/calls.rs` pass one without a key yet: the per-call
+//! 32-byte shared secret arrives with the `call.accepted` push (caller) or
+//! the `call.accept` response (callee) and is set with
+//! `CryptorConfig::set_key_from_secret`. Until then outbound frames are
+//! dropped and inbound payloads come out empty, as Android's
+//! `discardFrameWhenCryptorNotReady = true`.
 
 #![cfg(feature = "webrtc")]
 
