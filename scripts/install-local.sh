@@ -76,7 +76,9 @@ if [[ "$REBUILD" -eq 1 || ! -d "$APP_DIR" ]]; then
     if [[ "$WITH_CALLS" -eq 1 ]]; then
         echo "    (with --features webrtc; first compile of webrtc-rs is slow)"
     fi
-    cargo tauri build "${build_args[@]}"
+    # aws-lc-sys builds its own source, never a system AWS-LC (see
+    # .cargo/config.toml and src-tauri/build.rs).
+    AWS_LC_SYS_USE_SYSTEM=0 cargo tauri build "${build_args[@]}"
 fi
 
 if [[ ! -d "$APP_DIR" ]]; then

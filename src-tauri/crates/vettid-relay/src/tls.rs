@@ -35,10 +35,16 @@ use crate::client::RelayError;
 /// verifiers in the calls build; any plain `reqwest::Client::new()`).
 /// Call it first thing at startup, before anything uses TLS. Calling it
 /// again, or after a default is already installed, changes nothing.
-pub fn install_default_provider() {
+///
+/// Returns whether the process default now offers `X25519MLKEM768`: false
+/// means another provider was installed first (nothing in the app does
+/// that). This crate doesn't log; the caller says so.
+pub fn install_default_provider() -> bool {
     // Err means a default is already installed: the first call's, or one
-    // installed before this (nothing in the app does that).
+    // installed before this.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    rustls::crypto::CryptoProvider::get_default()
+        .is_some_and(|p| p.kx_groups.iter().any(|g| g.name() == rustls::NamedGroup::X25519MLKEM768))
 }
 
 /// The client configuration: aws-lc-rs, its default groups, `roots` as
@@ -156,8 +162,7 @@ mod tests {
         // configuration still builds: it never asks for one.
         assert!(CryptoProvider::get_default().is_none());
         let c = config(RootCertStore::empty()).unwrap();
-        // ring's provider has no ML-KEM group; aws-lc-rs's does.
-        assert!(rustls::crypto::ring::default_provider().kx_groups.iter().all(|g| g.name() != NamedGroup::X25519MLKEM768));
+        // Only aws-lc-rs's provider has an ML-KEM group (ring's has none).
         assert!(c.crypto_provider().kx_groups.iter().any(|g| g.name() == NamedGroup::X25519MLKEM768));
         // reqwest takes it: every builder here builds a client.
         public_builder().unwrap().build().unwrap();

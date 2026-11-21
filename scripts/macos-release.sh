@@ -110,6 +110,10 @@ record() {
 # 1. The app bundle. Tauri is told no identity (the variable is not passed on),
 #    so it signs ad-hoc; the real signature is made below, after the optional
 #    provisioning profile is in the bundle.
+# aws-lc-sys (the relay client's TLS) builds its own source, never a system
+# AWS-LC: .cargo/config.toml sets this too, and src-tauri/build.rs stops a
+# release build without it.
+export AWS_LC_SYS_USE_SYSTEM=0
 build=(cargo tauri build --target "$TARGET" --bundles app)
 if [[ "$CALLS" -eq 1 ]]; then
     build+=(--features webrtc)

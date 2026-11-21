@@ -66,11 +66,26 @@ jobs:
       - name: system packages (macOS)
         if: runner.os == 'macOS'
         run: brew install opus pkg-config
-      - name: NASM 2.16.3 (Windows, for aws-lc-sys)
+      - name: NASM 2.16.03 (Windows, checksum-verified, for aws-lc-sys)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          choco install nasm --version=2.16.3 -y --no-progress
-          echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
+          # nasm.us's x64 installer, checked against the SHA-256 the
+          # Chocolatey nasm 2.16.3 package records for that exact file
+          # (its tools/VERIFICATION.txt), then installed silently.
+          $url = 'https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/win64/nasm-2.16.03-installer-x64.exe'
+          $want = '657E1252676CFB26A008835C20A760F731C8E0414469A4ED0F83F0FB059CDD35'
+          Invoke-WebRequest -Uri $url -OutFile nasm-setup.exe
+          $got = (Get-FileHash nasm-setup.exe -Algorithm SHA256).Hash
+          if ($got -ne $want) { throw "NASM installer SHA-256 $got, expected $want" }
+          $p = Start-Process -FilePath .\nasm-setup.exe -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "NASM installer exit code $($p.ExitCode)" }
+          Remove-Item nasm-setup.exe
+          Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\NASM'
+      # This NASM, not another one on PATH.
+      - name: NASM version (Windows)
+        if: runner.os == 'Windows'
+        run: nasm -v | grep -F "NASM version 2.16.03 "
       - name: rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
