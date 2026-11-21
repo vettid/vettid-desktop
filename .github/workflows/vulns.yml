@@ -45,31 +45,68 @@ jobs:
           mkdir ca
           tar -xzf ca.tgz -C ca
           install -m 0755 "$(find ca -type f -name cargo-audit)" "$RUNNER_TEMP/cargo-audit"
-      # .cargo/audit.toml may ignore an advisory only with a dated line
-      # "# RUSTSEC-YYYY-NNNN expires YYYY-MM-DD". An ignore without one,
-      # or one past its date, fails the scan. AUDIT_TODAY overrides the
-      # date, for testing only.
-      - name: ignored advisories have not expired (.cargo/audit.toml)
+      # .cargo/audit.toml may only ignore advisories, each with one dated
+      # line "# RUSTSEC-YYYY-NNNN expires YYYY-MM-DD" at most 400 days
+      # ahead. Any other setting (another advisory database, a severity
+      # threshold, a target filter) fails the scan, as do an ignore
+      # without a valid date and one past its date. AUDIT_TODAY overrides
+      # today's date, for testing only.
+      - name: audit config only ignores, with dates (.cargo/audit.toml)
         run: |
           python3 - <<'EOF'
           import datetime, os, re, sys, tomllib
           path = ".cargo/audit.toml"
           if not os.path.exists(path):
               sys.exit(0)
+          bad = []
+          def fail(msg):
+              print(f"::error::{msg}")
+              bad.append(msg)
           text = open(path, encoding="utf-8").read()
-          ignored = tomllib.loads(text).get("advisories", {}).get("ignore", [])
-          today = os.environ.get("AUDIT_TODAY") or datetime.date.today().isoformat()
-          bad = False
-          for adv in ignored:
-              m = re.findall(r"^\s*#\s*" + re.escape(adv) + r"\s+expires\s+(\d{4}-\d{2}-\d{2})\s*$", text, re.M)
+          try:
+              cfg = tomllib.loads(text)
+          except tomllib.TOMLDecodeError as e:
+              print(f"::error::{path} is not valid TOML: {e}")
+              sys.exit(1)
+          try:
+              today = datetime.date.fromisoformat(os.environ.get("AUDIT_TODAY") or datetime.date.today().isoformat())
+          except ValueError:
+              print("::error::AUDIT_TODAY is not a YYYY-MM-DD date")
+              sys.exit(1)
+          latest = today + datetime.timedelta(days=400)
+          if set(cfg) - {"advisories"}:
+              fail(f"{path} may only have an [advisories] table; it also has {sorted(set(cfg) - {'advisories'})}")
+          adv = cfg.get("advisories", {})
+          if not isinstance(adv, dict):
+              fail(f"`advisories` in {path} must be a table")
+              adv = {}
+          if set(adv) - {"ignore"}:
+              fail(f"[advisories] in {path} may only set `ignore`; it also sets {sorted(set(adv) - {'ignore'})}")
+          ignored = adv.get("ignore", [])
+          if not isinstance(ignored, list):
+              fail(f"`ignore` in {path} must be a list")
+              ignored = []
+          for a in ignored:
+              if not isinstance(a, str):
+                  fail(f"`ignore` entries in {path} must be strings; found {a!r}")
+                  continue
+              m = re.findall(r"^[ \t]*#[ \t]*" + re.escape(a) + r"[ \t]+expires[ \t]+(\S+)[ \t]*$", text, re.M)
               if len(m) != 1:
-                  print(f"::error::{adv} is ignored in {path} without exactly one 'expires YYYY-MM-DD' line")
-                  bad = True
-              elif m[0] < today:
-                  print(f"::error::the ignore of {adv} expired on {m[0]}: fix the advisory or renew the ignore by a reviewed change")
-                  bad = True
+                  fail(f"{a} is ignored in {path} without exactly one 'expires YYYY-MM-DD' line")
+                  continue
+              try:
+                  if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", m[0]):
+                      raise ValueError
+                  until = datetime.date.fromisoformat(m[0])
+              except ValueError:
+                  fail(f"the expiry of {a} in {path} is not a valid YYYY-MM-DD date: {m[0]!r}")
+                  continue
+              if until < today:
+                  fail(f"the ignore of {a} expired on {until}: fix the advisory or renew the ignore by a reviewed change")
+              elif until > latest:
+                  fail(f"the ignore of {a} runs to {until}, more than 400 days ahead (latest {latest}): renew it nearer the time")
               else:
-                  print(f"{adv}: ignored until {m[0]}")
+                  print(f"{a}: ignored until {until}")
           sys.exit(1 if bad else 0)
           EOF
       - name: cargo audit (src-tauri/Cargo.lock)
