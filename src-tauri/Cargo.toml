@@ -55,7 +55,7 @@ vettid-device = { path = "crates/vettid-device" }
 # Use rustls-tls instead of native-tls so the app has a single TLS stack,
 # the one the relay client (crates/vettid-relay) uses. Saves a few MB of
 # binary too.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-no-provider"] }
 
 # Hex encoding
 hex = "0.4"
