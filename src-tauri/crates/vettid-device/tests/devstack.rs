@@ -99,7 +99,8 @@ async fn pairs_and_collects_on_the_dev_stack() {
     let origin = vettid_relay::dev::check_control_url(&url).expect("a loopback http:// control URL with a port");
     let ctl = Control {
         url: origin,
-        http: reqwest::Client::builder()
+        http: vettid_relay::tls::plain_http_builder()
+            .unwrap()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(150))

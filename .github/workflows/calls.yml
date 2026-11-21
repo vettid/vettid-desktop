@@ -1,7 +1,8 @@
 name: calls
 
 # The `--calls` build: the app crate with `--features webrtc` (webrtc-rs,
-# cpal, Opus) on Linux, Windows and macOS. Build only. The pure call crypto
+# cpal, Opus) on Linux, Windows and macOS, plus the dtls / rustls
+# process-default test (vettid-relay). The pure call crypto
 # (crypto::frame_cryptor) is tested in ci.yml without the feature.
 #
 # Windows minutes are billed at twice the Linux rate, so pull requests run
@@ -34,6 +35,10 @@ jobs:
         os: [ubuntu-26.04, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    env:
+      # aws-lc-sys (the relay client's TLS) on Windows: build its assembly
+      # with NASM (installed below), never the prebuilt objects.
+      AWS_LC_SYS_PREBUILT_NASM: "0"
     defaults:
       run:
         shell: bash
@@ -61,6 +66,11 @@ jobs:
       - name: system packages (macOS)
         if: runner.os == 'macOS'
         run: brew install opus pkg-config
+      - name: NASM 2.16.3 (Windows, for aws-lc-sys)
+        if: runner.os == 'Windows'
+        run: |
+          choco install nasm --version=2.16.3 -y --no-progress
+          echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
       - name: rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
@@ -74,3 +84,9 @@ jobs:
           npm run build
       - name: cargo build --features webrtc
         run: cargo build --manifest-path src-tauri/Cargo.toml --locked -p vettid-desktop --features webrtc
+      # With webrtc, rustls has ring (dtls) and aws-lc-rs compiled in, so no
+      # automatic default: dtls's verifiers need the process default that
+      # run() installs. This test builds dtls with both providers, panics
+      # without the default, and completes a DTLS handshake with it.
+      - name: dtls with both rustls providers (process default)
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked -p vettid-relay --test dtls_default_provider

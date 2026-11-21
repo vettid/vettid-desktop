@@ -21,6 +21,8 @@ jobs:
   windows:
     runs-on: windows-latest
     timeout-minutes: 45
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
     defaults:
       run:
         shell: bash
@@ -39,6 +41,15 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustc --version
+      # aws-lc-sys (the relay client's TLS) assembles with NASM. Without it
+      # it would link the prebuilt objects in the crate; with
+      # AWS_LC_SYS_PREBUILT_NASM=0 a missing NASM fails the build instead.
+      - name: NASM 2.16.3 (for aws-lc-sys)
+        run: |
+          choco install nasm --version=2.16.3 -y --no-progress
+          echo "C:\Program Files\NASM" >> "$GITHUB_PATH"
+      - name: NASM version
+        run: nasm -v
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |

@@ -35,6 +35,11 @@ lists only `app`, `dmg`, `appimage` and `deb`.
   stays a DLL. After a release build, check it:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows/check-no-vcruntime.ps1 src-tauri/target/release/vettid-desktop.exe`
   must exit 0. CI checks the debug build the same way.
+- **TLS:** the relay client's TLS is rustls with aws-lc-rs (`vettid-relay/src/tls.rs`). `aws-lc-sys` builds its C
+  code with the MSVC compiler the build already needs. Its assembly needs NASM: when NASM isn't installed it links
+  prebuilt objects shipped in the crate instead. CI (`windows.yml`) and release builds install NASM 2.16.3
+  (`choco install nasm --version=2.16.3`, then `C:\Program Files\NASM` on `PATH`) and set
+  `AWS_LC_SYS_PREBUILT_NASM=0`, so the assembly is built from source and a missing NASM stops the build.
 - **Calls (`--features webrtc`)** also need CMake, from the Visual Studio Build Tools or a standalone install.
   There is no system libopus on Windows, so `audiopus_sys` builds its bundled Opus from source. That Opus asks
   for CMake older than 3.5, which CMake 4 refuses; `.cargo/config.toml` sets `CMAKE_POLICY_VERSION_MINIMUM=3.5`

@@ -392,7 +392,7 @@ impl RelayClient {
     /// nothing else) signing as `key`.
     pub fn new(base_url: &str, key: SigningKey) -> Result<Self, RelayError> {
         let base_url = check_base_url(base_url, http_allowed())?;
-        let http = reqwest::Client::builder()
+        let http = crate::tls::public_builder()?
             .user_agent(USER_AGENT)
             .https_only(!http_allowed())
             .redirect(reqwest::redirect::Policy::none())
@@ -411,7 +411,7 @@ impl RelayClient {
         if base_url != crate::dev::DEV_RELAY_URL {
             return Err(RelayError::Invalid);
         }
-        let http = dev.builder().user_agent(USER_AGENT).redirect(reqwest::redirect::Policy::none()).build().map_err(|_| RelayError::Invalid)?;
+        let http = dev.builder()?.user_agent(USER_AGENT).redirect(reqwest::redirect::Policy::none()).build().map_err(|_| RelayError::Invalid)?;
         Ok(Self { base_url, key, http, max_attempts: 3, max_payload_bytes: DEFAULT_MAX_PAYLOAD })
     }
 

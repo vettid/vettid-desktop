@@ -16,6 +16,12 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // First, before anything uses TLS: aws-lc-rs as rustls's process
+    // default. The calls build compiles rustls with ring too (dtls), and
+    // then has no automatic default; dtls builds its certificate verifiers
+    // without naming a provider and would panic at every call's setup
+    // (vettid_relay::tls).
+    vettid_relay::tls::install_default_provider();
     // Initialize env_logger so `log::info!` / `log::warn!` calls across
     // the codebase actually surface. Defaults to `info` for our crate
     // and `warn` for noisy dependencies; users can override at launch

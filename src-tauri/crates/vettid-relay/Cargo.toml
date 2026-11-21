@@ -18,8 +18,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 zeroize = "1"
-# The transport. reqwest as the app uses it (rustls, no native TLS).
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# The transport. reqwest as the app uses it (rustls, no native TLS). No
+# crypto provider of reqwest's own: every client gets the aws-lc-rs
+# configuration from `tls` (hybrid post-quantum key exchange first).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-no-provider"] }
+# aws-lc-rs and its default groups, X25519MLKEM768 first. No `logging`:
+# rustls writes nothing to the log.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12"] }
+webpki-roots = "1"
 tokio = { version = "1", features = ["time"] }
 rand = "0.8"
 
@@ -31,4 +37,13 @@ rand = "0.8"
 dev-relay = []
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
+# TEST-ONLY certificates for the handshake tests in `tls`.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "crypto"] }
+# A TLS server for the reqwest handshake test in `tls`.
+tokio-rustls = { version = "0.26", default-features = false }
+# tests/dtls_default_provider.rs: dtls as the calls build has it, which
+# also turns on rustls's ring provider in this crate's test build (a
+# dev-dependency: it never reaches the app's own build).
+dtls = "0.17"
+webrtc-util = { version = "0.17", default-features = false, features = ["conn"] }

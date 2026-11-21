@@ -27,6 +27,9 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::CertificateDer;
+use rustls::RootCertStore;
 use serde::Deserialize;
 
 use crate::client::RelayError;
@@ -44,7 +47,7 @@ const MAX_CONTROL_BODY: usize = 64 * 1024;
 #[derive(Clone)]
 pub struct DevRelay {
     front: SocketAddr,
-    root: reqwest::Certificate,
+    root: CertificateDer<'static>,
 }
 
 impl std::fmt::Debug for DevRelay {
@@ -94,7 +97,7 @@ impl DevRelay {
     /// `ctl` (for example `http://127.0.0.1:18082`): see the module doc.
     pub async fn from_stack(ctl: &str) -> Result<Self, RelayError> {
         let ctl = check_control_url(ctl)?;
-        let http = reqwest::Client::builder()
+        let http = crate::tls::plain_http_builder()?
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(10))
@@ -134,14 +137,18 @@ impl DevRelay {
         if !front.ip().is_loopback() || front.port() == 0 {
             return Err(RelayError::Invalid);
         }
-        // Split as the root store reads it: exactly one certificate.
-        let mut certs = reqwest::Certificate::from_pem_bundle(root_pem).map_err(|_| RelayError::Invalid)?;
+        // Exactly one certificate, and nothing else that starts like a PEM
+        // section (a loose second one included).
+        if root_pem.windows(11).filter(|w| *w == b"-----BEGIN ").count() != 1 {
+            return Err(RelayError::Invalid);
+        }
+        let mut certs = CertificateDer::pem_slice_iter(root_pem).collect::<Result<Vec<_>, _>>().map_err(|_| RelayError::Invalid)?;
         if certs.len() != 1 {
             return Err(RelayError::Invalid);
         }
         let d = Self { front, root: certs.remove(0) };
         // It parses as a trust anchor (the store refuses it otherwise).
-        d.builder().build().map_err(|_| RelayError::Invalid)?;
+        d.builder()?.build().map_err(|_| RelayError::Invalid)?;
         Ok(d)
     }
 
@@ -150,14 +157,12 @@ impl DevRelay {
         self.front
     }
 
-    /// A client builder for the dev relay only (see the module doc).
-    pub(crate) fn builder(&self) -> reqwest::ClientBuilder {
-        reqwest::Client::builder()
-            .tls_built_in_root_certs(false)
-            .add_root_certificate(self.root.clone())
-            .resolve(DEV_RELAY_HOST, self.front)
-            .https_only(true)
-            .no_proxy()
+    /// A client builder for the dev relay only (see the module doc): the
+    /// TLS of [`crate::tls`], trusting the test root and nothing else.
+    pub(crate) fn builder(&self) -> Result<reqwest::ClientBuilder, RelayError> {
+        let mut roots = RootCertStore::empty();
+        roots.add(self.root.clone()).map_err(|_| RelayError::Invalid)?;
+        Ok(crate::tls::builder_with(roots)?.resolve(DEV_RELAY_HOST, self.front).https_only(true).no_proxy())
     }
 
     /// A dev relay for tests: the front and the test fixture's root.
