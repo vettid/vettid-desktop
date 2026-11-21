@@ -35,6 +35,10 @@ lists only `app`, `dmg`, `appimage` and `deb`.
   stays a DLL. After a release build, check it:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows/check-no-vcruntime.ps1 src-tauri/target/release/vettid-desktop.exe`
   must exit 0. CI checks the debug build the same way.
+- **Calls (`--features webrtc`)** also need CMake, from the Visual Studio Build Tools or a standalone install.
+  There is no system libopus on Windows, so `audiopus_sys` builds its bundled Opus from source. That Opus asks
+  for CMake older than 3.5, which CMake 4 refuses; `.cargo/config.toml` sets `CMAKE_POLICY_VERSION_MINIMUM=3.5`
+  so it configures anyway. CI builds calls on Linux, Windows and macOS (`.github/workflows/calls.yml`).
 - **Servicing:** Windows Update doesn't patch a VC runtime linked into the program. A fix to it reaches members
   only with a rebuild, so build releases with a current MSVC toolset (an up-to-date Visual Studio Build Tools).
 

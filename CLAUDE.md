@@ -23,6 +23,7 @@ cargo tauri build    # Production binary
 
 # With WebRTC calls (audio in/out via libopus + cpal)
 brew install opus pkg-config cmake     # one-time system deps
+#   Linux: libopus-dev libasound2-dev; Windows: CMake (docs/WINDOWS-TESTING.md, "Build")
 cargo tauri build --features webrtc    # adds ~5min on first compile
 
 # Local install (drag-to-Applications + ad-hoc sign + quarantine strip)
