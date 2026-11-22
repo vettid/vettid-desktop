@@ -7,4 +7,13 @@
 # still listed after its date.
 
 [advisories]
-ignore = []
+ignore = [
+    # RUSTSEC-2026-0592 expires 2026-12-05
+    # url 2.5.8: a stack overflow in Url::origin() on deeply nested blob:
+    # URLs. The fix, url 2.5.9, was published on 2026-11-20, and this
+    # repository takes a release only once it is 14 days old (2026-12-04).
+    # Ignored until then by the owner's decision (Ground Control #16299), so
+    # that the tauri 2.11.1 fix can merge. The scan's expiry check passes it
+    # through 2026-12-05 and fails the scan from 2026-12-06 while it is here.
+    "RUSTSEC-2026-0592",
+]
