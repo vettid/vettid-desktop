@@ -2,6 +2,7 @@ pub mod crypto;
 pub mod fingerprint;
 pub mod credential;
 pub mod link;
+pub mod nav_guard;
 pub mod session;
 pub mod commands;
 pub mod state;
@@ -51,6 +52,8 @@ pub fn run() {
                 let _ = win.unminimize();
             }
         }))
+        // Every webview may load only the app's own pages (nav_guard.rs).
+        .plugin(nav_guard::plugin())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .manage(AppState::new())
