@@ -2,12 +2,12 @@ pub mod crypto;
 pub mod fingerprint;
 pub mod credential;
 pub mod link;
+pub mod nav_guard;
 pub mod session;
 pub mod commands;
 pub mod state;
 pub mod tray;
 pub mod uninstall;
-pub mod nav_guard;
 #[cfg(feature = "webrtc")]
 pub mod webrtc;
 
