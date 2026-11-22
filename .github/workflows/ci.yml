@@ -228,8 +228,15 @@ jobs:
           # Bumped with the aarch64-apple-darwin linker (.cargo/config.toml), so that no
           # proc-macro linked before it is reused.
           prefix-key: v1-macos-linker
+      # The version is checked, not only the command's presence: the cache
+      # above keeps ~/.cargo/bin, so an older CLI would otherwise stay. It
+      # matches the tauri crate's minor release (and @tauri-apps/api's).
       - name: tauri CLI
-        run: command -v cargo-tauri || cargo install tauri-cli --version '=2.10.1' --locked
+        run: |
+          if [ "$(cargo tauri --version 2>/dev/null)" != "tauri-cli 2.11.1" ]; then
+            cargo install tauri-cli --version '=2.11.1' --locked --force
+          fi
+          cargo tauri --version
       - run: npm ci
       - name: build, ad-hoc sign, make the DMG, verify (the DMG and the app in it)
         env:
