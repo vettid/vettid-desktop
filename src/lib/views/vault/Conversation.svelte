@@ -17,6 +17,7 @@
     import { INBOUND_EVENT, type InboundBatch } from '../../inbound';
     import { sessionStore } from '../../stores/session';
     import { kept } from '../../stores/conversations.svelte.js';
+    import { connectionsStore } from '../../stores/vault';
     import { connectionTitle } from '../../connectionView.js';
     import {
         PAGE_LIMIT,
@@ -26,6 +27,11 @@
         EMPTY_MESSAGE,
         LINE_ISOLATE,
         LINK_NOT_OPENED,
+        EDIT_NEEDS_EMPTY_BOX,
+        returnedElsewhereText,
+        knownOutgoing,
+        deadlineOf,
+        seenInView,
         mergeMessages,
         applySyncEvent,
         markedRead,
@@ -124,6 +130,8 @@
         linkAsk = null;
         linkError = '';
         tried.clear();
+        // Receipts held for messages not known yet are stale by the next read.
+        kept.held = [];
     }
 
     /** Texts back to the member: the box when it is empty, else bubbles. */
@@ -133,7 +141,20 @@
         kept.locals = p.locals;
         kept.drafts = p.drafts;
         for (const [c, e] of Object.entries(p.errors)) kept.errors[c] = e;
+        // A text back in another conversation is said here too.
+        const others = returned.map((r) => r.connection_id).filter((c) => c !== cid && !kept.returnedTo.includes(c));
+        if (others.length) kept.returnedTo = [...kept.returnedTo, ...new Set(others)];
     }
+
+    /** The other conversations a text went back to, by title. */
+    let elsewhere = $derived(
+        kept.returnedTo
+            .filter((c) => c !== cid)
+            .map((c) => {
+                const conn = $connectionsStore.find((x) => x.id === c);
+                return { id: c, text: returnedElsewhereText(conn ? connectionTitle(conn) : '') };
+            }),
+    );
 
     /** Receipts held for messages of this connection that are known now. */
     function releaseNow(): void {
@@ -300,12 +321,12 @@
                       for (const e of entries) {
                           const id = (e.target as HTMLElement).dataset.unreadId ?? '';
                           if (!id) continue;
-                          if (e.isIntersecting) inView.add(id);
+                          if (seenInView(e)) inView.add(id);
                           else inView.delete(id);
                       }
                       noteSeen();
                   },
-                  { threshold: 0.6 },
+                  { threshold: [0, 0.6] },
               );
 
     /** What is in the viewport counts as seen while the window is visible. */
@@ -344,7 +365,9 @@
         if (kept.sending[cid] || !live || !takes || !canSend(text)) return;
         // Always a new message (send_message); an unconfirmed one is tried
         // again by its own "Try again".
-        const l = newLocal(cid, text, Date.now());
+        // What the view has of this connection's outgoing messages now, so a
+        // later read can tell a new one from those (in the vault's terms).
+        const l = newLocal(cid, text, Date.now(), knownOutgoing(messages, kept.locals, cid));
         kept.locals = [...kept.locals, l];
         kept.drafts[cid] = '';
         kept.errors[cid] = '';
@@ -368,7 +391,7 @@
 
     async function retry(key: string): Promise<void> {
         const l = kept.locals.find((x) => x.key === key);
-        if (!l?.pending_id || kept.sending[cid] || !live) return;
+        if (!l?.pending_id || kept.sending[cid] || !live || !takes) return;
         const pendingId = l.pending_id;
         kept.locals = startRetry(kept.locals, key);
         kept.sending[cid] = true;
@@ -441,12 +464,14 @@
     });
 
     onMount(() => {
+        // Opened: a note that a text came back here is no longer needed.
+        if (kept.returnedTo.includes(cid)) kept.returnedTo = kept.returnedTo.filter((c) => c !== cid);
         const un = listen<InboundBatch>(INBOUND_EVENT, (event) => void onInbound(event.payload));
         // A send past its expires_at is read about before anything else.
         const timer = setInterval(() => {
             if (!live || !takes || loading) return;
             const now = Date.now();
-            if (kept.locals.some((l) => l.connection_id === cid && l.state === 'unconfirmed' && l.expires_at != null && now >= l.expires_at)) {
+            if (kept.locals.some((l) => l.connection_id === cid && l.state === 'unconfirmed' && now >= deadlineOf(l))) {
                 void loadNewest();
             }
         }, 5_000);
@@ -475,6 +500,9 @@
     {:else if !live}
         <div class="status">{MESSAGES_NOT_LIVE_TEXT}</div>
     {:else}
+        {#each elsewhere as e (e.id)}
+            <div class="note">{e.text}</div>
+        {/each}
         <div class="tools">
             <button class="refresh" aria-label="Refresh" title="Refresh" onclick={() => void loadNewest()} disabled={loading}>↻</button>
         </div>
@@ -551,7 +579,7 @@
                         {:else if st === 'unsent'}
                             <div class="actions">
                                 <!-- NEW TEXT (owner approval needed): "Edit", "Remove" -->
-                                <button type="button" onclick={() => editUnsent(m.key)} disabled={draft !== ''}>Edit</button>
+                                <button type="button" onclick={() => editUnsent(m.key)} disabled={draft !== ''} title={draft !== '' ? EDIT_NEEDS_EMPTY_BOX : undefined}>Edit</button>
                                 <button type="button" onclick={() => removeUnsent(m.key)}>Remove</button>
                             </div>
                         {/if}

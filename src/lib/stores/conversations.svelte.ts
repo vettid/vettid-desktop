@@ -14,7 +14,10 @@ export const kept = $state<{
     sending: Record<string, boolean>;
     /** Receipts for messages not known yet (an answer still on its way). */
     held: Array<{ ev: SyncEv; at: number }>;
-}>({ locals: [], drafts: {}, errors: {}, sending: {}, held: [] });
+    /** Connections a text went back to (an earlier send not done) while
+     *  another conversation was open; cleared when that one is opened. */
+    returnedTo: string[];
+}>({ locals: [], drafts: {}, errors: {}, sending: {}, held: [], returnedTo: [] });
 
 /**
  * The list was read: sends, drafts and errors of connections it no longer
@@ -26,6 +29,7 @@ export function keepOnly(ids: Set<string>): void {
     kept.locals = p.locals;
     kept.drafts = p.drafts;
     kept.errors = Object.fromEntries(Object.entries(kept.errors).filter(([k]) => ids.has(k)));
+    kept.returnedTo = kept.returnedTo.filter((k) => ids.has(k));
 }
 
 /** A reset (log out: the pairing is wiped and the link's kept send is gone): everything goes. */
@@ -35,4 +39,5 @@ export function clearKept(): void {
     kept.errors = {};
     kept.sending = {};
     kept.held = [];
+    kept.returnedTo = [];
 }

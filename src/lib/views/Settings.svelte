@@ -3,6 +3,7 @@
   import { themeStore, setTheme, type Theme } from '../stores/theme';
   import { sessionNotice } from '../stores/session';
   import { clearKept } from '../stores/conversations.svelte.js';
+  import { logoutWiped } from '../conversationView.js';
 
   let theme = $derived($themeStore);
 
@@ -90,10 +91,11 @@
     logoutMessage = '';
     // A notice about an earlier session end doesn't outlive the pairing.
     sessionNotice.set(null);
-    // Log out resets the link: the conversations' kept sends and drafts go.
-    clearKept();
     try {
       const result = await invoke<{ revoke_sent: boolean; local_wiped: boolean; notice?: string | null }>('logout');
+      // Wiped here: the conversations' kept sends and drafts go too. Not
+      // wiped, everything stays.
+      if (logoutWiped(result)) clearKept();
       if (result?.revoke_sent && result?.local_wiped && !result?.notice) {
         logoutMessage = 'Logged out. Reloading…';
         setTimeout(() => window.location.reload(), 600);
