@@ -4,22 +4,28 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   MAX_TEXT_BYTES,
-  KEPT_FOR_MS,
+  RECEIPT_HOLD_MS,
   ATTACHMENT_PLACEHOLDER,
   EMPTY_MESSAGE,
-  UNCONFIRMED_EXPIRED_TEXT,
+  CHECKING_TEXT,
+  NOT_FOUND_TEXT,
   compareMessages,
   mergeMessages,
   applySyncEvent,
   markedRead,
   nextToMark,
   newLocal,
-  sameUnconfirmed,
+  startRetry,
   applySendAnswer,
-  retrying,
-  expireStale,
+  applyRetryAnswer,
+  dedupeLocals,
+  expireDue,
   afterReload,
-  withReturned,
+  placeReturned,
+  unsentToDraft,
+  pruneKept,
+  knowsEvent,
+  releaseHeld,
   viewMessages,
   deliveryState,
   deliveryText,
@@ -93,152 +99,348 @@ test('message.read from another device, and the attachment state', () => {
   assert.equal(b[0].attachment, null);
 });
 
-test('marking read: oldest incoming unread first, each tried once, outgoing never', () => {
+test('marking read: only seen messages, oldest incoming unread first, each tried once, outgoing never', () => {
   const ms = [msg('1', 'a', { read: true }), msg('2', 'b', { direction: 'out' }), msg('3', 'c'), msg('4', 'd')];
   const tried = new Set();
-  assert.equal(nextToMark(ms, tried), '3');
+  // Nothing seen: nothing marked, though 3 and 4 are loaded.
+  assert.equal(nextToMark(ms, tried, new Set()), null);
+  const seen = new Set(['2', '4']);
+  assert.equal(nextToMark(ms, tried, seen), '4');
+  seen.add('3');
+  assert.equal(nextToMark(ms, tried, seen), '3');
   tried.add('3');
-  assert.equal(nextToMark(ms, tried), '4');
-  const after = markedRead(ms, '4');
-  assert.equal(after[3].read, true);
+  assert.equal(nextToMark(ms, tried, seen), '4');
+  assert.equal(markedRead(ms, '4')[3].read, true);
   assert.equal(markedRead(ms, '2')[1].read, false);
   tried.add('4');
-  assert.equal(nextToMark(ms, tried), null);
+  assert.equal(nextToMark(ms, tried, seen), null);
 });
+
+const SENT = { message_id: 'M1', sent_at: '2026-11-25T10:00:00Z' };
+const EXP = '2026-11-25T10:07:00Z';
+
+/** @returns {any} */
+function unconf(text, at, pid, extra = {}) {
+  return { ...newLocal(C, text, at), state: 'unconfirmed', everUnconfirmed: true, pending_id: pid, expires_at: Date.parse(EXP), notice: 'old', ...extra };
+}
 
 test('a send answered {message_id, sent_at} is sent', () => {
   const l = newLocal(C, 'hi', 1000);
   assert.equal(l.state, 'sending');
-  const r = applySendAnswer([l], l.key, { success: true, data: { message_id: 'M1', sent_at: '2026-11-25T10:00:00Z' } }, 2000);
+  const r = applySendAnswer([l], l.key, { success: true, data: SENT }, 2000);
   assert.equal(r.locals[0].state, 'sent');
   assert.equal(r.locals[0].message_id, 'M1');
-  assert.equal(r.draft, null);
+  assert.deepEqual(r.returned, []);
   assert.equal(r.refresh, false);
 });
 
-test('a first try that never got a pending_id keeps its text as the draft, with the error', () => {
-  for (const code of ['not_sent', 'bad_argument', 'clock', 'no_session', 'locked', 'held', 'earlier_unconfirmed', 'forbidden', 'vault_error']) {
+test('L1: success without a usable {message_id, sent_at} is read again, never a draft', () => {
+  for (const data of [{}, { message_id: '', sent_at: SENT.sent_at }, { message_id: 'M', sent_at: '' }, { message_id: 'M', sent_at: 'not a time' }, undefined]) {
+    const l = newLocal(C, 'hi', 1000);
+    const r = applySendAnswer([l], l.key, { success: true, data }, 2000);
+    assert.equal(r.locals.length, 1, JSON.stringify(data));
+    assert.equal(r.locals[0].state, 'unreadable', JSON.stringify(data));
+    assert.equal(r.locals[0].message_id, undefined);
+    assert.deepEqual(r.returned, []);
+    assert.equal(r.refresh, true);
+  }
+});
+
+test('a first try that never got a pending_id goes back to the member, with the error', () => {
+  for (const code of ['not_sent', 'bad_argument', 'no_session', 'locked', 'held', 'earlier_unconfirmed', 'forbidden', 'vault_error']) {
     const l = newLocal(C, 'draft me', 1000);
     const r = applySendAnswer([l], l.key, { success: false, error: `E ${code}`, error_code: code }, 2000);
     assert.equal(r.locals.length, 0, code);
-    assert.equal(r.draft, 'draft me', code);
-    assert.equal(r.error, `E ${code}`, code);
+    assert.deepEqual(r.returned, [{ connection_id: C, text: 'draft me', error: `E ${code}` }], code);
   }
 });
 
-test('unconfirmed with a pending_id: kept on the bubble, with the notice, never a draft', () => {
-  const l = newLocal(C, 'maybe', 1000);
-  const r = applySendAnswer([l], l.key, { success: false, error: 'not yet', error_code: 'unconfirmed', data: { pending_id: 'P1' } }, 2000);
-  assert.equal(r.draft, null);
-  assert.equal(r.locals[0].state, 'unconfirmed');
-  assert.equal(r.locals[0].pending_id, 'P1');
-  assert.equal(r.locals[0].notice, 'not yet');
-  // Unconfirmed without an id is still unconfirmed.
-  const l2 = newLocal(C, 'maybe', 1000);
-  const r2 = applySendAnswer([l2], l2.key, { success: false, error: 'not yet', error_code: 'unconfirmed' }, 2000);
-  assert.equal(r2.locals[0].state, 'unconfirmed');
-  assert.equal(r2.draft, null);
-  // No answer at all (the call failed): unconfirmed, never not sent.
-  const l3 = newLocal(C, 'maybe', 1000);
-  assert.equal(applySendAnswer([l3], l3.key, null, 2000).locals[0].state, 'unconfirmed');
-});
-
-test('a message holding a pending_id stays unconfirmed on every answer but success, expired, unreadable', () => {
-  for (const code of ['no_session', 'locked', 'held', 'not_sent', 'clock', 'earlier_unconfirmed', 'unconfirmed', 'forbidden']) {
-    const u = { ...newLocal(C, 'same', 1000), state: 'unconfirmed', pending_id: 'P1', notice: 'old' };
-    const r = applySendAnswer(retrying([u], u.key), u.key, { success: false, error: `N ${code}`, error_code: code }, 2000);
-    assert.equal(r.draft, null, code);
+test('a kept answer (any code, clock included) is unconfirmed until expires_at', () => {
+  for (const code of ['unconfirmed', 'clock']) {
+    const l = newLocal(C, 'maybe', 1000);
+    const r = applySendAnswer([l], l.key, { success: false, error: 'not yet', error_code: code, data: { pending_id: 'P1', expires_at: EXP } }, 2000);
+    assert.deepEqual(r.returned, [], code);
     assert.equal(r.locals[0].state, 'unconfirmed', code);
-    assert.equal(r.locals[0].pending_id, 'P1', code);
-    assert.equal(r.locals[0].notice, `N ${code}`, code);
+    assert.equal(r.locals[0].pending_id, 'P1');
+    assert.equal(r.locals[0].expires_at, Date.parse(EXP));
+    assert.equal(r.locals[0].everUnconfirmed, true);
+    assert.equal(r.locals[0].notice, 'not yet');
   }
-  const u = { ...newLocal(C, 'same', 1000), state: 'unconfirmed', pending_id: 'P1' };
-  const ex = applySendAnswer([u], u.key, { success: false, error: 'late', error_code: 'unconfirmed_expired' }, 5000);
+});
+
+test('M2: unconfirmed without an id, or no answer at all, stays unconfirmed and never returns on its own', () => {
+  const l = newLocal(C, 'maybe', 1000);
+  const r = applySendAnswer([l], l.key, { success: false, error: 'not yet', error_code: 'unconfirmed' }, 2000);
+  assert.equal(r.locals[0].state, 'unconfirmed');
+  assert.equal(r.locals[0].everUnconfirmed, true);
+  assert.deepEqual(r.returned, []);
+  const l2 = newLocal(C, 'maybe', 1000);
+  const r2 = applySendAnswer([l2], l2.key, null, 2000);
+  assert.equal(r2.locals[0].state, 'unconfirmed');
+  assert.equal(r2.locals[0].pending_id, undefined);
+  // It can't be tried again by id.
+  assert.equal(startRetry(r2.locals, l2.key)[0].state, 'unconfirmed');
+  // Once unconfirmed, a later answer about it (not_sent, say) doesn't make it a draft.
+  const again = applyRetryAnswer(r.locals, l.key, { success: false, error: 'x', error_code: 'not_sent' }, 3000);
+  assert.equal(again.locals[0].state, 'unconfirmed');
+  assert.deepEqual(again.returned, []);
+  // Even an answer taken as its first try's leaves it unconfirmed.
+  const firstAgain = applySendAnswer(r2.locals, l2.key, { success: false, error: 'x', error_code: 'not_sent' }, 3000);
+  assert.equal(firstAgain.locals[0].state, 'unconfirmed');
+  assert.deepEqual(firstAgain.returned, []);
+  // Never expired by time without an expires_at.
+  assert.equal(expireDue(r2.locals, 1e15).changed, false);
+});
+
+test('retry_send: settled done is sent, not_done goes back, expired and unreadable read again', () => {
+  const u = unconf('same', 1000, 'P1');
+  const s = startRetry([u], u.key);
+  assert.equal(s[0].state, 'sending');
+  assert.equal(s[0].retry, true);
+  const done = applyRetryAnswer(s, u.key, { success: true, data: { ...SENT, pending_id: 'P1', settled: 'done' } }, 2000);
+  assert.equal(done.locals[0].state, 'sent');
+  assert.equal(done.locals[0].pending_id, undefined);
+  assert.equal(done.locals[0].retry, undefined);
+  const nd = applyRetryAnswer(s, u.key, { success: false, error: 'refused', error_code: 'forbidden', data: { pending_id: 'P1', settled: 'not_done', vault_code: 'forbidden' } }, 2000);
+  assert.equal(nd.locals.length, 0);
+  assert.deepEqual(nd.returned, [{ connection_id: C, text: 'same', error: 'refused' }]);
+  const ex = applyRetryAnswer(s, u.key, { success: false, error: 'late', error_code: 'unconfirmed_expired', data: { pending_id: 'P1' } }, 5000);
   assert.equal(ex.locals[0].state, 'expired');
   assert.equal(ex.locals[0].since, 5000);
   assert.equal(ex.refresh, true);
-  const un = applySendAnswer([u], u.key, { success: false, error: 'unread', error_code: 'answer_unreadable' }, 5000);
+  const un = applyRetryAnswer(s, u.key, { success: false, error: 'unread', error_code: 'answer_unreadable', data: { pending_id: 'P1', settled: 'done' } }, 5000);
   assert.equal(un.locals[0].state, 'unreadable');
   assert.equal(un.refresh, true);
-  const ok = applySendAnswer([u], u.key, { success: true, data: { message_id: 'M', sent_at: '2026-11-25T10:00:00Z' } }, 5000);
-  assert.equal(ok.locals[0].state, 'sent');
-  assert.equal(ok.locals[0].pending_id, undefined);
+});
+
+test('a pending_id message stays unconfirmed on every other answer, retry or earlier', () => {
+  for (const code of ['no_session', 'locked', 'held', 'not_sent', 'clock', 'earlier_unconfirmed', 'unconfirmed', 'bad_argument']) {
+    const u = unconf('same', 1000, 'P1');
+    const r = applyRetryAnswer(startRetry([u], u.key), u.key, { success: false, error: `N ${code}`, error_code: code }, 2000);
+    assert.deepEqual(r.returned, [], code);
+    assert.equal(r.locals[0].state, 'unconfirmed', code);
+    assert.equal(r.locals[0].pending_id, 'P1', code);
+    assert.equal(r.locals[0].notice, `N ${code}`, code);
+    assert.equal(r.locals[0].retry, undefined, code);
+  }
+  // The call itself failed: still unconfirmed, with its id.
+  const u = unconf('same', 1000, 'P1');
+  assert.equal(applyRetryAnswer(startRetry([u], u.key), u.key, null, 2000).locals[0].pending_id, 'P1');
+});
+
+test('a new pending_id is a new request: its time starts then; the same id keeps it', () => {
+  const u = unconf('same', 1000, 'P1');
+  const same = applyRetryAnswer([u], u.key, { success: false, error_code: 'unconfirmed', data: { pending_id: 'P1', expires_at: EXP } }, 9000);
+  assert.equal(same.locals[0].at, 1000);
+  const fresh = applyRetryAnswer([u], u.key, { success: false, error_code: 'unconfirmed', data: { pending_id: 'P2', expires_at: EXP } }, 9000);
+  assert.equal(fresh.locals[0].at, 9000);
+  assert.equal(fresh.locals[0].pending_id, 'P2');
+  // A first send's id keeps its creation time.
+  const l = newLocal(C, 'x', 1000);
+  assert.equal(applySendAnswer([l], l.key, { success: false, error_code: 'unconfirmed', data: { pending_id: 'P3', expires_at: EXP } }, 9000).locals[0].at, 1000);
 });
 
 test('earlier settles the unconfirmed message it names by pending_id', () => {
-  const u = { ...newLocal(C, 'first', 1000), state: 'unconfirmed', pending_id: 'P1' };
+  const u = unconf('first', 1000, 'P1');
   const l = newLocal(C, 'second', 2000);
   const r = applySendAnswer([u, l], l.key, {
     success: true,
-    data: { message_id: 'M2', sent_at: '2026-11-25T10:02:00Z', earlier: { pending_id: 'P1', connection_id: C, success: true, data: { message_id: 'M1', sent_at: '2026-11-25T10:01:00Z' } } },
+    data: { message_id: 'M2', sent_at: '2026-11-25T10:02:00Z', earlier: { pending_id: 'P1', expires_at: EXP, connection_id: C, success: true, settled: 'done', data: SENT } },
   }, 3000);
   assert.deepEqual(r.locals.map((x) => [x.state, x.message_id]), [['sent', 'M1'], ['sent', 'M2']]);
   assert.equal(r.refresh, false);
 });
 
-test('earlier still unconfirmed: it stays so; the new send that wasn’t sent is the draft', () => {
-  const u = { ...newLocal(C, 'first', 1000), state: 'unconfirmed', pending_id: 'P1' };
+test('earlier not_done goes back; with the new send also back, only one fills the box', () => {
+  const u = unconf('first', 1000, 'P1');
+  const l = newLocal(C, 'second', 2000);
+  const r = applySendAnswer([u, l], l.key, {
+    success: false,
+    error: 'not sent',
+    error_code: 'not_sent',
+    data: { earlier: { pending_id: 'P1', connection_id: C, success: false, settled: 'not_done', vault_code: 'vault_error', error: 'refused', error_code: 'vault_error' } },
+  }, 3000);
+  assert.equal(r.locals.length, 0);
+  assert.deepEqual(r.returned.map((x) => x.text), ['first', 'second']);
+  const p = placeReturned(r.locals, { [C]: '' }, r.returned, 4000);
+  assert.equal(p.drafts[C], 'first');
+  assert.equal(p.errors[C], 'refused');
+  assert.equal(p.locals.length, 1);
+  assert.equal(p.locals[0].state, 'unsent');
+  assert.equal(p.locals[0].text, 'second');
+  assert.equal(p.locals[0].notice, 'not sent');
+});
+
+test('placeReturned never joins texts: a box with text keeps it, the returned text is a bubble', () => {
+  const p = placeReturned([], { [C]: 'typing' }, [{ connection_id: C, text: 'back', error: 'E' }], 1);
+  assert.equal(p.drafts[C], 'typing');
+  assert.equal(p.locals[0].text, 'back');
+  assert.equal(p.locals[0].state, 'unsent');
+  assert.deepEqual(p.errors, {});
+  // Another connection's box.
+  const q = placeReturned([], { [C]: 'typing' }, [{ connection_id: 'c2', text: 'other', error: 'E' }], 1);
+  assert.equal(q.drafts.c2, 'other');
+});
+
+test('earlier still unconfirmed stays so; the new send that wasn’t sent goes back', () => {
+  const u = unconf('first', 1000, 'P1');
   const l = newLocal(C, 'second', 2000);
   const r = applySendAnswer([u, l], l.key, {
     success: false,
     error: 'previous not confirmed',
     error_code: 'earlier_unconfirmed',
-    data: { earlier: { pending_id: 'P1', connection_id: C, success: false, error: 'still', error_code: 'unconfirmed' } },
+    data: { earlier: { pending_id: 'P1', expires_at: EXP, connection_id: C, success: false, error: 'still', error_code: 'unconfirmed' } },
   }, 3000);
   assert.equal(r.locals.length, 1);
   assert.equal(r.locals[0].state, 'unconfirmed');
   assert.equal(r.locals[0].notice, 'still');
-  assert.equal(r.draft, 'second');
-  assert.equal(r.error, 'previous not confirmed');
+  assert.deepEqual(r.returned, [{ connection_id: C, text: 'second', error: 'previous not confirmed' }]);
 });
 
-test('earlier expired or unreadable asks for a read; one the view lacks asks too', () => {
-  const u = { ...newLocal(C, 'first', 1000), state: 'unconfirmed', pending_id: 'P1' };
+test('earlier never matches the send it came with, even with the same pending_id', () => {
+  const l = { ...newLocal(C, 'mine', 1000), pending_id: 'P1' };
+  const r = applySendAnswer([l], l.key, {
+    success: true,
+    data: { ...SENT, earlier: { pending_id: 'P1', success: false, settled: 'not_done', error: 'E', error_code: 'vault_error' } },
+  }, 2000);
+  assert.equal(r.locals.length, 1);
+  assert.equal(r.locals[0].state, 'sent');
+  assert.deepEqual(r.returned, []);
+});
+
+test('earlier expired asks for a read; one the view lacks asks only when it settled or expired', () => {
+  const u = unconf('first', 1000, 'P1');
   const l = newLocal(C, 'second', 2000);
-  const sent = { message_id: 'M2', sent_at: '2026-11-25T10:02:00Z' };
-  const ex = applySendAnswer([u, l], l.key, { success: true, data: { ...sent, earlier: { pending_id: 'P1', success: false, error: 'late', error_code: 'unconfirmed_expired' } } }, 3000);
+  const ex = applySendAnswer([u, l], l.key, { success: true, data: { ...SENT, earlier: { pending_id: 'P1', success: false, error: 'late', error_code: 'unconfirmed_expired' } } }, 3000);
   assert.equal(ex.locals[0].state, 'expired');
   assert.equal(ex.refresh, true);
-  const lost = applySendAnswer([l], l.key, { success: true, data: { ...sent, earlier: { pending_id: 'P9', success: true, data: sent } } }, 3000);
+  const lost = applySendAnswer([l], l.key, { success: true, data: { ...SENT, earlier: { pending_id: 'P9', success: true, settled: 'done', data: SENT } } }, 3000);
   assert.equal(lost.refresh, true);
-  assert.equal(lost.locals[0].state, 'sent');
+  const quiet = applySendAnswer([l], l.key, { success: true, data: { message_id: 'M3', sent_at: SENT.sent_at, earlier: { pending_id: 'P9', success: false, error_code: 'unconfirmed' } } }, 3000);
+  assert.equal(quiet.refresh, false);
 });
 
-test('the same text again is the unconfirmed message’s retry', () => {
-  const u = { ...newLocal(C, 'same', 1000), state: 'unconfirmed', pending_id: 'P1' };
-  assert.equal(sameUnconfirmed([u], C, 'same'), u);
-  assert.equal(sameUnconfirmed([u], C, 'other'), undefined);
-  assert.equal(sameUnconfirmed([u], 'c2', 'same'), undefined);
+test('the same text twice is two messages', () => {
+  const u = unconf('same', 1000, 'P1');
+  const l = newLocal(C, 'same', 2000);
+  const r = applySendAnswer([u, l], l.key, { success: true, data: SENT }, 3000);
+  assert.equal(r.locals.length, 2);
+  assert.equal(r.locals[0].state, 'unconfirmed');
+  assert.equal(r.locals[1].state, 'sent');
 });
 
-test('unconfirmed past its time, by this clock, is expired; then a read offers the text again', () => {
-  const u = { ...newLocal(C, 'old', 0), state: 'unconfirmed', pending_id: 'P1' };
-  assert.equal(expireStale([u], KEPT_FOR_MS - 1).changed, false);
-  const e = expireStale([u], KEPT_FOR_MS);
+test('L2: locals are one per message_id and per pending_id', () => {
+  const a = { ...newLocal(C, 'a', 1), state: 'sent', message_id: 'M1', sent_at: 'x' };
+  const b = { ...newLocal(C, 'a', 2), state: 'sent', message_id: 'M1', sent_at: 'x' };
+  const c = unconf('c', 3, 'P1');
+  const d = unconf('c', 4, 'P1');
+  assert.deepEqual(dedupeLocals([a, b, c, d]).map((l) => l.key), [a.key, c.key]);
+  // A retry that comes back sent with a message_id another local has is merged away.
+  const r = applyRetryAnswer([a, c], c.key, { success: true, data: { ...SENT, settled: 'done' } }, 5);
+  assert.equal(r.locals.length, 1);
+});
+
+test('only unconfirmed sends past expires_at expire; a send in flight never does', () => {
+  const u = unconf('old', 0, 'P1');
+  assert.equal(expireDue([u], Date.parse(EXP) - 1).changed, false);
+  const e = expireDue([u], Date.parse(EXP));
   assert.equal(e.changed, true);
   assert.equal(e.locals[0].state, 'expired');
-  assert.equal(e.locals[0].notice, UNCONFIRMED_EXPIRED_TEXT);
-  // A read that started before it expired doesn't count.
-  assert.equal(afterReload(e.locals, C, new Set(), KEPT_FOR_MS - 1).returned.length, 0);
-  const r = afterReload(e.locals, C, new Set(), KEPT_FOR_MS + 1);
-  assert.deepEqual(r.returned, ['old']);
-  assert.equal(r.locals.length, 0);
+  assert.equal(e.locals[0].notice, CHECKING_TEXT);
+  const inFlight = startRetry([u], u.key);
+  assert.equal(expireDue(inFlight, 1e15).changed, false);
+  assert.equal(expireDue([newLocal(C, 'x', 0)], 1e15).changed, false);
 });
 
-test('after a read: unreadable sends go (they were done), sent ones go once the page has them', () => {
+test('M1: an expired send the page shows is dropped, and nothing goes to the box', () => {
+  const at = Date.parse('2026-11-25T10:00:00Z');
+  const e = { ...unconf('hello', at, 'P1'), state: 'expired', since: at + 10 };
+  const page = [msg('9', '2026-11-25T10:00:05Z', { direction: 'out', text: 'hello' })];
+  const r = afterReload([e], C, page, at + 20);
+  assert.equal(r.locals.length, 0);
+  assert.equal(r.recheck, false);
+});
+
+test('M1: an expired send the page doesn’t show is kept on its bubble as unsent, never put in the box', () => {
+  const at = Date.parse('2026-11-25T10:00:00Z');
+  const e = { ...unconf('hello', at, 'P1'), state: 'expired', since: at + 10 };
+  // The same text sent before this send began, another text, or an incoming one: not it.
+  const page = [
+    msg('7', '2026-11-25T09:59:00Z', { direction: 'out', text: 'hello' }),
+    msg('8', '2026-11-25T10:00:05Z', { direction: 'out', text: 'other' }),
+    msg('9', '2026-11-25T10:00:06Z', { direction: 'in', text: 'hello' }),
+  ];
+  const r = afterReload([e], C, page, at + 20);
+  assert.equal(r.locals.length, 1);
+  assert.equal(r.locals[0].state, 'unsent');
+  assert.equal(r.locals[0].notice, NOT_FOUND_TEXT);
+  // Its "Edit" puts it in an empty box only.
+  assert.equal(unsentToDraft(r.locals, { [C]: 'typing' }, r.locals[0].key), null);
+  const d = unsentToDraft(r.locals, { [C]: '' }, r.locals[0].key);
+  assert.equal(d?.drafts[C], 'hello');
+  assert.equal(d?.locals.length, 0);
+});
+
+test('M1: two expired sends of the same text need two page messages', () => {
+  const at = Date.parse('2026-11-25T10:00:00Z');
+  const e1 = { ...unconf('ok', at, 'P1'), state: 'expired', since: at + 10 };
+  const e2 = { ...unconf('ok', at + 1, 'P2'), state: 'expired', since: at + 10 };
+  const page = [msg('9', '2026-11-25T10:00:05Z', { direction: 'out', text: 'ok' })];
+  const r = afterReload([e1, e2], C, page, at + 20);
+  assert.deepEqual(r.locals.map((l) => l.state), ['unsent']);
+});
+
+test('M2: an unconfirmed send without an id goes once a read shows it, and stays otherwise', () => {
+  const at = Date.parse('2026-11-25T10:00:00Z');
+  const u = { ...newLocal(C, 'hi', at), state: 'unconfirmed', everUnconfirmed: true };
+  const shown = afterReload([u], C, [msg('9', '2026-11-25T10:00:01Z', { direction: 'out', text: 'hi' })], at + 5);
+  assert.equal(shown.locals.length, 0);
+  const not = afterReload([u], C, [], at + 5);
+  assert.equal(not.locals[0].state, 'unconfirmed');
+  // One with a pending_id waits for its own answers.
+  const p = unconf('hi', at, 'P1');
+  assert.equal(afterReload([p], C, [msg('9', '2026-11-25T10:00:01Z', { direction: 'out', text: 'hi' })], at + 5).locals.length, 1);
+});
+
+test('after a read: unreadable sends go (they were done), sent ones go once the page has them; L5 recheck', () => {
   const un = { ...newLocal(C, 'done', 0), state: 'unreadable', since: 10 };
   const s1 = { ...newLocal(C, 'a', 0), state: 'sent', message_id: 'M1', sent_at: 'x' };
   const s2 = { ...newLocal(C, 'b', 0), state: 'sent', message_id: 'M2', sent_at: 'y' };
   const other = { ...newLocal('c2', 'z', 0), state: 'unreadable', since: 10 };
-  const r = afterReload([un, s1, s2, other], C, new Set(['M1']), 20);
+  const r = afterReload([un, s1, s2, other], C, [msg('M1', 'x', { direction: 'out' })], 20);
   assert.deepEqual(r.locals.map((l) => l.text), ['b', 'z']);
-  assert.deepEqual(r.returned, []);
+  assert.equal(r.recheck, false);
+  // One that began after the read started is read about again.
+  const late = { ...newLocal(C, 'late', 0), state: 'expired', since: 30 };
+  const r2 = afterReload([late], C, [], 20);
+  assert.equal(r2.locals[0].state, 'expired');
+  assert.equal(r2.recheck, true);
 });
 
-test('texts offered again go before what is in the box', () => {
-  assert.equal(withReturned('', ['a']), 'a');
-  assert.equal(withReturned('typed', ['a', 'b']), 'a\nb\ntyped');
-  assert.equal(withReturned('typed', []), 'typed');
+test('L3: sends and drafts of connections no longer listed are dropped', () => {
+  const p = pruneKept([newLocal(C, 'a', 1), newLocal('gone', 'b', 1)], { [C]: 'x', gone: 'y' }, new Set([C]));
+  assert.deepEqual(p.locals.map((l) => l.connection_id), [C]);
+  assert.deepEqual(p.drafts, { [C]: 'x' });
+});
+
+test('L6: a receipt for a message not known yet is held, then applied once it is', () => {
+  const ev = { kind: 'message.receipt', members: { connection_id: C, message_id: 'M1', receipt: 'delivered' } };
+  const l = newLocal(C, 'hi', 0);
+  assert.equal(knowsEvent([], [l], ev, C), false);
+  // Other kinds and other connections have nothing to hold.
+  assert.equal(knowsEvent([], [], { kind: 'connection.changed', members: {} }, C), true);
+  assert.equal(knowsEvent([], [], { ...ev, members: { ...ev.members, connection_id: 'c2' } }, C), true);
+  let held = [{ ev, at: 1000 }];
+  const sent = applySendAnswer([l], l.key, { success: true, data: SENT }, 1500).locals;
+  assert.equal(knowsEvent([], sent, ev, C), true);
+  const rel = releaseHeld(held, (e) => knowsEvent([], sent, e, C), 2000);
+  assert.equal(rel.ready.length, 1);
+  assert.equal(rel.held.length, 0);
+  const after = applySyncEvent(sent, rel.ready[0], C);
+  assert.equal(after[0].delivered, true);
+  // Not known yet: still held; too old: dropped.
+  assert.equal(releaseHeld(held, () => false, 2000).held.length, 1);
+  assert.equal(releaseHeld(held, () => true, 1000 + RECEIPT_HOLD_MS + 1).ready.length, 0);
 });
 
 test('the view list: own sent messages by sent_at, pending sends last, no duplicate once a page has one', () => {
@@ -270,6 +472,9 @@ test('delivery text: the plan’s words, the relay_held line, and the backend’
   assert.equal(deliveryText('unconfirmed', { notice: 'N' }), 'N');
   assert.equal(deliveryText('expired', { notice: 'E' }), 'E');
   assert.equal(deliveryText(null), '');
+  assert.equal(deliveryText('unsent'), NOT_FOUND_TEXT);
+  assert.equal(deliveryText('expired'), CHECKING_TEXT);
+  assert.equal(deliveryState({ direction: 'out', delivered: false, read: false, local: { state: 'unsent' } }), 'unsent');
 });
 
 test('§10.8 bubble cleaning: lines kept, directional marks kept, other controls go, ends trimmed', () => {
@@ -289,6 +494,10 @@ test('§10.5 links: only https:// is a link, with its host; other schemes are te
     { text: 'https://example.com/a?b=1', href: 'https://example.com/a?b=1', host: 'example.com' },
     { text: '.' },
   ]);
+  // A balanced closing bracket stays; one the URL doesn't open goes.
+  assert.equal(/** @type {any} */ (linkPieces('https://en.wikipedia.org/wiki/Tor_(network)')[0]).href, 'https://en.wikipedia.org/wiki/Tor_(network)');
+  assert.deepEqual(linkPieces('(see https://example.com/a)').map((p) => p.text), ['(see ', 'https://example.com/a', ')']);
+  assert.equal(/** @type {any} */ (linkPieces('https://x.example/f(a)).')[0]).text, 'https://x.example/f(a)');
   for (const t of ['http://example.com', 'someapp://x', 'javascript:alert(1)', 'www.example.com', 'ftp://x']) {
     assert.deepEqual(linkPieces(t), [{ text: t }], t);
   }
@@ -321,6 +530,8 @@ test('the compose box counts UTF-8 bytes, 1 B to 16 KiB', () => {
   assert.equal(textBytes('😀'), 4);
   assert.equal(canSend(''), false);
   assert.equal(canSend('   '), false);
+  // Empty by §10.8 step 4: zero-width and blank code points only.
+  assert.equal(canSend(String.fromCharCode(0x200b, 0x2800, 0x3164)), false);
   assert.equal(canSend('a'), true);
   assert.equal(canSend('a'.repeat(16384)), true);
   assert.equal(canSend('a'.repeat(16385)), false);
