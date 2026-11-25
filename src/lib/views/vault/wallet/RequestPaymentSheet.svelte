@@ -2,9 +2,9 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { onMount, onDestroy } from 'svelte';
-  import type { Connection } from '../../../types';
+  import type { Connection } from '../../../connections';
   import { modal } from '../../../actions/modal';
-  import { peerName } from '../../../connectionName';
+  import { connectionTitle } from '../../../connectionView.js';
 
   // --- Request payment sheet ------------------------------------------
   //
@@ -43,9 +43,7 @@
     try {
       const resp: any = await invoke('list_connections');
       if (resp?.success && resp?.data) {
-        const all = (resp.data.connections ?? []) as Connection[];
-        // Only active connections can receive a payment request.
-        connections = all.filter((c) => c.status === 'active');
+        connections = (resp.data.connections ?? []) as Connection[];
       } else {
         connError = resp?.error || 'Failed to load connections';
       }
@@ -193,8 +191,8 @@
           {:else}
             <select bind:value={connectionId}>
               <option value="" disabled selected>Select a connection…</option>
-              {#each connections as c (c.connection_id)}
-                <option value={c.connection_id}>{peerName(c)}</option>
+              {#each connections as c (c.id)}
+                <option value={c.id}>{connectionTitle(c)}</option>
               {/each}
             </select>
           {/if}

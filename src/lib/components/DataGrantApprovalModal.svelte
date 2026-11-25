@@ -10,7 +10,8 @@
         type PendingRequestSummary,
     } from '../grants';
     import { pendingGrantCountStore } from '../stores/vault';
-    import type { Connection } from '../types';
+    import type { Connection } from '../connections';
+    import { connectionTitle } from '../connectionView.js';
 
     // App-level modal — surfaces incoming grant requests so the user
     // can approve or deny without going to a dedicated screen. Polls
@@ -68,16 +69,7 @@
             const conns = (resp?.data?.connections ?? []) as Connection[];
             const map: Record<string, string> = {};
             for (const c of conns) {
-                if (c.peer_guid) {
-                    map[c.peer_guid] = c.peer_profile?.full_name
-                        ?? c.peer_alias
-                        ?? c.peer_guid.slice(0, 8);
-                }
-                if (c.connection_id) {
-                    map[c.connection_id] = c.peer_profile?.full_name
-                        ?? c.peer_alias
-                        ?? c.connection_id.slice(0, 8);
-                }
+                if (c.id) map[c.id] = connectionTitle(c);
             }
             peerNames = map;
         } catch (e) {

@@ -1,128 +1,174 @@
 <script lang="ts">
     import { onMount } from 'svelte';
-    import type { Connection } from '../../types';
+    import { invoke } from '@tauri-apps/api/core';
+    import type { Connection, VaultOpResponse } from '../../connections';
     import { selectedConnectionStore } from '../../stores/navigation';
-    import { connectionsStore, connectionsErrorStore, loadConnections as refreshStore } from '../../stores/vault';
-    import { peerName } from '../../connectionName';
+    import {
+        connectionsStore,
+        connectionsErrorStore,
+        connectionsUnreadableStore,
+        connectionRequestsStore,
+        connectionRequestsErrorStore,
+        loadConnections,
+        loadConnectionRequests,
+        reloadConnectionViews,
+        NOT_LIVE_TEXT,
+    } from '../../stores/vault';
+    import {
+        connectionTitle,
+        secondaryNames,
+        requestRow,
+        declineArgs,
+        UNREADABLE_CONNECTIONS,
+        hasUnreadableConnections,
+    } from '../../connectionView.js';
     import { formatRelativeOrAbsolute } from '../../time';
     import Avatar from '../../components/Avatar.svelte';
-    import StatusChip from '../../components/StatusChip.svelte';
 
-    // The vault store owns the canonical list — it's refreshed by
-    // initVaultListeners() on connection/message push events, so reading
-    // from the store gives us live updates without an extra subscription
-    // here. A failed refresh (here or from a push event) is shown through
-    // connectionsErrorStore.
+    // The vault store owns the list and the pending requests, as the last
+    // load confirmed them: it reads them again on the session going live
+    // and on the vault's connection events (stores/vault.ts). A failed
+    // load clears them and leaves the backend's error text.
     let connections = $derived($connectionsStore);
     let loading = $state(true);
     let error = $derived($connectionsErrorStore);
+    let requests = $derived($connectionRequestsStore);
+    // While the session isn't live the list says so; the requests don't say it again.
+    let requestsError = $derived($connectionRequestsErrorStore === NOT_LIVE_TEXT ? '' : $connectionRequestsErrorStore);
+    let someUnreadable = $derived(hasUnreadableConnections($connectionsUnreadableStore));
     let search = $state('');
 
     type SortOrder = 'recent' | 'alpha' | 'created';
     let sort: SortOrder = $state('recent');
 
-    // Active vs archived split — mirrors Android's Connection History
-    // screen. Active (status active|pending) is the main list; archived
-    // (revoked|expired) sits behind a "Connection history" card at the
-    // bottom and gets its own view.
-    type ViewMode = 'active' | 'history';
-    let viewMode: ViewMode = $state('active');
-    function isArchived(c: Connection): boolean {
-        return c.status === 'revoked' || c.status === 'expired';
-    }
-    let historyCount = $derived(connections.filter(isArchived).length);
-
-    // Highlight the currently-selected connection's card. Read via
-    // $derived so the highlight tracks the store across the parent
-    // shell's swap to/from Conversation/Detail.
-    let selectedId = $derived($selectedConnectionStore?.connection_id);
+    let selectedId = $derived($selectedConnectionStore?.id);
 
     function openConnection(conn: Connection): void {
         selectedConnectionStore.set(conn);
     }
 
-    async function loadConnections() {
+    async function loadAll() {
         loading = connections.length === 0;
-        // Writes the shared store (and its error) so anything else
-        // subscribed sees the fresh list too.
-        await refreshStore();
+        await Promise.all([loadConnections(), loadConnectionRequests()]);
         loading = false;
     }
 
-    // Subtitle preference mirrors Android: a recent message preview if
-    // we have one; otherwise the most recent activity title; otherwise
-    // when the connection was made.
-    function subtitle(c: Connection): string {
-        if (c.last_message_preview) {
-            const when = formatRelativeOrAbsolute(c.last_message_at);
-            return when ? `${c.last_message_preview} · ${when}` : c.last_message_preview;
-        }
-        if (c.last_activity_title) {
-            const when = formatRelativeOrAbsolute(c.last_activity_at);
-            return when ? `${c.last_activity_title} · ${when}` : c.last_activity_title;
-        }
+    function refresh() {
+        reloadConnectionViews();
+    }
+
+    // The row's second line, without names: when the connection was made.
+    function connectedWhen(c: Connection): string {
         const when = formatRelativeOrAbsolute(c.created_at);
         return when ? `Connected ${when}` : '';
     }
 
-    function lastActivityTs(c: Connection): number {
-        const ts = [c.last_message_at, c.last_activity_at, c.last_active_at, c.created_at]
-            .map((s) => (s ? Date.parse(s) : 0))
-            .filter((n) => !Number.isNaN(n) && n > 0);
-        return ts.length ? Math.max(...ts) : 0;
+    function ts(s: string | undefined): number {
+        const n = s ? Date.parse(s) : NaN;
+        return Number.isNaN(n) ? 0 : n;
     }
 
     let visible = $derived.by(() => {
-        const base = connections.filter((c) =>
-            viewMode === 'history' ? isArchived(c) : !isArchived(c),
-        );
         const q = search.trim().toLowerCase();
         const filtered = q
-            ? base.filter((c) => peerName(c).toLowerCase().includes(q))
-            : base.slice();
+            ? connections.filter((c) =>
+                  [connectionTitle(c), ...secondaryNames(c)].some((t) => t.toLowerCase().includes(q)),
+              )
+            : connections.slice();
         switch (sort) {
             case 'alpha':
-                filtered.sort((a, b) => peerName(a).localeCompare(peerName(b)));
+                filtered.sort((a, b) => connectionTitle(a).localeCompare(connectionTitle(b)));
                 break;
             case 'created':
-                filtered.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+                filtered.sort((a, b) => ts(b.created_at) - ts(a.created_at));
                 break;
             case 'recent':
             default:
-                // Unread floats to the top, then most-recent-activity
-                // descending — same rule the Android list uses.
-                filtered.sort((a, b) => {
-                    const au = (a.unread_count ?? 0) > 0 ? 1 : 0;
-                    const bu = (b.unread_count ?? 0) > 0 ? 1 : 0;
-                    if (au !== bu) return bu - au;
-                    return lastActivityTs(b) - lastActivityTs(a);
-                });
+                filtered.sort((a, b) => ts(b.last_active_at || b.created_at) - ts(a.last_active_at || a.created_at));
                 break;
         }
         return filtered;
     });
 
-    function typeBadge(c: Connection): string {
-        // Only flag the non-peer kinds; peer is the default and would
-        // just add visual noise.
-        if (c.connection_type === 'agent') return 'agent';
-        if (c.connection_type === 'device') return 'device';
-        return '';
+    // Declining is the only request action a desktop has (§3.1, §6.4):
+    // approving is the phone's, so no approve control is shown.
+    let declining = $state<string | null>(null);
+    let declineErrors = $state<Record<string, string>>({});
+
+    async function decline(side: 'incoming' | 'outgoing', key: string, req: { pending_id?: string; connection_id?: string }) {
+        const args = declineArgs(side, req);
+        if (!args || declining) return;
+        declining = key;
+        declineErrors = { ...declineErrors, [key]: '' };
+        try {
+            const resp: VaultOpResponse<unknown> = await invoke('decline_connection_request', args);
+            if (!resp.success) declineErrors = { ...declineErrors, [key]: resp.error ?? '' };
+        } catch (e) {
+            declineErrors = { ...declineErrors, [key]: String(e) };
+        }
+        declining = null;
+        // Whatever the answer, read again: the requests shown are the vault's.
+        reloadConnectionViews();
     }
 
-    onMount(() => { loadConnections(); });
+    let hasRequests = $derived((requests?.incoming.length ?? 0) + (requests?.outgoing.length ?? 0) > 0);
+
+    onMount(() => { loadAll(); });
 </script>
 
 <div class="connections-list">
     <div class="header">
-        <div class="header-left">
-            {#if viewMode === 'history'}
-                <button class="back-btn" onclick={() => (viewMode = 'active')} aria-label="Back to connections">←</button>
-            {/if}
-            <h3>{viewMode === 'history' ? 'Connection history' : 'Connections'}</h3>
-        </div>
-        <button class="refresh" aria-label="Refresh" onclick={loadConnections}>↻</button>
+        <h3>Connections</h3>
+        <button class="refresh" aria-label="Refresh" onclick={refresh}>↻</button>
     </div>
+
+    {#if requestsError || hasRequests}
+        <section class="requests">
+            <h4>Requests</h4>
+            {#if requestsError}
+                <div class="status error">{requestsError}</div>
+            {:else if requests}
+                {#if requests.incoming.length}
+                    <h5>Incoming</h5>
+                    <ul class="req-list">
+                        {#each requests.incoming as req (req.pending_id)}
+                            {@const key = `in:${req.pending_id}`}
+                            {@const row = requestRow(req)}
+                            <li class="req" class:unreadable={row.unreadable}>
+                                <div class="req-text">
+                                    <div class="name"><bdi>{row.title}</bdi></div>
+                                    {#each row.secondary as s}<div class="row2"><bdi>{s}</bdi></div>{/each}
+                                    {#if declineErrors[key]}<div class="req-error">{declineErrors[key]}</div>{/if}
+                                </div>
+                                <button class="decline" disabled={declining !== null} onclick={() => decline('incoming', key, req)}>
+                                    {declining === key ? '…' : 'Decline'}
+                                </button>
+                            </li>
+                        {/each}
+                    </ul>
+                {/if}
+                {#if requests.outgoing.length}
+                    <h5>Outgoing</h5>
+                    <ul class="req-list">
+                        {#each requests.outgoing as req (req.connection_id)}
+                            {@const key = `out:${req.connection_id}`}
+                            {@const row = requestRow(req)}
+                            <li class="req" class:unreadable={row.unreadable}>
+                                <div class="req-text">
+                                    <div class="name"><bdi>{row.title}</bdi></div>
+                                    {#each row.secondary as s}<div class="row2"><bdi>{s}</bdi></div>{/each}
+                                    {#if declineErrors[key]}<div class="req-error">{declineErrors[key]}</div>{/if}
+                                </div>
+                                <button class="decline" disabled={declining !== null} onclick={() => decline('outgoing', key, req)}>
+                                    {declining === key ? '…' : 'Decline'}
+                                </button>
+                            </li>
+                        {/each}
+                    </ul>
+                {/if}
+            {/if}
+        </section>
+    {/if}
 
     <div class="toolbar">
         <input
@@ -139,6 +185,11 @@
         </select>
     </div>
 
+    <!-- The count is 0 after a failed load, so this never sits beside an error. -->
+    {#if someUnreadable}
+        <div class="status error unreadable-note">{UNREADABLE_CONNECTIONS}</div>
+    {/if}
+
     {#if loading && connections.length === 0}
         <div class="status">Loading connections…</div>
     {:else if error}
@@ -146,15 +197,7 @@
     {:else if visible.length === 0}
         {#if search.trim()}
             <div class="status">No connections match "{search}".</div>
-        {:else if viewMode === 'history'}
-            <div class="empty">
-                <div class="empty-icon" aria-hidden="true">🗄️</div>
-                <p class="empty-title">No connection history</p>
-                <p class="empty-hint">
-                    Revoked, declined, and expired connections will show up here.
-                </p>
-            </div>
-        {:else}
+        {:else if !someUnreadable}
             <div class="empty">
                 <div class="empty-icon" aria-hidden="true">👥</div>
                 <p class="empty-title">No connections yet</p>
@@ -166,55 +209,34 @@
         {/if}
     {:else}
         <ul class="list">
-            {#each visible as conn (conn.connection_id)}
-                {@const unread = conn.unread_count ?? 0}
-                {@const missed = conn.missed_call_count ?? 0}
-                {@const tBadge = typeBadge(conn)}
+            {#each visible as conn (conn.id)}
+                {@const title = connectionTitle(conn)}
+                {@const names = secondaryNames(conn)}
                 <li>
                     <button
                         type="button"
                         class="card"
-                        class:selected={selectedId === conn.connection_id}
-                        class:needs-attention={conn.needs_attention}
+                        class:selected={selectedId === conn.id}
                         onclick={() => openConnection(conn)}
                     >
-                        <Avatar
-                            name={peerName(conn)}
-                            photo={conn.peer_profile?.photo}
-                            connectionType={conn.connection_type}
-                            size={40}
-                        />
+                        <Avatar name={title} size={40} />
                         <div class="card-text">
                             <div class="row1">
-                                <span class="name">{peerName(conn)}</span>
-                                {#if tBadge}<span class="type-badge">{tBadge}</span>{/if}
-                                {#if missed > 0}
-                                    <span class="missed-tag" title="{missed} missed call{missed === 1 ? '' : 's'}">
-                                        📵 {missed}
-                                    </span>
+                                <span class="name"><bdi>{title}</bdi></span>
+                            </div>
+                            <!-- The names under an alias and the display name (§10.8), each isolated. -->
+                            <div class="row2">
+                                {#if names.length}
+                                    {#each names as s, i}{#if i}{' · '}{/if}<bdi>{s}</bdi>{/each}
+                                {:else}
+                                    {connectedWhen(conn)}
                                 {/if}
                             </div>
-                            <div class="row2">{subtitle(conn)}</div>
-                        </div>
-                        <div class="card-meta">
-                            {#if unread > 0}
-                                <span class="unread" aria-label="{unread} unread">
-                                    {unread > 99 ? '99+' : unread}
-                                </span>
-                            {/if}
-                            <StatusChip status={conn.status} />
                         </div>
                     </button>
                 </li>
             {/each}
         </ul>
-        {#if viewMode === 'active' && historyCount > 0}
-            <button class="history-link" onclick={() => (viewMode = 'history')}>
-                <span class="history-label">Connection history</span>
-                <span class="history-count">{historyCount}</span>
-                <span class="history-chevron">›</span>
-            </button>
-        {/if}
     {/if}
 </div>
 
@@ -259,6 +281,7 @@
 
     .status { color: var(--text-muted); padding: 16px; text-align: center; }
     .status.error { color: var(--error); }
+    .unreadable-note { padding: 0 0 10px; text-align: left; font-size: 0.85rem; }
 
     .empty {
         flex: 1;
@@ -289,7 +312,7 @@
         position: relative;
         font: inherit;
         display: grid;
-        grid-template-columns: auto 1fr auto;
+        grid-template-columns: auto 1fr;
         gap: 10px;
         align-items: center;
         transition: background 0.12s, border-color 0.12s;
@@ -315,40 +338,6 @@
         white-space: nowrap;
         min-width: 0;
     }
-    .type-badge {
-        font-size: 0.65rem;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        color: var(--text-muted);
-        border: 1px solid var(--border);
-        border-radius: 3px;
-        padding: 1px 5px;
-        flex-shrink: 0;
-    }
-    .missed-tag {
-        font-size: 0.68rem;
-        font-weight: 600;
-        color: #ef5350;
-        border: 1px solid rgba(244, 67, 54, 0.45);
-        background: rgba(244, 67, 54, 0.12);
-        border-radius: 999px;
-        padding: 1px 7px;
-        flex-shrink: 0;
-        white-space: nowrap;
-    }
-    .card.needs-attention .name {
-        font-weight: 600;
-    }
-    .card.needs-attention::before {
-        content: '';
-        position: absolute;
-        left: 0;
-        top: 6px;
-        bottom: 6px;
-        width: 3px;
-        background: var(--accent);
-        border-radius: 0 2px 2px 0;
-    }
     .row2 {
         margin-top: 2px;
         font-size: 0.82rem;
@@ -357,32 +346,6 @@
         text-overflow: ellipsis;
         white-space: nowrap;
     }
-
-    .card-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
-    .unread {
-        background: var(--error);
-        color: #fff;
-        font-size: 0.7rem;
-        font-weight: 600;
-        line-height: 1;
-        padding: 2px 6px;
-        border-radius: 10px;
-        min-width: 18px;
-        text-align: center;
-    }
-
-    .header-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
-    .back-btn {
-        background: none;
-        border: 1px solid var(--border);
-        border-radius: 4px;
-        padding: 4px 9px;
-        cursor: pointer;
-        color: inherit;
-        font: inherit;
-        line-height: 1;
-    }
-    .back-btn:hover { background: var(--bg-elevated); }
 
     /* Explicit option colors — native <select> dropdowns in some
        WebView builds ignore the .sort CSS for the expanded option list
@@ -394,34 +357,33 @@
         color: var(--text);
     }
 
-    .history-link {
+    .requests { padding: 0 0 10px; }
+    .requests h4 { margin: 0 0 6px; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); }
+    .requests h5 { margin: 6px 0 4px; font-size: 0.75rem; font-weight: 500; color: var(--text-muted); }
+    .req-list { list-style: none; padding: 0; margin: 0; }
+    .req-list li + li { margin-top: 4px; }
+    .req {
         display: flex;
         align-items: center;
-        gap: 8px;
-        width: 100%;
-        padding: 10px 12px;
-        margin-top: 12px;
+        gap: 10px;
         background: var(--surface);
-        border: 1px dashed var(--border);
         border-radius: 8px;
+        padding: 8px 12px;
+    }
+    .req-text { flex: 1; min-width: 0; }
+    .req.unreadable .name { color: var(--text-muted); font-style: italic; }
+    .req-error { margin-top: 4px; font-size: 0.8rem; color: var(--error); }
+    .decline {
+        background: none;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 4px 10px;
         cursor: pointer;
-        color: var(--text-muted);
+        color: inherit;
         font: inherit;
-        text-align: left;
-        transition: background 0.12s, color 0.12s;
+        font-size: 0.85rem;
+        flex-shrink: 0;
     }
-    .history-link:hover {
-        background: var(--bg-elevated);
-        color: var(--text);
-    }
-    .history-label { flex: 1; font-weight: 500; }
-    .history-count {
-        background: var(--bg-elevated);
-        color: var(--text-muted);
-        font-size: 0.75rem;
-        padding: 2px 8px;
-        border-radius: 999px;
-        font-weight: 500;
-    }
-    .history-chevron { font-size: 1.2em; line-height: 1; opacity: 0.6; }
+    .decline:hover:not(:disabled) { background: var(--bg-elevated); }
+    .decline:disabled { opacity: 0.6; cursor: default; }
 </style>

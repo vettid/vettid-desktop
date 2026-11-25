@@ -1154,6 +1154,7 @@ fn end_notice<T: vettid_device::transport::Transport, C: vettid_device::pairing:
 /// First, before anything is cleared.
 fn begin_reset(state: &AppState) {
     state.resets_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state.reset_notify.notify_waiters();
 }
 
 /// #43: a memory reset is done, after everything is cleared.
@@ -1163,14 +1164,14 @@ fn finish_reset(state: &AppState) {
 
 /// Where the resets stood when an [`unlock`] started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ResetMark {
+pub(crate) struct ResetMark {
     started: u64,
     under_way: bool,
 }
 
 /// Read `finished` first, then `started`: a reset that starts between the
 /// two reads counts as under way.
-fn reset_mark(state: &AppState) -> ResetMark {
+pub(crate) fn reset_mark(state: &AppState) -> ResetMark {
     use std::sync::atomic::Ordering::SeqCst;
     let finished = state.resets_finished.load(SeqCst);
     let started = state.resets_started.load(SeqCst);
@@ -1179,7 +1180,7 @@ fn reset_mark(state: &AppState) -> ResetMark {
 
 /// Whether a reset was under way when `mark` was taken, or has started
 /// since: then what an unlock set may be what that reset meant to clear.
-fn overtaken_by_reset(state: &AppState, mark: ResetMark) -> bool {
+pub(crate) fn overtaken_by_reset(state: &AppState, mark: ResetMark) -> bool {
     mark.under_way || state.resets_started.load(std::sync::atomic::Ordering::SeqCst) != mark.started
 }
 

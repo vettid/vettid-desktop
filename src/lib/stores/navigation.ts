@@ -1,5 +1,5 @@
 import { writable, type Writable } from 'svelte/store';
-import type { Connection } from '../types';
+import type { Connection } from '../connections';
 
 /**
  * Currently-selected connection for detail / conversation views. `null` means

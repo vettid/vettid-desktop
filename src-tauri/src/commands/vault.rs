@@ -1,9 +1,12 @@
 use serde::Serialize;
 use tauri::State;
 
-// Every vault operation answers one plain "not available" error in this
-// build: see `unavailable`.
+// The vault operations not carried over yet answer one plain "not
+// available" error: see `unavailable`. The connection operations go over the
+// link (DESKTOP-REWORK-PLAN Phase 5, 5.2; `link::ops`).
 use crate::commands::unavailable as operations;
+use crate::link::ops::{link_op_with, OpError};
+use crate::link::shape::{self, BadShape};
 use crate::state::AppState;
 
 #[derive(Debug, Serialize)]
@@ -43,22 +46,85 @@ impl VaultOpResponse {
 // Independent operations (no phone approval)
 // ---------------------------------------------------------------------------
 
-/// List connections.
-#[tauri::command]
-pub async fn list_connections(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(&state, "connection.list", serde_json::json!({})).await;
-    Ok(VaultOpResponse::from_op(result))
+impl VaultOpResponse {
+    /// What a vault operation over the link answers: its body, or why it
+    /// failed (with a stable code for the frontend).
+    fn from_link(result: Result<serde_json::Value, OpError>) -> Self {
+        match result {
+            Ok(v) => Self { success: true, data: Some(v), error: None, error_code: None, pending_approval: false },
+            Err(e) => Self { success: false, data: None, error: Some(e.notice().to_string()), error_code: Some(e.code()), pending_approval: false },
+        }
+    }
 }
 
-/// Get a specific connection.
+/// Run `kind` with `body` over the link ([`link_op_with`]): only while
+/// the screen shows a live session and no End session, lock or log-out is
+/// under way; its answer checked by `shape`.
+async fn link_op(
+    state: &AppState,
+    kind: &str,
+    body: serde_json::Value,
+    shape: fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>,
+    change: bool,
+) -> VaultOpResponse {
+    // Registered before the reset mark is read, so a reset that starts any
+    // time after it wakes the operation.
+    let stop = state.reset_notify.notified();
+    tokio::pin!(stop);
+    stop.as_mut().enable();
+    let mark = crate::commands::auth::reset_mark(state);
+    let r = link_op_with(
+        &state.link,
+        || state.snapshot().active_at(chrono::Utc::now()),
+        || crate::commands::auth::overtaken_by_reset(state, mark),
+        |s| state.publish(s),
+        stop,
+        kind,
+        body,
+        shape,
+        change,
+    )
+    .await;
+    VaultOpResponse::from_link(r)
+}
+
+/// List connections (`connection.list`, VAULT-MESSAGING §10.4): read-only.
+#[tauri::command]
+pub async fn list_connections(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
+    Ok(link_op(&state, "connection.list", serde_json::json!({}), shape::connection_list, false).await)
+}
+
+/// Get a specific connection (`connection.get`, §10.4).
 #[tauri::command]
 pub async fn get_connection(state: State<'_, AppState>, connection_id: String) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(
-        &state,
-        "connection.get",
-        serde_json::json!({ "connection_id": connection_id }),
-    ).await;
-    Ok(VaultOpResponse::from_op(result))
+    if connection_id.is_empty() {
+        return Ok(VaultOpResponse::from_link(Err(OpError::BadArgument)));
+    }
+    Ok(link_op(&state, "connection.get", serde_json::json!({ "connection_id": connection_id }), shape::connection, false).await)
+}
+
+/// The connection requests waiting (`connection.request.list`, §10.4):
+/// incoming and outgoing. A desktop sees them, may decline them, and never
+/// approves one (§3.1).
+#[tauri::command]
+pub async fn list_connection_requests(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
+    Ok(link_op(&state, "connection.request.list", serde_json::json!({}), shape::request_list, false).await)
+}
+
+/// Decline a connection request (`connection.decline`, §10.4): an incoming
+/// one by `pending_id`, or an outgoing one by `connection_id`, exactly one.
+#[tauri::command]
+pub async fn decline_connection_request(
+    state: State<'_, AppState>,
+    pending_id: Option<String>,
+    connection_id: Option<String>,
+) -> Result<VaultOpResponse, String> {
+    let body = match (pending_id, connection_id) {
+        (Some(p), None) if !p.is_empty() => serde_json::json!({ "pending_id": p }),
+        (None, Some(c)) if !c.is_empty() => serde_json::json!({ "connection_id": c }),
+        _ => return Ok(VaultOpResponse::from_link(Err(OpError::BadArgument))),
+    };
+    Ok(link_op(&state, "connection.decline", body, shape::empty, true).await)
 }
 
 /// List paired agents with their Contract (scope / approval mode /
