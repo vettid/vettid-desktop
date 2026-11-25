@@ -599,6 +599,36 @@ async fn a_failed_retry_stays_unconfirmed() {
     assert!(n.contains("may still happen") && !n.contains("Try again") && !n.contains("couldn't send"), "{n}");
 }
 
+/// A retry of the kept send with no session, the vault known locked, or
+/// known held: nothing is deposited, it stays unconfirmed (said with the
+/// cause) and kept.
+#[tokio::test]
+async fn a_retry_while_not_open_deposits_nothing() {
+    let body = serde_json::json!({"connection_id": "c-1", "text": "hi"});
+    for (name, cause) in [("no session", OpError::NoSession), ("locked", OpError::Locked), ("held", OpError::Held)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, mut link) = live(dir.path()).await; // message.send: taken, not answered
+        assert_eq!(link.op("message.send", &body, any, true).await, Err(OpError::Unconfirmed), "{name}");
+        let kept = link.unconfirmed.clone().unwrap();
+        match cause {
+            OpError::NoSession => vault.set_session(None),
+            OpError::Locked => {
+                vault.lock_vault(None);
+            }
+            _ => vault.hold(true, ""),
+        }
+        let _ = link.read_status().await; // known before the retry
+        assert!(!link.snapshot(Utc::now()).active_at(Utc::now()), "{name}: still live");
+        // Any retry that reached the vault would be answered done.
+        vault.answer("message.send", Ok("{}"));
+        let before = vault.deposited().len();
+        let r = link.op_retry("message.send", &kept.id, Some("c-1"), any).await;
+        assert_eq!(r, Err(OpError::UnconfirmedFor(Box::new(cause))), "{name}");
+        assert_eq!(vault.deposited().len(), before, "{name}: deposited {:?}", &vault.deposited()[before..]);
+        assert_eq!(link.unconfirmed.as_ref().map(|p| (p.id.clone(), p.retries)), Some((kept.id.clone(), 0)), "{name}: still kept");
+    }
+}
+
 /// A retry the vault answers with an error is settled, not done. A cached
 /// `session_required` for the old id doesn't end the screen's session.
 #[tokio::test]

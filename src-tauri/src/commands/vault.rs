@@ -1386,6 +1386,38 @@ mod tests {
         assert!(vault.deposited().iter().all(|k| k != "message.send"));
     }
 
+    /// While a send is kept, a retry under another id (a stale one, of a
+    /// send already settled, or one never kept), or of another connection,
+    /// is unconfirmed_expired, and nothing is sent: not the kept one under
+    /// its id either. The kept one is still retried by its own.
+    #[tokio::test]
+    async fn a_retry_of_another_send_sends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, s) = live(dir.path()).await; // taken, not answered
+        let sends = |v: &FakeVault| v.deposited().iter().filter(|k| *k == "message.send").count();
+        // A first send, kept, then settled by its retry: its token is stale.
+        let (stale, _) = pending(&send(&s, "c-1", "first").await);
+        vault.answer("message.send", Ok(SENT));
+        assert!(retry(&s, "c-1", &stale).await.success);
+        // A second, kept.
+        vault.unanswer("message.send");
+        let (token, until) = pending(&send(&s, "c-1", "second").await);
+        assert_ne!(token, stale);
+        // Any send would now be answered done.
+        vault.answer("message.send", Ok(SENT));
+        let before = sends(&vault);
+        for (id, pending_id) in [("c-1", stale.as_str()), ("c-1", "p-never-kept"), ("c-2", token.as_str())] {
+            let r = retry(&s, id, pending_id).await;
+            assert_eq!((r.success, r.error_code), (false, Some("unconfirmed_expired")), "{id} {pending_id}: {r:?}");
+            assert_eq!(sends(&vault), before, "{id} {pending_id}: sent");
+        }
+        // Still kept: by its own token and connection, sent once, done.
+        let r = retry(&s, "c-1", &token).await;
+        assert!(r.success, "{r:?} (kept until {until})");
+        assert_eq!(sends(&vault), before + 1);
+        assert_eq!(vault.deposited_ids("message.send"), [stale, token], "two messages, each under its own id");
+    }
+
     /// The vault answered ok, but its answer doesn't read: never a "try
     /// again" code, and nothing goes again on its own (the view reads the
     /// conversation before it offers another send).
