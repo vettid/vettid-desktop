@@ -2,7 +2,7 @@
 
 > **Note (2026-11-03):** NATS is retired in this desktop. It reaches its vault through the
 > relay with `src-tauri/crates/vettid-device` (vettid-desktop#64). The NATS details below are
-> history; this plan has not been rewritten.
+> history; this plan has not been rewritten, except Phase 5 (2026-11-25), which is.
 
 Supersedes the relevant sections of `DEVELOPMENT-PLAN.md` (which is
 oriented around the old 8-character pairing flow and a feature-parity
@@ -477,22 +477,162 @@ user vault carries all three sections; the empty states handle
 **Acceptance:** parity with Android's vault management for secrets +
 wallet, minus mobile-specific affordances (biometric reveal, etc.).
 
-### Phase 5 — Connections + Messaging (~1.5 weeks)
+### Phase 5 — Connections (read-only) + Messaging, over the relay
 
-- Connection list with the same status variants as Android
-  (Active / Pending / Outstanding invitation)
-- Connection detail screen (peer profile + interaction history +
-  grants)
-- Conversation view wired against `messages.list` /
-  `connection.send-message` (E2E encryption via the existing
-  session-key derivation)
+*Rewritten 2026-11-25 for the relay and the vault of VAULT-MESSAGING
+0.94.1. The May text assumed NATS, `messages.list` /
+`connection.send-message` and a per-connection session key. None of
+these exist now. The desktop talks only to its own vault, over its relay
+session (`vettid-device`); messages between members go vault to vault.*
 
-Connection *creation* (sending an invitation) is intentionally
-phone-only — see §7 decision #6. The desktop manages and converses
-with connections; it does not originate them.
+**What the desktop may do (VAULT-MESSAGING §3.1, §6.8).**
+- A desktop never creates or accepts connections. Inviting, accepting
+  an invitation, approving a request, and starting or accepting an
+  introduction are the app's; the vault answers them `forbidden`. A
+  desktop may decline (`connection.decline`). This keeps §7 decision #6.
+- It acts only inside an access session that the phone grants
+  (`device.session.request`, §6.8). Without one, everything below is
+  `session_required`, and no `message.new` or `sync.event` reaches it.
+- Attachments are app-only for now (§10.5.1, owner decision
+  2026-10-15). A desktop sees the "device view" of an attachment
+  without `thumb` or `name`, and shows a placeholder that sends the
+  member to the phone (its wording goes to the owner with 5.3). Sending
+  one is `forbidden`.
+- A connection with `peer_kind: "service"` takes no messages, so no
+  conversation is shown for it (§10.5).
 
-**Acceptance:** can chat with a peer end-to-end from desktop, with
-read receipts and delivery state matching Android.
+**The vault operations used.** All are D→V requests on the relay
+session (`Session::request`, 30 s, retried with the same `id`, §8.1,
+§8.2).
+
+| Operation | Section | Used for |
+|---|---|---|
+| `vault.status` | §10.2 | the access session, held or open (exists today) |
+| `connection.list`, `connection.get` | §10.4 | the list and the detail, read-only |
+| `connection.request.list`, `connection.decline` | §10.4 | pending requests: shown, and declinable; approving says "approve it on your phone" |
+| `message.list` | §10.5, §10.5.2 | a conversation, newest page first, paged with `before` / `next_before`; volatile, never cached on disk |
+| `message.send` | §10.5 | `{connection_id, text}`, 1 B to 16 KiB |
+| `message.read` | §10.5 | marks an incoming message read; the vault sends the read receipt (not while held, §3.6.3) |
+| `feed.list` | §10.9 | `message.not_delivered` and `message.delivery_unconfirmed` items, the only "failed" states there are |
+| V→D `message.new`, `sync.event` (kinds `message.receipt`, `message.read`, `connection.changed`, `connection.request`, `block.added`, `block.removed`), `vault.held`, `vault.locking` | §9.1, §10.1 | live updates while a session runs |
+
+**What the UI shows, and from where.**
+- **The connection list:**
+  - The title is built from the names as §10.8 says, with the
+    fingerprint of `ik` on the detail.
+  - The spec's `<connection>` has no unread count and no last message.
+    The desktop takes both from the newest `message.list` page of each
+    connection: unread means an incoming message with `read: false`.
+    The page is read with `limit` 20, when the list opens and when a
+    `message.new` arrives for it (chosen; not in the spec).
+  - Those reads are bounded: at most 4 in flight, visible rows first,
+    and the rest only as they scroll into view. Each is one signed
+    request from the desktop's key, so they count against the relay's
+    per-key limit (RELAY-PROTOCOL §7.2 limit 2: 20/s, burst 100) and
+    the flood guard. A list of 100 connections stays well inside both.
+  - Pending requests come from `connection.request.list`.
+- **A message's state** follows the booleans, never a guess:
+  - "Sending" until `message.send` answers.
+  - "Sent" once it has `message_id`. When the connection has
+    `relay_held`, a message without `delivered` is shown as held, in
+    the approved text: "Waiting to reach <First Last> at their vault's
+    new address."
+  - "Delivered" with `delivered: true`.
+  - "Read" with `read: true`.
+  - "Not delivered" / "Not confirmed" from the feed items.
+  - A send that fails is kept as a draft, with its error. It is never
+    shown as sent.
+- **Held** (§3.6.3, §3.6.5): the desktop can't do the owner check.
+  - Sends are answered `owner_check_required`, so the text stays a
+    draft.
+  - The views show the hold, the waiting counts and a line that sends
+    the member to the phone (the wording goes to the owner with 5.5),
+    and hide the cached connections and messages until the check is
+    done.
+  - Nothing arrives meanwhile. After the check the desktop catches up
+    by reading again (below).
+- **Locked:** requests go unanswered. The desktop shows the lock as
+  `Access` reports it today and keeps nothing on screen that was read
+  under the old unlock.
+- **Catching up:** the `sync.since` cursor is not specified yet (§15
+  item 2). After a session starts, a hold ends or the link was away,
+  the desktop reads `connection.list`, the newest `message.list` page
+  of the conversation on screen, and `feed.list` again.
+
+**The PRs.**
+1. **5.1 — The link carries messages.**
+   - `link.rs` dispatches `message.new`, `sync.event` and `vault.held`
+     to the frontend as typed events. Today anything that `Access`
+     doesn't take is acked and dropped.
+   - While an access session runs, the link polls the mailbox
+     (`Session::poll`) every 5 s (chosen; not in the spec). It stops
+     when the session ends, the vault is held or locked, or the link
+     goes away, and starts again with the next session.
+   - Message plaintext (`message.new`, `message.list`) is held in
+     memory only, for the views that show it. It is never written to
+     disk or `device.enc`, and never logged: logs carry types, ids and
+     sizes.
+   - Rust and TypeScript types follow the spec: `<connection>`, and
+     `message.new` `{connection_id, message_id, direction "in"|"out",
+     text, sent_at, delivered, read, attachment?}`.
+   - `link/fake.rs` answers `connection.*`, `message.*` and `feed.list`,
+     and sends `message.new` and `sync.event`, for the tests.
+   - No UI change yet.
+2. **5.2 — Connections, read-only.**
+   - `list_connections`, `get_connection`,
+     `list_connection_requests` and `decline_connection_request` move
+     off `unavailable.rs` onto the link.
+   - `ConnectionsList` and `ConnectionDetail` show the spec's fields,
+     `relay_held` and pending requests.
+   - The actions that aren't the desktop's say so: invite, approve,
+     rotate, authenticate.
+   - `connection.remove` is a step-up type (§6.8): it waits for the
+     phone's approval, and the UI says so while it waits.
+3. **5.3 — A conversation.**
+   - `get_conversation` (`message.list` with `before`), `send_message`
+     (`{connection_id, text}`), and `mark_message_read` sent as
+     `message.read` when a message is seen.
+   - Live `message.new` and receipt events.
+   - Attachment placeholders.
+   - No conversation for a service connection.
+   - Drafts kept on a failed or held send.
+4. **5.4 — Delivery states and unread.** The `feed.list` items, and the
+   unread count and last message per connection.
+5. **5.5 — Held and locked in these views.** Hide the cached content
+   while held, the waiting counts, the catch-up after the check, and
+   the lock.
+6. **5.6 — Removed:**
+   - commands and types from the old vault with no spec counterpart:
+     `send_agent_message` (`agent.message-reply`), payment content
+     types and `list_wallets` in the conversation,
+     `list_connection_audit` (`connection.audit.list`),
+     `connection.rotate`, `get_connection_verify_state`;
+   - the NATS event decoding in `src/lib/events.ts` and the
+     `vault:*` listeners in `stores/vault.ts`.
+
+Each PR gets an Opus review. The PRs that handle message plaintext
+(5.1 and 5.3) also get the lead's blind pair.
+
+**Tests.**
+- Rust unit tests against `link/fake.rs` for each operation, for the
+  event dispatch, and for held, locked, `session_required`, `forbidden`
+  and `owner_check_required` answers.
+- `node --test` for the plain helpers: message state, unread, titles.
+- Then DT3 from the R33 check list, with D, on Windows, macOS and Linux.
+
+**To confirm before 5.3.** That the staging vault release answers the
+`message.*`, `connection.request.*` and `feed.list` types for a desktop
+as specified, including `message.list` paging (§10.5.2, 0.32.0). If it
+doesn't, that's a vettid-vault issue, not a desktop workaround.
+
+**Acceptance:**
+- From a desktop with an access session, a member can read their
+  connections and pending requests, read a conversation, send and
+  receive text messages, and see delivered, read, held and
+  not-delivered states as Android shows them for the same messages.
+- While the vault is held or locked, nothing cached is shown and
+  nothing is sent.
+- DT3 passes on all three desktops.
 
 ### Phase 6 — Voice + Video calls (~1.5 weeks, optional first pass)
 
