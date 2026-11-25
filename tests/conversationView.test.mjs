@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import {
   MAX_TEXT_BYTES,
   RECEIPT_HOLD_MS,
+  NO_ID_BOUND_MS,
   ATTACHMENT_PLACEHOLDER,
   EMPTY_MESSAGE,
   CHECKING_TEXT,
@@ -15,6 +16,9 @@ import {
   markedRead,
   nextToMark,
   newLocal,
+  knownOutgoing,
+  deadlineOf,
+  seenInView,
   startRetry,
   applySendAnswer,
   applyRetryAnswer,
@@ -38,6 +42,8 @@ import {
   takesMessages,
   conversationAction,
   openLinkQuestion,
+  logoutWiped,
+  returnedElsewhereText,
 } from '../src/lib/conversationView.js';
 
 const FSI = '\u2068';
@@ -188,8 +194,8 @@ test('M2: unconfirmed without an id, or no answer at all, stays unconfirmed and 
   const firstAgain = applySendAnswer(r2.locals, l2.key, { success: false, error: 'x', error_code: 'not_sent' }, 3000);
   assert.equal(firstAgain.locals[0].state, 'unconfirmed');
   assert.deepEqual(firstAgain.returned, []);
-  // Never expired by time without an expires_at.
-  assert.equal(expireDue(r2.locals, 1e15).changed, false);
+  // Without an expires_at it is bounded by NO_ID_BOUND_MS (the L1 test).
+  assert.equal(expireDue(r2.locals, 1000 + NO_ID_BOUND_MS - 1).changed, false);
 });
 
 test('retry_send: settled done is sent, not_done goes back, expired and unreadable read again', () => {
@@ -352,28 +358,71 @@ test('only unconfirmed sends past expires_at expire; a send in flight never does
   assert.equal(expireDue([newLocal(C, 'x', 0)], 1e15).changed, false);
 });
 
-test('M1: an expired send the page shows is dropped, and nothing goes to the box', () => {
-  const at = Date.parse('2026-11-25T10:00:00Z');
-  const e = { ...unconf('hello', at, 'P1'), state: 'expired', since: at + 10 };
-  const page = [msg('9', '2026-11-25T10:00:05Z', { direction: 'out', text: 'hello' })];
-  const r = afterReload([e], C, page, at + 20);
-  assert.equal(r.locals.length, 0);
-  assert.equal(r.recheck, false);
+// What the view had when a send began: an earlier "ok" (A), sent by the vault at 10:00:00.
+const KNOWN_PAGE = [msg('A', '2026-11-25T10:00:00Z', { direction: 'out', text: 'ok' }), msg('B', '2026-11-25T10:00:30Z', { direction: 'in', text: 'hi' })];
+
+/** An expired send of `text` begun at `at` by this computer's clock, knowing `page`. */
+function expiredSend(text, at, page = KNOWN_PAGE) {
+  return { ...unconf(text, at, 'P1'), known: knownOutgoing(page, [], C), state: 'expired', since: at + 10 };
+}
+
+test('M-A: what was known is recorded in the vault’s terms: outgoing ids and the newest outgoing sent_at', () => {
+  const sent = { ...newLocal(C, 'x', 0), state: 'sent', message_id: 'L1', sent_at: '2026-11-25T10:01:00Z' };
+  const k = knownOutgoing(KNOWN_PAGE, [sent, { ...sent, connection_id: 'c2', message_id: 'Z' }], C);
+  assert.deepEqual(k.ids, ['A', 'L1']);
+  assert.equal(k.newest, '2026-11-25T10:01:00Z');
+  assert.deepEqual(knownOutgoing([], [], C), { ids: [], newest: null });
+  assert.deepEqual(newLocal(C, 't', 0, k).known, k);
+});
+
+for (const [skew, at] of [
+  ['this computer behind the vault', Date.parse('2026-11-25T09:50:00Z')],
+  ['this computer ahead of the vault', Date.parse('2026-11-25T10:20:00Z')],
+]) {
+  test(`M-A, ${skew}: a send that went is found by what wasn’t known, whatever this clock says`, () => {
+    const e = expiredSend('ok', at);
+    const page = [...KNOWN_PAGE, msg('C', '2026-11-25T10:01:00Z', { direction: 'out', text: 'ok' })];
+    const r = afterReload([e], C, page, at + 20);
+    assert.equal(r.locals.length, 0);
+  });
+
+  test(`M-A, ${skew}: a send that didn’t go isn’t matched to an earlier same text; it stays as unsent`, () => {
+    const e = expiredSend('ok', at);
+    const r = afterReload([e], C, KNOWN_PAGE, at + 20);
+    assert.equal(r.locals.length, 1);
+    assert.equal(r.locals[0].state, 'unsent');
+    assert.equal(r.locals[0].notice, NOT_FOUND_TEXT);
+  });
+}
+
+test('M-A: a same-text message older than the newest known one (further back than was read) is not it', () => {
+  const at = 1000;
+  const e = expiredSend('ok', at);
+  // "Load older" since brought in an "ok" from before the newest known outgoing message.
+  const page = [msg('O', '2026-11-25T09:00:00Z', { direction: 'out', text: 'ok' }), ...KNOWN_PAGE];
+  assert.equal(afterReload([e], C, page, at + 20).locals[0].state, 'unsent');
+});
+
+test('M-A: a send that began with nothing known matches nothing', () => {
+  const e = { ...unconf('ok', 1000, 'P1'), state: 'expired', since: 1010 };
+  const page = [msg('C', '2026-11-25T10:01:00Z', { direction: 'out', text: 'ok' })];
+  assert.equal(afterReload([e], C, page, 1020).locals[0].state, 'unsent');
+  // A conversation that had no outgoing message yet: any new one is not known.
+  const e2 = expiredSend('ok', 1000, []);
+  assert.equal(afterReload([e2], C, page, 1020).locals.length, 0);
 });
 
 test('M1: an expired send the page doesn’t show is kept on its bubble as unsent, never put in the box', () => {
-  const at = Date.parse('2026-11-25T10:00:00Z');
-  const e = { ...unconf('hello', at, 'P1'), state: 'expired', since: at + 10 };
-  // The same text sent before this send began, another text, or an incoming one: not it.
+  const e = expiredSend('hello', 1000);
+  // Another text, or an incoming one with the same text: not it.
   const page = [
-    msg('7', '2026-11-25T09:59:00Z', { direction: 'out', text: 'hello' }),
-    msg('8', '2026-11-25T10:00:05Z', { direction: 'out', text: 'other' }),
-    msg('9', '2026-11-25T10:00:06Z', { direction: 'in', text: 'hello' }),
+    ...KNOWN_PAGE,
+    msg('8', '2026-11-25T10:01:05Z', { direction: 'out', text: 'other' }),
+    msg('9', '2026-11-25T10:01:06Z', { direction: 'in', text: 'hello' }),
   ];
-  const r = afterReload([e], C, page, at + 20);
+  const r = afterReload([e], C, page, 1020);
   assert.equal(r.locals.length, 1);
   assert.equal(r.locals[0].state, 'unsent');
-  assert.equal(r.locals[0].notice, NOT_FOUND_TEXT);
   // Its "Edit" puts it in an empty box only.
   assert.equal(unsentToDraft(r.locals, { [C]: 'typing' }, r.locals[0].key), null);
   const d = unsentToDraft(r.locals, { [C]: '' }, r.locals[0].key);
@@ -381,25 +430,54 @@ test('M1: an expired send the page doesn’t show is kept on its bubble as unsen
   assert.equal(d?.locals.length, 0);
 });
 
-test('M1: two expired sends of the same text need two page messages', () => {
-  const at = Date.parse('2026-11-25T10:00:00Z');
-  const e1 = { ...unconf('ok', at, 'P1'), state: 'expired', since: at + 10 };
-  const e2 = { ...unconf('ok', at + 1, 'P2'), state: 'expired', since: at + 10 };
-  const page = [msg('9', '2026-11-25T10:00:05Z', { direction: 'out', text: 'ok' })];
-  const r = afterReload([e1, e2], C, page, at + 20);
+test('M1: two expired sends of the same text need two new page messages', () => {
+  const e1 = expiredSend('ok', 1000);
+  const e2 = { ...expiredSend('ok', 1001), pending_id: 'P2' };
+  const page = [...KNOWN_PAGE, msg('C', '2026-11-25T10:01:00Z', { direction: 'out', text: 'ok' })];
+  const r = afterReload([e1, e2], C, page, 1020);
   assert.deepEqual(r.locals.map((l) => l.state), ['unsent']);
 });
 
 test('M2: an unconfirmed send without an id goes once a read shows it, and stays otherwise', () => {
-  const at = Date.parse('2026-11-25T10:00:00Z');
-  const u = { ...newLocal(C, 'hi', at), state: 'unconfirmed', everUnconfirmed: true };
-  const shown = afterReload([u], C, [msg('9', '2026-11-25T10:00:01Z', { direction: 'out', text: 'hi' })], at + 5);
+  const at = 1000;
+  const u = { ...newLocal(C, 'ok', at, knownOutgoing(KNOWN_PAGE, [], C)), state: 'unconfirmed', everUnconfirmed: true };
+  const shown = afterReload([u], C, [...KNOWN_PAGE, msg('C', '2026-11-25T10:01:00Z', { direction: 'out', text: 'ok' })], at + 5);
   assert.equal(shown.locals.length, 0);
-  const not = afterReload([u], C, [], at + 5);
+  // Only the "ok" it knew: not found, still unconfirmed.
+  const not = afterReload([u], C, KNOWN_PAGE, at + 5);
   assert.equal(not.locals[0].state, 'unconfirmed');
   // One with a pending_id waits for its own answers.
-  const p = unconf('hi', at, 'P1');
-  assert.equal(afterReload([p], C, [msg('9', '2026-11-25T10:00:01Z', { direction: 'out', text: 'hi' })], at + 5).locals.length, 1);
+  const p = { ...unconf('ok', at, 'P1'), known: knownOutgoing(KNOWN_PAGE, [], C) };
+  assert.equal(afterReload([p], C, [...KNOWN_PAGE, msg('C', '2026-11-25T10:01:00Z', { direction: 'out', text: 'ok' })], at + 5).locals.length, 1);
+});
+
+test('L1: a send without expires_at expires at at + NO_ID_BOUND_MS, later than any backend window', () => {
+  assert.equal(NO_ID_BOUND_MS, 10 * 60_000);
+  assert.ok(NO_ID_BOUND_MS > (2 + 5) * 60_000);
+  const u = { ...newLocal(C, 'ok', 1000), state: 'unconfirmed', everUnconfirmed: true };
+  assert.equal(deadlineOf(u), 1000 + NO_ID_BOUND_MS);
+  assert.equal(deadlineOf({ ...u, expires_at: 5000 }), 5000);
+  assert.equal(expireDue([u], 1000 + NO_ID_BOUND_MS - 1).changed, false);
+  const e = expireDue([u], 1000 + NO_ID_BOUND_MS);
+  assert.equal(e.changed, true);
+  assert.equal(e.locals[0].state, 'expired');
+  // Then a read that doesn't show it makes it unsent (Edit, Remove).
+  const r = afterReload(e.locals, C, [], 1000 + NO_ID_BOUND_MS + 1);
+  assert.equal(r.locals[0].state, 'unsent');
+});
+
+test('L2: seen at 60% of the bubble, or 60% of the view for a tall one', () => {
+  const view = { height: 500 };
+  assert.equal(seenInView({ isIntersecting: false, intersectionRatio: 0, intersectionRect: { height: 0 }, rootBounds: view }), false);
+  // Not intersecting is never seen, whatever else the entry says (an edge entry at threshold 0).
+  assert.equal(seenInView({ isIntersecting: false, intersectionRatio: 0.6, intersectionRect: { height: 400 }, rootBounds: view }), false);
+  assert.equal(seenInView({ isIntersecting: true, intersectionRatio: 0.59, intersectionRect: { height: 59 }, rootBounds: view }), false);
+  assert.equal(seenInView({ isIntersecting: true, intersectionRatio: 0.6, intersectionRect: { height: 60 }, rootBounds: view }), true);
+  // A bubble three times the view's height can't reach 60% of itself.
+  assert.equal(seenInView({ isIntersecting: true, intersectionRatio: 0.33, intersectionRect: { height: 500 }, rootBounds: view }), true);
+  assert.equal(seenInView({ isIntersecting: true, intersectionRatio: 0.19, intersectionRect: { height: 299 }, rootBounds: view }), false);
+  assert.equal(seenInView({ isIntersecting: true, intersectionRatio: 0.2, intersectionRect: { height: 300 }, rootBounds: view }), true);
+  assert.equal(seenInView({ isIntersecting: true, intersectionRatio: 0.3, intersectionRect: { height: 300 }, rootBounds: null }), false);
 });
 
 test('after a read: unreadable sends go (they were done), sent ones go once the page has them; L5 recheck', () => {
@@ -554,4 +632,18 @@ test('inbound batches: dropped while not live, a resync reads the newest page', 
 
 test('the link question names the host, isolated', () => {
   assert.equal(openLinkQuestion('example.com'), `Open this link in your browser? It goes to ${FSI}example.com${PDI}.`);
+});
+
+test('L3: kept sends and drafts go only when the log-out wiped this desktop', () => {
+  assert.equal(logoutWiped({ revoke_sent: true, local_wiped: true }), true);
+  assert.equal(logoutWiped({ revoke_sent: false, local_wiped: true }), true);
+  assert.equal(logoutWiped({ revoke_sent: true, local_wiped: false }), false);
+  assert.equal(logoutWiped({}), false);
+  assert.equal(logoutWiped(null), false);
+  assert.equal(logoutWiped(undefined), false);
+});
+
+test('L4: a text back in another conversation is said with its title, isolated', () => {
+  assert.equal(returnedElsewhereText('Ada King'), `Your message to ${FSI}Ada King${PDI} wasn't sent. Its text is back in that conversation.`);
+  assert.equal(returnedElsewhereText(''), "Your message to a connection wasn't sent. Its text is back in that conversation.");
 });

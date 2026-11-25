@@ -8,7 +8,7 @@
 // Message text is plaintext: these helpers keep it in memory only and never
 // log it.
 
-import { isEmptyText, relayHeldText } from './connectionView.js';
+import { isEmptyText, relayHeldText, inSentence } from './connectionView.js';
 
 /** `message.send`'s bound on `text`, in UTF-8 bytes (§10.5; `MAX_TEXT_LEN` in link/inbound.rs). */
 export const MAX_TEXT_BYTES = 16 * 1024;
@@ -29,7 +29,19 @@ export const CHECKING_TEXT = 'Checking whether your vault sent this…';
 /** On a send that expired unconfirmed and that the conversation, read again
  *  since, doesn't show: its text is kept for the member to send again. */
 export const NOT_FOUND_TEXT =
-  "Your vault didn't confirm this message, and it isn't in the conversation. It may not have been sent.";
+  "Your vault didn't confirm this message, and this desktop didn't find it in your recent messages. It may not have been sent.";
+
+/**
+ * How long after it began a send without `expires_at` (no `pending_id`: the
+ * call itself failed, or `unconfirmed` came without one) is taken as able to
+ * arrive. Later than any `expires_at` the backend could have given it: its
+ * `exp` is `ops::CHANGE_TTL` (2 minutes) plus `ops::KEPT_MARGIN` (5 minutes)
+ * from when the send held the link, and the send may have waited for the
+ * link first (another operation holds it for up to `ops::OP_HOLD_MAX`, 8 s
+ * each), so 10 minutes leaves room for that wait. Past it the send is
+ * expired: the conversation is read again before its text is offered.
+ */
+export const NO_ID_BOUND_MS = 10 * 60_000;
 
 // NEW TEXT (owner approval needed)
 /** §10.5.1 "Desktops": a message's attachment, in place of a thumbnail. */
@@ -216,8 +228,13 @@ export function nextToMark(messages, tried, seen) {
  * `everUnconfirmed`: it was unconfirmed once, so it never goes back to a
  * draft on its own (only `settled: "not_done"` or a read that doesn't show
  * it after it expired).
+ * `known`: what the view had of this connection's outgoing messages when
+ * the send began, in the vault's own terms (`knownOutgoing`): a page
+ * message matches the send only if it isn't one of them. Without it the
+ * send matches nothing (it becomes `unsent` rather than vanish).
  * @typedef {{
  *   key: string, connection_id: string, text: string, at: number,
+ *   known?: { ids: string[], newest: string | null },
  *   state: 'sending' | 'sent' | 'unconfirmed' | 'expired' | 'unreadable' | 'unsent',
  *   retry?: boolean, everUnconfirmed?: boolean,
  *   pending_id?: string, expires_at?: number, notice?: string, since?: number,
@@ -231,15 +248,53 @@ export function nextToMark(messages, tried, seen) {
 let localSeq = 0;
 
 /**
- * A new send, `sending`.
+ * A new send, `sending`, with what the view knew of the connection's
+ * outgoing messages then (`knownOutgoing`), if it had read them.
  * @param {string} connectionId
  * @param {string} text
  * @param {number} now
+ * @param {{ ids: string[], newest: string | null }} [known]
  * @returns {Local}
  */
-export function newLocal(connectionId, text, now) {
+export function newLocal(connectionId, text, now, known) {
   localSeq += 1;
-  return { key: `local:${now}:${localSeq}`, connection_id: connectionId, text, at: now, state: 'sending' };
+  /** @type {Local} */
+  const l = { key: `local:${now}:${localSeq}`, connection_id: connectionId, text, at: now, state: 'sending' };
+  if (known) l.known = known;
+  return l;
+}
+
+/**
+ * The connection's outgoing messages the view has (its pages, live
+ * messages, and its own sends answered with a `message_id`): their ids and
+ * the newest `sent_at`, both the vault's. A page holds the newest messages,
+ * so a message on a later newest page that wasn't known when a send began
+ * is newer than every known one, unless it was further back than the view
+ * had read: hence also the newest `sent_at` (vault time against vault time,
+ * never this computer's clock).
+ * @param {Message[]} messages
+ * @param {Local[]} locals
+ * @param {string} connectionId
+ * @returns {{ ids: string[], newest: string | null }}
+ */
+export function knownOutgoing(messages, locals, connectionId) {
+  /** @type {Array<{ message_id: string, sent_at: string }>} */
+  const outs = [];
+  for (const m of messages) if (m.connection_id === connectionId && m.direction === 'out') outs.push(m);
+  for (const l of locals) if (l.connection_id === connectionId && l.message_id && l.sent_at) outs.push({ message_id: l.message_id, sent_at: l.sent_at });
+  /** @type {string | null} */
+  let newest = null;
+  for (const m of outs) if (newest === null || ms(m.sent_at) > ms(newest)) newest = m.sent_at;
+  return { ids: [...new Set(outs.map((m) => m.message_id))], newest };
+}
+
+/**
+ * Until when an unconfirmed send may still arrive: its `expires_at`, else
+ * `at` plus NO_ID_BOUND_MS.
+ * @param {Local} l
+ */
+export function deadlineOf(l) {
+  return l.expires_at ?? l.at + NO_ID_BOUND_MS;
 }
 
 /**
@@ -430,9 +485,10 @@ export function dedupeLocals(locals) {
 }
 
 /**
- * Unconfirmed sends past their `expires_at` (the backend's: `exp` plus its
- * margin): expired, so the conversation is read again before anything is
- * offered. A send in flight, and one without `expires_at`, is left as it is.
+ * Unconfirmed sends past their deadline (`deadlineOf`: the backend's
+ * `expires_at`, `exp` plus its margin, or NO_ID_BOUND_MS for a send without
+ * one): expired, so the conversation is read again before anything is
+ * offered. A send in flight is left as it is.
  * @param {Local[]} locals
  * @param {number} now
  * @returns {{ locals: Local[], changed: boolean }}
@@ -440,7 +496,7 @@ export function dedupeLocals(locals) {
 export function expireDue(locals, now) {
   let changed = false;
   const out = locals.map((l) => {
-    if (l.state !== 'unconfirmed' || l.expires_at == null || now < l.expires_at) return l;
+    if (l.state !== 'unconfirmed' || now < deadlineOf(l)) return l;
     changed = true;
     return { ...l, state: /** @type {const} */ ('expired'), notice: CHECKING_TEXT, since: now };
   });
@@ -452,8 +508,10 @@ export function expireDue(locals, now) {
  * - a sent message the page has is no longer kept here;
  * - an unreadable send (it was done) is dropped;
  * - an expired send, and an unconfirmed one without a `pending_id`, is
- *   looked for on the page: an outgoing message with the same text, sent at
- *   or after the send began, each page message matching one send. Found, it
+ *   looked for on the page: an outgoing message with the same text that the
+ *   view didn't know when the send began (not among `known.ids`, and sent
+ *   no earlier than `known.newest`, by the vault's clock), each page
+ *   message matching one send. Found, it
  *   is dropped (the page shows it); not found, an expired send is `unsent`
  *   (its text kept on the bubble, never put in the box), and one without a
  *   `pending_id` stays unconfirmed;
@@ -472,7 +530,9 @@ export function afterReload(locals, connectionId, page, startedAt) {
   const outs = page.filter((m) => m.direction === 'out');
   /** @param {Local} l */
   const found = (l) => {
-    const m = outs.find((x) => !used.has(x.message_id) && x.text === l.text && ms(x.sent_at) >= l.at);
+    const k = l.known;
+    if (!k) return false;
+    const m = outs.find((x) => !used.has(x.message_id) && x.text === l.text && !k.ids.includes(x.message_id) && (k.newest === null || ms(x.sent_at) >= ms(k.newest)));
     if (m) used.add(m.message_id);
     return !!m;
   };
@@ -823,6 +883,18 @@ export function tooLongText(bytes) {
   return `This message is too long to send: ${bytes.toLocaleString('en-US')} of ${MAX_TEXT_BYTES.toLocaleString('en-US')} bytes.`;
 }
 
+/**
+ * Whether a bubble counts as seen (thresholds [0, 0.6]): at least 60% of it
+ * in view, or, for one taller than the view, 60% of the view's height
+ * covered by it.
+ * @param {{ isIntersecting: boolean, intersectionRatio: number, intersectionRect: { height: number }, rootBounds: { height: number } | null }} e
+ */
+export function seenInView(e) {
+  if (!e.isIntersecting) return false;
+  if (e.intersectionRatio >= 0.6) return true;
+  return !!e.rootBounds && e.rootBounds.height > 0 && e.intersectionRect.height >= 0.6 * e.rootBounds.height;
+}
+
 /** Whether a connection takes messages (§10.5: a service connection doesn't). */
 export function takesMessages(/** @type {{ peer_kind?: string }} */ c) {
   return c.peer_kind !== 'service';
@@ -849,6 +921,30 @@ export function conversationAction(batch, live) {
 export function openLinkQuestion(host) {
   return `Open this link in your browser? It goes to ${FSI}${host}${PDI}.`;
 }
+
+// NEW TEXT (owner approval needed)
+/**
+ * Shown in the open conversation when a text went back to another
+ * connection (its earlier send wasn't done): to its box, or as a bubble.
+ * @param {string} title
+ */
+export function returnedElsewhereText(title) {
+  return `Your message to ${inSentence(title)} wasn't sent. Its text is back in that conversation.`;
+}
+
+/**
+ * Whether a log-out's answer lets the kept sends and drafts go: only when
+ * it says this desktop's local state was wiped (`local_wiped`, the logout
+ * command's `LogoutResponse`). A failed or partial log-out keeps them.
+ * @param {{ local_wiped?: unknown } | null | undefined} result
+ */
+export function logoutWiped(result) {
+  return result?.local_wiped === true;
+}
+
+// NEW TEXT (owner approval needed)
+/** The title of an unsent bubble's Edit while the box has text. */
+export const EDIT_NEEDS_EMPTY_BOX = 'Edit puts this text in the message box once the box is empty.';
 
 // NEW TEXT (owner approval needed)
 /** When the system wouldn't open a link (the app's shell scope refuses most hosts). */
