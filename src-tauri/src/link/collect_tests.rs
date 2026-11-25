@@ -109,3 +109,40 @@ async fn the_collect_loop_delivers_and_ends_with_the_link() {
     tokio::time::sleep(COLLECT_EVERY * 2).await;
     assert!(task.is_finished(), "the loop didn't end with the link");
 }
+
+/// The collector doesn't long-poll: it holds the link's lock only for the
+/// exchange (wait=0 at the relay).
+#[tokio::test]
+async fn a_collect_doesnt_wait_at_the_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await;
+    let before = vault.waits().len();
+    assert!(link.collect().await);
+    let waits = vault.waits();
+    assert!(waits.len() > before, "no collect");
+    assert!(waits[before..].iter().all(|w| *w == 0), "{waits:?}");
+}
+
+/// A lock notice collected with a message drops the message (§3.6.5).
+#[tokio::test]
+async fn a_lock_notice_drops_what_came_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await;
+    vault.event("message.new", MSG, Utc::now());
+    vault.lock_vault(None);
+    link.collect().await;
+    assert_eq!(link.take_inbound(), InboundBatch { messages: vec![], resync: true });
+}
+
+/// A session replaced (a new grant) drops what was queued under the old
+/// one: the views read again under the new one.
+#[tokio::test]
+async fn a_new_grant_drops_the_old_sessions_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await;
+    vault.event("message.new", MSG, Utc::now());
+    let until = vettid_vms::envelope::format_ts(Utc::now() + TimeDelta::hours(2));
+    vault.event("device.session.granted", &format!("{{\"session_id\":\"s-2\",\"expires_at\":\"{until}\"}}"), Utc::now());
+    link.collect().await;
+    assert_eq!(link.take_inbound(), InboundBatch { messages: vec![], resync: true });
+}

@@ -121,3 +121,16 @@ fn the_wire_shape_for_the_frontend() {
     assert_eq!(v["messages"][0]["body"]["text"], "hello there");
     assert_eq!(v["resync"], false);
 }
+
+/// Only each kind's members pass, and a string member is bounded.
+#[test]
+fn sync_members_are_the_kinds_own() {
+    let body = r#"{"kind":"connection.changed","connection_id":"c-1","version":3,"extra":"x","note":{"a":1}}"#;
+    let Some(Ok(Inbound::Sync(e))) = parse(&inner(TYPE_SYNC_EVENT, body)) else { panic!() };
+    assert_eq!(e.members.len(), 2, "{:?}", e.members);
+    assert!(e.members.contains_key("connection_id") && e.members.contains_key("version"));
+    let long = format!(r#"{{"kind":"message.read","connection_id":"{}","message_id":"m"}}"#, "c".repeat(MAX_MEMBER_LEN + 1));
+    assert_eq!(parse(&inner(TYPE_SYNC_EVENT, &long)), Some(Err(Unreadable)));
+    let nested = r#"{"kind":"message.read","connection_id":{"x":1},"message_id":"m"}"#;
+    assert_eq!(parse(&inner(TYPE_SYNC_EVENT, nested)), Some(Err(Unreadable)));
+}

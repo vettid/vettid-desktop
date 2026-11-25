@@ -1049,6 +1049,16 @@ impl<T: Transport, C: Clock> Session<T, C> {
         self.poll_batch(store, POLL_WAIT_SECS as u64).await
     }
 
+    /// [`Session::poll`] without the long-poll: the relay answers at once
+    /// with what is waiting (RELAY-PROTOCOL §6.3, `wait=0`). For a caller
+    /// that polls on its own timer and must not hold its lock for a wait.
+    pub async fn poll_now(&mut self, store: &mut impl Persist) -> Result<Vec<Inner>, SessionError> {
+        if !self.held.is_empty() {
+            return Ok(std::mem::take(&mut self.held));
+        }
+        self.poll_batch(store, 0).await
+    }
+
     async fn poll_batch(&mut self, store: &mut impl Persist, wait_secs: u64) -> Result<Vec<Inner>, SessionError> {
         // #107 (review M2): an earlier confirmation may be stale (the clock
         // can jump back over a sleep); only this poll's own collect counts,

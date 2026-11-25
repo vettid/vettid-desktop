@@ -696,36 +696,52 @@ impl<T: Transport, C: Clock> Link<T, C> {
         for m in self.session.take_held() {
             let e = self.access.observe(&mut self.session, &mut self.store, &m);
             self.noted(&e);
-            self.inbound.take(&m);
+            self.route(&m);
         }
     }
 
-    /// While an access session runs, collect the mailbox (Phase 5, 5.1):
-    /// session events go to [`Access::observe`], messages for the views to
-    /// the inbound queue. Nothing is collected without a live session, and
-    /// the queue is emptied then (nothing read before is shown). `false`
-    /// if there was no session to collect for.
+    /// Whether the views may get what the vault sends now: the session is
+    /// live as the screen shows it ([`Snapshot::active_at`]: confirmed,
+    /// not stale, the vault Open), and the device isn't refused.
+    fn views_live(&self, now: DateTime<Utc>) -> bool {
+        !self.refused() && self.snapshot(now).active_at(now)
+    }
+
+    /// Keep `m` for the views, if they may have it ([`Link::views_live`]);
+    /// nothing is queued while no session is live (Phase 5, 5.1).
+    fn route(&mut self, m: &vettid_vms::envelope::Inner) {
+        if self.views_live(Utc::now()) {
+            self.inbound.take(m);
+        }
+    }
+
+    /// While an access session is live, collect the mailbox (Phase 5, 5.1)
+    /// with no wait at the relay, so the link's lock is held only for the
+    /// exchange: session events go to [`Access::observe`], messages for the
+    /// views to the inbound queue. A sleep is looked for first, as the
+    /// refresh loop does; a collect doesn't count as the vault answering
+    /// (what waited during a sleep proves nothing about now). Not live,
+    /// before or after: nothing collected is kept, and the queue is emptied
+    /// (nothing read before is shown). `false` if there was no session to
+    /// collect for.
     pub async fn collect(&mut self) -> bool {
-        if self.refused() || !self.access.active_at(Utc::now()) {
+        self.check_gap(Utc::now());
+        if !self.views_live(Utc::now()) {
             self.inbound.clear();
             return false;
         }
-        match self.session.poll(&mut self.store).await {
+        match self.session.poll_now(&mut self.store).await {
             Ok(msgs) => {
                 self.reachable = true;
-                if !msgs.is_empty() {
-                    self.vault_answered();
-                }
                 for m in &msgs {
                     let e = self.access.observe(&mut self.session, &mut self.store, m);
                     self.noted(&e);
-                    self.inbound.take(m);
+                    self.route(m);
                 }
             }
             Err(e) => log::info!("link: collecting: {}", e),
         }
-        self.note_refused().await;
-        if !self.access.active_at(Utc::now()) {
+        if !self.views_live(Utc::now()) {
             self.inbound.clear();
         }
         true
@@ -752,8 +768,13 @@ impl<T: Transport, C: Clock> Link<T, C> {
             self.backoff = None;
             self.read_now = true;
         }
-        // Held or locked: nothing read before is shown (§3.6.5).
-        if matches!(e, Ok(Some(AccessEvent::Locked | AccessEvent::Held))) {
+        // Held, locked, a lock notice to place, or the session ended,
+        // denied or replaced: nothing queued before is shown (§3.6.5; the
+        // views read again under the session that is live then).
+        if matches!(
+            e,
+            Ok(Some(AccessEvent::Locked | AccessEvent::Held | AccessEvent::ReadStatus | AccessEvent::Ended | AccessEvent::Denied | AccessEvent::Granted(_)))
+        ) {
             self.inbound.clear();
         }
     }
@@ -1217,7 +1238,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
                     for m in &msgs {
                         let e = self.access.observe(&mut self.session, &mut self.store, m);
                         self.noted(&e);
-                        self.inbound.take(m);
+                        self.route(m);
                         match e {
                             Ok(Some(AccessEvent::Granted(_))) => granted = true,
                             // A denial from before this request's answer is
@@ -1579,10 +1600,17 @@ pub async fn collect_loop<T: Transport, C: Clock>(
     }
 }
 
-/// [`collect_loop`] as a task over the shared link.
+/// [`collect_loop`] as a task over the shared link. Just before handing a
+/// batch on it looks at what the screen shows ([`Shared`]'s snapshot): if
+/// the session is no longer live there (an End session published while
+/// this round ran), the messages are dropped and only the resync goes.
 pub fn spawn_collect(shared: Shared) -> JoinHandle<()> {
     tokio::spawn(async move {
-        collect_loop(&shared.link, COLLECT_EVERY, |b| {
+        collect_loop(&shared.link, COLLECT_EVERY, |mut b| {
+            let now = Utc::now();
+            if !shared.snapshot.read().unwrap_or_else(|p| p.into_inner()).active_at(now) {
+                b = inbound::InboundBatch { messages: Vec::new(), resync: true };
+            }
             let d = shared.deliver.read().unwrap_or_else(|p| p.into_inner()).clone();
             if let Some(d) = d {
                 d(b);

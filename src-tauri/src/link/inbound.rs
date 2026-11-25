@@ -24,20 +24,27 @@ pub const MAX_QUEUED: usize = 256;
 pub const TYPE_MESSAGE_NEW: &str = "message.new";
 pub const TYPE_SYNC_EVENT: &str = "sync.event";
 
-/// The `sync.event` kinds the Phase 5 views follow (§10.1); others are
-/// not this desktop's to show yet, and are dropped.
-pub const SYNC_KINDS: &[&str] = &[
-    "message.receipt",
-    "message.read",
-    "message.attachment",
-    "connection.changed",
-    "connection.request",
-    "block.added",
-    "block.removed",
-    "feed.updated",
-    "feed.deleted",
-    "owner_check",
+/// The `sync.event` kinds the Phase 5 views follow, with their members
+/// (§10.1); other kinds are not this desktop's to show yet and are dropped,
+/// and other members are ignored. Besides the plan's message, connection
+/// and block kinds: `message.attachment` (a placeholder's state), the feed
+/// kinds (delivery failures are feed items) and `owner_check` (a hold
+/// ended: read again).
+pub const SYNC_KINDS: &[(&str, &[&str])] = &[
+    ("message.receipt", &["connection_id", "message_id", "receipt"]),
+    ("message.read", &["connection_id", "message_id"]),
+    ("message.attachment", &["connection_id", "message_id", "state", "reason"]),
+    ("connection.changed", &["connection_id", "version"]),
+    ("connection.request", &["pending_id", "connection_id", "state"]),
+    ("block.added", &["block_id"]),
+    ("block.removed", &["block_id"]),
+    ("feed.updated", &["item_id", "seq"]),
+    ("feed.deleted", &["item_id", "seq"]),
+    ("owner_check", &["deadline"]),
 ];
+
+/// The longest string member passed on (§10.1's bound on strings).
+pub const MAX_MEMBER_LEN: usize = 4096;
 
 /// `message.new` (§10.5): an incoming message, or one another of the
 /// owner's devices sent.
@@ -154,6 +161,10 @@ pub fn parse(m: &Inner) -> Option<Result<Inbound, Unreadable>> {
     }
 }
 
+// SECURITY: the text passes through serde_json's own strings here, and
+// through Tauri's serialization on its way to the window; those copies are
+// freed without wiping. What this module keeps is wiped (Zeroizing), and
+// none of it reaches disk or a log.
 fn parse_message(body: &str) -> Result<MessageNew, Unreadable> {
     let v: serde_json::Value = serde_json::from_str(body).map_err(|_| Unreadable)?;
     let o = v.as_object().ok_or(Unreadable)?;
@@ -200,10 +211,23 @@ fn parse_sync(body: &str) -> Option<Result<SyncEvent, Unreadable>> {
         Some(serde_json::Value::String(k)) => k,
         _ => return Some(Err(Unreadable)),
     };
-    if !SYNC_KINDS.contains(&kind.as_str()) {
+    let Some((_, allowed)) = SYNC_KINDS.iter().find(|(k, _)| *k == kind) else {
         return None;
+    };
+    let mut members = serde_json::Map::new();
+    for name in *allowed {
+        match o.remove(*name) {
+            None => {}
+            Some(v @ (serde_json::Value::Number(_) | serde_json::Value::Bool(_))) => {
+                members.insert((*name).to_string(), v);
+            }
+            Some(serde_json::Value::String(t)) if t.len() <= MAX_MEMBER_LEN => {
+                members.insert((*name).to_string(), serde_json::Value::String(t));
+            }
+            Some(_) => return Some(Err(Unreadable)),
+        }
     }
-    Some(Ok(SyncEvent { kind, members: o }))
+    Some(Ok(SyncEvent { kind, members }))
 }
 
 /// The messages waiting for the next delivery.
@@ -247,6 +271,7 @@ impl Queue {
         self.q.clear();
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.q.is_empty() && !self.resync
     }
