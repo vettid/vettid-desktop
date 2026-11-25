@@ -134,3 +134,28 @@ fn sync_members_are_the_kinds_own() {
     let nested = r#"{"kind":"message.read","connection_id":{"x":1},"message_id":"m"}"#;
     assert_eq!(parse(&inner(TYPE_SYNC_EVENT, nested)), Some(Err(Unreadable)));
 }
+
+/// Bounds and types: text up to 16 KiB, ids and fields bounded; a sync
+/// member of the wrong type is unreadable, a null one absent.
+#[test]
+fn bounds_and_types() {
+    let with_text = |t: &str| MSG.replace("hello there", t);
+    assert!(matches!(parse(&inner(TYPE_MESSAGE_NEW, &with_text(&"x".repeat(MAX_TEXT_LEN)))), Some(Ok(_))));
+    assert_eq!(parse(&inner(TYPE_MESSAGE_NEW, &with_text(&"x".repeat(MAX_TEXT_LEN + 1)))), Some(Err(Unreadable)));
+    assert_eq!(parse(&inner(TYPE_MESSAGE_NEW, &MSG.replace("m-1", &"m".repeat(MAX_ID_LEN + 1)))), Some(Err(Unreadable)));
+    let att = |extra: &str| {
+        format!(
+            r#"{{"connection_id":"c","message_id":"m","direction":"in","text":"","sent_at":"2026-11-25T10:00:00Z","delivered":true,"read":false,"attachment":{{"att_id":"a","kind":"photo","size":1,"width":1,"height":1,"state":"stored"{extra}}}}}"#
+        )
+    };
+    assert!(matches!(parse(&inner(TYPE_MESSAGE_NEW, &att(r#","mime":null"#))), Some(Ok(_))));
+    assert_eq!(parse(&inner(TYPE_MESSAGE_NEW, &att(r#","mime":7"#))), Some(Err(Unreadable)));
+    let long_reason = format!(r#","reason":"{}""#, "r".repeat(MAX_FIELD_LEN + 1));
+    assert_eq!(parse(&inner(TYPE_MESSAGE_NEW, &att(&long_reason))), Some(Err(Unreadable)));
+    assert_eq!(parse(&inner(TYPE_SYNC_EVENT, r#"{"kind":"connection.changed","connection_id":"c","version":"3"}"#)), Some(Err(Unreadable)));
+    assert_eq!(parse(&inner(TYPE_SYNC_EVENT, r#"{"kind":"connection.changed","connection_id":7}"#)), Some(Err(Unreadable)));
+    let null_reason = r#"{"kind":"message.attachment","connection_id":"c","message_id":"m","state":"failed","reason":null}"#;
+    let Some(Ok(Inbound::Sync(e))) = parse(&inner(TYPE_SYNC_EVENT, null_reason)) else { panic!() };
+    assert!(!e.members.contains_key("reason"));
+    assert_eq!(parse(&inner(TYPE_SYNC_EVENT, r#"{"kind":"owner_check","deadline":"x"}"#)), None, "not followed");
+}

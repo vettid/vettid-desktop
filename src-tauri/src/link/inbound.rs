@@ -24,27 +24,42 @@ pub const MAX_QUEUED: usize = 256;
 pub const TYPE_MESSAGE_NEW: &str = "message.new";
 pub const TYPE_SYNC_EVENT: &str = "sync.event";
 
-/// The `sync.event` kinds the Phase 5 views follow, with their members
-/// (§10.1); other kinds are not this desktop's to show yet and are dropped,
-/// and other members are ignored. Besides the plan's message, connection
-/// and block kinds: `message.attachment` (a placeholder's state), the feed
-/// kinds (delivery failures are feed items) and `owner_check` (a hold
-/// ended: read again).
-pub const SYNC_KINDS: &[(&str, &[&str])] = &[
-    ("message.receipt", &["connection_id", "message_id", "receipt"]),
-    ("message.read", &["connection_id", "message_id"]),
-    ("message.attachment", &["connection_id", "message_id", "state", "reason"]),
-    ("connection.changed", &["connection_id", "version"]),
-    ("connection.request", &["pending_id", "connection_id", "state"]),
-    ("block.added", &["block_id"]),
-    ("block.removed", &["block_id"]),
-    ("feed.updated", &["item_id", "seq"]),
-    ("feed.deleted", &["item_id", "seq"]),
-    ("owner_check", &["deadline"]),
+/// A `sync.event` member's type (§10.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Member {
+    Str,
+    Num,
+}
+
+/// The `sync.event` kinds the Phase 5 views follow, with their members and
+/// their types (§10.1); other kinds are not this desktop's to show yet and
+/// are dropped, and other members are ignored. Besides the plan's message,
+/// connection and block kinds: `message.attachment` (a placeholder's state)
+/// and the feed kinds (delivery failures are feed items).
+pub const SYNC_KINDS: &[(&str, &[(&str, Member)])] = &[
+    ("message.receipt", &[("connection_id", Member::Str), ("message_id", Member::Str), ("receipt", Member::Str)]),
+    ("message.read", &[("connection_id", Member::Str), ("message_id", Member::Str)]),
+    ("message.attachment", &[("connection_id", Member::Str), ("message_id", Member::Str), ("state", Member::Str), ("reason", Member::Str)]),
+    ("connection.changed", &[("connection_id", Member::Str), ("version", Member::Num)]),
+    ("connection.request", &[("pending_id", Member::Str), ("connection_id", Member::Str), ("state", Member::Str)]),
+    ("block.added", &[("block_id", Member::Str)]),
+    ("block.removed", &[("block_id", Member::Str)]),
+    ("feed.updated", &[("item_id", Member::Str), ("seq", Member::Num)]),
+    ("feed.deleted", &[("item_id", Member::Str), ("seq", Member::Num)]),
 ];
 
 /// The longest string member passed on (§10.1's bound on strings).
 pub const MAX_MEMBER_LEN: usize = 4096;
+
+/// The longest message text (§10.5: 1 B to 16 KiB).
+pub const MAX_TEXT_LEN: usize = 16 * 1024;
+
+/// The longest id this desktop takes (connection, message, attachment).
+pub const MAX_ID_LEN: usize = 128;
+
+/// The longest other string in a message (time, attachment kind, mime,
+/// state, reason).
+pub const MAX_FIELD_LEN: usize = 256;
 
 /// `message.new` (§10.5): an incoming message, or one another of the
 /// owner's devices sent.
@@ -168,18 +183,22 @@ pub fn parse(m: &Inner) -> Option<Result<Inbound, Unreadable>> {
 fn parse_message(body: &str) -> Result<MessageNew, Unreadable> {
     let v: serde_json::Value = serde_json::from_str(body).map_err(|_| Unreadable)?;
     let o = v.as_object().ok_or(Unreadable)?;
-    let s = |k: &str| o.get(k).and_then(|v| v.as_str()).map(str::to_string).ok_or(Unreadable);
+    let s = |k: &str, max: usize| o.get(k).and_then(|v| v.as_str()).filter(|t| t.len() <= max).map(str::to_string).ok_or(Unreadable);
     let b = |k: &str| o.get(k).and_then(|v| v.as_bool()).ok_or(Unreadable);
     let direction = match o.get("direction").and_then(|v| v.as_str()) {
         Some("in") => Direction::In,
         Some("out") => Direction::Out,
         _ => return Err(Unreadable),
     };
-    let (connection_id, message_id, sent_at) = (s("connection_id")?, s("message_id")?, s("sent_at")?);
+    let (connection_id, message_id, sent_at) = (s("connection_id", MAX_ID_LEN)?, s("message_id", MAX_ID_LEN)?, s("sent_at", MAX_FIELD_LEN)?);
     if connection_id.is_empty() || message_id.is_empty() || chrono::DateTime::parse_from_rfc3339(&sent_at).is_err() {
         return Err(Unreadable);
     }
-    let text = Zeroizing::new(o.get("text").and_then(|v| v.as_str()).ok_or(Unreadable)?.to_string());
+    let text = o.get("text").and_then(|v| v.as_str()).ok_or(Unreadable)?;
+    if text.len() > MAX_TEXT_LEN {
+        return Err(Unreadable);
+    }
+    let text = Zeroizing::new(text.to_string());
     let attachment = match o.get("attachment") {
         None | Some(serde_json::Value::Null) => None,
         Some(a) => Some(parse_attachment(a)?),
@@ -189,17 +208,25 @@ fn parse_message(body: &str) -> Result<MessageNew, Unreadable> {
 
 fn parse_attachment(v: &serde_json::Value) -> Result<Attachment, Unreadable> {
     let o = v.as_object().ok_or(Unreadable)?;
-    let s = |k: &str| o.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    // Absent or null: `None`; a string over `max`, or not a string: unreadable.
+    let opt = |k: &str, max: usize| -> Result<Option<String>, Unreadable> {
+        match o.get(k) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(t)) if t.len() <= max => Ok(Some(t.clone())),
+            Some(_) => Err(Unreadable),
+        }
+    };
+    let req = |k: &str, max: usize| opt(k, max)?.ok_or(Unreadable);
     let n = |k: &str| o.get(k).and_then(|v| v.as_u64()).ok_or(Unreadable);
     Ok(Attachment {
-        att_id: s("att_id").ok_or(Unreadable)?,
-        kind: s("kind").ok_or(Unreadable)?,
-        mime: s("mime"),
+        att_id: req("att_id", MAX_ID_LEN)?,
+        kind: req("kind", MAX_FIELD_LEN)?,
+        mime: opt("mime", MAX_FIELD_LEN)?,
         size: n("size")?,
         width: n("width")?,
         height: n("height")?,
-        state: s("state").ok_or(Unreadable)?,
-        reason: s("reason"),
+        state: req("state", MAX_FIELD_LEN)?,
+        reason: opt("reason", MAX_FIELD_LEN)?,
     })
 }
 
@@ -211,20 +238,19 @@ fn parse_sync(body: &str) -> Option<Result<SyncEvent, Unreadable>> {
         Some(serde_json::Value::String(k)) => k,
         _ => return Some(Err(Unreadable)),
     };
-    let Some((_, allowed)) = SYNC_KINDS.iter().find(|(k, _)| *k == kind) else {
-        return None;
-    };
+    let (_, allowed) = SYNC_KINDS.iter().find(|(k, _)| *k == kind)?;
     let mut members = serde_json::Map::new();
-    for name in *allowed {
-        match o.remove(*name) {
-            None => {}
-            Some(v @ (serde_json::Value::Number(_) | serde_json::Value::Bool(_))) => {
+    for (name, ty) in *allowed {
+        match (o.remove(*name), ty) {
+            // Absent, or null (§10.1): not there.
+            (None | Some(serde_json::Value::Null), _) => {}
+            (Some(v @ serde_json::Value::Number(_)), Member::Num) => {
                 members.insert((*name).to_string(), v);
             }
-            Some(serde_json::Value::String(t)) if t.len() <= MAX_MEMBER_LEN => {
+            (Some(serde_json::Value::String(t)), Member::Str) if t.len() <= MAX_MEMBER_LEN => {
                 members.insert((*name).to_string(), serde_json::Value::String(t));
             }
-            Some(_) => return Some(Err(Unreadable)),
+            _ => return Some(Err(Unreadable)),
         }
     }
     Some(Ok(SyncEvent { kind, members }))
@@ -262,13 +288,26 @@ impl Queue {
         InboundBatch { messages: self.q.drain(..).collect(), resync: std::mem::take(&mut self.resync) }
     }
 
-    /// Drop everything queued (the vault was held or locked, or the session
-    /// ended: nothing read before is shown); the views read again.
+    /// Drop everything queued; the views read again if anything was.
     pub fn clear(&mut self) {
         if !self.q.is_empty() {
             self.resync = true;
         }
         self.q.clear();
+    }
+
+    /// Drop everything queued because the session or the vault changed
+    /// (held, locked, ended, replaced, unreadable): nothing read before is
+    /// shown, and the views read again in any case.
+    pub fn clear_changed(&mut self) {
+        self.q.clear();
+        self.resync = true;
+    }
+
+    /// A message for the views was dropped (no live session): they read
+    /// again once live.
+    pub fn lose(&mut self) {
+        self.resync = true;
     }
 
     #[cfg(test)]

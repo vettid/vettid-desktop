@@ -44,8 +44,7 @@ export interface SyncEvent {
     | 'block.added'
     | 'block.removed'
     | 'feed.updated'
-    | 'feed.deleted'
-    | 'owner_check';
+    | 'feed.deleted';
   /** The event's other members: ids and states, never secret values. */
   members: Record<string, unknown>;
 }

@@ -712,6 +712,9 @@ impl<T: Transport, C: Clock> Link<T, C> {
     fn route(&mut self, m: &vettid_vms::envelope::Inner) {
         if self.views_live(Utc::now()) {
             self.inbound.take(m);
+        } else if inbound::parse(m).is_some() {
+            // One of ours, dropped: the views read again once live.
+            self.inbound.lose();
         }
     }
 
@@ -724,13 +727,13 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// before or after: nothing collected is kept, and the queue is emptied
     /// (nothing read before is shown). `false` if there was no session to
     /// collect for.
-    pub async fn collect(&mut self) -> bool {
+    pub async fn collect(&mut self) -> Collected {
         self.check_gap(Utc::now());
         if !self.views_live(Utc::now()) {
             self.inbound.clear();
-            return false;
+            return Collected::NoSession;
         }
-        match self.session.poll_now(&mut self.store).await {
+        let out = match self.session.poll_now(&mut self.store).await {
             Ok(msgs) => {
                 self.reachable = true;
                 for m in &msgs {
@@ -738,13 +741,17 @@ impl<T: Transport, C: Clock> Link<T, C> {
                     self.noted(&e);
                     self.route(m);
                 }
+                Collected::Ok
             }
-            Err(e) => log::info!("link: collecting: {}", e),
-        }
+            Err(e) => {
+                log::info!("link: collecting: {}", e);
+                Collected::Failed { retry_after: retry_after_of(&e) }
+            }
+        };
         if !self.views_live(Utc::now()) {
-            self.inbound.clear();
+            self.inbound.clear_changed();
         }
-        true
+        out
     }
 
     /// What the vault sent for the views since the last call (see
@@ -771,11 +778,14 @@ impl<T: Transport, C: Clock> Link<T, C> {
         // Held, locked, a lock notice to place, or the session ended,
         // denied or replaced: nothing queued before is shown (§3.6.5; the
         // views read again under the session that is live then).
+        // A message that didn't read is no proof of anything: the same
+        // (fail secure).
         if matches!(
             e,
             Ok(Some(AccessEvent::Locked | AccessEvent::Held | AccessEvent::ReadStatus | AccessEvent::Ended | AccessEvent::Denied | AccessEvent::Granted(_)))
+                | Err(_)
         ) {
-            self.inbound.clear();
+            self.inbound.clear_changed();
         }
     }
 
@@ -1575,46 +1585,105 @@ pub fn spawn_refresh(shared: Shared, first: std::time::Duration) -> JoinHandle<(
     })
 }
 
-/// Collect the mailbox every `every` while an access session runs, and
-/// hand what came for the views to `deliver` (Phase 5, 5.1). A round that
-/// finds the link busy (a command holds it) is skipped: that command's own
-/// polls fill the queue, which the next round delivers. Ends when the link
-/// is gone. Polls stop on their own while there is no session (held,
-/// locked, ended), and start again with the next.
-pub async fn collect_loop<T: Transport, C: Clock>(
-    link: &Mutex<Option<Link<T, C>>>,
-    every: std::time::Duration,
-    deliver: impl Fn(inbound::InboundBatch),
-) {
-    loop {
-        tokio::time::sleep(every).await;
-        let batch = {
-            let Ok(mut slot) = link.try_lock() else { continue };
-            let Some(l) = slot.as_mut() else { return };
-            l.collect().await;
-            l.take_inbound()
-        };
-        if !batch.messages.is_empty() || batch.resync {
-            deliver(batch);
-        }
+/// What a [`Link::collect`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collected {
+    /// No live session: nothing was collected.
+    NoSession,
+    /// The mailbox was collected.
+    Ok,
+    /// The collect failed; the relay may have said when to try again
+    /// (`retry_after`, seconds).
+    Failed { retry_after: Option<u64> },
+}
+
+/// The relay's `retry_after` in a failed collect (RELAY-PROTOCOL §7.2).
+fn retry_after_of(e: &SessionError) -> Option<u64> {
+    match e {
+        SessionError::Relay(vettid_relay::client::RelayError::Relay { retry_after, .. }) => *retry_after,
+        _ => None,
     }
 }
 
-/// [`collect_loop`] as a task over the shared link. Just before handing a
-/// batch on it looks at what the screen shows ([`Shared`]'s snapshot): if
-/// the session is no longer live there (an End session published while
-/// this round ran), the messages are dropped and only the resync goes.
+/// The longest wait between collects after failures.
+pub const COLLECT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The wait before the next collect: [`COLLECT_EVERY`] after one that
+/// worked or had no session; after a failure, the relay's `retry_after`
+/// if it gave one, else double the last wait, at most
+/// [`COLLECT_BACKOFF_MAX`] (RELAY-PROTOCOL §7.2).
+pub fn next_collect_wait(last: std::time::Duration, c: Collected) -> std::time::Duration {
+    match c {
+        Collected::Ok | Collected::NoSession => COLLECT_EVERY,
+        Collected::Failed { retry_after: Some(s) } => std::time::Duration::from_secs(s).clamp(COLLECT_EVERY, COLLECT_BACKOFF_MAX),
+        Collected::Failed { retry_after: None } => (last * 2).clamp(COLLECT_EVERY, COLLECT_BACKOFF_MAX),
+    }
+}
+
+/// Collect the mailbox while an access session runs, and hand what came
+/// for the views to `deliver`, with the link's snapshot as the collect
+/// left it (Phase 5, 5.1). A round that finds the link busy (a command
+/// holds it) is skipped: that command's own polls fill the queue, which the
+/// next round delivers. Ends when the link is gone. Polls stop on their own
+/// while there is no session (held, locked, ended), and start again with
+/// the next. `deliver` gets every round's batch, empty or not, so it can
+/// publish a session that this round found ended.
+pub async fn collect_loop<T: Transport, C: Clock>(
+    link: &Mutex<Option<Link<T, C>>>,
+    every: std::time::Duration,
+    deliver: impl Fn(inbound::InboundBatch, Snapshot),
+) {
+    let mut wait = every;
+    loop {
+        tokio::time::sleep(wait).await;
+        let (batch, snap) = {
+            let Ok(mut slot) = link.try_lock() else { continue };
+            let Some(l) = slot.as_mut() else { return };
+            let c = l.collect().await;
+            wait = if c == Collected::Ok || c == Collected::NoSession { every } else { next_collect_wait(wait, c) };
+            (l.take_inbound(), l.snapshot(Utc::now()))
+        };
+        deliver(batch, snap);
+    }
+}
+
+/// What a round of [`spawn_collect`] does with its batch, given whether the
+/// published snapshot (what the screen shows) and the link's own are live:
+/// the batch to hand on (`None`: nothing), and whether to publish the
+/// link's snapshot first. The screen learns at once that a collect found
+/// the session over (only that direction: the refresh loop publishes the
+/// rest), and the views never get messages while the screen isn't live:
+/// then only the resync goes.
+pub fn gate(b: inbound::InboundBatch, published_live: bool, link_live: bool) -> (Option<inbound::InboundBatch>, bool) {
+    let publish = published_live && !link_live;
+    let any = !b.messages.is_empty() || b.resync;
+    if publish || !published_live {
+        return (any.then(|| inbound::InboundBatch { messages: Vec::new(), resync: true }), publish);
+    }
+    (any.then_some(b), false)
+}
+
+/// [`collect_loop`] as a task over the shared link. Each round goes
+/// through [`gate`]; a batch is handed on while the published snapshot is
+/// held for reading, so an End session or a lock published meanwhile comes
+/// after it, never before.
 pub fn spawn_collect(shared: Shared) -> JoinHandle<()> {
     tokio::spawn(async move {
-        collect_loop(&shared.link, COLLECT_EVERY, |mut b| {
+        collect_loop(&shared.link, COLLECT_EVERY, |b, snap| {
             let now = Utc::now();
-            if !shared.snapshot.read().unwrap_or_else(|p| p.into_inner()).active_at(now) {
-                b = inbound::InboundBatch { messages: Vec::new(), resync: true };
+            let published_live = shared.snapshot.read().unwrap_or_else(|p| p.into_inner()).active_at(now);
+            let (b, publish) = gate(b, published_live, snap.active_at(now));
+            if publish {
+                shared.publish(snap);
             }
+            let Some(b) = b else { return };
             let d = shared.deliver.read().unwrap_or_else(|p| p.into_inner()).clone();
+            let guard = shared.snapshot.read().unwrap_or_else(|p| p.into_inner());
+            let b = if guard.active_at(Utc::now()) { b } else { inbound::InboundBatch { messages: Vec::new(), resync: true } };
             if let Some(d) = d {
                 d(b);
             }
+            drop(guard);
         })
         .await;
     })

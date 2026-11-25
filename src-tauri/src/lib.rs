@@ -78,8 +78,16 @@ pub fn run() {
                 // Phase 5, 5.1: what the vault sent for the connection and
                 // message views reaches the window as `vault:inbound`.
                 let handle = app.handle().clone();
-                let deliver: std::sync::Arc<dyn Fn(link::inbound::InboundBatch) + Send + Sync> = std::sync::Arc::new(move |b| {
-                    let _ = handle.emit(link::inbound::INBOUND_EVENT, b);
+                let lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let deliver: std::sync::Arc<dyn Fn(link::inbound::InboundBatch) + Send + Sync> = std::sync::Arc::new(move |mut b: link::inbound::InboundBatch| {
+                    // A batch that didn't reach the window: the next one
+                    // says resync.
+                    if lost.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        b.resync = true;
+                    }
+                    if handle.emit_to("main", link::inbound::INBOUND_EVENT, b).is_err() {
+                        lost.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                 });
                 *app.state::<AppState>().deliver.write().unwrap_or_else(|p| p.into_inner()) = Some(deliver);
             }

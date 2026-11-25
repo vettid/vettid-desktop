@@ -23,7 +23,7 @@ async fn a_live_session_collects_messages_for_the_views() {
     vault.event("message.new", MSG, Utc::now());
     vault.event("sync.event", RECEIPT, Utc::now());
     vault.event("sync.event", r#"{"kind":"wallet.changed","wallet_id":"w","version":1}"#, Utc::now());
-    assert!(link.collect().await);
+    assert_eq!(link.collect().await, Collected::Ok);
     let b = link.take_inbound();
     assert!(!b.resync);
     assert_eq!(b.messages.len(), 2, "the wallet kind isn't followed");
@@ -42,7 +42,7 @@ async fn no_session_no_collect() {
     link.read_status().await.unwrap();
     vault.event("message.new", MSG, Utc::now());
     let before = vault.collects();
-    assert!(!link.collect().await);
+    assert_eq!(link.collect().await, Collected::NoSession);
     assert_eq!(vault.collects(), before, "the mailbox was collected without a session");
     assert_eq!(link.take_inbound(), InboundBatch::default());
 }
@@ -70,7 +70,7 @@ async fn an_ended_session_drops_the_queue() {
     vault.event("device.session.ended", "{\"reason\":\"ended\"}", Utc::now());
     link.read_status().await.unwrap();
     assert!(!link.snapshot(Utc::now()).active_at(Utc::now()));
-    assert!(!link.collect().await);
+    assert_eq!(link.collect().await, Collected::NoSession);
     assert_eq!(link.take_inbound(), InboundBatch { messages: vec![], resync: true });
 }
 
@@ -81,10 +81,10 @@ async fn a_hold_drops_the_queue() {
     let dir = tempfile::tempdir().unwrap();
     let (vault, mut link) = live(dir.path()).await;
     vault.event("message.new", MSG, Utc::now());
-    assert!(link.collect().await);
+    assert_eq!(link.collect().await, Collected::Ok);
     vault.hold(true, "");
     link.read_status().await.unwrap();
-    assert!(!link.collect().await);
+    assert_eq!(link.collect().await, Collected::NoSession);
     assert_eq!(link.take_inbound(), InboundBatch { messages: vec![], resync: true });
 }
 
@@ -98,7 +98,11 @@ async fn the_collect_loop_delivers_and_ends_with_the_link() {
     let got = Arc::new(std::sync::Mutex::new(Vec::<InboundBatch>::new()));
     let task = {
         let (slot, got) = (slot.clone(), got.clone());
-        tokio::spawn(async move { collect_loop(&slot, COLLECT_EVERY, |b| got.lock().unwrap().push(b)).await })
+        tokio::spawn(async move { collect_loop(&slot, COLLECT_EVERY, |b, _| {
+            if !b.messages.is_empty() || b.resync {
+                got.lock().unwrap().push(b)
+            }
+        }).await })
     };
     tokio::time::sleep(COLLECT_EVERY * 2 + std::time::Duration::from_millis(10)).await;
     assert!(got.lock().unwrap().is_empty(), "empty rounds deliver nothing");
@@ -117,7 +121,7 @@ async fn a_collect_doesnt_wait_at_the_relay() {
     let dir = tempfile::tempdir().unwrap();
     let (vault, mut link) = live(dir.path()).await;
     let before = vault.waits().len();
-    assert!(link.collect().await);
+    assert_eq!(link.collect().await, Collected::Ok);
     let waits = vault.waits();
     assert!(waits.len() > before, "no collect");
     assert!(waits[before..].iter().all(|w| *w == 0), "{waits:?}");
@@ -145,4 +149,157 @@ async fn a_new_grant_drops_the_old_sessions_queue() {
     vault.event("device.session.granted", &format!("{{\"session_id\":\"s-2\",\"expires_at\":\"{until}\"}}"), Utc::now());
     link.collect().await;
     assert_eq!(link.take_inbound(), InboundBatch { messages: vec![], resync: true });
+}
+
+fn msg_batch() -> InboundBatch {
+    let mut q = super::inbound::Queue::default();
+    let m = vettid_vms::envelope::Inner {
+        id: "01J0000000000000000000000A".into(),
+        kind: "message.new".into(),
+        ts: Utc::now(),
+        seq: Some(1),
+        response: None,
+        exp: None,
+        body: zeroize::Zeroizing::new(MSG.into()),
+    };
+    q.take(&m);
+    q.drain()
+}
+
+/// The gate: messages reach the window only while both the screen and the
+/// link are live; the link finding the session over is published.
+#[test]
+fn the_gate() {
+    let resync = InboundBatch { messages: vec![], resync: true };
+    assert_eq!(gate(msg_batch(), true, true), (Some(msg_batch()), false));
+    assert_eq!(gate(InboundBatch::default(), true, true), (None, false));
+    assert_eq!(gate(msg_batch(), true, false), (Some(resync.clone()), true), "the link found it over: publish");
+    assert_eq!(gate(InboundBatch::default(), true, false), (None, true));
+    assert_eq!(gate(msg_batch(), false, true), (Some(resync.clone()), false), "the screen isn't live");
+    assert_eq!(gate(msg_batch(), false, false), (Some(resync), false));
+    assert_eq!(gate(InboundBatch::default(), false, false), (None, false));
+}
+
+/// A message of ours dropped while no session is live asks for a resync.
+#[tokio::test]
+async fn a_dropped_message_asks_for_a_resync() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = FakeVault::paired(dir.path());
+    vault.event("message.new", MSG, Utc::now());
+    link.read_status().await.unwrap();
+    assert!(!link.snapshot(Utc::now()).active_at(Utc::now()));
+    assert_eq!(link.take_inbound(), InboundBatch { messages: vec![], resync: true });
+}
+
+/// A renewal denied while the session runs on drops what was queued (the
+/// session is still live, so only the clear on Denied does it).
+#[tokio::test]
+async fn a_denial_drops_the_queue_though_the_session_runs_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await;
+    vault.event("message.new", MSG, Utc::now());
+    vault.event("device.session.ended", "{\"reason\":\"denied\"}", Utc::now());
+    assert_eq!(link.collect().await, Collected::Ok);
+    assert!(link.snapshot(Utc::now()).active_at(Utc::now()), "a denied renewal ends nothing");
+    assert_eq!(link.take_inbound(), InboundBatch { messages: vec![], resync: true });
+}
+
+/// A session event that doesn't read drops the queue too (fail secure).
+#[tokio::test]
+async fn an_unreadable_session_event_drops_the_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await;
+    vault.event("message.new", MSG, Utc::now());
+    vault.event("device.session.ended", "{\"reason\":\"sideways\"}", Utc::now());
+    link.collect().await;
+    assert_eq!(link.take_inbound(), InboundBatch { messages: vec![], resync: true });
+}
+
+/// A collect looks for a sleep first: past a missed round, the vault's
+/// state is unconfirmed, so nothing is collected.
+#[tokio::test]
+async fn a_collect_after_a_sleep_collects_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await;
+    vault.event("message.new", MSG, Utc::now());
+    link.marks().due = Some(Utc::now() - TimeDelta::minutes(10));
+    let before = vault.collects();
+    assert_eq!(link.collect().await, Collected::NoSession);
+    assert_eq!(link.resumes, 1);
+    assert_eq!(vault.collects(), before);
+}
+
+/// A round that finds the link busy is skipped, not queued behind the
+/// command: when the command ends, nothing is collected until the next
+/// round.
+#[tokio::test(start_paused = true)]
+async fn a_busy_link_skips_the_round() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, link) = live(dir.path()).await;
+    let slot = Arc::new(Mutex::new(Some(link)));
+    let task = {
+        let slot = slot.clone();
+        tokio::spawn(async move { collect_loop(&slot, COLLECT_EVERY, |_, _| {}).await })
+    };
+    let held = slot.lock().await;
+    let before = vault.collects();
+    tokio::time::sleep(COLLECT_EVERY + COLLECT_EVERY / 2).await;
+    drop(held);
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(vault.collects(), before, "a round waited for the lock instead of skipping");
+    tokio::time::sleep(COLLECT_EVERY).await;
+    assert!(vault.collects() > before, "the next round didn't collect");
+    task.abort();
+}
+
+/// A message that arrives while a renewal request waits (and lapses) is
+/// kept for the views.
+#[tokio::test]
+async fn a_request_wait_keeps_messages_for_the_views() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await;
+    vault.request_window(TimeDelta::seconds(2));
+    vault.event("message.new", MSG, Utc::now());
+    let r = tokio::time::timeout(std::time::Duration::from_secs(12), link.request_access(|| {}, || false)).await.expect("lapsed");
+    assert!(r.is_err(), "{r:?}");
+    let b = link.take_inbound();
+    assert_eq!(b.messages.len(), 1, "{b:?}");
+}
+
+/// Failed collects back off: doubling to a minute, or the relay's
+/// retry_after; one that works goes back to every 5 s.
+#[test]
+fn collects_back_off() {
+    let s = std::time::Duration::from_secs;
+    assert_eq!(next_collect_wait(s(5), Collected::Ok), COLLECT_EVERY);
+    assert_eq!(next_collect_wait(s(40), Collected::NoSession), COLLECT_EVERY);
+    assert_eq!(next_collect_wait(s(5), Collected::Failed { retry_after: None }), s(10));
+    assert_eq!(next_collect_wait(s(40), Collected::Failed { retry_after: None }), COLLECT_BACKOFF_MAX);
+    assert_eq!(next_collect_wait(s(5), Collected::Failed { retry_after: Some(30) }), s(30));
+    assert_eq!(next_collect_wait(s(5), Collected::Failed { retry_after: Some(1) }), COLLECT_EVERY);
+    assert_eq!(next_collect_wait(s(5), Collected::Failed { retry_after: Some(900) }), COLLECT_BACKOFF_MAX);
+}
+
+/// In the loop: an unreachable relay is collected less and less often.
+#[tokio::test(start_paused = true)]
+async fn the_loop_backs_off_while_the_relay_is_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, link) = live(dir.path()).await;
+    let slot = Arc::new(Mutex::new(Some(link)));
+    vault.offline(true);
+    let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task = {
+        let (slot, rounds) = (slot.clone(), rounds.clone());
+        tokio::spawn(async move {
+            collect_loop(&slot, COLLECT_EVERY, |_, _| {
+                rounds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_secs(76)).await;
+    task.abort();
+    // 5, 15, 35, 75 s: four, where a fixed 5 s would make fifteen.
+    let n = rounds.load(std::sync::atomic::Ordering::SeqCst);
+    assert!((3..=5).contains(&n), "{n} collects in 76 s");
 }
