@@ -9,10 +9,11 @@
 
 /** A profile as a connection shares it (§10.8). */
 export interface ConnectionProfile {
-  version: number;
+  /** Absent on the inviter's side until the first `profile.update` (§10.4). */
+  version?: number;
   first_name: string;
   last_name: string;
-  ik: string;
+  ik?: string;
   name?: string;
   photo?: string;
   items: unknown[];
@@ -23,11 +24,12 @@ export interface Connection {
   id: string;
   kind: 'connection';
   state: 'active';
-  name: string;
+  /** The fields below the vault leaves out while unknown (§10.4). */
+  name?: string;
   ik: string;
-  profile: ConnectionProfile;
-  created_at: string;
-  last_active_at: string;
+  profile?: ConnectionProfile;
+  created_at?: string;
+  last_active_at?: string;
   version: number;
   alias: string;
   note: string;

@@ -128,8 +128,10 @@
                         <dt>Vault key fingerprint</dt>
                         <dd class="fp">{fingerprint}</dd>
                     {/if}
-                    <dt>Created</dt>
-                    <dd>{when(detail.created_at)}</dd>
+                    {#if when(detail.created_at)}
+                        <dt>Created</dt>
+                        <dd>{when(detail.created_at)}</dd>
+                    {/if}
                     {#if when(detail.last_active_at)}
                         <dt>Last active</dt>
                         <dd>{when(detail.last_active_at)}</dd>
