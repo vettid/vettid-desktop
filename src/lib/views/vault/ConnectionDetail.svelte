@@ -10,6 +10,7 @@
     import { clearSelectedConnection } from '../../stores/navigation';
     import { connectionsReload } from '../../stores/vault';
     import { connectionTitle, secondaryNames, relayHeldText } from '../../connectionView.js';
+    import { ikFingerprint } from '../../ikFingerprint.js';
     import Avatar from '../../components/Avatar.svelte';
 
     interface Props {
@@ -65,6 +66,22 @@
         untrack(() => void refreshDetail(id));
     });
 
+    /** §10.8: the fingerprint of the `ik` the last read confirmed; `null`
+     *  while it is worked out, or when that `ik` is not 32 bytes of base64. */
+    let fingerprint = $state<string | null>(null);
+    let fpSeq = 0;
+    let detailIk = $derived(detail?.ik);
+    $effect(() => {
+        const ik = detailIk;
+        const mine = ++fpSeq;
+        fingerprint = null;
+        if (!ik) return;
+        ikFingerprint(ik).then(
+            (fp) => { if (mine === fpSeq) fingerprint = fp; },
+            () => {},
+        );
+    });
+
     function when(iso: string | undefined): string {
         if (!iso) return '';
         const t = new Date(iso);
@@ -107,6 +124,10 @@
             <section class="card">
                 <h4>Connection</h4>
                 <dl class="fields">
+                    {#if fingerprint}
+                        <dt>Fingerprint</dt>
+                        <dd class="fp">{fingerprint}</dd>
+                    {/if}
                     <dt>Created</dt>
                     <dd>{when(detail.created_at)}</dd>
                     {#if when(detail.last_active_at)}
@@ -176,4 +197,5 @@
     .fields dt { color: var(--text-secondary); font-size: 0.85em; }
     .fields dd { margin: 0; font-size: 0.9em; word-break: break-word; }
     .note { white-space: pre-wrap; }
+    .fp { font-family: ui-monospace, Consolas, monospace; }
 </style>
