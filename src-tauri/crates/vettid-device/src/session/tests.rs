@@ -1361,3 +1361,115 @@ async fn after_a_failed_collect_the_next_one_is_a_probe() {
     assert_eq!(vault_receive(&mut vault).await.id, id);
     assert!(!s.probe_next, "long-polls again from here");
 }
+
+/// Every save, as `device.enc` would hold it.
+struct Recording<'a> {
+    inner: &'a mut Flaky,
+    saves: Vec<Vec<u8>>,
+}
+
+impl Persist for Recording<'_> {
+    fn save(&mut self, data: &[u8]) -> Result<(), StoreError> {
+        self.saves.push(data.to_vec());
+        self.inner.save(data)
+    }
+    fn load(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+        self.inner.load()
+    }
+    fn clear(&mut self) -> Result<(), StoreError> {
+        self.inner.clear()
+    }
+}
+
+const SENT_TEXT: &str = "zebra-umbrella-41 sent";
+const NEW_TEXT: &str = "quartz-lantern-77 new";
+const LISTED_TEXT: &str = "maple-orbit-13 listed";
+
+/// Message plaintext never reaches the store (DESKTOP-REWORK-PLAN 5.1): a
+/// `message.send` is never in the stored outbox, and neither its text, nor
+/// a `message.new` that arrives while it waits, nor a `message.list`
+/// answer is in any state saved.
+#[tokio::test]
+async fn message_plaintext_never_reaches_the_store() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    let mut rec = Recording { inner: &mut store, saves: Vec::new() };
+    assert!(!outbox_allowed("message.send") && memory_only("message.send"));
+    assert_eq!(s.send(&mut rec, "message.send", "{}", false).await.unwrap_err(), SessionError::NotQueueable, "only as a request");
+    let body = format!(r#"{{"connection_id":"c-1","text":"{SENT_TEXT}"}}"#);
+    let answer = async {
+        let req = vault_receive(&mut vault).await;
+        assert_eq!(req.kind, "message.send");
+        assert!(req.body.contains(SENT_TEXT), "the vault gets the text");
+        vault_deposit(&mut vault, event("message.new", &format!(r#"{{"connection_id":"c-1","text":"{NEW_TEXT}"}}"#)), None).await;
+        let mut resp = event("message.send", r#"{"message_id":"m-1","sent_at":"2026-11-25T10:00:00Z"}"#);
+        resp.response = Some(Response { re: req.id.clone(), status: Status::Ok });
+        vault_deposit(&mut vault, resp, None).await;
+        req.id
+    };
+    let (got, id) = tokio::join!(s.request(&mut rec, "message.send", &body, TimeDelta::seconds(30)), answer);
+    assert_eq!(got.unwrap().response.unwrap().re, id);
+    assert_eq!(s.last_request_id(), Some(id.as_str()));
+    let answer = async {
+        let req = vault_receive(&mut vault).await;
+        let mut resp = event("message.list", &format!(r#"{{"messages":[{{"text":"{LISTED_TEXT}"}}]}}"#));
+        resp.response = Some(Response { re: req.id.clone(), status: Status::Ok });
+        vault_deposit(&mut vault, resp, None).await;
+    };
+    let (got, ()) = tokio::join!(s.request(&mut rec, "message.list", r#"{"connection_id":"c-1"}"#, TimeDelta::seconds(30)), answer);
+    assert!(got.unwrap().body.contains(LISTED_TEXT));
+    let held = s.poll(&mut rec).await.unwrap();
+    assert!(held.iter().any(|m| m.kind == "message.new"), "the event is handed on, from memory");
+    assert!(rec.saves.len() >= 3, "the sends and the batches were stored: {}", rec.saves.len());
+    for (i, bytes) in rec.saves.iter().enumerate() {
+        let text = String::from_utf8_lossy(bytes);
+        for t in [SENT_TEXT, NEW_TEXT, LISTED_TEXT] {
+            assert!(!text.contains(t), "save {i} holds {t}");
+        }
+        let state = crate::store::DeviceState::from_json(bytes).unwrap();
+        assert!(state.outbox.iter().all(|o| o.kind != "message.send"), "save {i}: a message.send in the stored outbox");
+        assert!(state.inbox.iter().all(|m| m.kind != "message.new"));
+    }
+    assert_eq!(s.outbox_len(), 0);
+}
+
+/// A send the relay certainly didn't take leaves nothing: not stored, not
+/// the last request (nothing to retry under its id), and the vault never
+/// sees it.
+#[tokio::test]
+async fn a_send_not_taken_leaves_nothing() {
+    let (relay, vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    faults.lock().unwrap().temporary = 1;
+    let r = s.request(&mut store, "message.send", r#"{"connection_id":"c-1","text":"hi"}"#, TimeDelta::seconds(5)).await;
+    assert_eq!(r.unwrap_err(), SessionError::Relay(RelayError::Connect));
+    assert_eq!((s.last_request_id(), s.outbox_len()), (None, 0));
+    assert!(vault.mem.collect(URL, 0, 10).await.unwrap().is_empty(), "nothing reached the vault");
+}
+
+/// A send the relay may have taken (its answer lost) is still the last
+/// request: retried under its id, the vault gets the same inner id again
+/// and acts once (§8.2), and the answer is taken.
+#[tokio::test]
+async fn a_send_whose_deposit_answer_was_lost_is_retried_under_its_id() {
+    let (relay, mut vault, faults, mut store) = paired().await;
+    let mut s = session(&relay, &faults, &mut store, Ticking::new());
+    faults.lock().unwrap().lost_answers = 1;
+    let body = r#"{"connection_id":"c-1","text":"hi"}"#;
+    let r = s.request(&mut store, "message.send", body, TimeDelta::seconds(5)).await;
+    assert_eq!(r.unwrap_err(), SessionError::Relay(RelayError::Transport));
+    let id = s.last_request_id().expect("may have been taken: kept by its id").to_string();
+    assert_eq!(s.outbox_len(), 0);
+    let first = vault_receive(&mut vault).await;
+    assert_eq!(first.id, id);
+    let answer = async {
+        let again = vault_receive(&mut vault).await;
+        let mut resp = event("message.send", r#"{"message_id":"m-1","sent_at":"2026-11-25T10:00:00Z"}"#);
+        resp.response = Some(Response { re: again.id.clone(), status: Status::Ok });
+        vault_deposit(&mut vault, resp, None).await;
+        again.id
+    };
+    let (got, again) = tokio::join!(s.request_again(&mut store, &id, "message.send", body, TimeDelta::seconds(30)), answer);
+    assert_eq!(again, id, "the same inner id: the vault acts once");
+    assert_eq!(got.unwrap().response.unwrap().re, id);
+}

@@ -70,6 +70,9 @@ pub(crate) struct Faults {
     pub(crate) clock_collects: usize,
     pub(crate) clock_date: Option<i64>,
     pub(crate) deposits_seen: usize,
+    /// Take this many deposits, then answer them as a transport failure
+    /// (`possibly_delivered`): stored at the relay, the answer lost.
+    pub(crate) lost_answers: usize,
 }
 
 #[derive(Clone)]
@@ -136,6 +139,12 @@ impl Transport for Mem {
             return Err(DepositError { error, possibly_delivered: false });
         };
         mb.push(Message { msg_id: id.clone(), deposited_at: "t".into(), sender: encode_key(&self.key.verifying_key()), jti: None, payload: payload.to_vec() });
+        drop(r);
+        let mut f = self.faults.lock().unwrap();
+        if f.lost_answers > 0 {
+            f.lost_answers -= 1;
+            return Err(DepositError { error: RelayError::Transport, possibly_delivered: true });
+        }
         Ok(id)
     }
     /// Every waiting message, up to `max`, each time: unlike the real

@@ -110,3 +110,77 @@ fn an_ik_of_the_wrong_length() {
     c["ik"] = json!("A".repeat(44)); // 33 bytes
     assert_eq!(connection(&c), Err(BadShape));
 }
+
+fn msg(id: &str) -> Value {
+    json!({"connection_id": "c-1", "message_id": id, "direction": "in", "text": "hi", "sent_at": "2026-11-25T10:00:00Z",
+        "delivered": true, "read": false})
+}
+
+/// A page passes with its known members, oldest first as sent; a message
+/// that doesn't check out is left out and counted, and doesn't blank the
+/// page.
+#[test]
+fn a_page_of_messages_drops_and_counts_a_bad_one() {
+    let mut bad = msg("m-2");
+    bad["direction"] = json!("sideways");
+    let mut long = msg("m-3");
+    long["text"] = json!("x".repeat(crate::link::inbound::MAX_TEXT_LEN + 1));
+    let mut other = msg("m-4");
+    other["connection_id"] = json!("c-2");
+    let mut unnamed = msg("m-5");
+    unnamed.as_object_mut().unwrap().remove("connection_id");
+    let mut extra = msg("m-6");
+    extra["extra"] = json!("dropped");
+    let mut empty_text = msg("m-7");
+    empty_text["text"] = json!("");
+    let v = message_list(&json!({"messages": [msg("m-1"), bad, long, other, unnamed, extra, empty_text], "next_before": "m-1"}), "c-1").unwrap();
+    let ids: Vec<&str> = v["messages"].as_array().unwrap().iter().map(|m| m["message_id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["m-1", "m-5", "m-6"], "the bad, the too long, another connection's and an empty one are left out");
+    assert_eq!(v["unreadable"], 4);
+    assert_eq!(v["next_before"], "m-1");
+    assert_eq!(v["messages"][1]["connection_id"], "c-1", "a listed message may leave its connection out");
+    assert!(v["messages"][2].get("extra").is_none());
+    assert_eq!(message_list(&json!({"messages": []}), "c-1").unwrap(), json!({"messages": [], "unreadable": 0}));
+}
+
+/// A photo without its caption: kept, as the desktop's view (no thumb, no
+/// name), so the view can show a placeholder.
+#[test]
+fn an_attachment_is_kept_without_thumb_or_name() {
+    let mut m = msg("m-1");
+    m["text"] = json!("");
+    m["attachment"] = json!({"att_id": "a-1", "kind": "photo", "size": 1000, "width": 10, "height": 20, "state": "stored", "thumb": "AAAA", "name": "beach.jpg"});
+    let v = message_list(&json!({"messages": [m]}), "c-1").unwrap();
+    assert_eq!(v["unreadable"], 0);
+    let a = &v["messages"][0]["attachment"];
+    assert_eq!((a["att_id"].as_str(), a["state"].as_str(), v["messages"][0]["text"].as_str()), (Some("a-1"), Some("stored"), Some("")));
+    assert!(a.get("thumb").is_none() && a.get("name").is_none(), "{a}");
+    let mut no_att = msg("m-2");
+    no_att["attachment"] = json!(null);
+    assert!(message_list(&json!({"messages": [no_att]}), "c-1").unwrap()["messages"][0]["attachment"].is_null());
+}
+
+#[test]
+fn a_page_that_doesnt_check_out_is_refused() {
+    for v in [
+        json!({}),
+        json!({"messages": "x"}),
+        json!({"messages": [], "next_before": 7}),
+        json!({"messages": [], "next_before": ""}),
+        json!({"messages": [], "next_before": "m".repeat(crate::link::inbound::MAX_ID_LEN + 1)}),
+        json!({"messages": vec![msg("m-1"); MESSAGES_MAX + 1]}),
+    ] {
+        assert_eq!(message_list(&v, "c-1"), Err(BadShape), "{v}");
+    }
+}
+
+#[test]
+fn a_sent_message_is_its_id_and_time() {
+    let v = message_sent(&json!({"message_id": "m-9", "sent_at": "2026-11-25T10:00:00.123Z", "att_id": "a-1", "x": 1})).unwrap();
+    assert_eq!(v, json!({"message_id": "m-9", "sent_at": "2026-11-25T10:00:00.123Z"}));
+    for bad in [json!({"sent_at": "2026-11-25T10:00:00Z"}), json!({"message_id": "", "sent_at": "2026-11-25T10:00:00Z"}), json!({"message_id": "m", "sent_at": "yesterday"}), json!({"message_id": 1, "sent_at": "2026-11-25T10:00:00Z"})] {
+        assert_eq!(message_sent(&bad), Err(BadShape), "{bad}");
+    }
+    assert_eq!(empty(&json!({"x": 1})), Ok(json!({})));
+    assert_eq!(empty(&json!([])), Err(BadShape));
+}

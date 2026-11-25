@@ -182,6 +182,15 @@ pub fn parse(m: &Inner) -> Option<Result<Inbound, Unreadable>> {
 // none of it reaches disk or a log.
 fn parse_message(body: &str) -> Result<MessageNew, Unreadable> {
     let v: serde_json::Value = serde_json::from_str(body).map_err(|_| Unreadable)?;
+    message(&v, None)
+}
+
+/// A `<message.new body>` (§10.5), as `message.new` carries it and
+/// `message.list` and `message.get` list it: the same checks for each.
+/// `listed`: the connection a list was asked for; a message there may
+/// leave `connection_id` out, and one naming another connection is
+/// unreadable.
+pub fn message(v: &serde_json::Value, listed: Option<&str>) -> Result<MessageNew, Unreadable> {
     let o = v.as_object().ok_or(Unreadable)?;
     let s = |k: &str, max: usize| o.get(k).and_then(|v| v.as_str()).filter(|t| t.len() <= max).map(str::to_string).ok_or(Unreadable);
     let b = |k: &str| o.get(k).and_then(|v| v.as_bool()).ok_or(Unreadable);
@@ -190,7 +199,12 @@ fn parse_message(body: &str) -> Result<MessageNew, Unreadable> {
         Some("out") => Direction::Out,
         _ => return Err(Unreadable),
     };
-    let (connection_id, message_id, sent_at) = (s("connection_id", MAX_ID_LEN)?, s("message_id", MAX_ID_LEN)?, s("sent_at", MAX_FIELD_LEN)?);
+    let connection_id = match (listed, o.get("connection_id")) {
+        (Some(c), None | Some(serde_json::Value::Null)) => c.to_string(),
+        (Some(c), Some(_)) => Some(s("connection_id", MAX_ID_LEN)?).filter(|id| id == c).ok_or(Unreadable)?,
+        (None, _) => s("connection_id", MAX_ID_LEN)?,
+    };
+    let (message_id, sent_at) = (s("message_id", MAX_ID_LEN)?, s("sent_at", MAX_FIELD_LEN)?);
     if connection_id.is_empty() || message_id.is_empty() || chrono::DateTime::parse_from_rfc3339(&sent_at).is_err() {
         return Err(Unreadable);
     }
@@ -203,6 +217,11 @@ fn parse_message(body: &str) -> Result<MessageNew, Unreadable> {
         None | Some(serde_json::Value::Null) => None,
         Some(a) => Some(parse_attachment(a)?),
     };
+    // `""` is an attachment without a caption (§10.5); a text message has
+    // at least 1 byte.
+    if text.is_empty() && attachment.is_none() {
+        return Err(Unreadable);
+    }
     Ok(MessageNew { connection_id, message_id, direction, text, sent_at, delivered: b("delivered")?, read: b("read")?, attachment })
 }
 

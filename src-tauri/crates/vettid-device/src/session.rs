@@ -11,7 +11,16 @@
 //!   inner `id` (§8.2). An application retry reuses the inner id
 //!   ([`Session::resend`], §8.6). Ephemeral types and `vault.lock` never
 //!   enter the stored outbox (§8.5, §8.6): [`Session::send_once`] deposits
-//!   them once, from memory.
+//!   them once, from memory. Nor does `message.send` ([`memory_only`]):
+//!   its body is message plaintext, which the desktop plan keeps off disk
+//!   and out of `device.enc` (DESKTOP-REWORK-PLAN Phase 5, 5.1). It is
+//!   deposited once from memory, as VAULT-MESSAGING §8.6 has a device
+//!   deposit a request (the `quota_exceeded` row of its error table, the
+//!   paragraph "A device" (0.88.8): "a request (§8.1) ... deposited once,
+//!   outside the outbox, under the held token; they are not held"); §8.4
+//!   gives no ordering guarantee ("No global or causal order is
+//!   provided"), so it may pass stored entries. Only its id and the
+//!   epoch's `seq` are stored, and a retry under its id is the caller's.
 //! - **Receiving** ([`Session::poll`]): collect a batch; for each message,
 //!   the relay `msg_id` dedupe, the vault's relay key as sender (§6.3), the
 //!   epoch's keys, the freshness rules by type class (§8.4, §8.5), the
@@ -154,10 +163,25 @@ pub fn durable(kind: &str) -> bool {
 }
 
 /// Whether `kind` may wait in the stored outbox: not an ephemeral type,
-/// and not `vault.lock`, which "MUST NOT" be put in an outbox that
-/// outlives the attempt (§8.6).
+/// not `vault.lock`, which "MUST NOT" be put in an outbox that outlives
+/// the attempt (§8.6), and not a [`memory_only`] request.
 pub fn outbox_allowed(kind: &str) -> bool {
-    durable(kind) && kind != "vault.lock"
+    durable(kind) && kind != "vault.lock" && !memory_only(kind)
+}
+
+/// Whether `kind` is a request whose body is message plaintext
+/// (`message.send`, §10.5), which never reaches the store: the desktop
+/// plan's rule that message plaintext is never written to disk or to
+/// `device.enc` (DESKTOP-REWORK-PLAN Phase 5, 5.1). It is sealed and
+/// deposited once from memory, as VAULT-MESSAGING §8.6 has a device
+/// deposit a request (the `quota_exceeded` row of its error table, the
+/// paragraph "A device" (0.88.8): "a request (§8.1) ... deposited once,
+/// outside the outbox, under the held token; they are not held"; §8.4
+/// gives no ordering guarantee). Its id is armed and stored (not its
+/// body), so a late answer is still taken, and a retry under that id
+/// ([`Session::request_again`]) is the caller's.
+pub fn memory_only(kind: &str) -> bool {
+    kind == "message.send"
 }
 
 /// The longest `exp` ahead of now a `vault.lock` may carry (§8.6).
@@ -204,7 +228,8 @@ pub enum SessionError {
     /// A request had no response within its timeout.
     TimedOut,
     /// This type may not wait in the stored outbox (an ephemeral type, or
-    /// `vault.lock`): use [`Session::send_once`].
+    /// `vault.lock`): use [`Session::send_once`]. A [`memory_only`] type
+    /// goes only as a request.
     NotQueueable,
     /// `send_once` takes an ephemeral type with an `exp` in the future, or
     /// `vault.lock` with an `exp` at most 60 s ahead (§8.5, §8.6).
@@ -734,6 +759,9 @@ impl<T: Transport, C: Clock> Session<T, C> {
             return Err(SessionError::Refused);
         }
         if !outbox_allowed(&inner.kind) {
+            if request && memory_only(&inner.kind) {
+                return self.request_once(store, inner).await;
+            }
             return Err(SessionError::NotQueueable);
         }
         let (id, exp, kind) = (inner.id.clone(), inner.exp, inner.kind.clone());
@@ -767,6 +795,72 @@ impl<T: Transport, C: Clock> Session<T, C> {
         match self.flush(store).await {
             Err(SessionError::Refused) => Err(SessionError::Refused),
             _ => Ok(id),
+        }
+    }
+
+    /// A [`memory_only`] request: sealed (the epoch assigns its `seq`), its
+    /// id armed, and that stored, never its body; then the stored outbox
+    /// goes, in order, and this request is deposited once from memory.
+    /// `Ok` once the relay took it. If the relay may have taken it
+    /// (`possibly_delivered`) it is still [`Session::last_request_id`], so
+    /// the caller can retry it under its id; one certainly not taken
+    /// leaves nothing to retry. Not held by the outbox's backoff (§8.6: a
+    /// device's request is "not held").
+    async fn request_once(&mut self, store: &mut impl Persist, mut inner: Inner) -> Result<String, SessionError> {
+        let (id, exp, kind) = (inner.id.clone(), inner.exp, inner.kind.clone());
+        let cp = self.checkpoint();
+        let env = self.keys.current_mut().seal(&mut inner).map_err(SessionError::Seal)?;
+        // SECURITY: the plaintext body is wiped here; only the sealed
+        // envelope stays, in memory.
+        drop(inner);
+        self.arm(&id, &kind, exp);
+        if let Err(e) = self.save(store) {
+            self.rollback(cp);
+            return Err(e.into());
+        }
+        // #107 (review M2): no relay call just took this clock.
+        self.clock_confirmed = false;
+        if let Err(SessionError::Refused) = self.flush(store).await {
+            return Err(SessionError::Refused);
+        }
+        // From the deposit's start it may reach the relay: a caller whose
+        // wait is cut off during it keeps it under its id.
+        self.last_request = Some(id.clone());
+        self.tracked.retain(|t| t.id != id);
+        self.tracked.push(Tracked { id: id.clone(), payload: env.clone(), deposited: false, collected_after: false });
+        if self.tracked.len() > TRACKED_KEEP {
+            self.tracked.remove(0);
+        }
+        let to = self.state.vault.relay.clone();
+        let token = Token::from_received(self.state.vault_token.to_string());
+        let sent = self.transport.deposit(&to.url, &to.mailbox, &token, &env).await;
+        self.note_clock(sent.as_ref().err().map(|d| &d.error));
+        match &sent {
+            Ok(_) => {
+                if let Some(t) = self.tracked.iter_mut().find(|t| t.id == id) {
+                    t.deposited = true;
+                }
+            }
+            // Certainly not taken: nothing to retry.
+            Err(d) if !d.possibly_delivered => {
+                self.last_request = None;
+                self.tracked.retain(|t| t.id != id);
+            }
+            Err(_) => {}
+        }
+        match sent {
+            Ok(_) => Ok(id),
+            Err(d) => match &d.error {
+                RelayError::Relay { code, .. } if code == "token_revoked" => {
+                    self.state.refused = true;
+                    let lost: Vec<String> = self.state.outbox.drain(..).map(|o| o.kind).collect();
+                    self.dropped.extend(lost);
+                    self.save(store)?;
+                    Err(SessionError::Refused)
+                }
+                _ if d.possibly_delivered && !d.error.retryable() => Ok(id),
+                _ => Err(SessionError::Relay(d.error)),
+            },
         }
     }
 
