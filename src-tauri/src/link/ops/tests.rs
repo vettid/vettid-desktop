@@ -459,7 +459,7 @@ async fn kept_first_through_the_link() {
 #[test]
 fn pending_and_earlier_leave_the_body_out_of_debug() {
     let body = Zeroizing::new(r#"{"text":"meet at noon"}"#.to_string());
-    let p = Pending { kind: "message.send".into(), body: body.clone(), id: "i".into(), exp: Utc::now() };
+    let p = Pending { kind: "message.send".into(), body: body.clone(), id: "i".into(), exp: Utc::now(), retries: 0 };
     let e = Earlier { body, result: Ok(serde_json::json!({"text": "meet at noon"})) };
     let d = format!("{p:?} {e:?}");
     assert!(!d.contains("noon"), "{d}");
@@ -471,4 +471,53 @@ fn the_new_codes() {
     assert_eq!((OpError::EarlierUnconfirmed.code(), OpError::EarlierUnconfirmed.notice()), ("earlier_unconfirmed", OP_NOT_SENT_NOTICE.to_string()));
     assert_eq!(OpError::Vault("connection_unavailable".into()).code(), "connection_unavailable");
     assert_eq!(OpError::Vault("connection_unavailable".into()).notice(), OP_FAILED_NOTICE);
+}
+
+/// §8.6: a change is retried under its id at most twice. Through
+/// link_op_with: the 1st and 2nd retries reuse the id; a 3rd attempt is a
+/// new request.
+#[tokio::test]
+async fn a_change_is_retried_under_its_id_at_most_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, link) = live(dir.path()).await; // taken, never answered
+    let s = slot(link);
+    let body = serde_json::json!({"n": "p"});
+    let go = || link_op_with(&s, || true, || false, |_| {}, std::future::pending(), "test.change", body.clone(), any, true);
+    assert_eq!(go().await, Err(OpError::Unconfirmed));
+    let first = s.lock().await.as_ref().unwrap().unconfirmed.clone().unwrap();
+    assert_eq!(first.retries, 0);
+    // The spec's number, not the constant: two retries.
+    for n in 1..=2 {
+        assert_eq!(go().await, Err(OpError::Unconfirmed), "retry {n}");
+        let kept = s.lock().await.as_ref().unwrap().unconfirmed.clone().unwrap();
+        assert_eq!((kept.id.as_str(), kept.retries), (first.id.as_str(), n), "retry {n} reuses the id");
+        assert_eq!(kept.exp, first.exp, "with its first exp");
+        assert_eq!(vault.deposited_ids("test.change"), std::slice::from_ref(&first.id));
+    }
+    // A 3rd attempt doesn't reuse it.
+    vault.answer("test.change", Ok("{}"));
+    assert_eq!(go().await, Ok(serde_json::json!({})));
+    let ids = vault.deposited_ids("test.change");
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert_ne!(ids[1], first.id);
+    assert!(s.lock().await.as_ref().unwrap().unconfirmed.is_none());
+}
+
+/// A kept change retried twice already isn't retried before another: it
+/// is told as unconfirmed, as one past its exp, and the new one goes.
+#[tokio::test]
+async fn a_kept_change_retried_twice_isnt_retried_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await;
+    vault.answer("test.change", Ok("{}"));
+    vault.offline(true);
+    assert_eq!(link.op_kept_first("test.change", &serde_json::json!({"n": "a"}), any).await, Err(OpError::Unconfirmed));
+    let kept = link.unconfirmed.clone().unwrap();
+    link.unconfirmed.as_mut().unwrap().retries = 2; // §8.6: at most twice
+    vault.offline(false);
+    link.op_kept_first("test.change", &serde_json::json!({"n": "b"}), any).await.unwrap();
+    assert_eq!(sent(&vault, "test.change"), 2, "only the stored copy and the new one, no retry");
+    assert_ne!(vault.asked_ids().last().unwrap().0, kept.id);
+    assert_eq!(link.earlier.take().map(|e| e.result), Some(Err(OpError::Unconfirmed)));
+    assert!(link.unconfirmed.is_none());
 }

@@ -159,7 +159,9 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// - A change (`change`) carries an `exp` of [`CHANGE_TTL`], a read
     ///   one of [`READ_TTL`]. A change not confirmed is remembered, and the
     ///   same change asked again is retried under its id (§8.6), so the
-    ///   vault answers it from its cache instead of acting twice.
+    ///   vault answers it from its cache instead of acting twice. At most
+    ///   [`MAX_RETRIES`] times: asked again after that, it is a new
+    ///   request (only a read tells whether the first was carried out).
     /// - Once the request is stored, any failure is
     ///   [`OpError::Unconfirmed`]: it goes with the next exchange. A
     ///   `message.send` is never stored (its body is plaintext,
@@ -187,12 +189,17 @@ impl<T: Transport, C: Clock> Link<T, C> {
         // The same change asked again while its first try can still arrive:
         // its id and its exp.
         let again = match &self.unconfirmed {
-            Some(p) if change && p.kind == kind && *p.body == *body && now < p.exp => Some((p.id.clone(), p.exp)),
+            Some(p) if change && p.kind == kind && *p.body == *body && p.retriable(now) => Some((p.id.clone(), p.exp)),
             _ => None,
+        };
+        // How many times this change has been retried under its id.
+        let retries = match (&again, &self.unconfirmed) {
+            (Some(_), Some(p)) => p.retries + 1,
+            _ => 0,
         };
         let exp = again.as_ref().map_or_else(|| now + if change { CHANGE_TTL } else { READ_TTL }, |(_, e)| *e);
         if change {
-            self.sending = Some(Pending { kind: kind.to_string(), body: body.clone(), id: again.as_ref().map(|(i, _)| i.clone()).unwrap_or_default(), exp });
+            self.sending = Some(Pending { kind: kind.to_string(), body: body.clone(), id: again.as_ref().map(|(i, _)| i.clone()).unwrap_or_default(), exp, retries });
         }
         let r = self.session.request_at(&mut self.store, again.as_ref().map(|(i, _)| i.as_str()), kind, &body, OP_TIMEOUT, exp).await;
         self.sending = None;
@@ -248,7 +255,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
                 // is right, within its exp).
                 if let Some(d) = e.clock_skew() {
                     if let (true, Some(id)) = (change, stored) {
-                        self.unconfirmed = Some(Pending { kind: kind.to_string(), body: body.clone(), id, exp });
+                        self.unconfirmed = Some(Pending { kind: kind.to_string(), body: body.clone(), id, exp, retries });
                     }
                     return Err(OpError::Clock(d));
                 }
@@ -259,7 +266,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
                             self.reachable = false;
                         }
                         if change {
-                            self.unconfirmed = Some(Pending { kind: kind.to_string(), body: body.clone(), id, exp });
+                            self.unconfirmed = Some(Pending { kind: kind.to_string(), body: body.clone(), id, exp, retries });
                         }
                         Err(OpError::Unconfirmed)
                     }
@@ -283,19 +290,36 @@ impl<T: Transport, C: Clock> Link<T, C> {
     }
 }
 
+/// How many times a change is retried under its id (§8.6: "Application
+/// retries reuse the inner `id`, at most twice").
+pub const MAX_RETRIES: u32 = 2;
+
 /// A change sent and not confirmed: retried under its id, with its first
-/// `exp`, until then. `Debug` leaves the body out (message plaintext).
+/// `exp`, until then, at most [`MAX_RETRIES`] times. `Debug` leaves the
+/// body out (message plaintext).
 #[derive(Clone)]
 pub struct Pending {
     kind: String,
     body: Zeroizing<String>,
     id: String,
     exp: DateTime<Utc>,
+    /// The retries under `id` so far.
+    retries: u32,
+}
+
+impl Pending {
+    /// Whether it may still be retried under its id at `now`: before its
+    /// `exp`, and fewer than [`MAX_RETRIES`] retries so far. Past either,
+    /// a retry would be a new request, and only a read tells whether it
+    /// was carried out.
+    fn retriable(&self, now: DateTime<Utc>) -> bool {
+        now < self.exp && self.retries < MAX_RETRIES
+    }
 }
 
 impl std::fmt::Debug for Pending {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Pending").field("kind", &self.kind).field("body_len", &self.body.len()).field("id", &self.id).field("exp", &self.exp).finish()
+        f.debug_struct("Pending").field("kind", &self.kind).field("body_len", &self.body.len()).field("id", &self.id).field("exp", &self.exp).field("retries", &self.retries).finish()
     }
 }
 
@@ -323,7 +347,8 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// `earlier` for the caller. While it stays unconfirmed, or nothing
     /// could be sent, this change isn't sent:
     /// [`OpError::EarlierUnconfirmed`], or the error that would have
-    /// stopped this one too. A kept change past its `exp` isn't retried (it
+    /// stopped this one too. A kept change past its `exp`, or retried
+    /// [`MAX_RETRIES`] times already, isn't retried (it
     /// would be a new request): it is reported unconfirmed, and only a read
     /// tells whether it happened.
     pub async fn op_kept_first(&mut self, kind: &str, body: &serde_json::Value, shape: impl Fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>) -> Result<serde_json::Value, OpError> {
@@ -333,7 +358,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
         if let Some(p) = kept {
             // Unconfirmed until its answer is in (a cut-off leaves it so).
             self.earlier = Some(Earlier { body: p.body.clone(), result: Err(OpError::Unconfirmed) });
-            if Utc::now() >= p.exp {
+            if !p.retriable(Utc::now()) {
                 self.unconfirmed = None;
             } else {
                 let again: serde_json::Value = serde_json::from_str(&p.body).map_err(|_| OpError::Malformed)?;
