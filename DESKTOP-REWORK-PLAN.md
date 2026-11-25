@@ -525,6 +525,11 @@ session (`Session::request`, 30 s, retried with the same `id`, §8.1,
     connection: unread means an incoming message with `read: false`.
     The page is read with `limit` 20, when the list opens and when a
     `message.new` arrives for it (chosen; not in the spec).
+  - Those reads are bounded: at most 4 in flight, visible rows first,
+    and the rest only as they scroll into view. Each is one signed
+    request from the desktop's key, so they count against the relay's
+    per-key limit (RELAY-PROTOCOL §7.2 limit 2: 20/s, burst 100) and
+    the flood guard. A list of 100 connections stays well inside both.
   - Pending requests come from `connection.request.list`.
 - **A message's state** follows the booleans, never a guess:
   - "Sending" until `message.send` answers.
@@ -560,7 +565,13 @@ session (`Session::request`, 30 s, retried with the same `id`, §8.1,
      to the frontend as typed events. Today anything that `Access`
      doesn't take is acked and dropped.
    - While an access session runs, the link polls the mailbox
-     (`Session::poll`) on a short timer.
+     (`Session::poll`) every 5 s (chosen; not in the spec). It stops
+     when the session ends, the vault is held or locked, or the link
+     goes away, and starts again with the next session.
+   - Message plaintext (`message.new`, `message.list`) is held in
+     memory only, for the views that show it. It is never written to
+     disk or `device.enc`, and never logged: logs carry types, ids and
+     sizes.
    - Rust and TypeScript types follow the spec: `<connection>`, and
      `message.new` `{connection_id, message_id, direction "in"|"out",
      text, sent_at, delivered, read, attachment?}`.
