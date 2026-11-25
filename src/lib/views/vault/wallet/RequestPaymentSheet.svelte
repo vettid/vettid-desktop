@@ -43,9 +43,7 @@
     try {
       const resp: any = await invoke('list_connections');
       if (resp?.success && resp?.data) {
-        const all = (resp.data.connections ?? []) as Connection[];
-        // Only active connections can receive a payment request.
-        connections = all.filter((c) => c.state === 'active');
+        connections = (resp.data.connections ?? []) as Connection[];
       } else {
         connError = resp?.error || 'Failed to load connections';
       }

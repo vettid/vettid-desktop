@@ -35,7 +35,7 @@ export interface Connection {
   archived: boolean;
   /** `service` connections take no messages (§10.5). */
   peer_kind?: string;
-  asks: { muted: boolean; paused: boolean; cooldowns: unknown };
+  asks: { muted: boolean; paused: boolean };
   /** Set while the peer's vault is at a new address: messages without a
    *  `delivered` receipt are shown as held, never as sent (§3.4.2 RK14). */
   relay_held?: { since: string };
