@@ -1,8 +1,12 @@
-import { writable, derived, type Writable, type Readable } from 'svelte/store';
+import { writable, derived, get, type Writable, type Readable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
-import type { Connection, VaultOpResponse } from '../types';
+import type { Connection, ConnectionRequests, VaultOpResponse } from '../connections';
+import { INBOUND_EVENT, type InboundBatch } from '../inbound';
+import { inboundAction, livenessChanged } from '../connectionView.js';
 import { decodeEventPayload } from '../events';
+import { sessionStore } from './session';
+import { selectedConnectionStore } from './navigation';
 
 // ---------------------------------------------------------------------------
 // Store-local types
@@ -56,26 +60,75 @@ export const pendingGrantCountStore: Writable<number | null> = writable(null);
 /** Why the last `loadConnections` failed (the backend's own text), or ''. */
 export const connectionsErrorStore: Writable<string> = writable('');
 
+/** Counts `loadConnections` calls: only the latest one's answer is applied. */
+let connectionsSeq = 0;
+
 /**
  * Re-fetch the connection list. On failure the list is cleared (a list
  * we could not confirm is not shown as current) and the backend's error
  * text goes to `connectionsErrorStore`; it never reads as an empty list.
+ * The selected connection follows the list: replaced by its new copy, or
+ * cleared when the list no longer has it or couldn't be read.
  */
 export async function loadConnections(): Promise<void> {
+    const seq = ++connectionsSeq;
+    let list: Connection[] = [];
+    let error = '';
     try {
-        const resp: VaultOpResponse = await invoke('list_connections');
-        if (resp.success && resp.data) {
-            const data = resp.data as { connections?: Connection[] };
-            connectionsStore.set(data.connections ?? []);
-            connectionsErrorStore.set('');
-            return;
-        }
-        connectionsStore.set([]);
-        connectionsErrorStore.set(resp.error ?? 'Failed to load connections');
+        const resp: VaultOpResponse<{ connections?: Connection[] }> = await invoke('list_connections');
+        if (resp.success && resp.data) list = resp.data.connections ?? [];
+        else error = resp.error ?? 'Failed to load connections';
     } catch (e) {
-        connectionsStore.set([]);
-        connectionsErrorStore.set(String(e));
+        error = String(e);
     }
+    if (seq !== connectionsSeq) return;
+    connectionsStore.set(list);
+    connectionsErrorStore.set(error);
+    const selected = get(selectedConnectionStore);
+    if (selected) selectedConnectionStore.set(list.find((c) => c.id === selected.id) ?? null);
+}
+
+/** The pending requests as the last load confirmed them; `null` when it failed. */
+export const connectionRequestsStore: Writable<ConnectionRequests | null> = writable(null);
+/** Why the last `loadConnectionRequests` failed (the backend's own text), or ''. */
+export const connectionRequestsErrorStore: Writable<string> = writable('');
+
+let requestsSeq = 0;
+
+/**
+ * Re-fetch the pending requests (`connection.request.list`). On failure
+ * they are cleared and the backend's error text is kept, as for the list.
+ */
+export async function loadConnectionRequests(): Promise<void> {
+    const seq = ++requestsSeq;
+    let requests: ConnectionRequests | null = null;
+    let error = '';
+    try {
+        const resp: VaultOpResponse<Partial<ConnectionRequests>> = await invoke('list_connection_requests');
+        if (resp.success && resp.data) {
+            requests = { incoming: resp.data.incoming ?? [], outgoing: resp.data.outgoing ?? [] };
+        } else {
+            error = resp.error ?? '';
+        }
+    } catch (e) {
+        error = String(e);
+    }
+    if (seq !== requestsSeq) return;
+    connectionRequestsStore.set(requests);
+    connectionRequestsErrorStore.set(error);
+}
+
+/**
+ * Bumped each time the connection views should read again: a view that
+ * reads on its own (the detail's `connection.get`) follows it.
+ */
+export const connectionsReload: Writable<number> = writable(0);
+
+/** Read the list and the requests again, and tell the other views to. */
+export function reloadConnectionViews(): void {
+    connectionsReload.update((n) => n + 1);
+    void loadConnections();
+    void loadConnectionRequests();
 }
 
 // ---------------------------------------------------------------------------
@@ -88,20 +141,23 @@ export function initVaultListeners(): void {
     if (listenersInitialized) return;
     listenersInitialized = true;
 
-    // Connection lifecycle (peer-accepted, activated, key-exchanged, rejected).
-    // We re-list to pick up state transitions — cheaper than maintaining a
-    // delta-application path until the dataset gets large.
-    listen<AppEventEnvelope>('vault:connection-event', () => {
-        void loadConnections();
+    // The connection views read again when the session goes live (and when
+    // it stops being live, so what was shown is cleared by the failed read),
+    // as the window's own session state shows it (`vault:changed`, then the
+    // session snapshot).
+    let lastSession: string | undefined;
+    sessionStore.subscribe((s) => {
+        const prev = lastSession;
+        lastSession = s.state;
+        if (prev !== undefined && livenessChanged(prev, s.state)) reloadConnectionViews();
     });
 
-    listen<AppEventEnvelope>('vault:connection-revoked', () => {
-        void loadConnections();
-    });
-
-    // Profile changes — peer's published profile updated.
-    listen<AppEventEnvelope>('vault:profile-update', () => {
-        void loadConnections();
+    // What the vault sent this desktop (Phase 5, 5.1): dropped while the
+    // session isn't live here; a resync or a connection, request or block
+    // change reads the views again.
+    listen<InboundBatch>(INBOUND_EVENT, (event) => {
+        const live = get(sessionStore).state === 'active';
+        if (inboundAction(event.payload, live) === 'reload') reloadConnectionViews();
     });
 
     // New message — bump per-connection unread count for the in-app
