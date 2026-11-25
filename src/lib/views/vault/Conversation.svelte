@@ -1,554 +1,582 @@
 <script lang="ts">
+    // A conversation (DESKTOP-REWORK-PLAN Phase 5, 5.3): `get_conversation`
+    // (`message.list`, newest page, then older pages with `before`),
+    // `send_message`, `retry_send` and `mark_message_read`, live
+    // `message.new` and receipts from `vault:inbound`. The rules are in
+    // conversationView.js; this window's own sends and drafts are kept in
+    // stores/conversations.svelte.ts. Only what the vault answered is shown:
+    // a failed read clears the messages and shows the backend's text;
+    // nothing is shown while the session isn't live; a send is never shown
+    // as sent before the vault said so, and never offered again before a
+    // read of the conversation showed it isn't there.
     import { invoke } from '@tauri-apps/api/core';
     import { listen } from '@tauri-apps/api/event';
     import { open } from '@tauri-apps/plugin-shell';
-    import type { Connection, Message, VaultOpResponse } from '../../types';
-    import { clearSelectedConnection } from '../../stores/navigation';
-    import { markConversationRead } from '../../stores/vault';
-    import { placeCall, type CallType } from '../../stores/calls';
-    import { CALLS_ENABLED } from '../../config/features';
-    import { peerName } from '../../connectionName';
-    import { decodeEventPayload } from '../../events';
-    import SendBtcSheet from './wallet/SendBtcSheet.svelte';
-    import RequestPaymentSheet from './wallet/RequestPaymentSheet.svelte';
+    import { onMount, tick, untrack } from 'svelte';
+    import type { Connection, VaultOpResponse } from '../../connections';
+    import { INBOUND_EVENT, type InboundBatch } from '../../inbound';
+    import { sessionStore } from '../../stores/session';
+    import { kept } from '../../stores/conversations.svelte.js';
+    import { connectionsStore } from '../../stores/vault';
+    import { connectionTitle } from '../../connectionView.js';
+    import {
+        PAGE_LIMIT,
+        SERVICE_NO_MESSAGES,
+        MESSAGES_NOT_LIVE_TEXT,
+        UNREADABLE_MESSAGES,
+        EMPTY_MESSAGE,
+        LINE_ISOLATE,
+        LINK_NOT_OPENED,
+        EDIT_NEEDS_EMPTY_BOX,
+        returnedElsewhereText,
+        knownOutgoing,
+        seenInView,
+        shouldReread,
+        mergeNewest,
+        rereadDelay,
+        DELIVERY_TEXT,
+        mergeMessages,
+        applySyncEvent,
+        markedRead,
+        nextToMark,
+        newLocal,
+        startRetry,
+        applySendAnswer,
+        applyRetryAnswer,
+        expireDue,
+        afterReload,
+        placeReturned,
+        unsentToDraft,
+        knowsEvent,
+        releaseHeld,
+        viewMessages,
+        deliveryState,
+        deliveryText,
+        bubbleContent,
+        textBytes,
+        canSend,
+        tooLongText,
+        MAX_TEXT_BYTES,
+        takesMessages,
+        conversationAction,
+        openLinkQuestion,
+    } from '../../conversationView.js';
+    import type { Message, Returned, SyncEv } from '../../conversationView.js';
 
     interface Props {
         connection: Connection;
-        onShowProfile: () => void;
-        /** Hide the local identity header when embedded in
-         *  ConnectionWorkspace, which owns the workspace header. */
+        /** Hide the local header when embedded in ConnectionWorkspace,
+         *  which owns the workspace header. */
         compact?: boolean;
     }
 
-    let { connection, onShowProfile, compact = false }: Props = $props();
+    let { connection, compact = false }: Props = $props();
 
+    // The workspace mounts one Conversation per connection ({#key}).
+    const cid = untrack(() => connection.id);
+
+    let live = $derived($sessionStore.state === 'active');
+    let takes = $derived(takesMessages(connection));
+    let title = $derived(connectionTitle(connection));
+
+    /** The vault's messages as the last reads gave them, and live ones since. */
     let messages = $state<Message[]>([]);
-    let composeText = $state('');
-    let loading = $state(true);
-    let sending = $state(false);
-    let error = $state('');
+    let nextBefore = $state<string | null>(null);
+    let unreadable = $state(0);
+    let loading = $state(false);
+    let loaded = $state(false);
+    let loadError = $state('');
+    let olderLoading = $state(false);
+    let olderError = $state('');
+    let linkAsk = $state<{ href: string; host: string } | null>(null);
+    let linkError = $state('');
     let scrollEl: HTMLDivElement | undefined = $state();
-    // Scroll-to-bottom FAB only shows when the user has scrolled
-    // up enough that they're no longer near the latest message.
-    let nearBottom = $state(true);
-    // Pagination: vault returns the most-recent `limit` messages; when
-    // the user scrolls to within `LOAD_OLDER_THRESHOLD_PX` of the top
-    // we fetch the page before that (`before=<oldest message_id>`).
-    let loadingOlder = $state(false);
-    let hasMoreOlder = $state(true);
-    const PAGE_SIZE = 50;
-    const LOAD_OLDER_THRESHOLD_PX = 120;
 
-    // Per-incoming-payment-request action state. Keyed by request_id
-    // (or message_id as fallback) so each bubble tracks its own pay /
-    // decline state independently.
-    let paymentActionState = $state<Record<string, { busy: boolean; error?: string }>>({});
-    // Which payment_request_id (or message_id) is the user currently
-    // typing a decline reason for? Drives the inline decline composer.
-    let decliningFor = $state<string | null>(null);
-    let declineReason = $state('');
+    /** Counts newest-page reads: only the latest one's answer is applied,
+     *  and an older page read before it is dropped. */
+    let seq = 0;
+    /** When the last newest-page read began, by `performance.now()`. */
+    let lastReadAt = -Infinity;
+    /** Newest-page reads in a row that failed: the reads the view makes on
+     *  its own back off (rereadDelay). */
+    let readFailures = 0;
+    /** `message.new` and receipts that arrive while the newest page is read. */
+    let buffer: { messages: Message[]; events: SyncEv[] } | null = null;
 
-    // Compose menu (➕) — Request payment lives here. Send-via-attach
-    // can come later (D.6 image/file).
-    let composeMenuOpen = $state(false);
+    if (kept.drafts[cid] === undefined) kept.drafts[cid] = '';
+    let draft = $derived(kept.drafts[cid] ?? '');
+    let draftBytes = $derived(textBytes(draft));
+    let sendError = $derived(kept.errors[cid] ?? '');
+    let sending = $derived(!!kept.sending[cid]);
 
-    // Sheets mounted by the conversation. Loaded lazily on demand so
-    // tabs that never touch payments don't pay the wallet.list cost.
-    interface WalletItem {
-        wallet_id: string;
-        label: string;
-        address: string;
-        network: string;
-        cached_balance_sats: number;
-    }
-    let activeSheet = $state<'send' | 'request' | null>(null);
-    let walletsForSheet = $state<WalletItem[]>([]);
-    let walletsError = $state('');
-    let payPrefill = $state<{ toAddress: string; amountSats: number } | null>(null);
+    let items = $derived(viewMessages(messages, kept.locals, cid));
 
-    interface PaymentPayload {
-        amount_sats?: number;
-        memo?: string;
-        address?: string;
-        txid?: string;
-        label?: string;
-        request_id?: string;
-        reason?: string;
+    /** Each bubble's cleaned content, worked out once per text. */
+    const contentCache = new Map<string, { text: string; att: boolean; value: ReturnType<typeof bubbleContent> }>();
+    function contentOf(m: { key: string; text: string; attachment?: unknown }) {
+        const att = !!m.attachment;
+        const hit = contentCache.get(m.key);
+        if (hit && hit.text === m.text && hit.att === att) return hit.value;
+        const value = bubbleContent(m);
+        contentCache.set(m.key, { text: m.text, att, value });
+        return value;
     }
 
-    function parsePayment(content: string): PaymentPayload | null {
-        try {
-            const j = JSON.parse(content);
-            return typeof j === 'object' && j !== null ? (j as PaymentPayload) : null;
-        } catch {
-            return null;
-        }
-    }
+    /** Messages tried in this read of the conversation; a failed mark is
+     *  tried again after the next read. */
+    const tried = new Set<string>();
+    /** Incoming messages the member has seen: shown in the viewport while
+     *  the window was visible. Only these are marked read. */
+    const seen = new Set<string>();
+    /** Incoming unread messages in the viewport now. */
+    const inView = new Set<string>();
+    let marking = false;
+    /** Set once the view is closed: a send's answer still lands in `kept`,
+     *  but nothing is read for a closed view. */
+    let closed = false;
 
-    function paymentKey(msg: Message, payload: PaymentPayload | null): string {
-        return payload?.request_id || msg.message_id;
-    }
-
-    function formatBtc(sats?: number): string {
-        if (typeof sats !== 'number' || !isFinite(sats)) return '';
-        const btc = (sats / 100_000_000).toFixed(8);
-        return btc.replace(/\.?0+$/, '') + ' BTC';
-    }
-
-    /**
-     * Sanitize a page of vault-returned messages before handing them to
-     * the keyed {#each} render. Three checks, each catches a wire-drift
-     * mode we've actually been bitten by:
-     *
-     *  1. Missing `message_id` — Svelte's keyed each throws
-     *     `each_key_duplicate` on the second `undefined` key and aborts
-     *     the render, leaving the pane stuck on "Loading…" (the
-     *     2026-05-24 wedge).
-     *  2. Duplicate `message_id` — same error mode if the vault ever
-     *     returns the same row twice (e.g. inclusive `before` cursor).
-     *  3. Missing/unknown `direction` — `isSent` would mis-attribute
-     *     the bubble (right-aligned vs left-aligned + color swap).
-     *
-     * Each failure is logged and the row is skipped. Surfacing the
-     * count makes a future regression visible instead of silent.
-     */
-    function sanitizeMessages(rows: Message[]): Message[] {
-        const seen = new Set<string>();
-        const out: Message[] = [];
-        let missingId = 0;
-        let duplicateId = 0;
-        let badDirection = 0;
-        for (const m of rows) {
-            const id = m?.message_id;
-            if (!id) { missingId++; continue; }
-            if (seen.has(id)) { duplicateId++; continue; }
-            if (m.direction !== 'incoming' && m.direction !== 'outgoing') {
-                badDirection++;
-                continue;
-            }
-            seen.add(id);
-            out.push(m);
-        }
-        const total = missingId + duplicateId + badDirection;
-        if (total > 0) {
-            console.warn(
-                `Conversation: dropped ${total} message row(s) — missing_id=${missingId}, duplicate_id=${duplicateId}, bad_direction=${badDirection}`,
-            );
-        }
-        return out;
-    }
-
-    async function loadMessages() {
-        loading = true;
-        error = '';
-        hasMoreOlder = true;
-        try {
-            const resp: VaultOpResponse = await invoke('get_conversation', {
-                peerConnectionId: connection.connection_id,
-                limit: PAGE_SIZE,
-            });
-            if (resp.success && resp.data) {
-                const data = resp.data as { messages?: Message[] };
-                messages = sanitizeMessages(data.messages ?? []).sort((a, b) => {
-                    // Date.parse on undefined → NaN; NaN-NaN sort is
-                    // undefined behaviour in V8 and at minimum drops
-                    // stability. Coerce missing timestamps to 0 so the
-                    // sort is total.
-                    const at = a.sent_at ? Date.parse(a.sent_at) : 0;
-                    const bt = b.sent_at ? Date.parse(b.sent_at) : 0;
-                    return (Number.isNaN(at) ? 0 : at) - (Number.isNaN(bt) ? 0 : bt);
-                });
-                // If the vault returned fewer than the page size, we
-                // already have every message — disable further fetches.
-                if (messages.length < PAGE_SIZE) hasMoreOlder = false;
-            } else if (resp.error) {
-                error = resp.error;
-            }
-        } catch (e) {
-            error = String(e);
-        }
+    function clear(): void {
+        seq++;
+        buffer = null;
+        messages = [];
+        nextBefore = null;
+        unreadable = 0;
         loading = false;
-        scrollToBottom();
-        markConversationRead(connection.connection_id);
-        sendReadReceiptsForUnread();
+        loaded = false;
+        loadError = '';
+        olderLoading = false;
+        olderError = '';
+        linkAsk = null;
+        linkError = '';
+        tried.clear();
+        // No cleaned message text stays in memory for a conversation not shown.
+        contentCache.clear();
+        // Receipts held for messages not known yet are stale by the next read.
+        kept.held = [];
     }
 
-    /**
-     * Page older messages into the top of the list. Anchored on the
-     * scroll height before the prepend so the user's viewport stays
-     * locked to the message they were reading instead of jumping.
-     */
-    async function loadOlder() {
-        if (loadingOlder || !hasMoreOlder || messages.length === 0) return;
-        const oldest = messages[0];
-        if (!oldest) return;
-        loadingOlder = true;
-        const heightBefore = scrollEl?.scrollHeight ?? 0;
-        const topBefore = scrollEl?.scrollTop ?? 0;
-        try {
-            const resp: VaultOpResponse = await invoke('get_conversation', {
-                peerConnectionId: connection.connection_id,
-                limit: PAGE_SIZE,
-                before: oldest.message_id,
-            });
-            if (resp.success && resp.data) {
-                const data = resp.data as { messages?: Message[] };
-                const older = sanitizeMessages(data.messages ?? []).sort((a, b) => {
-                    const at = a.sent_at ? Date.parse(a.sent_at) : 0;
-                    const bt = b.sent_at ? Date.parse(b.sent_at) : 0;
-                    return (Number.isNaN(at) ? 0 : at) - (Number.isNaN(bt) ? 0 : bt);
-                });
-                // De-dupe by id in case the vault's `before` semantics
-                // are inclusive on either side.
-                const have = new Set(messages.map((m) => m.message_id));
-                const fresh = older.filter((m) => !have.has(m.message_id));
-                if (fresh.length === 0) {
-                    hasMoreOlder = false;
-                } else {
-                    messages = [...fresh, ...messages];
-                    if (fresh.length < PAGE_SIZE) hasMoreOlder = false;
-                    // Anchor the viewport to the same message after prepend.
-                    queueMicrotask(() => {
-                        if (!scrollEl) return;
-                        const newHeight = scrollEl.scrollHeight;
-                        scrollEl.scrollTop = topBefore + (newHeight - heightBefore);
-                    });
-                }
-            }
-        } catch (e) {
-            // Pagination failures are non-fatal — keep what we have.
-            console.warn('loadOlder failed', e);
-        }
-        loadingOlder = false;
+    /** Texts back to the member: the box when it is empty, else bubbles. */
+    function giveBack(returned: Returned[]): void {
+        if (!returned.length) return;
+        const p = placeReturned(kept.locals, kept.drafts, returned, Date.now());
+        kept.locals = p.locals;
+        kept.drafts = p.drafts;
+        for (const [c, e] of Object.entries(p.errors)) kept.errors[c] = e;
+        // A text back in another conversation is said here too.
+        const others = returned.map((r) => r.connection_id).filter((c) => c !== cid && !kept.returnedTo.includes(c));
+        if (others.length) kept.returnedTo = [...kept.returnedTo, ...new Set(others)];
     }
 
-    /**
-     * Fire `message.read-receipt` for every received message we haven't yet
-     * marked read. The vault de-dupes by (connection_id, message_id), so it's
-     * safe to be permissive — better than missing one and leaving the peer
-     * staring at a single check forever.
-     */
-    async function sendReadReceiptsForUnread() {
-        const unread = messages.filter((m) =>
-            !isSent(m) && m.status !== 'read',
+    /** The other conversations a text went back to, by title. */
+    let elsewhere = $derived(
+        kept.returnedTo
+            .filter((c) => c !== cid)
+            .map((c) => {
+                const conn = $connectionsStore.find((x) => x.id === c);
+                return { id: c, text: returnedElsewhereText(conn ? connectionTitle(conn) : '') };
+            }),
+    );
+
+    /** Receipts held for messages of this connection that are known now. */
+    function releaseNow(): void {
+        if (!kept.held.length) return;
+        const r = releaseHeld(
+            kept.held,
+            (ev) => ev.members?.connection_id === cid && knowsEvent(messages, kept.locals, ev, cid),
+            Date.now(),
         );
-        for (const msg of unread) {
-            try {
-                await invoke('mark_message_read', {
-                    connectionId: connection.connection_id,
-                    messageId: msg.message_id,
-                });
-                msg.status = 'read';
-            } catch (e) {
-                console.warn('Failed to send read receipt:', e);
-            }
-        }
-        // Trigger reactivity since we mutated objects in place.
-        messages = [...messages];
+        kept.held = r.held;
+        for (const ev of r.ready) applyEvent(ev);
     }
 
-    async function sendMessage() {
-        const text = composeText.trim();
-        if (!text || sending) return;
-        sending = true;
+    function applyEvent(ev: SyncEv): void {
+        messages = applySyncEvent(messages, ev, cid);
+        kept.locals = applySyncEvent(kept.locals, ev, cid);
+    }
+
+    async function loadNewest(): Promise<void> {
+        if (closed) return;
+        const mine = ++seq;
+        const startedAt = Date.now();
+        lastReadAt = performance.now();
+        // A send past its expires_at is read about now.
+        const due = expireDue(kept.locals, startedAt);
+        if (due.changed) kept.locals = due.locals;
+        buffer = { messages: [], events: [] };
+        loading = true;
+        olderLoading = false;
+        olderError = '';
+        let resp: VaultOpResponse<{ messages?: Message[]; next_before?: string; unreadable?: number }> | null = null;
+        let err = '';
         try {
-            // Agent connections route through a different vault op
-            // (agent.message-reply) because the agent crypto path uses
-            // the AgentSession key, not the peer SharedSecret that
-            // message.send/HandleSend assumes. Mirrors the Android
-            // ConversationViewModel branch — keeps the failure mode
-            // ("Send failed" with no detail) from coming back the
-            // moment the user tries to message an agent. Vault-side
-            // handler shipped in v5; see vettid-dev's
-            // HandleAgentMessageReply.
-            const isAgent = connection.connection_type === 'agent';
-            const resp: VaultOpResponse = isAgent
-                ? await invoke('send_agent_message', {
-                    connectionId: connection.connection_id,
-                    content: text,
-                })
-                : await invoke('send_message', {
-                    peerConnectionId: connection.connection_id,
-                    content: text,
-                });
-            if (resp.success) {
-                composeText = '';
-                await loadMessages();
-            } else {
-                error = resp.error ?? 'Send failed';
-            }
+            resp = await invoke('get_conversation', { connectionId: cid, limit: PAGE_LIMIT });
         } catch (e) {
-            error = String(e);
+            err = String(e);
         }
-        sending = false;
-    }
-
-    function handleKeydown(e: KeyboardEvent) {
-        if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            sendMessage();
+        if (mine !== seq) return;
+        const got = buffer;
+        buffer = null;
+        loading = false;
+        loaded = true;
+        if (resp?.success && resp.data) {
+            const firstRead = messages.length === 0;
+            const atBottom = nearBottom();
+            // The older pages loaded stay, when this page meets them.
+            const merged = mergeNewest(messages, resp.data.messages ?? [], nextBefore, resp.data.next_before ?? null, cid);
+            const keptOlder = merged.messages.length > (resp.data.messages ?? []).length;
+            let next = mergeMessages(merged.messages, got?.messages ?? [], cid);
+            for (const ev of got?.events ?? []) next = applySyncEvent(next, ev, cid);
+            messages = next;
+            nextBefore = merged.nextBefore;
+            unreadable = keptOlder ? Math.max(unreadable, resp.data.unreadable ?? 0) : (resp.data.unreadable ?? 0);
+            loadError = '';
+            tried.clear();
+            const after = afterReload(kept.locals, cid, next, startedAt);
+            kept.locals = after.locals;
+            releaseNow();
+            readFailures = 0;
+            await tick();
+            // Someone reading history stays where they are.
+            if (firstRead || atBottom) scrollToBottom();
+            // A send that expired or came back unreadable during this read
+            // is read about again by the timer (shouldReread).
+        } else {
+            readFailures += 1;
+            // Nothing that wasn't confirmed stays on screen.
+            messages = [];
+            nextBefore = null;
+            unreadable = 0;
+            loadError = resp?.error ?? err;
         }
     }
 
-    function scrollToBottom() {
-        // Defer to next tick so the DOM has rendered the new content.
-        queueMicrotask(() => {
-            if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
-        });
-    }
-
-    function onMessagesScroll() {
-        if (!scrollEl) return;
-        nearBottom = scrollEl.scrollTop + scrollEl.clientHeight >= scrollEl.scrollHeight - 100;
-        if (scrollEl.scrollTop <= LOAD_OLDER_THRESHOLD_PX && hasMoreOlder && !loadingOlder) {
-            void loadOlder();
+    async function loadOlder(): Promise<void> {
+        const before = nextBefore;
+        if (!before || olderLoading || loading) return;
+        const mine = seq;
+        olderLoading = true;
+        olderError = '';
+        let resp: VaultOpResponse<{ messages?: Message[]; next_before?: string; unreadable?: number }> | null = null;
+        let err = '';
+        try {
+            resp = await invoke('get_conversation', { connectionId: cid, before, limit: PAGE_LIMIT });
+        } catch (e) {
+            err = String(e);
+        }
+        if (mine !== seq) return;
+        olderLoading = false;
+        if (resp?.success && resp.data) {
+            const height = scrollEl?.scrollHeight ?? 0;
+            messages = mergeMessages(messages, resp.data.messages ?? [], cid);
+            nextBefore = resp.data.next_before ?? null;
+            unreadable += resp.data.unreadable ?? 0;
+            releaseNow();
+            await tick();
+            // Keep the messages that were on screen where they were.
+            if (scrollEl) scrollEl.scrollTop += scrollEl.scrollHeight - height;
+        } else if (resp?.error_code === 'page_gone') {
+            // That message is gone (§10.5.2): start again from the newest page.
+            void loadNewest();
+        } else {
+            olderError = resp?.error ?? err;
         }
     }
 
-    /**
-     * Pay an incoming payment request. Loads wallets (lazy) and opens
-     * SendBtcSheet prefilled with the address + amount. The user
-     * confirms in the sheet — we never silently send.
-     */
-    async function payPaymentRequest(msg: Message, payload: PaymentPayload | null) {
-        if (!payload?.address || !payload?.amount_sats) {
-            error = 'Payment request is missing address or amount.';
+    function nearBottom(): boolean {
+        if (!scrollEl) return true;
+        return scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 80;
+    }
+
+    function scrollToBottom(): void {
+        if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
+    }
+
+    async function onInbound(batch: InboundBatch): Promise<void> {
+        const action = conversationAction(batch, live && takes);
+        if (action === 'drop') return;
+        if (action === 'reload') {
+            void loadNewest();
             return;
         }
-        const key = paymentKey(msg, payload);
-        paymentActionState = { ...paymentActionState, [key]: { busy: true } };
-        try {
-            await ensureWalletsLoaded();
-            if (walletsForSheet.length === 0) {
-                paymentActionState = {
-                    ...paymentActionState,
-                    [key]: { busy: false, error: walletsError || 'No wallets available' },
-                };
-                return;
+        const atBottom = nearBottom();
+        let added = false;
+        for (const m of batch.messages ?? []) {
+            if (m?.type === 'message.new') {
+                if (m.body?.connection_id !== cid) continue;
+                if (buffer) buffer.messages.push(m.body);
+                messages = mergeMessages(messages, [m.body], cid);
+                added = true;
+            } else if (m?.type === 'sync.event') {
+                if (buffer) buffer.events.push(m.body);
+                if (knowsEvent(messages, kept.locals, m.body, cid)) applyEvent(m.body);
+                // Its message isn't known yet (send_message's answer may be
+                // on its way, or a page will have it): held a while.
+                else kept.held = [...kept.held, { ev: m.body, at: Date.now() }];
             }
-            payPrefill = { toAddress: payload.address, amountSats: payload.amount_sats };
-            activeSheet = 'send';
-            paymentActionState = { ...paymentActionState, [key]: { busy: false } };
-        } catch (e) {
-            paymentActionState = {
-                ...paymentActionState,
-                [key]: { busy: false, error: String(e) },
-            };
+        }
+        if (added) releaseNow();
+        if (added && atBottom) {
+            await tick();
+            scrollToBottom();
         }
     }
 
-    /**
-     * Decline an incoming payment request by sending a structured
-     * `btc_payment_decline` message with `{request_id, reason}`. The
-     * recipient renders it as a dedicated bubble.
-     */
-    async function declinePaymentRequest(msg: Message, payload: PaymentPayload | null) {
-        const key = paymentKey(msg, payload);
-        const reason = declineReason.trim() || 'Declined';
-        paymentActionState = { ...paymentActionState, [key]: { busy: true } };
-        try {
-            const body = JSON.stringify({
-                request_id: payload?.request_id ?? msg.message_id,
-                reason,
+    // ---- Marking read: only what was seen, one call at a time, never in
+    // the way of the view.
+
+    function pumpReads(): void {
+        if (closed || marking || !live || !takes || !attending()) return;
+        const id = nextToMark(messages, tried, seen);
+        if (!id) return;
+        tried.add(id);
+        marking = true;
+        const mine = seq;
+        invoke<VaultOpResponse<unknown>>('mark_message_read', { connectionId: cid, messageId: id })
+            .then((resp) => {
+                if (resp.success && mine === seq) messages = markedRead(messages, id);
+            })
+            .catch(() => {})
+            .finally(() => {
+                marking = false;
+                pumpReads();
             });
-            const resp: VaultOpResponse = await invoke('send_message', {
-                peerConnectionId: connection.connection_id,
-                content: body,
-                contentType: 'btc_payment_decline',
-            });
-            if (resp.success) {
-                decliningFor = null;
-                declineReason = '';
-                paymentActionState = { ...paymentActionState, [key]: { busy: false } };
-                await loadMessages();
-            } else {
-                paymentActionState = {
-                    ...paymentActionState,
-                    [key]: { busy: false, error: resp.error ?? 'Decline failed' },
-                };
-            }
-        } catch (e) {
-            paymentActionState = {
-                ...paymentActionState,
-                [key]: { busy: false, error: String(e) },
-            };
-        }
     }
 
-    function openDecline(msg: Message, payload: PaymentPayload | null) {
-        decliningFor = paymentKey(msg, payload);
-        declineReason = '';
-    }
-
-    function cancelDecline() {
-        decliningFor = null;
-        declineReason = '';
-    }
-
-    async function ensureWalletsLoaded() {
-        if (walletsForSheet.length > 0) return;
-        walletsError = '';
-        try {
-            const resp: VaultOpResponse = await invoke('list_wallets');
-            if (resp.success && resp.data) {
-                const data = resp.data as { wallets?: (WalletItem & { is_archived?: boolean })[] };
-                walletsForSheet = (data.wallets ?? []).filter((w) => !w.is_archived);
-            } else {
-                walletsError = resp.error ?? 'Failed to load wallets';
-            }
-        } catch (e) {
-            walletsError = String(e);
-        }
-    }
-
-    async function openRequestPaymentSheet() {
-        composeMenuOpen = false;
-        await ensureWalletsLoaded();
-        if (walletsForSheet.length === 0) {
-            error = walletsError || 'You have no wallets. Create one in the Wallets tab first.';
-            return;
-        }
-        activeSheet = 'request';
-    }
-
-    function closeSheet() {
-        activeSheet = null;
-        payPrefill = null;
-    }
-
-    function onSheetSent() {
-        loadMessages();
-    }
-
-    /**
-     * Split a message into text/link tokens for click-through. We only want to
-     * recognize the conservative `https?://` and `www.` shapes used by the
-     * Android app — wider matchers tend to false-positive on punctuation.
-     */
-    const URL_PATTERN = /(https?:\/\/[^\s]+|www\.[^\s]+)/g;
-    interface Token { text: string; isLink: boolean; href?: string; }
-
-    function tokenize(text: string | null | undefined): Token[] {
-        // The vault SHOULD always set content to a string, but a single
-        // null/undefined field in the response would otherwise abort the
-        // whole {#each messages} render — and that takes the conversation
-        // pane with it (Svelte 5 propagates the error up the reactive
-        // graph). Coerce to "" so the worst case is an empty bubble.
-        const safe = typeof text === 'string' ? text : '';
-        const tokens: Token[] = [];
-        let lastIndex = 0;
-        for (const match of safe.matchAll(URL_PATTERN)) {
-            const start = match.index ?? 0;
-            if (start > lastIndex) {
-                tokens.push({ text: safe.slice(lastIndex, start), isLink: false });
-            }
-            const url = match[0];
-            const href = url.startsWith('http') ? url : `https://${url}`;
-            tokens.push({ text: url, isLink: true, href });
-            lastIndex = start + url.length;
-        }
-        if (lastIndex < safe.length) {
-            tokens.push({ text: safe.slice(lastIndex), isLink: false });
-        }
-        return tokens;
-    }
-
-    async function openLink(href: string) {
-        // SECURITY: `open()` is gated by the plugin-shell scope regex
-        // in tauri.conf.json. The scope was previously too permissive
-        // (`^https://(vett.id|api.vettid.dev|vettid.org)/.*`), which
-        // accepted ANY path/query on those hosts — letting a peer
-        // message URL drive the user's default browser to any
-        // open-redirect or attacker-influenced URL on a vetted host.
-        // Scope is now restricted to known marketing paths; the API
-        // host (api.vettid.dev) is intentionally NOT a click target.
-        // See SECURITY-REVIEW-2026-05-25.md D-HIGH-2.
-        try {
-            await open(href);
-        } catch (e) {
-            console.error('Failed to open link:', e);
-        }
-    }
-
-    /**
-     * Heuristic for sender → "is this me or the peer". The vault encodes the
-     * sender as either the peer's connection_id (when we receive) or our own
-     * device id / "me" (when we send). We treat anything that doesn't match
-     * the peer connection id as outbound.
-     */
-    function isSent(msg: Message): boolean {
-        // The vault stamps `direction` authoritatively when the message
-        // is recorded (MessageRecord.Direction in messaging.go); trust
-        // it over any heuristic on sender_guid / peer_guid (those break
-        // for system / device / agent connections where peer_guid is
-        // absent).
-        return msg.direction === 'outgoing';
-    }
-
-    async function startCall(type: CallType) {
-        // Calls need a peer identity — the system connection, device
-        // pairings, and agents have no peer_guid and can't be called.
-        if (!connection.peer_guid) {
-            error = "This connection can't be called.";
-            return;
-        }
-        try {
-            await placeCall(connection.connection_id, connection.peer_guid, peerName(connection), type);
-        } catch (e) {
-            error = `Call failed: ${e}`;
-        }
-    }
-
-    // Reload when the connection prop changes.
+    /** Dense thresholds, every 0.05, so that a bubble taller than the pane
+     *  is measured as it scrolls (seenInView's second rule). */
+    const THRESHOLDS = Array.from({ length: 21 }, (_, i) => i / 20);
+    /** The incoming unread bubbles watched, whatever the observer is now. */
+    const watched = new Set<HTMLElement>();
+    /** Watches against the message pane itself (`root`), so `rootBounds`
+     *  is the pane, not the window; made again whenever the pane is. */
+    let observer: IntersectionObserver | null = null;
     $effect(() => {
-        // Take a stable reference so the effect re-fires on connection change.
-        const _ = connection.connection_id;
-        loadMessages();
+        const root = scrollEl;
+        if (!root || typeof IntersectionObserver === 'undefined') return;
+        const o = new IntersectionObserver(
+            (entries) => {
+                for (const e of entries) {
+                    const id = (e.target as HTMLElement).dataset.unreadId ?? '';
+                    if (!id) continue;
+                    if (seenInView(e)) inView.add(id);
+                    else inView.delete(id);
+                }
+                noteSeen();
+            },
+            { root, threshold: THRESHOLDS },
+        );
+        observer = o;
+        for (const n of watched) o.observe(n);
+        return () => {
+            o.disconnect();
+            if (observer === o) observer = null;
+            inView.clear();
+        };
     });
 
-    // Real-time message + read-receipt handlers. Both arrive on the
-    // per-device fan-out subject `MessageSpace.{owner}.forApp.device
-    // .{conn}.{event}` — the conversation's connection_id lives inside
-    // the payload (set by messaging.go's handleIncomingPeerMessage and
-    // handleIncomingReadReceipt), so we decode and filter on that.
-    // Both responses reload the conversation since vault.message.list
-    // is the authoritative source for both content and per-message
-    // status.
+    /** What is in the viewport counts as seen while the window is visible. */
+    /** The member can see the window: shown, and focused. */
+    function attending(): boolean {
+        return document.visibilityState === 'visible' && document.hasFocus();
+    }
+
+    function noteSeen(): void {
+        if (!attending()) return;
+        for (const id of inView) seen.add(id);
+        pumpReads();
+    }
+
+    /** Watches an incoming unread bubble (id ''): nothing to watch. */
+    function watchUnread(node: HTMLElement, id: string) {
+        const set = (v: string) => {
+            node.dataset.unreadId = v;
+            if (v) {
+                watched.add(node);
+                observer?.observe(node);
+            } else {
+                watched.delete(node);
+                observer?.unobserve(node);
+            }
+        };
+        set(id);
+        return {
+            update(v: string) {
+                if (!v) inView.delete(node.dataset.unreadId ?? '');
+                set(v);
+            },
+            destroy() {
+                inView.delete(node.dataset.unreadId ?? '');
+                watched.delete(node);
+                observer?.unobserve(node);
+            },
+        };
+    }
+
+    // ---- Sending
+
+    async function send(): Promise<void> {
+        const text = kept.drafts[cid] ?? '';
+        if (kept.sending[cid] || !live || !takes || !canSend(text)) return;
+        // Always a new message (send_message); an unconfirmed one is tried
+        // again by its own "Try again".
+        // What the view has of this connection's outgoing messages now, so a
+        // later read can tell a new one from those (in the vault's terms).
+        const l = newLocal(cid, text, Date.now(), knownOutgoing(messages, kept.locals, cid));
+        kept.locals = [...kept.locals, l];
+        kept.drafts[cid] = '';
+        kept.errors[cid] = '';
+        kept.sending[cid] = true;
+        await tick();
+        scrollToBottom();
+        let refresh = false;
+        try {
+            let resp: VaultOpResponse<any> | null = null;
+            try {
+                resp = await invoke('send_message', { connectionId: cid, text });
+            } catch {
+                // No answer at all: it may have gone, so it is unconfirmed.
+                resp = null;
+            }
+            const r = applySendAnswer(kept.locals, l.key, resp, Date.now());
+            kept.locals = r.locals;
+            giveBack(r.returned);
+            refresh = r.refresh;
+        } finally {
+            kept.sending[cid] = false;
+        }
+        if (!closed) releaseNow();
+        if (refresh && live && !closed) void loadNewest();
+    }
+
+    async function retry(key: string): Promise<void> {
+        const l = kept.locals.find((x) => x.key === key);
+        if (!l?.pending_id || l.state !== 'unconfirmed' || kept.sending[cid] || !live || !takes) return;
+        const pendingId = l.pending_id;
+        kept.locals = startRetry(kept.locals, key);
+        kept.sending[cid] = true;
+        let refresh = false;
+        try {
+            let resp: VaultOpResponse<any> | null = null;
+            try {
+                resp = await invoke('retry_send', { connectionId: cid, pendingId });
+            } catch {
+                resp = null;
+            }
+            const r = applyRetryAnswer(kept.locals, key, resp, Date.now());
+            kept.locals = r.locals;
+            giveBack(r.returned);
+            refresh = r.refresh;
+        } finally {
+            kept.sending[cid] = false;
+        }
+        if (!closed) releaseNow();
+        if (refresh && live && !closed) void loadNewest();
+    }
+
+    function editUnsent(key: string): void {
+        const r = unsentToDraft(kept.locals, kept.drafts, key);
+        if (!r) return;
+        kept.locals = r.locals;
+        kept.drafts = r.drafts;
+        kept.errors[cid] = '';
+    }
+
+    function removeUnsent(key: string): void {
+        kept.locals = kept.locals.filter((x) => !(x.key === key && x.state === 'unsent'));
+    }
+
+    function onKeydown(e: KeyboardEvent): void {
+        // An Enter that confirms an IME candidate (WebKit says keyCode 229) isn't a send.
+        if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+            e.preventDefault();
+            void send();
+        }
+    }
+
+    // ---- Links (§10.5): the host is shown and the member asked first.
+
+    /** Moves focus into the link prompt when it opens: to Cancel, so that
+     *  a repeated Enter can't open the link before the host is read. */
+    function focusFirst(node: HTMLElement) {
+        node.focus();
+    }
+
+    /** The link that opened the prompt: focus goes back to it on Cancel. */
+    let opener: HTMLElement | null = null;
+
+    async function cancelAsk(): Promise<void> {
+        linkAsk = null;
+        const back = opener;
+        opener = null;
+        await tick();
+        if (back?.isConnected) back.focus();
+    }
+
+    function onAskKeydown(e: KeyboardEvent): void {
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            void cancelAsk();
+        }
+    }
+
+    function askOpen(p: { href: string; host: string }, from?: EventTarget | null): void {
+        opener = from instanceof HTMLElement ? from : null;
+        linkError = '';
+        linkAsk = { href: p.href, host: p.host };
+    }
+
+    async function openAsked(): Promise<void> {
+        const ask = linkAsk;
+        linkAsk = null;
+        if (!ask) return;
+        try {
+            await open(ask.href);
+        } catch {
+            linkError = LINK_NOT_OPENED;
+        }
+    }
+
+    function when(iso: string): string {
+        if (!iso) return '';
+        const t = new Date(iso);
+        return Number.isNaN(t.getTime()) ? '' : t.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    }
+
+    // Read when the session goes live (and on opening, which also reads
+    // about any send that expired while the view was closed); cleared when
+    // it stops.
     $effect(() => {
-        const unlistenMsg = listen<{ subject: string; payload_b64: string }>(
-            'vault:message-received',
-            (event) => {
-                const body = decodeEventPayload<{ connection_id?: string }>(event.payload);
-                if (body?.connection_id !== connection.connection_id) return;
-                loadMessages();
-            },
-        );
-        const unlistenReceipt = listen<{ subject: string; payload_b64: string }>(
-            'vault:read-receipt',
-            (event) => {
-                const body = decodeEventPayload<{ connection_id?: string }>(event.payload);
-                if (body?.connection_id !== connection.connection_id) return;
-                loadMessages();
-            },
-        );
-        // Agent connections: the vault emits agent.message.received
-        // (not new-message) for agent→owner messages because the
-        // payload comes from the agent's encrypted channel rather
-        // than a peer's. Listener.rs routes this to a dedicated
-        // vault:agent-message event so we don't have to disambiguate
-        // by subject on the JS side.
-        const unlistenAgentMsg = listen<{ subject: string; payload_b64: string }>(
-            'vault:agent-message',
-            (event) => {
-                const body = decodeEventPayload<{ connection_id?: string }>(event.payload);
-                if (body?.connection_id !== connection.connection_id) return;
-                loadMessages();
-            },
-        );
+        const on = live && takes;
+        untrack(() => {
+            if (on) void loadNewest();
+            else clear();
+        });
+    });
+
+    onMount(() => {
+        // Opened: a note that a text came back here is no longer needed.
+        if (kept.returnedTo.includes(cid)) kept.returnedTo = kept.returnedTo.filter((c) => c !== cid);
+        const un = listen<InboundBatch>(INBOUND_EVENT, (event) => void onInbound(event.payload));
+        // A send past its deadline, or still being checked (a read that
+        // failed leaves it so), is read about again, every few seconds.
+        const timer = setInterval(() => {
+            if (!live || !takes || loading) return;
+            if (shouldReread(kept.locals, cid, Date.now(), performance.now() - lastReadAt, readFailures)) void loadNewest();
+        }, 1_000);
+        const onVisible = () => noteSeen();
+        document.addEventListener('visibilitychange', onVisible);
+        // Marking resumes when the window gets focus again.
+        window.addEventListener('focus', onVisible);
+        window.addEventListener('blur', onVisible);
         return () => {
-            unlistenMsg.then((fn) => fn());
-            unlistenReceipt.then((fn) => fn());
-            unlistenAgentMsg.then((fn) => fn());
+            closed = true;
+            seq++;
+            contentCache.clear();
+            clearInterval(timer);
+            document.removeEventListener('visibilitychange', onVisible);
+            window.removeEventListener('focus', onVisible);
+            window.removeEventListener('blur', onVisible);
+            void un.then((f) => f());
         };
     });
 </script>
@@ -556,466 +584,289 @@
 <div class="conversation">
     {#if !compact}
         <header class="bar">
-            <button class="back" onclick={clearSelectedConnection} aria-label="Back">←</button>
-            <button class="header-name" onclick={onShowProfile}>
-                <span class="name">{peerName(connection)}</span>
-                <span class="profile-hint">view profile</span>
-            </button>
-            {#if CALLS_ENABLED}
-                <button class="call-btn" onclick={() => startCall('audio')} aria-label="Voice call" title="Voice call">📞</button>
-                <button class="call-btn" onclick={() => startCall('video')} aria-label="Video call" title="Video call">🎥</button>
-            {/if}
-            <span class="status-dot {connection.status}" aria-label={connection.status}></span>
+            <h3><bdi>{title}</bdi></h3>
         </header>
     {/if}
 
-    {#if loading && messages.length === 0}
-        <div class="status">Loading…</div>
-    {:else if error}
-        <div class="status error">{error}</div>
+    {#if !takes}
+        <div class="status">{SERVICE_NO_MESSAGES}</div>
+    {:else if !live}
+        <div class="status">{MESSAGES_NOT_LIVE_TEXT}</div>
     {:else}
-        <div class="messages-scroll" bind:this={scrollEl} onscroll={onMessagesScroll}>
-            {#if loadingOlder}
-                <div class="older-status">Loading older messages…</div>
-            {:else if !hasMoreOlder && messages.length >= PAGE_SIZE}
-                <div class="older-status muted">— Start of conversation —</div>
-            {/if}
-            {#each messages as msg (msg.message_id)}
-                {@const sent = isSent(msg)}
-                <div class="message" class:sent class:received={!sent}>
-                    <div class="bubble">
-                        {#if msg.content_type === 'payment_request'}
-                            {@const p = parsePayment(msg.content)}
-                            {@const key = paymentKey(msg, p)}
-                            {@const action = paymentActionState[key]}
-                            <div class="pay-head">{sent ? '📤 Payment request sent' : '📥 Payment request'}</div>
-                            {#if p?.amount_sats !== undefined}
-                                <div class="pay-amount">{formatBtc(p.amount_sats)}</div>
-                            {/if}
-                            {#if p?.memo}<div class="pay-memo">"{p.memo}"</div>{/if}
-                            {#if p?.address}<div class="pay-addr mono">{p.address.slice(0, 18)}…</div>{/if}
-                            {#if !sent}
-                                {#if decliningFor === key}
-                                    <div class="decline-row">
-                                        <input
-                                            type="text"
-                                            placeholder="Reason (optional)"
-                                            bind:value={declineReason}
-                                            maxlength="140"
-                                            class="decline-input"
-                                        />
-                                        <button
-                                            class="pay-action danger"
-                                            onclick={() => declinePaymentRequest(msg, p)}
-                                            disabled={action?.busy}
-                                        >{action?.busy ? '…' : 'Send decline'}</button>
-                                        <button class="pay-action ghost" onclick={cancelDecline} disabled={action?.busy}>Cancel</button>
-                                    </div>
-                                {:else}
-                                    <div class="pay-actions">
-                                        <button
-                                            class="pay-action primary"
-                                            onclick={() => payPaymentRequest(msg, p)}
-                                            disabled={action?.busy}
-                                        >Pay</button>
-                                        <button
-                                            class="pay-action ghost"
-                                            onclick={() => openDecline(msg, p)}
-                                            disabled={action?.busy}
-                                        >Decline</button>
-                                    </div>
-                                {/if}
-                                {#if action?.error}
-                                    <div class="pay-err">{action.error}</div>
-                                {/if}
-                            {/if}
-                        {:else if msg.content_type === 'btc_payment_decline'}
-                            {@const p = parsePayment(msg.content)}
-                            <div class="pay-head">{sent ? '🚫 You declined a payment request' : '🚫 Payment request declined'}</div>
-                            {#if p?.reason}<div class="pay-memo">"{p.reason}"</div>{/if}
-                        {:else if msg.content_type === 'btc_payment_receipt'}
-                            {@const p = parsePayment(msg.content)}
-                            <div class="pay-head">{sent ? '✅ Payment sent' : '✅ Payment received'}</div>
-                            {#if p?.amount_sats !== undefined}
-                                <div class="pay-amount">{formatBtc(p.amount_sats)}</div>
-                            {/if}
-                            {#if p?.txid}<div class="pay-addr mono">tx: {p.txid.slice(0, 16)}…</div>{/if}
-                        {:else if msg.content_type === 'btc_address'}
-                            {@const p = parsePayment(msg.content)}
-                            <div class="pay-head">📬 Shared wallet address</div>
-                            {#if p?.label}<div class="pay-label">{p.label}</div>{/if}
-                            {#if p?.address}<div class="pay-addr mono">{p.address}</div>{/if}
-                        {:else}
-                            {#each tokenize(msg.content) as tok}
-                                {#if tok.isLink && tok.href}
-                                    <button
-                                        type="button"
-                                        class="link-btn"
-                                        onclick={() => openLink(tok.href!)}
-                                    >{tok.text}</button>
-                                {:else}<span>{tok.text}</span>{/if}
-                            {/each}
-                        {/if}
-                    </div>
-                    <div class="msg-meta">
-                        <span class="time">{new Date(msg.sent_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</span>
-                        {#if sent && connection.connection_type !== 'agent'}
-                            <span class="receipt" class:read={msg.status === 'read'}>
-                                {#if msg.status === 'read'}✓✓
-                                {:else if msg.status === 'delivered'}✓✓
-                                {:else if msg.status === 'sent'}✓
-                                {:else if msg.status === 'sending'}…
-                                {:else if msg.status === 'failed'}!{/if}
-                            </span>
-                        {/if}
-                    </div>
-                </div>
-            {/each}
-            {#if !nearBottom}
-                <button
-                    type="button"
-                    class="scroll-fab"
-                    onclick={scrollToBottom}
-                    aria-label="Scroll to latest"
-                    title="Scroll to latest"
-                >↓</button>
-            {/if}
+        {#each elsewhere as e (e.id)}
+            <div class="note">{e.text}</div>
+        {/each}
+        <div class="tools">
+            <button class="refresh" aria-label="Refresh" title="Refresh" onclick={() => void loadNewest()} disabled={loading}>↻</button>
         </div>
 
-        <form class="compose" onsubmit={(e) => { e.preventDefault(); sendMessage(); }}>
-            <div class="compose-menu-wrap">
-                <button
-                    type="button"
-                    class="compose-attach"
-                    aria-label="More actions"
-                    title="More"
-                    onclick={() => (composeMenuOpen = !composeMenuOpen)}
-                >+</button>
-                {#if composeMenuOpen}
-                    <div class="compose-menu" role="menu">
-                        <button
-                            type="button"
-                            class="compose-menu-item"
-                            onclick={openRequestPaymentSheet}
-                        >💸 Request payment</button>
+        {#if loading && !loaded}
+            <div class="status">Loading…</div>
+        {:else if loadError}
+            <div class="status error">{loadError}</div>
+        {:else}
+            <div class="messages-scroll" bind:this={scrollEl}>
+                {#if unreadable > 0}
+                    <div class="note">{UNREADABLE_MESSAGES}</div>
+                {/if}
+                {#if nextBefore}
+                    <div class="older">
+                        {#if olderLoading}
+                            <span class="muted">Loading…</span>
+                        {:else}
+                            <!-- NEW TEXT (owner approval needed) -->
+                            <button class="older-btn" onclick={() => void loadOlder()}>Load older</button>
+                        {/if}
                     </div>
                 {/if}
+                {#if olderError}
+                    <div class="older error">{olderError}</div>
+                {/if}
+
+                {#each items as m (m.key)}
+                    {@const content = contentOf(m)}
+                    {@const st = deliveryState(m, { relayHeld: !!connection.relay_held })}
+                    {@const stText = deliveryText(st, { notice: m.local?.notice, title })}
+                    <div
+                        class="message"
+                        class:sent={m.direction === 'out'}
+                        class:received={m.direction !== 'out'}
+                        use:watchUnread={m.direction === 'in' && !m.read ? m.message_id : ''}
+                    >
+                        <div
+                            class="bubble"
+                            class:pending={st === 'sending' || st === 'unconfirmed'}
+                            class:check={st === 'expired' || st === 'unreadable' || st === 'unsent'}
+                        >
+                            {#if content.placeholder}
+                                <div class="attachment">{content.placeholder}</div>
+                            {/if}
+                            {#if content.body}
+                                {#if content.body.empty}
+                                    <div class="empty">{EMPTY_MESSAGE}</div>
+                                {:else}
+                                    <div class="text" class:caption={!!content.placeholder}>
+                                        {#each content.body.lines as line}
+                                            <div class="line">{LINE_ISOLATE.start}{#each line as p}{#if 'href' in p}<button type="button" class="link" onclick={(e) => askOpen(p, e.currentTarget)}>{p.text}</button>{:else}{p.text}{/if}{/each}{LINE_ISOLATE.end}</div>
+                                        {/each}
+                                    </div>
+                                {/if}
+                            {/if}
+                        </div>
+                        <div class="meta">
+                            {#if when(m.sent_at)}<span class="time">{when(m.sent_at)}</span>{/if}
+                            {#if stText}
+                                <span
+                                    aria-live="polite"
+                                    class="state"
+                                    class:unconfirmed={st === 'unconfirmed' || st === 'held'}
+                                    class:check={st === 'expired' || st === 'unreadable' || st === 'unsent'}
+                                    class:read={st === 'read'}
+                                >{stText}</span>
+                            {/if}
+                        </div>
+                        {#if st === 'unconfirmed' && m.local?.pending_id}
+                            <div class="actions">
+                                <!-- NEW TEXT (owner approval needed): "Try again" -->
+                                <button type="button" onclick={() => void retry(m.key)} disabled={sending}>Try again</button>
+                            </div>
+                        {:else if st === 'unsent'}
+                            <div class="actions">
+                                <!-- NEW TEXT (owner approval needed): "Edit", "Remove" -->
+                                <!-- Focusable while the box has text (it does nothing then), with the hint said and shown. -->
+                                <button
+                                    type="button"
+                                    onclick={() => editUnsent(m.key)}
+                                    aria-disabled={draft !== '' ? 'true' : undefined}
+                                    aria-describedby={draft !== '' ? `${m.key}-edit-hint` : undefined}
+                                >Edit</button>
+                                <button type="button" onclick={() => removeUnsent(m.key)}>Remove</button>
+                            </div>
+                            {#if draft !== ''}
+                                <div class="hint" id="{m.key}-edit-hint">{EDIT_NEEDS_EMPTY_BOX}</div>
+                            {/if}
+                        {/if}
+                    </div>
+                {/each}
             </div>
-            <textarea
-                bind:value={composeText}
-                onkeydown={handleKeydown}
-                placeholder="Message {peerName(connection)}…"
-                rows="1"
-            ></textarea>
-            <button type="submit" disabled={sending || !composeText.trim()}>
-                {sending ? '…' : 'Send'}
-            </button>
-        </form>
+
+            {#if linkAsk}
+                <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+                <div class="link-ask" role="dialog" aria-modal="false" aria-labelledby="{cid}-link-ask" tabindex="-1" onkeydown={onAskKeydown}>
+                    <span id="{cid}-link-ask">{openLinkQuestion(linkAsk.host)}</span>
+                    <!-- NEW TEXT (owner approval needed): "Open" -->
+                    <button type="button" class="primary" onclick={() => void openAsked()}>Open</button>
+                    <button type="button" use:focusFirst onclick={() => void cancelAsk()}>Cancel</button>
+                </div>
+            {/if}
+            <div aria-live="polite">
+                {#if linkError}
+                    <div class="compose-note error">{linkError}</div>
+                {/if}
+            </div>
+
+            <form class="compose" onsubmit={(e) => { e.preventDefault(); void send(); }}>
+                <!-- NEW TEXT (owner approval needed): the box's label, "Message" -->
+                <textarea
+                    bind:value={kept.drafts[cid]}
+                    onkeydown={onKeydown}
+                    rows="2"
+                    aria-label="Message"
+                ></textarea>
+                <button type="submit" disabled={sending || !canSend(draft)}>{sending ? DELIVERY_TEXT.sending : 'Send'}</button>
+            </form>
+            <div aria-live="polite">
+                {#if draftBytes > MAX_TEXT_BYTES}
+                    <div class="compose-note error">{tooLongText(draftBytes)}</div>
+                {/if}
+                {#if sendError}
+                    <div class="compose-note error">{sendError}</div>
+                {/if}
+            </div>
+        {/if}
     {/if}
 </div>
 
-{#if activeSheet === 'send' && payPrefill}
-    <SendBtcSheet
-        wallets={walletsForSheet}
-        prefillToAddress={payPrefill.toAddress}
-        prefillAmountSats={payPrefill.amountSats}
-        onClose={closeSheet}
-        onSent={onSheetSent}
-    />
-{:else if activeSheet === 'request' && walletsForSheet[0]}
-    <RequestPaymentSheet
-        wallet={{
-            wallet_id: walletsForSheet[0].wallet_id,
-            label: walletsForSheet[0].label,
-            network: walletsForSheet[0].network,
-        }}
-        prefillConnectionId={connection.connection_id}
-        onClose={closeSheet}
-        onSent={onSheetSent}
-    />
-{/if}
-
 <style>
-    .conversation { height: 100%; display: flex; flex-direction: column; }
-
+    .conversation { height: 100%; display: flex; flex-direction: column; min-height: 0; }
     .bar {
-        display: flex; align-items: center; gap: 12px;
-        padding: 0 0 10px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 0 0 12px;
         border-bottom: 1px solid var(--border);
     }
-    .back, .header-name {
+    .bar h3 { margin: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .tools { display: flex; justify-content: flex-end; }
+    .refresh {
         background: none;
         border: 1px solid var(--border);
         border-radius: 4px;
-        padding: 4px 10px;
+        padding: 2px 8px;
         cursor: pointer;
         color: inherit;
     }
-    .header-name {
-        flex: 1;
-        text-align: left;
-        display: flex;
-        flex-direction: column;
-        gap: 1px;
-    }
-    .name { font-weight: 500; }
-    .profile-hint { font-size: 0.7em; color: var(--text-secondary); }
 
-    .call-btn {
-        background: none;
+    .status { padding: 24px; text-align: center; color: var(--text-muted); }
+    .error { color: var(--error); }
+    .muted { color: var(--text-muted); }
+    .note {
+        font-size: 0.85em;
+        color: var(--text-muted);
         border: 1px solid var(--border);
-        border-radius: 4px;
-        padding: 4px 10px;
-        cursor: pointer;
-        color: inherit;
-        font-size: 1.05em;
+        border-radius: 6px;
+        padding: 6px 10px;
+        margin-bottom: 8px;
     }
-    .call-btn:hover { background: rgba(255,193,37,0.1); border-color: var(--accent, #ffc125); }
-
-    .status-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--text-secondary); }
-    .status-dot.active { background: #4caf50; }
-    .status-dot.pending { background: #ff9800; }
-    .status-dot.revoked, .status-dot.expired { background: #f44336; }
-
-    .status { padding: 24px; text-align: center; color: var(--text-secondary); }
-    .status.error { color: var(--danger); }
 
     .messages-scroll {
         flex: 1;
+        min-height: 0;
         overflow-y: auto;
-        padding: 16px 8px;
         display: flex;
         flex-direction: column;
         gap: 6px;
+        padding: 8px 2px;
+    }
+    .older { text-align: center; font-size: 0.85em; padding: 4px 0; }
+    .older-btn {
+        background: none;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 3px 12px;
+        cursor: pointer;
+        color: inherit;
     }
 
-    .message {
-        display: flex;
-        flex-direction: column;
-        max-width: 75%;
-    }
+    .message { display: flex; flex-direction: column; max-width: 75%; }
     .message.sent { align-self: flex-end; align-items: flex-end; }
     .message.received { align-self: flex-start; align-items: flex-start; }
-
     .bubble {
-        padding: 8px 12px;
-        border-radius: 14px;
-        word-break: break-word;
-        white-space: pre-wrap;
-        line-height: 1.35;
+        border-radius: 12px;
+        padding: 7px 11px;
+        background: var(--bg-elevated);
+        border: 1px solid var(--border);
+        overflow-wrap: anywhere;
     }
-    /* Android color scheme: gold on black for sent, black on gold for received */
-    .message.sent .bubble {
-        background: #ffc125;
-        color: #000;
-        border-bottom-right-radius: 4px;
-    }
-    .message.received .bubble {
-        background: #1c1c1c;
-        color: #ffc125;
-        border-bottom-left-radius: 4px;
-    }
-
-    .link-btn {
+    .message.sent .bubble { background: var(--accent-muted, var(--bg-elevated)); }
+    .bubble.pending { opacity: 0.75; border-style: dashed; }
+    .bubble.check { border-color: var(--warning); }
+    .line { white-space: pre-wrap; min-height: 1.3em; }
+    .text.caption { margin-top: 6px; }
+    .attachment { font-style: italic; color: var(--text-muted); }
+    .empty { font-style: italic; color: var(--text-muted); }
+    .link {
         background: none;
         border: none;
         padding: 0;
         font: inherit;
-        cursor: pointer;
-        color: inherit;
+        color: var(--accent);
         text-decoration: underline;
-    }
-    .message.sent .link-btn { color: #003a6c; }
-
-    .msg-meta {
-        display: flex;
-        gap: 6px;
-        font-size: 0.7em;
-        color: var(--text-secondary);
-        margin-top: 2px;
-    }
-    .receipt { color: var(--text-secondary); }
-    .receipt.read { color: #4caf50; }
-
-    .compose {
-        display: flex;
-        gap: 8px;
-        padding: 10px;
-        border-top: 1px solid var(--border);
-    }
-    .compose textarea {
-        flex: 1;
-        resize: none;
-        padding: 8px 12px;
-        background: #1c1c1c;
-        color: inherit;
-        border: 1px solid var(--border);
-        border-radius: 18px;
-        font-family: inherit;
-        font-size: 0.95em;
-        max-height: 120px;
-    }
-    .compose button {
-        background: #ffc125;
-        color: #000;
-        border: none;
-        border-radius: 18px;
-        padding: 8px 18px;
         cursor: pointer;
-        font-weight: 500;
     }
-    .compose button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .meta { display: flex; gap: 8px; font-size: 0.75em; color: var(--text-muted); margin-top: 2px; max-width: 100%; }
+    .state.unconfirmed { color: var(--warning); }
+    .state.check { color: var(--warning); }
+    .state.read { color: var(--accent); }
 
-    /* BTC message types — payment requests, receipts, address shares.
-       Inherit bubble color so sent (gold-on-black) and received
-       (black-on-gold) variants stay consistent with text messages. */
-    .pay-head { font-weight: 600; font-size: 0.95em; margin-bottom: 4px; }
-    .pay-amount {
-        font-weight: 600;
-        font-size: 1.15em;
-        font-variant-numeric: tabular-nums;
-        margin: 4px 0;
-    }
-    .pay-memo { font-style: italic; opacity: 0.88; margin: 4px 0; }
-    .pay-label { font-weight: 500; margin: 2px 0; }
-    .pay-addr {
-        font-family: 'JetBrains Mono', 'Consolas', monospace;
-        font-size: 0.85em;
-        word-break: break-all;
-        margin: 4px 0;
-        opacity: 0.92;
-    }
-    .pay-hint {
-        font-size: 0.8em;
-        margin-top: 8px;
-        padding-top: 6px;
-        border-top: 1px solid rgba(0,0,0,0.18);
-        opacity: 0.75;
-    }
-    .mono { font-family: 'JetBrains Mono', 'Consolas', monospace; }
-
-    /* Payment-request action row inside an incoming bubble. */
-    .pay-actions { display: flex; gap: 8px; margin-top: 10px; }
-    .pay-action {
-        font: inherit;
-        font-size: 0.85em;
-        padding: 5px 12px;
-        border-radius: 6px;
-        cursor: pointer;
-        border: 1px solid currentColor;
-    }
-    .pay-action:disabled { opacity: 0.5; cursor: not-allowed; }
-    .pay-action.primary {
-        background: #000;
-        color: #ffc125;
-        border-color: #000;
-    }
-    .pay-action.ghost {
-        background: transparent;
-        color: inherit;
-    }
-    .pay-action.danger {
-        background: #c62828;
-        color: #fff;
-        border-color: #c62828;
-    }
-    .decline-row {
+    .link-ask {
         display: flex;
-        flex-direction: column;
-        gap: 6px;
-        margin-top: 10px;
-    }
-    .decline-input {
-        background: rgba(0,0,0,0.18);
-        color: inherit;
-        border: 1px solid rgba(0,0,0,0.3);
-        border-radius: 6px;
-        padding: 6px 10px;
-        font: inherit;
-        font-size: 0.85em;
-    }
-    .decline-row { gap: 6px; }
-    .decline-row .pay-action { align-self: flex-start; }
-    .pay-err {
-        margin-top: 6px;
-        padding: 6px 8px;
-        background: rgba(198, 40, 40, 0.18);
-        border: 1px solid rgba(198, 40, 40, 0.45);
-        border-radius: 6px;
-        color: #ef5350;
-        font-size: 0.78em;
-    }
-
-    /* Older-messages indicator banner above the message list. */
-    .older-status {
-        text-align: center;
-        font-size: 0.78em;
-        color: var(--text-secondary);
-        padding: 6px 0;
-    }
-    .older-status.muted { opacity: 0.6; }
-
-    /* Compose ➕ menu (Request payment, future attach actions). */
-    .compose-menu-wrap { position: relative; display: flex; align-items: center; }
-    .compose-attach {
-        background: transparent;
-        color: var(--text-secondary);
-        border: 1px solid var(--border);
-        border-radius: 50%;
-        width: 32px;
-        height: 32px;
-        font-size: 1.2em;
-        line-height: 1;
-        cursor: pointer;
-        display: flex;
+        flex-wrap: wrap;
         align-items: center;
-        justify-content: center;
-    }
-    .compose-attach:hover { color: var(--accent); border-color: var(--accent); }
-    .compose-menu {
-        position: absolute;
-        bottom: 100%;
-        left: 0;
-        margin-bottom: 6px;
-        background: var(--surface, #1c1c1c);
+        gap: 8px;
         border: 1px solid var(--border);
         border-radius: 8px;
-        padding: 4px;
-        box-shadow: 0 6px 18px rgba(0,0,0,0.45);
-        min-width: 180px;
-        z-index: 5;
-    }
-    .compose-menu-item {
-        display: block;
-        width: 100%;
-        background: transparent;
-        color: inherit;
-        border: none;
-        text-align: left;
-        padding: 8px 12px;
-        border-radius: 4px;
-        cursor: pointer;
-        font: inherit;
+        padding: 8px 10px;
+        margin-top: 6px;
         font-size: 0.9em;
     }
-    .compose-menu-item:hover { background: rgba(255,255,255,0.06); }
-
-    /* Scroll-to-latest FAB — only shown when scrolled up. */
-    .messages-scroll { position: relative; }
-    .scroll-fab {
-        position: sticky;
-        bottom: 12px;
-        align-self: flex-end;
-        margin-right: 4px;
-        background: var(--accent);
-        color: #1a1a1a;
-        border: none;
-        border-radius: 50%;
-        width: 36px;
-        height: 36px;
-        font-size: 1.1rem;
+    .link-ask span { flex: 1; min-width: 12em; overflow-wrap: anywhere; }
+    .link-ask button {
+        background: none;
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 3px 10px;
         cursor: pointer;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+        color: inherit;
     }
-    .scroll-fab:hover { background: var(--accent-hover); }
+    .link-ask button.primary { border-color: var(--accent); color: var(--accent); }
+
+    .actions { display: flex; gap: 6px; margin-top: 3px; }
+    .actions button {
+        background: none;
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 2px 8px;
+        font-size: 0.8em;
+        cursor: pointer;
+        color: inherit;
+    }
+    .actions button:disabled,
+    .actions button[aria-disabled='true'] { opacity: 0.5; cursor: default; }
+    .hint { font-size: 0.75em; color: var(--text-muted); margin-top: 2px; }
+
+    .compose { display: flex; gap: 8px; margin-top: 8px; }
+    .compose textarea {
+        flex: 1;
+        resize: vertical;
+        min-height: 2.4em;
+        max-height: 12em;
+        font: inherit;
+        padding: 6px 8px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: var(--bg);
+        color: var(--text);
+    }
+    .compose button {
+        border: 1px solid var(--accent);
+        background: var(--accent);
+        color: var(--bg-pure, #fff);
+        border-radius: 6px;
+        padding: 0 16px;
+        cursor: pointer;
+    }
+    .compose button:disabled { opacity: 0.5; cursor: default; }
+    .compose-note { font-size: 0.85em; margin-top: 4px; }
 </style>

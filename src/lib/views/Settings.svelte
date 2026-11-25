@@ -2,6 +2,8 @@
   import { invoke } from '@tauri-apps/api/core';
   import { themeStore, setTheme, type Theme } from '../stores/theme';
   import { sessionNotice } from '../stores/session';
+  import { clearKept } from '../stores/conversations.svelte.js';
+  import { logoutWiped } from '../conversationView.js';
 
   let theme = $derived($themeStore);
 
@@ -91,6 +93,9 @@
     sessionNotice.set(null);
     try {
       const result = await invoke<{ revoke_sent: boolean; local_wiped: boolean; notice?: string | null }>('logout');
+      // Wiped here: the conversations' kept sends and drafts go too. Not
+      // wiped, everything stays.
+      if (logoutWiped(result)) clearKept();
       if (result?.revoke_sent && result?.local_wiped && !result?.notice) {
         logoutMessage = 'Logged out. Reloading…';
         setTimeout(() => window.location.reload(), 600);
