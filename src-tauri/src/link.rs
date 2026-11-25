@@ -578,6 +578,9 @@ pub struct Link<T: Transport = Http, C: Clock = SystemClock> {
     /// What became of a kept change retried before a new one
     /// ([`Link::op_kept_first`]), until the caller takes it.
     earlier: Option<ops::Earlier>,
+    /// The request id the current operation kept as `unconfirmed`, for its
+    /// answer ([`ops::Ran::pending`]).
+    kept_now: Option<String>,
 }
 
 /// What the refresh loop records of its own rounds, by the wall clock.
@@ -652,6 +655,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
             unconfirmed: None,
             sending: None,
             earlier: None,
+            kept_now: None,
         }
     }
 
@@ -897,6 +901,8 @@ impl<T: Transport, C: Clock> Link<T, C> {
     }
 
     fn check_gap(&mut self, now: DateTime<Utc>) {
+        // Every tick: a kept send's text goes once it can't arrive.
+        self.forget_spent(now);
         let slept = self.marks().slept(now);
         if slept {
             log::info!("link: the computer slept; the vault's state is checked again");
@@ -1083,6 +1089,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// Read `vault.status`, and settle a stored unanswered end if it says
     /// there is one.
     pub async fn refresh(&mut self) -> Result<(), AccessError> {
+        self.forget_spent(Utc::now());
         if self.vault_stale(Utc::now()) {
             self.access.vault_unconfirmed();
         }
