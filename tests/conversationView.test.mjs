@@ -395,6 +395,13 @@ for (const [skew, at] of [
   });
 }
 
+test('M-A: a new message with the same sent_at as the newest known one still counts (sent no earlier)', () => {
+  const e = expiredSend('ok', 1000);
+  // The vault's clock gives the new message the same second as A.
+  const page = [...KNOWN_PAGE, msg('C', '2026-11-25T10:00:00Z', { direction: 'out', text: 'ok' })];
+  assert.equal(afterReload([e], C, page, 1020).locals.length, 0);
+});
+
 test('M-A: a same-text message older than the newest known one (further back than was read) is not it', () => {
   const at = 1000;
   const e = expiredSend('ok', at);

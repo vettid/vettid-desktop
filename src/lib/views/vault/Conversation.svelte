@@ -313,21 +313,37 @@
             });
     }
 
-    const observer =
-        typeof IntersectionObserver === 'undefined'
-            ? null
-            : new IntersectionObserver(
-                  (entries) => {
-                      for (const e of entries) {
-                          const id = (e.target as HTMLElement).dataset.unreadId ?? '';
-                          if (!id) continue;
-                          if (seenInView(e)) inView.add(id);
-                          else inView.delete(id);
-                      }
-                      noteSeen();
-                  },
-                  { threshold: [0, 0.6] },
-              );
+    /** Dense thresholds, every 0.05, so that a bubble taller than the pane
+     *  is measured as it scrolls (seenInView's second rule). */
+    const THRESHOLDS = Array.from({ length: 21 }, (_, i) => i / 20);
+    /** The incoming unread bubbles watched, whatever the observer is now. */
+    const watched = new Set<HTMLElement>();
+    /** Watches against the message pane itself (`root`), so `rootBounds`
+     *  is the pane, not the window; made again whenever the pane is. */
+    let observer: IntersectionObserver | null = null;
+    $effect(() => {
+        const root = scrollEl;
+        if (!root || typeof IntersectionObserver === 'undefined') return;
+        const o = new IntersectionObserver(
+            (entries) => {
+                for (const e of entries) {
+                    const id = (e.target as HTMLElement).dataset.unreadId ?? '';
+                    if (!id) continue;
+                    if (seenInView(e)) inView.add(id);
+                    else inView.delete(id);
+                }
+                noteSeen();
+            },
+            { root, threshold: THRESHOLDS },
+        );
+        observer = o;
+        for (const n of watched) o.observe(n);
+        return () => {
+            o.disconnect();
+            if (observer === o) observer = null;
+            inView.clear();
+        };
+    });
 
     /** What is in the viewport counts as seen while the window is visible. */
     function noteSeen(): void {
@@ -340,8 +356,11 @@
     function watchUnread(node: HTMLElement, id: string) {
         const set = (v: string) => {
             node.dataset.unreadId = v;
-            if (v) observer?.observe(node);
-            else {
+            if (v) {
+                watched.add(node);
+                observer?.observe(node);
+            } else {
+                watched.delete(node);
                 observer?.unobserve(node);
             }
         };
@@ -353,6 +372,7 @@
             },
             destroy() {
                 inView.delete(node.dataset.unreadId ?? '');
+                watched.delete(node);
                 observer?.unobserve(node);
             },
         };
@@ -481,7 +501,6 @@
             closed = true;
             seq++;
             clearInterval(timer);
-            observer?.disconnect();
             document.removeEventListener('visibilitychange', onVisible);
             void un.then((f) => f());
         };
@@ -579,9 +598,18 @@
                         {:else if st === 'unsent'}
                             <div class="actions">
                                 <!-- NEW TEXT (owner approval needed): "Edit", "Remove" -->
-                                <button type="button" onclick={() => editUnsent(m.key)} disabled={draft !== ''} title={draft !== '' ? EDIT_NEEDS_EMPTY_BOX : undefined}>Edit</button>
+                                <!-- Focusable while the box has text (it does nothing then), with the hint said and shown. -->
+                                <button
+                                    type="button"
+                                    onclick={() => editUnsent(m.key)}
+                                    aria-disabled={draft !== '' ? 'true' : undefined}
+                                    aria-describedby={draft !== '' ? `${m.key}-edit-hint` : undefined}
+                                >Edit</button>
                                 <button type="button" onclick={() => removeUnsent(m.key)}>Remove</button>
                             </div>
+                            {#if draft !== ''}
+                                <div class="hint" id="{m.key}-edit-hint">{EDIT_NEEDS_EMPTY_BOX}</div>
+                            {/if}
                         {/if}
                     </div>
                 {/each}
@@ -734,7 +762,9 @@
         cursor: pointer;
         color: inherit;
     }
-    .actions button:disabled { opacity: 0.5; cursor: default; }
+    .actions button:disabled,
+    .actions button[aria-disabled='true'] { opacity: 0.5; cursor: default; }
+    .hint { font-size: 0.75em; color: var(--text-muted); margin-top: 2px; }
 
     .compose { display: flex; gap: 8px; margin-top: 8px; }
     .compose textarea {
