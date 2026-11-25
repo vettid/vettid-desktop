@@ -288,6 +288,51 @@ export function knownOutgoing(messages, locals, connectionId) {
   return { ids: [...new Set(outs.map((m) => m.message_id))], newest };
 }
 
+/** How long the view waits between two reads it makes on its own (chosen). */
+export const RECHECK_MS = 5_000;
+
+/**
+ * Whether the view should read the newest page again on its own: a send of
+ * this connection is past its deadline, or expired or unreadable and not
+ * yet settled by a read (one that failed leaves it so), and the last read
+ * began at least RECHECK_MS ago (`sinceLastRead`, by `performance.now()`).
+ * @param {Local[]} locals
+ * @param {string} connectionId
+ * @param {number} now
+ * @param {number} sinceLastRead
+ */
+export function shouldReread(locals, connectionId, now, sinceLastRead) {
+  if (sinceLastRead < RECHECK_MS) return false;
+  return locals.some(
+    (l) =>
+      l.connection_id === connectionId &&
+      (l.state === 'expired' || l.state === 'unreadable' || (l.state === 'unconfirmed' && now >= deadlineOf(l))),
+  );
+}
+
+/**
+ * The newest page merged into what was shown, so that a read made while
+ * the member reads history keeps the older pages: when the page overlaps
+ * what was shown (a message in both), the messages older than the page
+ * stay, with the older cursor; otherwise (a gap, or nothing older) the
+ * page alone is shown. A page without `next_before` is the whole
+ * conversation.
+ * @param {Message[]} shown
+ * @param {Message[]} page
+ * @param {string | null} shownNextBefore
+ * @param {string | null} pageNextBefore
+ * @param {string} connectionId
+ * @returns {{ messages: Message[], nextBefore: string | null }}
+ */
+export function mergeNewest(shown, page, shownNextBefore, pageNextBefore, connectionId) {
+  const fresh = mergeMessages([], page, connectionId);
+  if (!pageNextBefore || !fresh.length) return { messages: fresh, nextBefore: pageNextBefore };
+  const ids = new Set(fresh.map((m) => m.message_id));
+  if (!shown.some((m) => ids.has(m.message_id))) return { messages: fresh, nextBefore: pageNextBefore };
+  const older = shown.filter((m) => !ids.has(m.message_id) && compareMessages(m, fresh[0]) < 0);
+  return { messages: mergeMessages(older, fresh, connectionId), nextBefore: older.length ? shownNextBefore : pageNextBefore };
+}
+
 /**
  * Until when an unconfirmed send may still arrive: its `expires_at`, else
  * `at` plus NO_ID_BOUND_MS.
@@ -427,6 +472,9 @@ function put(out, i, s, returned) {
  * @returns {{ locals: Local[], returned: Returned[], refresh: boolean }}
  */
 export function applySendAnswer(locals, key, resp, now) {
+  const at = locals.find((l) => l.key === key);
+  // An answer for a send that isn't waiting for one (already settled) changes nothing.
+  if (at && at.state !== 'sending') return { locals, returned: [], refresh: false };
   const out = locals.slice();
   /** @type {Returned[]} */
   const returned = [];
@@ -440,7 +488,7 @@ export function applySendAnswer(locals, key, resp, now) {
   }
   const j = out.findIndex((l) => l.key === key);
   if (j >= 0) refresh = put(out, j, settleLocal(out[j], answerOf(resp), now, true), returned) || refresh;
-  return { locals: dedupeLocals(out), returned, refresh };
+  return { locals: learnSettled(locals, dedupeLocals(out)), returned, refresh };
 }
 
 /**
@@ -459,8 +507,54 @@ export function applyRetryAnswer(locals, key, resp, now) {
   /** @type {Returned[]} */
   const returned = [];
   const j = out.findIndex((l) => l.key === key);
-  const refresh = j >= 0 ? put(out, j, settleLocal(out[j], answerOf(resp), now, false), returned) : false;
-  return { locals: dedupeLocals(out), returned, refresh };
+  // Only a retry still waiting for its answer takes it: a late answer for a
+  // send settled meanwhile (by an `earlier`, say) changes nothing.
+  if (j < 0 || out[j].state !== 'sending' || !out[j].retry) return { locals, returned, refresh: false };
+  const refresh = put(out, j, settleLocal(out[j], answerOf(resp), now, false), returned);
+  return { locals: learnSettled(locals, dedupeLocals(out)), returned, refresh };
+}
+
+/**
+ * Whether a send is still waiting to be settled, so its `known` can grow.
+ * @param {Local} l
+ */
+function unsettled(l) {
+  return l.state === 'sending' || l.state === 'unconfirmed' || l.state === 'expired';
+}
+
+/**
+ * `ids` of the connection's messages known to be other sends: added to the
+ * `known.ids` of its sends still unsettled, so none of them is later taken
+ * for one of those messages.
+ * @param {Local[]} locals
+ * @param {string} connectionId
+ * @param {Iterable<string>} ids
+ * @returns {Local[]}
+ */
+export function learnIds(locals, connectionId, ids) {
+  const add = [...ids];
+  if (!add.length) return locals;
+  return locals.map((l) => {
+    if (l.connection_id !== connectionId || !unsettled(l) || !l.known) return l;
+    const have = new Set(l.known.ids);
+    const more = add.filter((i) => !have.has(i));
+    return more.length ? { ...l, known: { ...l.known, ids: [...l.known.ids, ...more] } } : l;
+  });
+}
+
+/**
+ * After an answer: each send that became `sent` (a `message_id` it didn't
+ * have before) makes that id known to the other sends of its connection.
+ * @param {Local[]} before
+ * @param {Local[]} after
+ */
+function learnSettled(before, after) {
+  const had = new Set(before.filter((l) => l.message_id).map((l) => l.key));
+  let out = after;
+  for (const l of after) {
+    if (l.state === 'sent' && l.message_id && !had.has(l.key)) out = learnIds(out, l.connection_id, [l.message_id]);
+  }
+  return out;
 }
 
 /**
@@ -526,7 +620,10 @@ export function expireDue(locals, now) {
  */
 export function afterReload(locals, connectionId, page, startedAt) {
   const ids = new Set(page.map((m) => m.message_id));
-  const used = new Set(locals.filter((l) => l.connection_id === connectionId && l.message_id && ids.has(l.message_id)).map((l) => l.message_id));
+  // Page messages that are this view's own sent sends are theirs.
+  /** @type {Set<string>} */
+  const used = new Set();
+  for (const l of locals) if (l.connection_id === connectionId && l.state === 'sent' && l.message_id && ids.has(l.message_id)) used.add(l.message_id);
   const outs = page.filter((m) => m.direction === 'out');
   /** @param {Local} l */
   const found = (l) => {
@@ -556,8 +653,11 @@ export function afterReload(locals, connectionId, page, startedAt) {
     if (l.state === 'unconfirmed' && !l.pending_id && l.at <= startedAt && found(l)) continue;
     out.push(l);
   }
-  const recheck = out.some((l) => l.connection_id === connectionId && (l.state === 'expired' || l.state === 'unreadable'));
-  return { locals: out, recheck };
+  // Page messages now taken by sends (sent, or found) are known to the
+  // sends that remain, so a later read doesn't take one of them again.
+  const learned = learnIds(out, connectionId, used);
+  const recheck = learned.some((l) => l.connection_id === connectionId && (l.state === 'expired' || l.state === 'unreadable'));
+  return { locals: learned, recheck };
 }
 
 /**
@@ -760,12 +860,28 @@ export function deliveryText(state, opts = {}) {
  */
 export function cleanBubble(text) {
   if (typeof text !== 'string') return '';
-  return text
+  const cleaned = text
     .replace(/\r\n|[\r\u000B\u000C\u0085\u2028\u2029]/g, '\n')
     .replace(/\t/g, ' ')
     .replace(/\p{Cs}/gu, '\uFFFD')
-    .replace(/(?![\n\u200C\u200D\u200E\u200F\u061C])[\p{Cc}\p{Cf}]/gu, '')
-    .replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
+    .replace(/(?![\n\u200C\u200D\u200E\u200F\u061C])[\p{Cc}\p{Cf}]/gu, '');
+  return trimWhiteSpace(cleaned);
+}
+
+const WHITE_SPACE = /\p{White_Space}/u;
+
+/**
+ * White_Space trimmed at both ends, in one pass from each end (a regex
+ * anchored at the end backtracks over every inner run of spaces). Every
+ * White_Space code point is in the BMP, so code units are enough.
+ * @param {string} t
+ */
+function trimWhiteSpace(t) {
+  let a = 0;
+  let b = t.length;
+  while (a < b && WHITE_SPACE.test(t[a])) a++;
+  while (b > a && WHITE_SPACE.test(t[b - 1])) b--;
+  return t.slice(a, b);
 }
 
 /** @typedef {{ text: string } | { text: string, href: string, host: string }} Piece */
@@ -780,26 +896,34 @@ const CLOSERS = Object.freeze({ ')': '(', ']': '[', '}': '{' });
  * @param {string} raw
  */
 function trimTrail(raw) {
-  let s = raw;
-  for (;;) {
-    const c = s.slice(-1);
-    if (/[.,;:!?'">]/.test(c) && c !== '') {
-      s = s.slice(0, -1);
+  // Each bracket counted once; then taken off the end one by one, the
+  // counts kept as they go (linear, whatever the URL holds).
+  /** @type {Record<string, number>} */
+  const n = { '(': 0, ')': 0, '[': 0, ']': 0, '{': 0, '}': 0 };
+  for (const c of raw) if (c in n) n[c] += 1;
+  let end = raw.length;
+  while (end > 0) {
+    const c = raw[end - 1];
+    if (/[.,;:!?'">]/.test(c)) {
+      end -= 1;
       continue;
     }
     const open = CLOSERS[/** @type {keyof typeof CLOSERS} */ (c)];
-    if (open && s.split(open).length - 1 < s.split(c).length - 1) {
-      s = s.slice(0, -1);
+    if (open && n[open] < n[c]) {
+      n[c] -= 1;
+      end -= 1;
       continue;
     }
-    return s;
+    break;
   }
+  return raw.slice(0, end);
 }
 
 /**
  * §10.5 "Links": only `https://` URLs are links; every other scheme is
  * text. A link's `host` is what the view shows before it asks to open it
- * (the URL's own parsing, so an internationalised host shows as punycode).
+ * (the URL's own parsing, so an internationalised host shows as punycode;
+ * with its port when it has one).
  * @param {string} line
  * @returns {Piece[]}
  */
@@ -818,7 +942,7 @@ export function linkPieces(line) {
     }
     if (!url || url.protocol !== 'https:' || !url.hostname) continue;
     if (start > last) out.push({ text: line.slice(last, start) });
-    out.push({ text: raw, href: url.href, host: url.hostname });
+    out.push({ text: raw, href: url.href, host: url.host });
     last = start + raw.length;
   }
   if (last < line.length) out.push({ text: line.slice(last) });

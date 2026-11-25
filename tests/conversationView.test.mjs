@@ -17,6 +17,10 @@ import {
   nextToMark,
   newLocal,
   knownOutgoing,
+  learnIds,
+  shouldReread,
+  mergeNewest,
+  RECHECK_MS,
   deadlineOf,
   seenInView,
   startRetry,
@@ -236,9 +240,9 @@ test('a pending_id message stays unconfirmed on every other answer, retry or ear
 
 test('a new pending_id is a new request: its time starts then; the same id keeps it', () => {
   const u = unconf('same', 1000, 'P1');
-  const same = applyRetryAnswer([u], u.key, { success: false, error_code: 'unconfirmed', data: { pending_id: 'P1', expires_at: EXP } }, 9000);
+  const same = applyRetryAnswer(startRetry([u], u.key), u.key, { success: false, error_code: 'unconfirmed', data: { pending_id: 'P1', expires_at: EXP } }, 9000);
   assert.equal(same.locals[0].at, 1000);
-  const fresh = applyRetryAnswer([u], u.key, { success: false, error_code: 'unconfirmed', data: { pending_id: 'P2', expires_at: EXP } }, 9000);
+  const fresh = applyRetryAnswer(startRetry([u], u.key), u.key, { success: false, error_code: 'unconfirmed', data: { pending_id: 'P2', expires_at: EXP } }, 9000);
   assert.equal(fresh.locals[0].at, 9000);
   assert.equal(fresh.locals[0].pending_id, 'P2');
   // A first send's id keeps its creation time.
@@ -342,7 +346,7 @@ test('L2: locals are one per message_id and per pending_id', () => {
   const d = unconf('c', 4, 'P1');
   assert.deepEqual(dedupeLocals([a, b, c, d]).map((l) => l.key), [a.key, c.key]);
   // A retry that comes back sent with a message_id another local has is merged away.
-  const r = applyRetryAnswer([a, c], c.key, { success: true, data: { ...SENT, settled: 'done' } }, 5);
+  const r = applyRetryAnswer(startRetry([a, c], c.key), c.key, { success: true, data: { ...SENT, settled: 'done' } }, 5);
   assert.equal(r.locals.length, 1);
 });
 
@@ -653,4 +657,149 @@ test('L3: kept sends and drafts go only when the log-out wiped this desktop', ()
 test('L4: a text back in another conversation is said with its title, isolated', () => {
   assert.equal(returnedElsewhereText('Ada King'), `Your message to ${FSI}Ada King${PDI} wasn't sent. Its text is back in that conversation.`);
   assert.equal(returnedElsewhereText(''), "Your message to a connection wasn't sent. Its text is back in that conversation.");
+});
+
+test('item 1: a later same-text send that went is never taken for an earlier one, over two reads', () => {
+  // Send 1 "ok": no answer (no id). Send 2 "ok": sent as m2.
+  const k = knownOutgoing(KNOWN_PAGE, [], C);
+  const s1 = { ...newLocal(C, 'ok', 1000, k), state: 'unconfirmed', everUnconfirmed: true };
+  const s2 = newLocal(C, 'ok', 2000, knownOutgoing(KNOWN_PAGE, [s1], C));
+  const answered = applySendAnswer([s1, s2], s2.key, { success: true, data: { message_id: 'm2', sent_at: '2026-11-25T10:01:00Z' } }, 3000);
+  // m2 is known to send 1 now.
+  assert.ok(answered.locals[0].known?.ids.includes('m2'));
+  const page = [...KNOWN_PAGE, msg('m2', '2026-11-25T10:01:00Z', { direction: 'out', text: 'ok' })];
+  // Read 1: send 2 goes (the page has it); send 1 stays.
+  const r1 = afterReload(answered.locals, C, page, 4000);
+  assert.deepEqual(r1.locals.map((l) => l.key), [s1.key]);
+  // Read 2: send 1 is still not taken for m2.
+  const r2 = afterReload(r1.locals, C, page, 5000);
+  assert.deepEqual(r2.locals.map((l) => [l.key, l.state]), [[s1.key, 'unconfirmed']]);
+  // Expired and read again: unsent, not dropped.
+  const ex = expireDue(r2.locals, 1000 + NO_ID_BOUND_MS).locals;
+  const r3 = afterReload(ex, C, page, 1000 + NO_ID_BOUND_MS + 1);
+  assert.equal(r3.locals[0].state, 'unsent');
+});
+
+test('item 1: a page message found for one send is known to the others on later reads', () => {
+  const k = knownOutgoing(KNOWN_PAGE, [], C);
+  const a = { ...newLocal(C, 'ok', 1000, k), state: 'unconfirmed', everUnconfirmed: true };
+  const b = { ...newLocal(C, 'ok', 1001, k), state: 'unconfirmed', everUnconfirmed: true };
+  const page = [...KNOWN_PAGE, msg('m3', '2026-11-25T10:01:00Z', { direction: 'out', text: 'ok' })];
+  const r1 = afterReload([a, b], C, page, 2000);
+  assert.deepEqual(r1.locals.map((l) => l.key), [b.key]);
+  assert.ok(r1.locals[0].known?.ids.includes('m3'));
+  const r2 = afterReload(r1.locals, C, page, 3000);
+  assert.deepEqual(r2.locals.map((l) => l.key), [b.key]);
+});
+
+test('item 1: learnIds touches only unsettled sends of that connection that recorded what they knew', () => {
+  const k = { ids: ['A'], newest: null };
+  const ls = [
+    { ...newLocal(C, 'x', 1, k), state: 'unconfirmed' },
+    { ...newLocal(C, 'x', 1, k), state: 'unsent' },
+    { ...newLocal('c2', 'x', 1, k), state: 'unconfirmed' },
+    { ...newLocal(C, 'x', 1), state: 'unconfirmed' },
+  ];
+  const out = learnIds(ls, C, ['B']);
+  assert.deepEqual(out.map((l) => l.known?.ids ?? null), [['A', 'B'], ['A'], ['A'], null]);
+  assert.equal(learnIds(ls, C, []), ls);
+});
+
+test('item 2: a 16 KiB worst case cleans and splits in well under 50 ms', () => {
+  const cases = [
+    'https://x.example/' + ')'.repeat(16000),
+    'https://x.example/' + '('.repeat(8000) + ')'.repeat(8000) + '.'.repeat(300),
+    'a' + ' '.repeat(16000) + 'a',
+    'a' + ' x'.repeat(8000),
+  ];
+  for (const t of cases) {
+    const t0 = performance.now();
+    bubbleLines(t);
+    const took = performance.now() - t0;
+    assert.ok(took < 50, `${took.toFixed(1)} ms`);
+  }
+  // Still right: unbalanced closers go, balanced ones stay.
+  assert.equal(/** @type {any} */ (linkPieces('https://x.example/' + ')'.repeat(5))[0]).text, 'https://x.example/');
+  assert.equal(/** @type {any} */ (linkPieces('https://x.example/((a))))')[0]).text, 'https://x.example/((a))');
+  assert.equal(cleanBubble('  a   b  '), 'a   b');
+});
+
+test('item 4: a late retry answer for a send no longer retrying changes nothing', () => {
+  const u = unconf('same', 1000, 'P1');
+  // Settled meanwhile (an earlier said done): sent.
+  const sent = { ...u, state: 'sent', message_id: 'M9', sent_at: SENT.sent_at, pending_id: undefined };
+  const late = applyRetryAnswer([sent], u.key, { success: false, error: 'refused', error_code: 'vault_error', data: { pending_id: 'P1', settled: 'not_done' } }, 2000);
+  assert.deepEqual(late.locals, [sent]);
+  assert.deepEqual(late.returned, []);
+  // Not retrying (unconfirmed, no retry started): nothing either.
+  const idle = applyRetryAnswer([u], u.key, { success: true, data: { ...SENT, settled: 'done' } }, 2000);
+  assert.equal(idle.locals[0].state, 'unconfirmed');
+  // A send_message answer for a send already settled changes nothing too.
+  const again = applySendAnswer([sent], sent.key, { success: false, error: 'E', error_code: 'not_sent' }, 2000);
+  assert.deepEqual(again.locals, [sent]);
+  assert.deepEqual(again.returned, []);
+});
+
+test('item 6: read again on its own while a send is due, expired or unreadable, at most every RECHECK_MS', () => {
+  const now = 10_000;
+  const due = { ...newLocal(C, 'a', 0), state: 'unconfirmed', expires_at: now };
+  const notDue = { ...newLocal(C, 'a', 0), state: 'unconfirmed', expires_at: now + 1 };
+  const expired = { ...newLocal(C, 'a', 0), state: 'expired', since: 5 };
+  const unreadable = { ...newLocal(C, 'a', 0), state: 'unreadable', since: 5 };
+  assert.equal(shouldReread([due], C, now, RECHECK_MS), true);
+  assert.equal(shouldReread([notDue], C, now, RECHECK_MS), false);
+  // A failed read left "Checking…": it is tried again.
+  assert.equal(shouldReread([expired], C, now, RECHECK_MS), true);
+  assert.equal(shouldReread([unreadable], C, now, RECHECK_MS), true);
+  assert.equal(shouldReread([expired], C, now, RECHECK_MS - 1), false);
+  assert.equal(shouldReread([expired], 'c2', now, RECHECK_MS), false);
+  assert.equal(shouldReread([{ ...expired, state: 'unsent' }, { ...due, state: 'sending' }], C, now, RECHECK_MS), false);
+});
+
+test('item 8: a newest-page read keeps the older pages loaded when it overlaps them', () => {
+  const older = [msg('1', '2026-11-25T09:00:00Z'), msg('2', '2026-11-25T09:01:00Z')];
+  const shown = [...older, msg('3', '2026-11-25T09:02:00Z'), msg('4', '2026-11-25T09:03:00Z')];
+  const page = [msg('3', '2026-11-25T09:02:00Z'), msg('4', '2026-11-25T09:03:00Z'), msg('5', '2026-11-25T09:04:00Z')];
+  const r = mergeNewest(shown, page, 'cursor-old', '3', C);
+  assert.deepEqual(r.messages.map((m) => m.message_id), ['1', '2', '3', '4', '5']);
+  assert.equal(r.nextBefore, 'cursor-old');
+  // Nothing older loaded: the page's cursor.
+  assert.equal(mergeNewest(page.slice(0, 2), page, null, '3', C).nextBefore, '3');
+  // No overlap (a gap): the page alone.
+  const gap = mergeNewest(older, page, 'cursor-old', '3', C);
+  assert.deepEqual(gap.messages.map((m) => m.message_id), ['3', '4', '5']);
+  assert.equal(gap.nextBefore, '3');
+  // The whole conversation: the page alone, and a message gone from its range goes.
+  const whole = mergeNewest(shown, page, 'cursor-old', null, C);
+  assert.deepEqual(whole.messages.map((m) => m.message_id), ['3', '4', '5']);
+  assert.equal(whole.nextBefore, null);
+  const gone = mergeNewest([...older, msg('3x', '2026-11-25T09:02:30Z'), msg('4', '2026-11-25T09:03:00Z')], page, 'c', '3', C);
+  assert.deepEqual(gone.messages.map((m) => m.message_id), ['1', '2', '3', '4', '5']);
+});
+
+test('item 8: the link prompt names the host with its port', () => {
+  assert.equal(/** @type {any} */ (linkPieces('https://example.com:8443/x')[0]).host, 'example.com:8443');
+  assert.equal(/** @type {any} */ (linkPieces('https://example.com:443/x')[0]).host, 'example.com');
+});
+
+test('item 1: a page message that is one of this view’s sent sends is never found for another send', () => {
+  const e = expiredSend('ok', 1000);
+  const sent = { ...newLocal(C, 'ok', 1500), state: 'sent', message_id: 'm2', sent_at: '2026-11-25T10:01:00Z' };
+  const page = [...KNOWN_PAGE, msg('m2', '2026-11-25T10:01:00Z', { direction: 'out', text: 'ok' })];
+  // The expired send comes first in the list, and doesn't know m2.
+  const r = afterReload([e, sent], C, page, 2000);
+  assert.deepEqual(r.locals.map((l) => l.state), ['unsent']);
+});
+
+test('item 1: a retry that comes back sent makes its message_id known to the other sends', () => {
+  const k = knownOutgoing(KNOWN_PAGE, [], C);
+  const other = { ...newLocal(C, 'ok', 1000, k), state: 'unconfirmed', everUnconfirmed: true };
+  const u = { ...unconf('ok', 1001, 'P1'), known: k };
+  const r = applyRetryAnswer(startRetry([other, u], u.key), u.key, { success: true, data: { message_id: 'm7', sent_at: '2026-11-25T10:01:00Z', pending_id: 'P1', settled: 'done' } }, 2000);
+  assert.ok(r.locals[0].known?.ids.includes('m7'));
+  // And an earlier that comes back sent does the same.
+  const l = newLocal(C, 'x', 1500, k);
+  const e = applySendAnswer([other, u, l], l.key, { success: true, data: { ...SENT, earlier: { pending_id: 'P1', success: true, settled: 'done', data: { message_id: 'm8', sent_at: '2026-11-25T10:01:00Z' } } } }, 2000);
+  assert.ok(e.locals[0].known?.ids.includes('m8'));
+  assert.ok(e.locals[0].known?.ids.includes('M1'));
 });

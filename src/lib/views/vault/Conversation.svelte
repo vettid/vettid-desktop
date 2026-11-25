@@ -30,8 +30,10 @@
         EDIT_NEEDS_EMPTY_BOX,
         returnedElsewhereText,
         knownOutgoing,
-        deadlineOf,
         seenInView,
+        shouldReread,
+        mergeNewest,
+        DELIVERY_TEXT,
         mergeMessages,
         applySyncEvent,
         markedRead,
@@ -92,6 +94,8 @@
     /** Counts newest-page reads: only the latest one's answer is applied,
      *  and an older page read before it is dropped. */
     let seq = 0;
+    /** When the last newest-page read began, by `performance.now()`. */
+    let lastReadAt = -Infinity;
     /** `message.new` and receipts that arrive while the newest page is read. */
     let buffer: { messages: Message[]; events: SyncEv[] } | null = null;
 
@@ -102,6 +106,17 @@
     let sending = $derived(!!kept.sending[cid]);
 
     let items = $derived(viewMessages(messages, kept.locals, cid));
+
+    /** Each bubble's cleaned content, worked out once per text. */
+    const contentCache = new Map<string, { text: string; att: boolean; value: ReturnType<typeof bubbleContent> }>();
+    function contentOf(m: { key: string; text: string; attachment?: unknown }) {
+        const att = !!m.attachment;
+        const hit = contentCache.get(m.key);
+        if (hit && hit.text === m.text && hit.att === att) return hit.value;
+        const value = bubbleContent(m);
+        contentCache.set(m.key, { text: m.text, att, value });
+        return value;
+    }
 
     /** Messages tried in this read of the conversation; a failed mark is
      *  tried again after the next read. */
@@ -177,6 +192,7 @@
         if (closed) return;
         const mine = ++seq;
         const startedAt = Date.now();
+        lastReadAt = performance.now();
         // A send past its expires_at is read about now.
         const due = expireDue(kept.locals, startedAt);
         if (due.changed) kept.locals = due.locals;
@@ -197,18 +213,24 @@
         loading = false;
         loaded = true;
         if (resp?.success && resp.data) {
-            let next = mergeMessages(resp.data.messages ?? [], got?.messages ?? [], cid);
+            const firstRead = messages.length === 0;
+            const atBottom = nearBottom();
+            // The older pages loaded stay, when this page meets them.
+            const merged = mergeNewest(messages, resp.data.messages ?? [], nextBefore, resp.data.next_before ?? null, cid);
+            const keptOlder = merged.messages.length > (resp.data.messages ?? []).length;
+            let next = mergeMessages(merged.messages, got?.messages ?? [], cid);
             for (const ev of got?.events ?? []) next = applySyncEvent(next, ev, cid);
             messages = next;
-            nextBefore = resp.data.next_before ?? null;
-            unreadable = resp.data.unreadable ?? 0;
+            nextBefore = merged.nextBefore;
+            unreadable = keptOlder ? Math.max(unreadable, resp.data.unreadable ?? 0) : (resp.data.unreadable ?? 0);
             loadError = '';
             tried.clear();
             const after = afterReload(kept.locals, cid, next, startedAt);
             kept.locals = after.locals;
             releaseNow();
             await tick();
-            scrollToBottom();
+            // Someone reading history stays where they are.
+            if (firstRead || atBottom) scrollToBottom();
             // A send that expired or came back unreadable during this read
             // is read about once more.
             if (after.recheck) void loadNewest();
@@ -296,7 +318,7 @@
     // the way of the view.
 
     function pumpReads(): void {
-        if (closed || marking || !live || !takes || document.visibilityState !== 'visible') return;
+        if (closed || marking || !live || !takes || !attending()) return;
         const id = nextToMark(messages, tried, seen);
         if (!id) return;
         tried.add(id);
@@ -346,8 +368,13 @@
     });
 
     /** What is in the viewport counts as seen while the window is visible. */
+    /** The member can see the window: shown, and focused. */
+    function attending(): boolean {
+        return document.visibilityState === 'visible' && document.hasFocus();
+    }
+
     function noteSeen(): void {
-        if (document.visibilityState !== 'visible') return;
+        if (!attending()) return;
         for (const id of inView) seen.add(id);
         pumpReads();
     }
@@ -394,39 +421,49 @@
         kept.sending[cid] = true;
         await tick();
         scrollToBottom();
-        let resp: VaultOpResponse<any> | null = null;
+        let refresh = false;
         try {
-            resp = await invoke('send_message', { connectionId: cid, text });
-        } catch {
-            // No answer at all: it may have gone, so it is unconfirmed.
-            resp = null;
+            let resp: VaultOpResponse<any> | null = null;
+            try {
+                resp = await invoke('send_message', { connectionId: cid, text });
+            } catch {
+                // No answer at all: it may have gone, so it is unconfirmed.
+                resp = null;
+            }
+            const r = applySendAnswer(kept.locals, l.key, resp, Date.now());
+            kept.locals = r.locals;
+            giveBack(r.returned);
+            refresh = r.refresh;
+        } finally {
+            kept.sending[cid] = false;
         }
-        const r = applySendAnswer(kept.locals, l.key, resp, Date.now());
-        kept.locals = r.locals;
-        giveBack(r.returned);
-        kept.sending[cid] = false;
         if (!closed) releaseNow();
-        if (r.refresh && live && !closed) void loadNewest();
+        if (refresh && live && !closed) void loadNewest();
     }
 
     async function retry(key: string): Promise<void> {
         const l = kept.locals.find((x) => x.key === key);
-        if (!l?.pending_id || kept.sending[cid] || !live || !takes) return;
+        if (!l?.pending_id || l.state !== 'unconfirmed' || kept.sending[cid] || !live || !takes) return;
         const pendingId = l.pending_id;
         kept.locals = startRetry(kept.locals, key);
         kept.sending[cid] = true;
-        let resp: VaultOpResponse<any> | null = null;
+        let refresh = false;
         try {
-            resp = await invoke('retry_send', { connectionId: cid, pendingId });
-        } catch {
-            resp = null;
+            let resp: VaultOpResponse<any> | null = null;
+            try {
+                resp = await invoke('retry_send', { connectionId: cid, pendingId });
+            } catch {
+                resp = null;
+            }
+            const r = applyRetryAnswer(kept.locals, key, resp, Date.now());
+            kept.locals = r.locals;
+            giveBack(r.returned);
+            refresh = r.refresh;
+        } finally {
+            kept.sending[cid] = false;
         }
-        const r = applyRetryAnswer(kept.locals, key, resp, Date.now());
-        kept.locals = r.locals;
-        giveBack(r.returned);
-        kept.sending[cid] = false;
         if (!closed) releaseNow();
-        if (r.refresh && live && !closed) void loadNewest();
+        if (refresh && live && !closed) void loadNewest();
     }
 
     function editUnsent(key: string): void {
@@ -442,13 +479,26 @@
     }
 
     function onKeydown(e: KeyboardEvent): void {
-        if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+        // An Enter that confirms an IME candidate (WebKit says keyCode 229) isn't a send.
+        if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
             e.preventDefault();
             void send();
         }
     }
 
     // ---- Links (§10.5): the host is shown and the member asked first.
+
+    /** Moves focus into the link prompt when it opens. */
+    function focusFirst(node: HTMLElement) {
+        node.focus();
+    }
+
+    function onAskKeydown(e: KeyboardEvent): void {
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            linkAsk = null;
+        }
+    }
 
     function askOpen(p: { href: string; host: string }): void {
         linkError = '';
@@ -487,21 +537,24 @@
         // Opened: a note that a text came back here is no longer needed.
         if (kept.returnedTo.includes(cid)) kept.returnedTo = kept.returnedTo.filter((c) => c !== cid);
         const un = listen<InboundBatch>(INBOUND_EVENT, (event) => void onInbound(event.payload));
-        // A send past its expires_at is read about before anything else.
+        // A send past its deadline, or still being checked (a read that
+        // failed leaves it so), is read about again, every few seconds.
         const timer = setInterval(() => {
             if (!live || !takes || loading) return;
-            const now = Date.now();
-            if (kept.locals.some((l) => l.connection_id === cid && l.state === 'unconfirmed' && now >= deadlineOf(l))) {
-                void loadNewest();
-            }
-        }, 5_000);
+            if (shouldReread(kept.locals, cid, Date.now(), performance.now() - lastReadAt)) void loadNewest();
+        }, 1_000);
         const onVisible = () => noteSeen();
         document.addEventListener('visibilitychange', onVisible);
+        // Marking resumes when the window gets focus again.
+        window.addEventListener('focus', onVisible);
+        window.addEventListener('blur', onVisible);
         return () => {
             closed = true;
             seq++;
             clearInterval(timer);
             document.removeEventListener('visibilitychange', onVisible);
+            window.removeEventListener('focus', onVisible);
+            window.removeEventListener('blur', onVisible);
             void un.then((f) => f());
         };
     });
@@ -550,7 +603,7 @@
                 {/if}
 
                 {#each items as m (m.key)}
-                    {@const content = bubbleContent(m)}
+                    {@const content = contentOf(m)}
                     {@const st = deliveryState(m, { relayHeld: !!connection.relay_held })}
                     {@const stText = deliveryText(st, { notice: m.local?.notice, title })}
                     <div
@@ -583,6 +636,7 @@
                             {#if when(m.sent_at)}<span class="time">{when(m.sent_at)}</span>{/if}
                             {#if stText}
                                 <span
+                                    aria-live="polite"
                                     class="state"
                                     class:unconfirmed={st === 'unconfirmed' || st === 'held'}
                                     class:check={st === 'expired' || st === 'unreadable' || st === 'unsent'}
@@ -616,16 +670,19 @@
             </div>
 
             {#if linkAsk}
-                <div class="link-ask" role="dialog" aria-modal="false">
-                    <span>{openLinkQuestion(linkAsk.host)}</span>
+                <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+                <div class="link-ask" role="dialog" aria-modal="false" aria-labelledby="{cid}-link-ask" tabindex="-1" onkeydown={onAskKeydown}>
+                    <span id="{cid}-link-ask">{openLinkQuestion(linkAsk.host)}</span>
                     <!-- NEW TEXT (owner approval needed): "Open" -->
-                    <button type="button" class="primary" onclick={() => void openAsked()}>Open</button>
+                    <button type="button" class="primary" use:focusFirst onclick={() => void openAsked()}>Open</button>
                     <button type="button" onclick={() => (linkAsk = null)}>Cancel</button>
                 </div>
             {/if}
-            {#if linkError}
-                <div class="compose-note error">{linkError}</div>
-            {/if}
+            <div aria-live="polite">
+                {#if linkError}
+                    <div class="compose-note error">{linkError}</div>
+                {/if}
+            </div>
 
             <form class="compose" onsubmit={(e) => { e.preventDefault(); void send(); }}>
                 <!-- NEW TEXT (owner approval needed): the box's label, "Message" -->
@@ -635,14 +692,16 @@
                     rows="2"
                     aria-label="Message"
                 ></textarea>
-                <button type="submit" disabled={sending || !canSend(draft)}>{sending ? '…' : 'Send'}</button>
+                <button type="submit" disabled={sending || !canSend(draft)}>{sending ? DELIVERY_TEXT.sending : 'Send'}</button>
             </form>
-            {#if draftBytes > MAX_TEXT_BYTES}
-                <div class="compose-note error">{tooLongText(draftBytes)}</div>
-            {/if}
-            {#if sendError}
-                <div class="compose-note error">{sendError}</div>
-            {/if}
+            <div aria-live="polite">
+                {#if draftBytes > MAX_TEXT_BYTES}
+                    <div class="compose-note error">{tooLongText(draftBytes)}</div>
+                {/if}
+                {#if sendError}
+                    <div class="compose-note error">{sendError}</div>
+                {/if}
+            </div>
         {/if}
     {/if}
 </div>

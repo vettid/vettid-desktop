@@ -42,6 +42,7 @@
   </div>
 </header>
 
+<!-- NEW TEXT (owner approval needed): the tab list's label "Connection sections", and the tabs "Messages" and "Profile" -->
 <div class="tabs" role="tablist" aria-label="Connection sections">
   <button
     type="button"
