@@ -84,7 +84,7 @@ fn requests_are_checked_too() {
 }
 
 /// One bad entry doesn't blank the list: a connection is left out and
-/// counted; a request is kept by its id, marked, so it can be declined.
+/// counted; a request is kept by its id, marked, and still listed read-only.
 #[test]
 fn a_bad_entry_doesnt_blank_the_list() {
     let mut bad = conn();
