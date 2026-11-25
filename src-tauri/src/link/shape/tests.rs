@@ -39,6 +39,8 @@ fn bad_connections_are_refused() {
         ("photo not an image", Box::new(|v| v["profile"]["photo"] = json!("aGVsbG8="))),
         ("items", Box::new(|v| v["profile"]["items"] = json!(vec![json!({}); ITEMS_MAX + 1]))),
         ("relay_held", Box::new(|v| v["relay_held"] = json!({"since": 1}))),
+        ("profile version a string", Box::new(|v| v["profile"]["version"] = json!("1"))),
+        ("profile version negative", Box::new(|v| v["profile"]["version"] = json!(-1))),
     ];
     for (name, f) in cases {
         let mut c = conn();
@@ -213,4 +215,24 @@ fn a_connection_with_its_empty_parts_left_out() {
     let mut p = prof();
     p["ik"] = json!("short");
     assert_eq!(profile(&p), Err(BadShape), "a present ik is still checked");
+}
+
+/// What the vault always sends stays required: each one missing is refused.
+#[test]
+fn a_connection_missing_a_required_field_is_refused() {
+    for k in ["id", "kind", "state", "ik", "version", "favorite", "archived", "asks"] {
+        let mut c = conn();
+        c.as_object_mut().unwrap().remove(k);
+        assert_eq!(connection(&c), Err(BadShape), "{k}");
+    }
+    for k in ["first_name", "last_name"] {
+        let mut c = conn();
+        c["profile"].as_object_mut().unwrap().remove(k);
+        assert_eq!(connection(&c), Err(BadShape), "profile {k}");
+    }
+    for k in ["muted", "paused"] {
+        let mut c = conn();
+        c["asks"].as_object_mut().unwrap().remove(k);
+        assert_eq!(connection(&c), Err(BadShape), "asks {k}");
+    }
 }

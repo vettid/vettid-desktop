@@ -114,7 +114,9 @@ pub fn profile(v: &Value) -> R<Value> {
     let mut out = Map::new();
     // The inviter's side holds only the request's `{first_name, last_name,
     // name?}` until the first `profile.update` (§10.4 "`name` and
-    // `profile`"), so `version`, `ik` and `items` may be absent.
+    // `profile`"), so `version`, `ik` and `items` may be absent. A profile
+    // with only some of them is read as it is: what is present is checked,
+    // and the view needs only the names.
     if !matches!(o.get("version"), None | Some(Value::Null)) {
         n(o, &mut out, "version")?;
     }
