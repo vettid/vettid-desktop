@@ -7,6 +7,7 @@ import { inboundAction, livenessChanged } from '../connectionView.js';
 import { decodeEventPayload } from '../events';
 import { sessionStore } from './session';
 import { selectedConnectionStore } from './navigation';
+import { keepOnly } from './conversations.svelte.js';
 
 // ---------------------------------------------------------------------------
 // Store-local types
@@ -91,6 +92,8 @@ export async function loadConnections(): Promise<void> {
     connectionsStore.set(list);
     connectionsUnreadableStore.set(unreadable);
     connectionsErrorStore.set(error);
+    // The conversations' kept sends and drafts follow the list the vault answered.
+    if (!error) keepOnly(new Set(list.map((c) => c.id)));
     const selected = get(selectedConnectionStore);
     if (selected) selectedConnectionStore.set(list.find((c) => c.id === selected.id) ?? null);
 }

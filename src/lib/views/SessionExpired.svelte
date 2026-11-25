@@ -4,6 +4,7 @@
   import { onDestroy } from 'svelte';
   import { noticeOf } from '../tooSoon.js';
   import { activateSession, sessionNotice, declinedNotice, endPending, vaultStore, askToEnd, endBusy } from '../stores/session';
+  import { clearKept } from '../stores/conversations.svelte.js';
   import { vaultScreen, endOffered } from '../vaultState.js';
 
   // #77: the vault's lock and hold (§3.2-§3.4). Held, locked or unknown,
@@ -75,6 +76,8 @@
   async function logoutFromHere() {
     try {
       sessionNotice.set(null);
+      // Log out resets the link: the conversations' kept sends and drafts go.
+      clearKept();
       const result = await invoke<{ revoke_sent: boolean; local_wiped: boolean; notice?: string | null }>('logout');
       if (result?.revoke_sent && result?.local_wiped && !result?.notice) {
         window.location.reload();

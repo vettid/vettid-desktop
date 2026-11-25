@@ -1,27 +1,14 @@
-<script module lang="ts">
-    import type { Local } from '../../conversationView.js';
-
-    // This window's own sends and drafts, per connection, kept while the
-    // conversation is closed or the session isn't live (a send left
-    // unconfirmed may still be carried out, and its answer may come back to
-    // a closed view). In memory only: message text is never stored or
-    // logged.
-    const kept = $state<{ locals: Local[]; drafts: Record<string, string>; errors: Record<string, string> }>({
-        locals: [],
-        drafts: {},
-        errors: {},
-    });
-</script>
-
 <script lang="ts">
     // A conversation (DESKTOP-REWORK-PLAN Phase 5, 5.3): `get_conversation`
     // (`message.list`, newest page, then older pages with `before`),
-    // `send_message` and `mark_message_read`, live `message.new` and
-    // receipts from `vault:inbound`. The rules are in conversationView.js.
-    // Only what the vault answered is shown: a failed read clears the
-    // messages and shows the backend's text; nothing is shown while the
-    // session isn't live; a send is never shown as sent before the vault
-    // said so.
+    // `send_message`, `retry_send` and `mark_message_read`, live
+    // `message.new` and receipts from `vault:inbound`. The rules are in
+    // conversationView.js; this window's own sends and drafts are kept in
+    // stores/conversations.svelte.ts. Only what the vault answered is shown:
+    // a failed read clears the messages and shows the backend's text;
+    // nothing is shown while the session isn't live; a send is never shown
+    // as sent before the vault said so, and never offered again before a
+    // read of the conversation showed it isn't there.
     import { invoke } from '@tauri-apps/api/core';
     import { listen } from '@tauri-apps/api/event';
     import { open } from '@tauri-apps/plugin-shell';
@@ -29,13 +16,13 @@
     import type { Connection, VaultOpResponse } from '../../connections';
     import { INBOUND_EVENT, type InboundBatch } from '../../inbound';
     import { sessionStore } from '../../stores/session';
+    import { kept } from '../../stores/conversations.svelte.js';
     import { connectionTitle } from '../../connectionView.js';
     import {
         PAGE_LIMIT,
         SERVICE_NO_MESSAGES,
         MESSAGES_NOT_LIVE_TEXT,
         UNREADABLE_MESSAGES,
-        UNCONFIRMED_EXPIRED_TEXT,
         EMPTY_MESSAGE,
         LINE_ISOLATE,
         LINK_NOT_OPENED,
@@ -44,12 +31,15 @@
         markedRead,
         nextToMark,
         newLocal,
-        sameUnconfirmed,
+        startRetry,
         applySendAnswer,
-        retrying,
-        expireStale,
+        applyRetryAnswer,
+        expireDue,
         afterReload,
-        withReturned,
+        placeReturned,
+        unsentToDraft,
+        knowsEvent,
+        releaseHeld,
         viewMessages,
         deliveryState,
         deliveryText,
@@ -62,7 +52,7 @@
         conversationAction,
         openLinkQuestion,
     } from '../../conversationView.js';
-    import type { Message } from '../../conversationView.js';
+    import type { Message, Returned, SyncEv } from '../../conversationView.js';
 
     interface Props {
         connection: Connection;
@@ -89,7 +79,6 @@
     let loadError = $state('');
     let olderLoading = $state(false);
     let olderError = $state('');
-    let sending = $state(false);
     let linkAsk = $state<{ href: string; host: string } | null>(null);
     let linkError = $state('');
     let scrollEl: HTMLDivElement | undefined = $state();
@@ -98,18 +87,24 @@
      *  and an older page read before it is dropped. */
     let seq = 0;
     /** `message.new` and receipts that arrive while the newest page is read. */
-    let buffer: { messages: Message[]; events: Array<{ kind?: string; members?: Record<string, unknown> }> } | null = null;
+    let buffer: { messages: Message[]; events: SyncEv[] } | null = null;
 
     if (kept.drafts[cid] === undefined) kept.drafts[cid] = '';
     let draft = $derived(kept.drafts[cid] ?? '');
     let draftBytes = $derived(textBytes(draft));
     let sendError = $derived(kept.errors[cid] ?? '');
+    let sending = $derived(!!kept.sending[cid]);
 
     let items = $derived(viewMessages(messages, kept.locals, cid));
 
     /** Messages tried in this read of the conversation; a failed mark is
      *  tried again after the next read. */
     const tried = new Set<string>();
+    /** Incoming messages the member has seen: shown in the viewport while
+     *  the window was visible. Only these are marked read. */
+    const seen = new Set<string>();
+    /** Incoming unread messages in the viewport now. */
+    const inView = new Set<string>();
     let marking = false;
     /** Set once the view is closed: a send's answer still lands in `kept`,
      *  but nothing is read for a closed view. */
@@ -131,9 +126,39 @@
         tried.clear();
     }
 
+    /** Texts back to the member: the box when it is empty, else bubbles. */
+    function giveBack(returned: Returned[]): void {
+        if (!returned.length) return;
+        const p = placeReturned(kept.locals, kept.drafts, returned, Date.now());
+        kept.locals = p.locals;
+        kept.drafts = p.drafts;
+        for (const [c, e] of Object.entries(p.errors)) kept.errors[c] = e;
+    }
+
+    /** Receipts held for messages of this connection that are known now. */
+    function releaseNow(): void {
+        if (!kept.held.length) return;
+        const r = releaseHeld(
+            kept.held,
+            (ev) => ev.members?.connection_id === cid && knowsEvent(messages, kept.locals, ev, cid),
+            Date.now(),
+        );
+        kept.held = r.held;
+        for (const ev of r.ready) applyEvent(ev);
+    }
+
+    function applyEvent(ev: SyncEv): void {
+        messages = applySyncEvent(messages, ev, cid);
+        kept.locals = applySyncEvent(kept.locals, ev, cid);
+    }
+
     async function loadNewest(): Promise<void> {
+        if (closed) return;
         const mine = ++seq;
         const startedAt = Date.now();
+        // A send past its expires_at is read about now.
+        const due = expireDue(kept.locals, startedAt);
+        if (due.changed) kept.locals = due.locals;
         buffer = { messages: [], events: [] };
         loading = true;
         olderLoading = false;
@@ -158,14 +183,14 @@
             unreadable = resp.data.unreadable ?? 0;
             loadError = '';
             tried.clear();
-            const after = afterReload(kept.locals, cid, new Set(next.map((m) => m.message_id)), startedAt);
+            const after = afterReload(kept.locals, cid, next, startedAt);
             kept.locals = after.locals;
-            if (after.returned.length) {
-                kept.drafts[cid] = withReturned(kept.drafts[cid] ?? '', after.returned);
-                kept.errors[cid] = UNCONFIRMED_EXPIRED_TEXT;
-            }
+            releaseNow();
             await tick();
             scrollToBottom();
+            // A send that expired or came back unreadable during this read
+            // is read about once more.
+            if (after.recheck) void loadNewest();
         } else {
             // Nothing that wasn't confirmed stays on screen.
             messages = [];
@@ -195,6 +220,7 @@
             messages = mergeMessages(messages, resp.data.messages ?? [], cid);
             nextBefore = resp.data.next_before ?? null;
             unreadable += resp.data.unreadable ?? 0;
+            releaseNow();
             await tick();
             // Keep the messages that were on screen where they were.
             if (scrollEl) scrollEl.scrollTop += scrollEl.scrollHeight - height;
@@ -232,21 +258,25 @@
                 added = true;
             } else if (m?.type === 'sync.event') {
                 if (buffer) buffer.events.push(m.body);
-                messages = applySyncEvent(messages, m.body, cid);
-                kept.locals = applySyncEvent(kept.locals, m.body, cid);
+                if (knowsEvent(messages, kept.locals, m.body, cid)) applyEvent(m.body);
+                // Its message isn't known yet (send_message's answer may be
+                // on its way, or a page will have it): held a while.
+                else kept.held = [...kept.held, { ev: m.body, at: Date.now() }];
             }
         }
+        if (added) releaseNow();
         if (added && atBottom) {
             await tick();
             scrollToBottom();
         }
     }
 
-    // ---- Marking read: one call at a time, never in the way of the view.
+    // ---- Marking read: only what was seen, one call at a time, never in
+    // the way of the view.
 
     function pumpReads(): void {
         if (closed || marking || !live || !takes || document.visibilityState !== 'visible') return;
-        const id = nextToMark(messages, tried);
+        const id = nextToMark(messages, tried, seen);
         if (!id) return;
         tried.add(id);
         marking = true;
@@ -262,33 +292,63 @@
             });
     }
 
-    $effect(() => {
-        // Marked once they are on screen: whenever the messages change.
-        void messages;
-        void live;
-        untrack(pumpReads);
-    });
+    const observer =
+        typeof IntersectionObserver === 'undefined'
+            ? null
+            : new IntersectionObserver(
+                  (entries) => {
+                      for (const e of entries) {
+                          const id = (e.target as HTMLElement).dataset.unreadId ?? '';
+                          if (!id) continue;
+                          if (e.isIntersecting) inView.add(id);
+                          else inView.delete(id);
+                      }
+                      noteSeen();
+                  },
+                  { threshold: 0.6 },
+              );
+
+    /** What is in the viewport counts as seen while the window is visible. */
+    function noteSeen(): void {
+        if (document.visibilityState !== 'visible') return;
+        for (const id of inView) seen.add(id);
+        pumpReads();
+    }
+
+    /** Watches an incoming unread bubble (id ''): nothing to watch. */
+    function watchUnread(node: HTMLElement, id: string) {
+        const set = (v: string) => {
+            node.dataset.unreadId = v;
+            if (v) observer?.observe(node);
+            else {
+                observer?.unobserve(node);
+            }
+        };
+        set(id);
+        return {
+            update(v: string) {
+                if (!v) inView.delete(node.dataset.unreadId ?? '');
+                set(v);
+            },
+            destroy() {
+                inView.delete(node.dataset.unreadId ?? '');
+                observer?.unobserve(node);
+            },
+        };
+    }
 
     // ---- Sending
 
     async function send(): Promise<void> {
         const text = kept.drafts[cid] ?? '';
-        if (sending || !live || !takes || !canSend(text)) return;
-        // The same text as an unconfirmed send is that send's retry (the
-        // backend sends it again under its id), never a second message.
-        const same = sameUnconfirmed(kept.locals, cid, text);
-        let key: string;
-        if (same) {
-            key = same.key;
-            kept.locals = retrying(kept.locals, key);
-        } else {
-            const l = newLocal(cid, text, Date.now());
-            key = l.key;
-            kept.locals = [...kept.locals, l];
-        }
+        if (kept.sending[cid] || !live || !takes || !canSend(text)) return;
+        // Always a new message (send_message); an unconfirmed one is tried
+        // again by its own "Try again".
+        const l = newLocal(cid, text, Date.now());
+        kept.locals = [...kept.locals, l];
         kept.drafts[cid] = '';
         kept.errors[cid] = '';
-        sending = true;
+        kept.sending[cid] = true;
         await tick();
         scrollToBottom();
         let resp: VaultOpResponse<any> | null = null;
@@ -298,12 +358,44 @@
             // No answer at all: it may have gone, so it is unconfirmed.
             resp = null;
         }
-        const r = applySendAnswer(kept.locals, key, resp, Date.now());
+        const r = applySendAnswer(kept.locals, l.key, resp, Date.now());
         kept.locals = r.locals;
-        if (r.draft !== null) kept.drafts[cid] = withReturned(kept.drafts[cid] ?? '', [r.draft]);
-        kept.errors[cid] = r.error;
-        sending = false;
+        giveBack(r.returned);
+        kept.sending[cid] = false;
+        if (!closed) releaseNow();
         if (r.refresh && live && !closed) void loadNewest();
+    }
+
+    async function retry(key: string): Promise<void> {
+        const l = kept.locals.find((x) => x.key === key);
+        if (!l?.pending_id || kept.sending[cid] || !live) return;
+        const pendingId = l.pending_id;
+        kept.locals = startRetry(kept.locals, key);
+        kept.sending[cid] = true;
+        let resp: VaultOpResponse<any> | null = null;
+        try {
+            resp = await invoke('retry_send', { connectionId: cid, pendingId });
+        } catch {
+            resp = null;
+        }
+        const r = applyRetryAnswer(kept.locals, key, resp, Date.now());
+        kept.locals = r.locals;
+        giveBack(r.returned);
+        kept.sending[cid] = false;
+        if (!closed) releaseNow();
+        if (r.refresh && live && !closed) void loadNewest();
+    }
+
+    function editUnsent(key: string): void {
+        const r = unsentToDraft(kept.locals, kept.drafts, key);
+        if (!r) return;
+        kept.locals = r.locals;
+        kept.drafts = r.drafts;
+        kept.errors[cid] = '';
+    }
+
+    function removeUnsent(key: string): void {
+        kept.locals = kept.locals.filter((x) => !(x.key === key && x.state === 'unsent'));
     }
 
     function onKeydown(e: KeyboardEvent): void {
@@ -337,7 +429,9 @@
         return Number.isNaN(t.getTime()) ? '' : t.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
     }
 
-    // Read when the session goes live (and on opening); cleared when it stops.
+    // Read when the session goes live (and on opening, which also reads
+    // about any send that expired while the view was closed); cleared when
+    // it stops.
     $effect(() => {
         const on = live && takes;
         untrack(() => {
@@ -347,22 +441,22 @@
     });
 
     onMount(() => {
-        kept.locals = expireStale(kept.locals, Date.now()).locals;
         const un = listen<InboundBatch>(INBOUND_EVENT, (event) => void onInbound(event.payload));
-        // A send left unconfirmed past its time, by this clock, is read
-        // about again before its text is offered again.
+        // A send past its expires_at is read about before anything else.
         const timer = setInterval(() => {
-            const e = expireStale(kept.locals, Date.now());
-            if (!e.changed) return;
-            kept.locals = e.locals;
-            if (live && takes) void loadNewest();
-        }, 15_000);
-        const onVisible = () => pumpReads();
+            if (!live || !takes || loading) return;
+            const now = Date.now();
+            if (kept.locals.some((l) => l.connection_id === cid && l.state === 'unconfirmed' && l.expires_at != null && now >= l.expires_at)) {
+                void loadNewest();
+            }
+        }, 5_000);
+        const onVisible = () => noteSeen();
         document.addEventListener('visibilitychange', onVisible);
         return () => {
             closed = true;
             seq++;
             clearInterval(timer);
+            observer?.disconnect();
             document.removeEventListener('visibilitychange', onVisible);
             void un.then((f) => f());
         };
@@ -412,11 +506,16 @@
                     {@const content = bubbleContent(m)}
                     {@const st = deliveryState(m, { relayHeld: !!connection.relay_held })}
                     {@const stText = deliveryText(st, { notice: m.local?.notice, title })}
-                    <div class="message" class:sent={m.direction === 'out'} class:received={m.direction !== 'out'}>
+                    <div
+                        class="message"
+                        class:sent={m.direction === 'out'}
+                        class:received={m.direction !== 'out'}
+                        use:watchUnread={m.direction === 'in' && !m.read ? m.message_id : ''}
+                    >
                         <div
                             class="bubble"
                             class:pending={st === 'sending' || st === 'unconfirmed'}
-                            class:check={st === 'expired' || st === 'unreadable'}
+                            class:check={st === 'expired' || st === 'unreadable' || st === 'unsent'}
                         >
                             {#if content.placeholder}
                                 <div class="attachment">{content.placeholder}</div>
@@ -439,11 +538,23 @@
                                 <span
                                     class="state"
                                     class:unconfirmed={st === 'unconfirmed' || st === 'held'}
-                                    class:check={st === 'expired' || st === 'unreadable'}
+                                    class:check={st === 'expired' || st === 'unreadable' || st === 'unsent'}
                                     class:read={st === 'read'}
                                 >{stText}</span>
                             {/if}
                         </div>
+                        {#if st === 'unconfirmed' && m.local?.pending_id}
+                            <div class="actions">
+                                <!-- NEW TEXT (owner approval needed): "Try again" -->
+                                <button type="button" onclick={() => void retry(m.key)} disabled={sending}>Try again</button>
+                            </div>
+                        {:else if st === 'unsent'}
+                            <div class="actions">
+                                <!-- NEW TEXT (owner approval needed): "Edit", "Remove" -->
+                                <button type="button" onclick={() => editUnsent(m.key)} disabled={draft !== ''}>Edit</button>
+                                <button type="button" onclick={() => removeUnsent(m.key)}>Remove</button>
+                            </div>
+                        {/if}
                     </div>
                 {/each}
             </div>
@@ -584,6 +695,18 @@
         color: inherit;
     }
     .link-ask button.primary { border-color: var(--accent); color: var(--accent); }
+
+    .actions { display: flex; gap: 6px; margin-top: 3px; }
+    .actions button {
+        background: none;
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 2px 8px;
+        font-size: 0.8em;
+        cursor: pointer;
+        color: inherit;
+    }
+    .actions button:disabled { opacity: 0.5; cursor: default; }
 
     .compose { display: flex; gap: 8px; margin-top: 8px; }
     .compose textarea {
