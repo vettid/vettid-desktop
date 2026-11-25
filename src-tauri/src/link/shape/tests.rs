@@ -184,3 +184,33 @@ fn a_sent_message_is_its_id_and_time() {
     assert_eq!(empty(&json!({"x": 1})), Ok(json!({})));
     assert_eq!(empty(&json!([])), Err(BadShape));
 }
+
+/// As the vault sends it (vettid-vault `peerJSON`): empty metadata, the
+/// display name, the profile and the times left out. It is read, with
+/// empty metadata; a partial profile (the inviter's side before the first
+/// `profile.update`) is read too.
+#[test]
+fn a_connection_with_its_empty_parts_left_out() {
+    let v = json!({"id": "c-1", "kind": "connection", "state": "active", "ik": IK, "version": 0,
+        "favorite": false, "archived": false, "asks": {"muted": false, "paused": false}});
+    let c = connection(&v).unwrap();
+    assert_eq!(c["alias"], "");
+    assert_eq!(c["note"], "");
+    assert_eq!(c["tags"], json!([]));
+    assert!(c.get("profile").is_none() && c.get("name").is_none() && c.get("last_active_at").is_none());
+    let mut w = v.clone();
+    w["profile"] = json!({"first_name": "Ann", "last_name": "Lee"});
+    assert_eq!(connection(&w).unwrap()["profile"]["first_name"], "Ann");
+    let l = connection_list(&json!({"connections": [v, w]})).unwrap();
+    assert_eq!(l["unreadable"], 0);
+    // Present but wrong is still refused.
+    for (k, bad) in [("alias", json!(7)), ("tags", json!("x")), ("profile", json!({"first_name": 1, "last_name": "L"})), ("last_active_at", json!(1))] {
+        let mut x = json!({"id": "c-1", "kind": "connection", "state": "active", "ik": IK, "version": 0,
+            "favorite": false, "archived": false, "asks": {"muted": false, "paused": false}});
+        x[k] = bad;
+        assert_eq!(connection(&x), Err(BadShape), "{k}");
+    }
+    let mut p = prof();
+    p["ik"] = json!("short");
+    assert_eq!(profile(&p), Err(BadShape), "a present ik is still checked");
+}
