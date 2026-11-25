@@ -65,6 +65,10 @@ struct State {
     deny: bool,
     collects: usize,
     waits: Vec<u64>,
+    /// Scripted answers by request type: `Ok(body)` or `Err(code)`.
+    answers: std::collections::HashMap<String, Result<String, String>>,
+    /// The type and body of every scripted request answered.
+    asked: Vec<(String, String)>,
     n: u64,
     /// The `unlock_id` `vault.status` names (written as is, so a test can
     /// give a malformed one); `None`: no member (a vault before release L).
@@ -255,6 +259,8 @@ impl FakeVault {
             deny: false,
             collects: 0,
             waits: Vec::new(),
+            answers: std::collections::HashMap::new(),
+            asked: Vec::new(),
             n: 0,
             unlock_id: Some(UNLOCK_1.into()),
             owner_check: Some(owner_check("ok", false, "")),
@@ -400,6 +406,17 @@ impl FakeVault {
         self.lock().collects
     }
 
+    /// Answer every request of type `kind` with `a`: `Ok(body)` or
+    /// `Err(code)`.
+    pub(crate) fn answer(&self, kind: &str, a: Result<&str, &str>) {
+        self.lock().answers.insert(kind.to_string(), a.map(str::to_string).map_err(str::to_string));
+    }
+
+    /// The scripted requests answered so far: type and body.
+    pub(crate) fn asked(&self) -> Vec<(String, String)> {
+        self.lock().asked.clone()
+    }
+
     /// The `wait` of every collect so far.
     pub(crate) fn waits(&self) -> Vec<u64> {
         self.lock().waits.clone()
@@ -444,6 +461,17 @@ impl Transport for FakeVault {
             let answer = s.inner(&inner.kind, refused, "{}".into());
             s.send(answer);
             return Ok(taken);
+        }
+        if inner.response.is_none() {
+            if let Some(a) = s.answers.get(&inner.kind).cloned() {
+                s.asked.push((inner.kind.clone(), inner.body.to_string()));
+                let answer = match a {
+                    Ok(body) => s.inner(&inner.kind, ok(&inner), body),
+                    Err(code) => s.inner(&inner.kind, Some(Response { re: inner.id.clone(), status: Status::Error { code, message: None } }), "{}".into()),
+                };
+                s.send(answer);
+                return Ok(taken);
+            }
         }
         if inner.response.is_none() && inner.kind == "vault.status" {
             let body = s.status_body();

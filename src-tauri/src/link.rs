@@ -1762,6 +1762,7 @@ pub fn spawn_collect(shared: Shared) -> JoinHandle<()> {
 }
 
 pub mod inbound;
+pub mod ops;
 
 #[cfg(test)]
 pub(crate) mod fake;
