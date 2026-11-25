@@ -11,7 +11,6 @@
     // read of the conversation showed it isn't there.
     import { invoke } from '@tauri-apps/api/core';
     import { listen } from '@tauri-apps/api/event';
-    import { open } from '@tauri-apps/plugin-shell';
     import { onMount, tick, untrack } from 'svelte';
     import type { Connection, VaultOpResponse } from '../../connections';
     import { INBOUND_EVENT, type InboundBatch } from '../../inbound';
@@ -59,7 +58,6 @@
         MAX_TEXT_BYTES,
         takesMessages,
         conversationAction,
-        openLinkQuestion,
     } from '../../conversationView.js';
     import type { Message, Returned, SyncEv } from '../../conversationView.js';
 
@@ -88,7 +86,6 @@
     let loadError = $state('');
     let olderLoading = $state(false);
     let olderError = $state('');
-    let linkAsk = $state<{ href: string; host: string } | null>(null);
     let linkError = $state('');
     let scrollEl: HTMLDivElement | undefined = $state();
 
@@ -146,7 +143,6 @@
         loadError = '';
         olderLoading = false;
         olderError = '';
-        linkAsk = null;
         linkError = '';
         tried.clear();
         // No cleaned message text stays in memory for a conversation not shown.
@@ -493,45 +489,18 @@
         }
     }
 
-    // ---- Links (§10.5): the host is shown and the member asked first.
+    // ---- Links (§10.5): open_message_link checks the link, shows its host
+    // in a native prompt and opens it only on the member's "Open". The
+    // window itself can't open a URL.
 
-    /** Moves focus into the link prompt when it opens: to Cancel, so that
-     *  a repeated Enter can't open the link before the host is read. */
-    function focusFirst(node: HTMLElement) {
-        node.focus();
-    }
-
-    /** The link that opened the prompt: focus goes back to it on Cancel. */
-    let opener: HTMLElement | null = null;
-
-    async function cancelAsk(): Promise<void> {
-        linkAsk = null;
-        const back = opener;
-        opener = null;
-        await tick();
-        if (back?.isConnected) back.focus();
-    }
-
-    function onAskKeydown(e: KeyboardEvent): void {
-        if (e.key === 'Escape') {
-            e.preventDefault();
-            void cancelAsk();
-        }
-    }
-
-    function askOpen(p: { href: string; host: string }, from?: EventTarget | null): void {
-        opener = from instanceof HTMLElement ? from : null;
+    async function openLink(p: { text: string }): Promise<void> {
         linkError = '';
-        linkAsk = { href: p.href, host: p.host };
-    }
-
-    async function openAsked(): Promise<void> {
-        const ask = linkAsk;
-        linkAsk = null;
-        if (!ask) return;
         try {
-            await open(ask.href);
+            // `opened`, or nothing to say: cancelled, or "Open" too soon
+            // after the prompt showed (MIN_CONFIRM_MS in commands/links.rs).
+            await invoke<string>('open_message_link', { text: p.text });
         } catch {
+            // Refused, another link's prompt shown, or not opened.
             linkError = LINK_NOT_OPENED;
         }
     }
@@ -647,7 +616,7 @@
                                 {:else}
                                     <div class="text" class:caption={!!content.placeholder}>
                                         {#each content.body.lines as line}
-                                            <div class="line">{LINE_ISOLATE.start}{#each line as p}{#if 'href' in p}<button type="button" class="link" onclick={(e) => askOpen(p, e.currentTarget)}>{p.text}</button>{:else}{p.text}{/if}{/each}{LINE_ISOLATE.end}</div>
+                                            <div class="line">{LINE_ISOLATE.start}{#each line as p}{#if 'href' in p}<button type="button" class="link" onclick={() => void openLink(p)}>{p.text}</button>{:else}{p.text}{/if}{/each}{LINE_ISOLATE.end}</div>
                                         {/each}
                                     </div>
                                 {/if}
@@ -690,15 +659,6 @@
                 {/each}
             </div>
 
-            {#if linkAsk}
-                <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-                <div class="link-ask" role="dialog" aria-modal="false" aria-labelledby="{cid}-link-ask" tabindex="-1" onkeydown={onAskKeydown}>
-                    <span id="{cid}-link-ask">{openLinkQuestion(linkAsk.host)}</span>
-                    <!-- NEW TEXT (owner approval needed): "Open" -->
-                    <button type="button" class="primary" onclick={() => void openAsked()}>Open</button>
-                    <button type="button" use:focusFirst onclick={() => void cancelAsk()}>Cancel</button>
-                </div>
-            {/if}
             <div aria-live="polite">
                 {#if linkError}
                     <div class="compose-note error">{linkError}</div>
@@ -809,28 +769,6 @@
     .state.unconfirmed { color: var(--warning); }
     .state.check { color: var(--warning); }
     .state.read { color: var(--accent); }
-
-    .link-ask {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 8px;
-        border: 1px solid var(--border);
-        border-radius: 8px;
-        padding: 8px 10px;
-        margin-top: 6px;
-        font-size: 0.9em;
-    }
-    .link-ask span { flex: 1; min-width: 12em; overflow-wrap: anywhere; }
-    .link-ask button {
-        background: none;
-        border: 1px solid var(--border);
-        border-radius: 4px;
-        padding: 3px 10px;
-        cursor: pointer;
-        color: inherit;
-    }
-    .link-ask button.primary { border-color: var(--accent); color: var(--accent); }
 
     .actions { display: flex; gap: 6px; margin-top: 3px; }
     .actions button {

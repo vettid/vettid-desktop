@@ -41,6 +41,7 @@ import {
   deliveryText,
   cleanBubble,
   linkPieces,
+  MAX_LINK_BYTES,
   bubbleLines,
   bubbleContent,
   textBytes,
@@ -592,9 +593,33 @@ test('§10.5 links: only https:// is a link, with its host; other schemes are te
   for (const t of ['http://example.com', 'someapp://x', 'javascript:alert(1)', 'www.example.com', 'ftp://x']) {
     assert.deepEqual(linkPieces(t), [{ text: t }], t);
   }
-  // The host is the URL's own: user info is not the host, IDN shows as punycode.
-  assert.equal(/** @type {any} */ (linkPieces('https://good.com@evil.example/')[0]).host, 'evil.example');
+  // IDN shows as punycode.
   assert.equal(/** @type {any} */ (linkPieces('https://bücher.example/')[0]).host, 'xn--bcher-kva.example');
+});
+
+test('§10.5 links: what open_message_link would refuse is text, not a link', () => {
+  // A user or password before the host.
+  for (const t of ['https://good.com@evil.example/', 'https://user:pw@example.com/', 'https://:pw@example.com/', 'https://@example.com/']) {
+    assert.deepEqual(linkPieces(t), [{ text: t }], t);
+  }
+  // An @ after the host is the path's or the query's.
+  assert.equal(/** @type {any} */ (linkPieces('https://example.com/@user')[0]).host, 'example.com');
+  assert.equal(/** @type {any} */ (linkPieces('https://example.com?to=a@b')[0]).host, 'example.com');
+  // No host before the path.
+  assert.deepEqual(linkPieces('https:///example.com/'), [{ text: 'https:///example.com/' }]);
+  // A control or bidi character anywhere in it.
+  for (const c of ['\u0000', '\u0007', '\u001B', '\u007F', '\u0085', '\u009F', '\u061C', '\u200E', '\u200F', '\u202A', '\u202B', '\u202C', '\u202D', '\u202E', '\u2066', '\u2067', '\u2068', '\u2069']) {
+    const t = `https://example.com/a${c}b`;
+    assert.deepEqual(linkPieces(t), [{ text: t }], JSON.stringify(t));
+  }
+  // Up to MAX_LINK_BYTES UTF-8 bytes.
+  const base = 'https://example.com/';
+  const atCap = base + 'a'.repeat(MAX_LINK_BYTES - base.length);
+  assert.equal(/** @type {any} */ (linkPieces(atCap)[0]).text, atCap);
+  assert.deepEqual(linkPieces(atCap + 'a'), [{ text: atCap + 'a' }]);
+  const wide = base + '\u00E9'.repeat((MAX_LINK_BYTES - base.length) / 2 + 1);
+  assert.deepEqual(linkPieces(wide), [{ text: wide }]);
+  assert.equal(MAX_LINK_BYTES, 2048);
 });
 
 test('bubble lines and content: attachment placeholder, caption under it, never an empty bubble', () => {
