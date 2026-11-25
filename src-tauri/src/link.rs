@@ -571,6 +571,8 @@ pub struct Link<T: Transport = Http, C: Clock = SystemClock> {
     /// (`message.new`, `sync.event`), until [`Link::take_inbound`]: in
     /// memory only (Phase 5, 5.1).
     inbound: inbound::Queue,
+    /// A change sent and not confirmed (ops.rs): retried under its id.
+    unconfirmed: Option<ops::Pending>,
 }
 
 /// What the refresh loop records of its own rounds, by the wall clock.
@@ -642,6 +644,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
             resumes: 0,
             last_attempt: None,
             inbound: inbound::Queue::default(),
+            unconfirmed: None,
         }
     }
 
@@ -1763,6 +1766,7 @@ pub fn spawn_collect(shared: Shared) -> JoinHandle<()> {
 
 pub mod inbound;
 pub mod ops;
+pub mod shape;
 
 #[cfg(test)]
 pub(crate) mod fake;

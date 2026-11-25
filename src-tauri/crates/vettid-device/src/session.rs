@@ -590,6 +590,13 @@ impl<T: Transport, C: Clock> Session<T, C> {
     /// §12.1). False while it waits in the outbox (a hold after a 429 or a
     /// 5xx, a deposit that failed), when its deposit was only "possibly
     /// delivered", and before a collect after it (VAULT-LOCK-PLAN §3.1).
+    /// The inner id of the last request sent (stored in the outbox), if
+    /// its send got that far: then it goes with the next exchange even if
+    /// its wait failed, and a retry should use [`Session::request_again`].
+    pub fn last_request_id(&self) -> Option<&str> {
+        self.last_request.as_deref()
+    }
+
     pub fn last_request_reached(&self) -> bool {
         let Some(id) = &self.last_request else { return false };
         self.tracked.iter().any(|t| t.id == *id && t.deposited && t.collected_after)

@@ -5,7 +5,8 @@ use tauri::State;
 // available" error: see `unavailable`. The connection operations go over the
 // link (DESKTOP-REWORK-PLAN Phase 5, 5.2; `link::ops`).
 use crate::commands::unavailable as operations;
-use crate::link::ops::OpError;
+use crate::link::ops::{link_op_with, OpError};
+use crate::link::shape::{self, BadShape};
 use crate::state::AppState;
 
 #[derive(Debug, Serialize)]
@@ -56,47 +57,44 @@ impl VaultOpResponse {
     }
 }
 
-/// Run `kind` with `body` over the link, only while the screen shows a
-/// live session and no End session, lock or log-out is under way; then
-/// publish what the link learned (a hold, an ended session), unless one
-/// started meanwhile or a newer snapshot was published (then the answer
-/// isn't handed on either: the screen has moved on).
-async fn link_op(state: &AppState, kind: &str, body: serde_json::Value) -> VaultOpResponse {
+/// Run `kind` with `body` over the link ([`link_op_with`]): only while
+/// the screen shows a live session and no End session, lock or log-out is
+/// under way; its answer checked by `shape`.
+async fn link_op(
+    state: &AppState,
+    kind: &str,
+    body: serde_json::Value,
+    shape: fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>,
+    change: bool,
+) -> VaultOpResponse {
     let mark = crate::commands::auth::reset_mark(state);
-    let seen = state.snapshot();
-    if crate::commands::auth::overtaken_by_reset(state, mark) || !seen.active_at(chrono::Utc::now()) {
-        return VaultOpResponse::from_link(Err(OpError::NoSession));
-    }
-    let mut slot = state.link.lock().await;
-    let Some(link) = slot.as_mut() else {
-        return VaultOpResponse::from_link(Err(OpError::NoSession));
-    };
-    if crate::commands::auth::overtaken_by_reset(state, mark) {
-        return VaultOpResponse::from_link(Err(OpError::NoSession));
-    }
-    let result = link.op(kind, &body).await;
-    let snap = link.snapshot(chrono::Utc::now());
-    drop(slot);
-    if crate::commands::auth::overtaken_by_reset(state, mark) || !state.shared().publish_if(seen.seq, snap) {
-        // A reset or a newer snapshot came first: what it shows stands.
-        return VaultOpResponse::from_link(match result {
-            Ok(_) => Err(OpError::NoSession),
-            Err(e) => Err(e),
-        });
-    }
-    VaultOpResponse::from_link(result)
+    let r = link_op_with(
+        &state.link,
+        || state.snapshot().active_at(chrono::Utc::now()),
+        || crate::commands::auth::overtaken_by_reset(state, mark),
+        |s| state.publish(s),
+        kind,
+        body,
+        shape,
+        change,
+    )
+    .await;
+    VaultOpResponse::from_link(r)
 }
 
 /// List connections (`connection.list`, VAULT-MESSAGING §10.4): read-only.
 #[tauri::command]
 pub async fn list_connections(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
-    Ok(link_op(&state, "connection.list", serde_json::json!({})).await)
+    Ok(link_op(&state, "connection.list", serde_json::json!({}), shape::connection_list, false).await)
 }
 
 /// Get a specific connection (`connection.get`, §10.4).
 #[tauri::command]
 pub async fn get_connection(state: State<'_, AppState>, connection_id: String) -> Result<VaultOpResponse, String> {
-    Ok(link_op(&state, "connection.get", serde_json::json!({ "connection_id": connection_id })).await)
+    if connection_id.is_empty() {
+        return Ok(VaultOpResponse::from_link(Err(OpError::BadArgument)));
+    }
+    Ok(link_op(&state, "connection.get", serde_json::json!({ "connection_id": connection_id }), shape::connection, false).await)
 }
 
 /// The connection requests waiting (`connection.request.list`, §10.4):
@@ -104,7 +102,7 @@ pub async fn get_connection(state: State<'_, AppState>, connection_id: String) -
 /// approves one (§3.1).
 #[tauri::command]
 pub async fn list_connection_requests(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
-    Ok(link_op(&state, "connection.request.list", serde_json::json!({})).await)
+    Ok(link_op(&state, "connection.request.list", serde_json::json!({}), shape::request_list, false).await)
 }
 
 /// Decline a connection request (`connection.decline`, §10.4): an incoming
@@ -118,9 +116,9 @@ pub async fn decline_connection_request(
     let body = match (pending_id, connection_id) {
         (Some(p), None) if !p.is_empty() => serde_json::json!({ "pending_id": p }),
         (None, Some(c)) if !c.is_empty() => serde_json::json!({ "connection_id": c }),
-        _ => return Ok(VaultOpResponse::from_link(Err(OpError::Vault("bad_request".into())))),
+        _ => return Ok(VaultOpResponse::from_link(Err(OpError::BadArgument))),
     };
-    Ok(link_op(&state, "connection.decline", body).await)
+    Ok(link_op(&state, "connection.decline", body, shape::empty, true).await)
 }
 
 /// List paired agents with their Contract (scope / approval mode /
