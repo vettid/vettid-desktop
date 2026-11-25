@@ -1,8 +1,12 @@
-import { writable, derived, type Writable, type Readable } from 'svelte/store';
+import { writable, derived, get, type Writable, type Readable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
-import type { Connection, VaultOpResponse } from '../types';
+import type { Connection, ConnectionList, ConnectionRequests, VaultOpResponse } from '../connections';
+import { INBOUND_EVENT, type InboundBatch } from '../inbound';
+import { inboundAction, livenessChanged } from '../connectionView.js';
 import { decodeEventPayload } from '../events';
+import { sessionStore } from './session';
+import { selectedConnectionStore } from './navigation';
 
 // ---------------------------------------------------------------------------
 // Store-local types
@@ -56,26 +60,101 @@ export const pendingGrantCountStore: Writable<number | null> = writable(null);
 /** Why the last `loadConnections` failed (the backend's own text), or ''. */
 export const connectionsErrorStore: Writable<string> = writable('');
 
+/** How many connections the last load left out as unreadable (0 on failure). */
+export const connectionsUnreadableStore: Writable<number> = writable(0);
+
+/** Counts `loadConnections` calls: only the latest one's answer is applied. */
+let connectionsSeq = 0;
+
 /**
  * Re-fetch the connection list. On failure the list is cleared (a list
  * we could not confirm is not shown as current) and the backend's error
  * text goes to `connectionsErrorStore`; it never reads as an empty list.
+ * The selected connection follows the list: replaced by its new copy, or
+ * cleared when the list no longer has it or couldn't be read.
  */
 export async function loadConnections(): Promise<void> {
+    const seq = ++connectionsSeq;
+    let list: Connection[] = [];
+    let unreadable = 0;
+    let error = '';
     try {
-        const resp: VaultOpResponse = await invoke('list_connections');
+        const resp: VaultOpResponse<Partial<ConnectionList>> = await invoke('list_connections');
         if (resp.success && resp.data) {
-            const data = resp.data as { connections?: Connection[] };
-            connectionsStore.set(data.connections ?? []);
-            connectionsErrorStore.set('');
-            return;
-        }
-        connectionsStore.set([]);
-        connectionsErrorStore.set(resp.error ?? 'Failed to load connections');
+            list = resp.data.connections ?? [];
+            unreadable = resp.data.unreadable ?? 0;
+        } else error = resp.error ?? 'Failed to load connections';
     } catch (e) {
-        connectionsStore.set([]);
-        connectionsErrorStore.set(String(e));
+        error = String(e);
     }
+    if (seq !== connectionsSeq) return;
+    connectionsStore.set(list);
+    connectionsUnreadableStore.set(unreadable);
+    connectionsErrorStore.set(error);
+    const selected = get(selectedConnectionStore);
+    if (selected) selectedConnectionStore.set(list.find((c) => c.id === selected.id) ?? null);
+}
+
+/** The pending requests as the last load confirmed them; `null` when it failed. */
+export const connectionRequestsStore: Writable<ConnectionRequests | null> = writable(null);
+/** Why the last `loadConnectionRequests` failed (the backend's own text), or ''. */
+export const connectionRequestsErrorStore: Writable<string> = writable('');
+
+let requestsSeq = 0;
+
+/**
+ * Re-fetch the pending requests (`connection.request.list`). On failure
+ * they are cleared and the backend's error text is kept, as for the list.
+ */
+export async function loadConnectionRequests(): Promise<void> {
+    const seq = ++requestsSeq;
+    let requests: ConnectionRequests | null = null;
+    let error = '';
+    try {
+        const resp: VaultOpResponse<Partial<ConnectionRequests>> = await invoke('list_connection_requests');
+        if (resp.success && resp.data) {
+            requests = { incoming: resp.data.incoming ?? [], outgoing: resp.data.outgoing ?? [] };
+        } else {
+            error = resp.error ?? '';
+        }
+    } catch (e) {
+        error = String(e);
+    }
+    if (seq !== requestsSeq) return;
+    connectionRequestsStore.set(requests);
+    connectionRequestsErrorStore.set(error);
+}
+
+/**
+ * Bumped each time the connection views should read again: a view that
+ * reads on its own (the detail's `connection.get`) follows it.
+ */
+export const connectionsReload: Writable<number> = writable(0);
+
+/** Read the list and the requests again, and tell the other views to. */
+export function reloadConnectionViews(): void {
+    connectionsReload.update((n) => n + 1);
+    void loadConnections();
+    void loadConnectionRequests();
+}
+
+/** Shown once, in place of the list, while no session is live (the requests view does not repeat it). */
+export const NOT_LIVE_TEXT = "Your session isn't live, so your connections aren't shown.";
+
+/**
+ * Clear the list, the requests and the selected connection at once when the
+ * session stops being live. An answer to a read already under way is not
+ * applied (its count is no longer the latest).
+ */
+export function clearConnectionViews(): void {
+    connectionsSeq++;
+    requestsSeq++;
+    connectionsStore.set([]);
+    connectionsUnreadableStore.set(0);
+    connectionsErrorStore.set(NOT_LIVE_TEXT);
+    connectionRequestsStore.set(null);
+    connectionRequestsErrorStore.set(NOT_LIVE_TEXT);
+    selectedConnectionStore.set(null);
 }
 
 // ---------------------------------------------------------------------------
@@ -88,20 +167,27 @@ export function initVaultListeners(): void {
     if (listenersInitialized) return;
     listenersInitialized = true;
 
-    // Connection lifecycle (peer-accepted, activated, key-exchanged, rejected).
-    // We re-list to pick up state transitions — cheaper than maintaining a
-    // delta-application path until the dataset gets large.
-    listen<AppEventEnvelope>('vault:connection-event', () => {
-        void loadConnections();
+    // The connection views read again when the session goes live, and are
+    // cleared when it stops being live, as the window's own session state
+    // shows it (`vault:changed`, then the session snapshot). A new
+    // `session_id` without a change in liveness needs nothing here: a new
+    // grant drops the backend's queue and sends a resync, which reads the
+    // views again (below).
+    let lastSession: string | undefined;
+    sessionStore.subscribe((s) => {
+        const prev = lastSession;
+        lastSession = s.state;
+        if (prev === undefined || !livenessChanged(prev, s.state)) return;
+        if (s.state === 'active') reloadConnectionViews();
+        else clearConnectionViews();
     });
 
-    listen<AppEventEnvelope>('vault:connection-revoked', () => {
-        void loadConnections();
-    });
-
-    // Profile changes — peer's published profile updated.
-    listen<AppEventEnvelope>('vault:profile-update', () => {
-        void loadConnections();
+    // What the vault sent this desktop (Phase 5, 5.1): dropped while the
+    // session isn't live here; a resync or a connection, request or block
+    // change reads the views again.
+    listen<InboundBatch>(INBOUND_EVENT, (event) => {
+        const live = get(sessionStore).state === 'active';
+        if (inboundAction(event.payload, live) === 'reload') reloadConnectionViews();
     });
 
     // New message — bump per-connection unread count for the in-app
