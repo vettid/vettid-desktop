@@ -221,6 +221,15 @@ impl<T: Transport, C: Clock> Link<T, C> {
             Err(SessionError::Refused) => Err(OpError::Refused),
             Err(e) => {
                 log::info!("link: {}: {}", kind, e);
+                // The relay refused this computer's clock: said so, stored
+                // or not (a stored change is kept, and goes once the clock
+                // is right, within its exp).
+                if let Some(d) = e.clock_skew() {
+                    if let (true, Some(id)) = (change, stored) {
+                        self.unconfirmed = Some(Pending { kind: kind.to_string(), body: body.clone(), id, exp });
+                    }
+                    return Err(OpError::Clock(d));
+                }
                 match stored {
                     // Stored: it goes with the next exchange (until exp).
                     Some(id) => {
@@ -233,7 +242,6 @@ impl<T: Transport, C: Clock> Link<T, C> {
                         Err(OpError::Unconfirmed)
                     }
                     None => Err(match &e {
-                        _ if e.clock_skew().is_some() => OpError::Clock(e.clock_skew().flatten()),
                         SessionError::Store(_) => OpError::NotSaved,
                         _ => OpError::NotSent,
                     }),

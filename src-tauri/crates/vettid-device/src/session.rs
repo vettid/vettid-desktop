@@ -747,6 +747,9 @@ impl<T: Transport, C: Clock> Session<T, C> {
             return Err(e.into());
         }
         if request {
+            // Stored: from here it goes with the next exchange, even if
+            // the deposit below is cut off (Session::last_request_id).
+            self.last_request = Some(id.clone());
             // Queued last: its envelope is the outbox's last entry.
             if let Some(entry) = self.state.outbox.last() {
                 self.tracked.retain(|t| t.id != id);

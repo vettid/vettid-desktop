@@ -67,10 +67,12 @@ struct State {
     waits: Vec<u64>,
     /// Each collect first waits this long (a stalled relay).
     stall: Option<std::time::Duration>,
+    /// Each deposit first waits this long.
+    deposit_stall: Option<std::time::Duration>,
+    /// Deposits are refused for this computer's clock (`timestamp_stale`).
+    clock_skew: bool,
     /// Scripted answers by request type: `Ok(body)` or `Err(code)`.
     answers: std::collections::HashMap<String, Result<String, String>>,
-    /// The type and body of every scripted request answered.
-    asked: Vec<(String, String)>,
     /// The inner id and exp of each of those.
     asked_ids: Vec<(String, Option<DateTime<Utc>>)>,
     n: u64,
@@ -264,8 +266,9 @@ impl FakeVault {
             collects: 0,
             waits: Vec::new(),
             stall: None,
+            deposit_stall: None,
+            clock_skew: false,
             answers: std::collections::HashMap::new(),
-            asked: Vec::new(),
             asked_ids: Vec::new(),
             n: 0,
             unlock_id: Some(UNLOCK_1.into()),
@@ -418,9 +421,14 @@ impl FakeVault {
         self.lock().answers.insert(kind.to_string(), a.map(str::to_string).map_err(str::to_string));
     }
 
-    /// The scripted requests answered so far: type and body.
-    pub(crate) fn asked(&self) -> Vec<(String, String)> {
-        self.lock().asked.clone()
+    /// Make each deposit wait `d` first.
+    pub(crate) fn stall_deposits(&self, d: Option<std::time::Duration>) {
+        self.lock().deposit_stall = d;
+    }
+
+    /// Refuse deposits for this computer's clock.
+    pub(crate) fn refuse_clock(&self, on: bool) {
+        self.lock().clock_skew = on;
     }
 
     /// Make each collect wait `d` first (`None`: answer at once).
@@ -450,7 +458,14 @@ impl Transport for FakeVault {
     }
 
     async fn deposit(&self, _base: &str, _mailbox: &str, _token: &Token, payload: &[u8]) -> Result<String, DepositError> {
+        let stall = self.lock().deposit_stall;
+        if let Some(d) = stall {
+            tokio::time::sleep(d).await;
+        }
         let mut s = self.lock();
+        if s.clock_skew {
+            return Err(DepositError { error: RelayError::ClockSkew { server_date: Some(0) }, possibly_delivered: false });
+        }
         if s.offline {
             return Err(DepositError { error: RelayError::Connect, possibly_delivered: false });
         }
@@ -480,7 +495,6 @@ impl Transport for FakeVault {
         }
         if inner.response.is_none() {
             if let Some(a) = s.answers.get(&inner.kind).cloned() {
-                s.asked.push((inner.kind.clone(), inner.body.to_string()));
                 s.asked_ids.push((inner.id.clone(), inner.exp));
                 let answer = match a {
                     Ok(body) => s.inner(&inner.kind, ok(&inner), body),
@@ -549,6 +563,9 @@ impl Transport for FakeVault {
             tokio::time::sleep(d).await;
         }
         let mut s = self.lock();
+        if s.clock_skew {
+            return Err(RelayError::ClockSkew { server_date: Some(0) });
+        }
         if s.offline {
             return Err(RelayError::Connect);
         }

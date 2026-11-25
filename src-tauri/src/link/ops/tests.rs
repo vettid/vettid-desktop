@@ -297,3 +297,52 @@ async fn exps_and_new_ids() {
     link.op("connection.decline", &serde_json::json!({"pending_id": "c"}), any, true).await.unwrap();
     assert_ne!(vault.asked_ids().last().unwrap().0, pending, "another change reused the pending one's id");
 }
+
+/// A reset 300 ms into a stalled deposit: the decline was stored before
+/// the deposit, so it is kept, and a second Decline retries it under its id.
+#[tokio::test]
+async fn a_change_cut_off_during_its_deposit_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, link) = live(dir.path()).await;
+    vault.stall_deposits(Some(std::time::Duration::from_secs(5)));
+    let s = slot(link);
+    let body = serde_json::json!({"pending_id": "p"});
+    let stop = tokio::time::sleep(std::time::Duration::from_millis(300));
+    let r = link_op_with(&s, || true, || false, |_| {}, stop, "connection.decline", body.clone(), any, true).await;
+    assert_eq!(r, Err(OpError::Unconfirmed));
+    let mut g = s.lock().await;
+    let l = g.as_mut().unwrap();
+    let kept = l.unconfirmed.clone().expect("the decline stored before its deposit is kept");
+    vault.stall_deposits(None);
+    vault.answer("connection.decline", Ok("{}"));
+    l.op("connection.decline", &body, any, true).await.unwrap();
+    assert_eq!(vault.asked_ids().last().map(|(i, _)| i.clone()), Some(kept.id));
+}
+
+/// The outer bound, with no reset: a deposit stalled past OP_HOLD_MAX lets
+/// the link go at the bound, and the change is kept.
+#[tokio::test]
+async fn the_outer_bound_ends_a_stalled_deposit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, link) = live(dir.path()).await;
+    vault.stall_deposits(Some(OP_HOLD_MAX + std::time::Duration::from_secs(5)));
+    let s = slot(link);
+    let start = std::time::Instant::now();
+    let r = link_op_with(&s, || true, || false, |_| {}, std::future::pending(), "connection.decline", serde_json::json!({"pending_id": "p"}), any, true).await;
+    assert_eq!(r, Err(OpError::Unconfirmed));
+    assert!(start.elapsed() < OP_HOLD_MAX + std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+    assert!(s.lock().await.as_ref().unwrap().unconfirmed.is_some());
+}
+
+/// The relay refusing this computer's clock is said as the clock, and a
+/// stored change is kept to go once the clock is right.
+#[tokio::test]
+async fn a_refused_clock_is_said_as_the_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await;
+    vault.refuse_clock(true);
+    let r = link.op("connection.decline", &serde_json::json!({"pending_id": "p"}), any, true).await;
+    assert_eq!(r, Err(OpError::Clock(Some(0))), "{r:?}");
+    assert!(link.unconfirmed.is_some(), "stored: kept for a retry");
+    assert!(OpError::Clock(None).notice().contains("clock"));
+}
