@@ -80,8 +80,9 @@ export interface VaultOpResponse<T> {
   success: boolean;
   data?: T;
   error?: string;
-  /** Stable codes: no_session, held, locked, unknown, unreachable, refused,
-   *  forbidden, not_found, vault_error, malformed. */
+  /** Stable codes: no_session, held, locked, unknown, unconfirmed (it may
+   *  still happen), clock, not_saved, not_sent, refused, forbidden,
+   *  not_found, vault_error, malformed, bad_argument. */
   error_code?: string;
   pending_approval: boolean;
 }
