@@ -567,6 +567,10 @@ pub struct Link<T: Transport = Http, C: Clock = SystemClock> {
     /// When this link last sent a `vault.status` of its own (answered or
     /// not): what a focus read is throttled on ([`Link::focused`]).
     last_attempt: Option<DateTime<Utc>>,
+    /// What the vault sent for the connection and message views
+    /// (`message.new`, `sync.event`), until [`Link::take_inbound`]: in
+    /// memory only (Phase 5, 5.1).
+    inbound: inbound::Queue,
 }
 
 /// What the refresh loop records of its own rounds, by the wall clock.
@@ -637,6 +641,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
             marks: Arc::default(),
             resumes: 0,
             last_attempt: None,
+            inbound: inbound::Queue::default(),
         }
     }
 
@@ -691,7 +696,45 @@ impl<T: Transport, C: Clock> Link<T, C> {
         for m in self.session.take_held() {
             let e = self.access.observe(&mut self.session, &mut self.store, &m);
             self.noted(&e);
+            self.inbound.take(&m);
         }
+    }
+
+    /// While an access session runs, collect the mailbox (Phase 5, 5.1):
+    /// session events go to [`Access::observe`], messages for the views to
+    /// the inbound queue. Nothing is collected without a live session, and
+    /// the queue is emptied then (nothing read before is shown). `false`
+    /// if there was no session to collect for.
+    pub async fn collect(&mut self) -> bool {
+        if self.refused() || !self.access.active_at(Utc::now()) {
+            self.inbound.clear();
+            return false;
+        }
+        match self.session.poll(&mut self.store).await {
+            Ok(msgs) => {
+                self.reachable = true;
+                if !msgs.is_empty() {
+                    self.vault_answered();
+                }
+                for m in &msgs {
+                    let e = self.access.observe(&mut self.session, &mut self.store, m);
+                    self.noted(&e);
+                    self.inbound.take(m);
+                }
+            }
+            Err(e) => log::info!("link: collecting: {}", e),
+        }
+        self.note_refused().await;
+        if !self.access.active_at(Utc::now()) {
+            self.inbound.clear();
+        }
+        true
+    }
+
+    /// What the vault sent for the views since the last call (see
+    /// [`Link::collect`]).
+    pub fn take_inbound(&mut self) -> inbound::InboundBatch {
+        self.inbound.drain()
     }
 
     /// What this link keeps of an observed message's outcome: a late `ok`
@@ -708,6 +751,10 @@ impl<T: Transport, C: Clock> Link<T, C> {
         if matches!(e, Ok(Some(AccessEvent::Locked | AccessEvent::Held | AccessEvent::ReadStatus))) {
             self.backoff = None;
             self.read_now = true;
+        }
+        // Held or locked: nothing read before is shown (§3.6.5).
+        if matches!(e, Ok(Some(AccessEvent::Locked | AccessEvent::Held))) {
+            self.inbound.clear();
         }
     }
 
@@ -1170,6 +1217,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
                     for m in &msgs {
                         let e = self.access.observe(&mut self.session, &mut self.store, m);
                         self.noted(&e);
+                        self.inbound.take(m);
                         match e {
                             Ok(Some(AccessEvent::Granted(_))) => granted = true,
                             // A denial from before this request's answer is
@@ -1270,6 +1318,14 @@ pub type Changed = Arc<RwLock<Option<Arc<dyn Fn() + Send + Sync>>>>;
 /// The Tauri event a [`Changed`] call emits (no payload).
 pub const CHANGED_EVENT: &str = "vault:changed";
 
+/// Hands what [`collect_loop`] took to the frontend, as
+/// [`inbound::INBOUND_EVENT`].
+pub type Deliver = Arc<RwLock<Option<Arc<dyn Fn(inbound::InboundBatch) + Send + Sync>>>>;
+
+/// How often the mailbox is collected while an access session runs
+/// (Phase 5, 5.1; chosen; not in the spec).
+pub const COLLECT_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What a change of which [`Shared::publish`] tells the UI at once:
 /// everything the screen shows of the vault at `now` (its state, Locked
 /// "as of" or not, the reason, the counts, the deadline, `idle_lock_at`,
@@ -1288,6 +1344,7 @@ pub struct Shared {
     pub is_registered: Arc<tokio::sync::RwLock<bool>>,
     pub notify: Notify,
     pub changed: Changed,
+    pub deliver: Deliver,
 }
 
 impl Shared {
@@ -1497,8 +1554,51 @@ pub fn spawn_refresh(shared: Shared, first: std::time::Duration) -> JoinHandle<(
     })
 }
 
+/// Collect the mailbox every `every` while an access session runs, and
+/// hand what came for the views to `deliver` (Phase 5, 5.1). A round that
+/// finds the link busy (a command holds it) is skipped: that command's own
+/// polls fill the queue, which the next round delivers. Ends when the link
+/// is gone. Polls stop on their own while there is no session (held,
+/// locked, ended), and start again with the next.
+pub async fn collect_loop<T: Transport, C: Clock>(
+    link: &Mutex<Option<Link<T, C>>>,
+    every: std::time::Duration,
+    deliver: impl Fn(inbound::InboundBatch),
+) {
+    loop {
+        tokio::time::sleep(every).await;
+        let batch = {
+            let Ok(mut slot) = link.try_lock() else { continue };
+            let Some(l) = slot.as_mut() else { return };
+            l.collect().await;
+            l.take_inbound()
+        };
+        if !batch.messages.is_empty() || batch.resync {
+            deliver(batch);
+        }
+    }
+}
+
+/// [`collect_loop`] as a task over the shared link.
+pub fn spawn_collect(shared: Shared) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        collect_loop(&shared.link, COLLECT_EVERY, |b| {
+            let d = shared.deliver.read().unwrap_or_else(|p| p.into_inner()).clone();
+            if let Some(d) = d {
+                d(b);
+            }
+        })
+        .await;
+    })
+}
+
+pub mod inbound;
+
 #[cfg(test)]
 pub(crate) mod fake;
+
+#[cfg(test)]
+mod collect_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2743,6 +2843,7 @@ mod tests {
             is_registered: Arc::default(),
             notify: Arc::default(),
             changed,
+            deliver: Arc::default(),
         };
         let count = || calls.load(std::sync::atomic::Ordering::SeqCst);
         let now = Utc::now();
