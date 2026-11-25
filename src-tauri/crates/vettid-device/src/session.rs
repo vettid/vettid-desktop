@@ -14,9 +14,13 @@
 //!   them once, from memory. Nor does `message.send` ([`memory_only`]):
 //!   its body is message plaintext, which the desktop plan keeps off disk
 //!   and out of `device.enc` (DESKTOP-REWORK-PLAN Phase 5, 5.1). It is
-//!   deposited once from memory, as §8.6 has a device deposit a request
-//!   ("deposited once, outside the outbox"); only its id and the epoch's
-//!   `seq` are stored, and a retry under its id is the caller's.
+//!   deposited once from memory, as VAULT-MESSAGING §8.6 has a device
+//!   deposit a request (the `quota_exceeded` row of its error table, the
+//!   paragraph "A device" (0.88.8): "a request (§8.1) ... deposited once,
+//!   outside the outbox, under the held token; they are not held"); §8.4
+//!   gives no ordering guarantee ("No global or causal order is
+//!   provided"), so it may pass stored entries. Only its id and the
+//!   epoch's `seq` are stored, and a retry under its id is the caller's.
 //! - **Receiving** ([`Session::poll`]): collect a batch; for each message,
 //!   the relay `msg_id` dedupe, the vault's relay key as sender (§6.3), the
 //!   epoch's keys, the freshness rules by type class (§8.4, §8.5), the
@@ -169,10 +173,12 @@ pub fn outbox_allowed(kind: &str) -> bool {
 /// (`message.send`, §10.5), which never reaches the store: the desktop
 /// plan's rule that message plaintext is never written to disk or to
 /// `device.enc` (DESKTOP-REWORK-PLAN Phase 5, 5.1). It is sealed and
-/// deposited once from memory, as §8.6 has a device deposit a request
-/// ("deposited once, outside the outbox, under the held token; they are
-/// not held"); its id is armed and stored (not its body), so a late
-/// answer is still taken, and a retry under that id
+/// deposited once from memory, as VAULT-MESSAGING §8.6 has a device
+/// deposit a request (the `quota_exceeded` row of its error table, the
+/// paragraph "A device" (0.88.8): "a request (§8.1) ... deposited once,
+/// outside the outbox, under the held token; they are not held"; §8.4
+/// gives no ordering guarantee). Its id is armed and stored (not its
+/// body), so a late answer is still taken, and a retry under that id
 /// ([`Session::request_again`]) is the caller's.
 pub fn memory_only(kind: &str) -> bool {
     kind == "message.send"

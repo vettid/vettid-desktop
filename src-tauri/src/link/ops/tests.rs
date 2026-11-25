@@ -393,7 +393,7 @@ async fn a_still_unconfirmed_kept_change_stops_another() {
 }
 
 /// A kept change past its exp isn't retried (that would be a new request):
-/// it is told as unconfirmed, and the new one goes.
+/// it is told as unconfirmed_expired, and the new one goes.
 #[tokio::test]
 async fn a_kept_change_past_its_exp_isnt_retried() {
     let dir = tempfile::tempdir().unwrap();
@@ -407,7 +407,7 @@ async fn a_kept_change_past_its_exp_isnt_retried() {
     link.op_kept_first("test.change", &serde_json::json!({"n": "b"}), any).await.unwrap();
     assert_eq!(sent(&vault, "test.change"), 2, "retried past its exp (only the stored copy and the new one)");
     assert_ne!(vault.asked_ids().last().unwrap().0, kept.id);
-    assert_eq!(link.earlier.take().map(|e| e.result), Some(Err(OpError::Unconfirmed)));
+    assert_eq!(link.earlier.take().map(|e| (e.id, e.result)), Some((kept.id, Err(OpError::UnconfirmedExpired))));
     assert!(link.unconfirmed.is_none());
 }
 
@@ -439,19 +439,19 @@ async fn kept_first_through_the_link() {
         link_run_with(&s, || true, || false, |_| {}, stop, "test.change", serde_json::json!({"n": n}), any, How::KeptFirst)
     };
     vault.offline(true);
-    let (r, e) = run("a", Box::pin(std::future::pending())).await;
+    let Ran { result: r, earlier: e, .. } = run("a", Box::pin(std::future::pending())).await;
     assert_eq!((r, e), (Err(OpError::Unconfirmed), None));
     let kept = s.lock().await.as_ref().unwrap().unconfirmed.clone().unwrap();
     vault.offline(false);
     vault.stall(Some(std::time::Duration::from_secs(2)));
     // The relay stalls each collect: stopped 300 ms into the kept one's retry.
-    let (r, e) = run("b", Box::pin(tokio::time::sleep(std::time::Duration::from_millis(300)))).await;
+    let Ran { result: r, earlier: e, .. } = run("b", Box::pin(tokio::time::sleep(std::time::Duration::from_millis(300)))).await;
     assert_eq!(r, Err(OpError::EarlierUnconfirmed));
     assert_eq!(e.map(|e| e.result), Some(Err(OpError::Unconfirmed)));
     assert_eq!(s.lock().await.as_ref().unwrap().unconfirmed.as_ref().map(|p| p.id.clone()), Some(kept.id.clone()), "still kept");
     vault.stall(None);
     vault.answer("test.change", Ok("{}"));
-    let (r, e) = run("b", Box::pin(std::future::pending())).await;
+    let Ran { result: r, earlier: e, .. } = run("b", Box::pin(std::future::pending())).await;
     assert_eq!(r, Ok(serde_json::json!({})));
     assert_eq!(e.map(|e| e.result), Some(Ok(serde_json::json!({}))));
 }
@@ -460,7 +460,7 @@ async fn kept_first_through_the_link() {
 fn pending_and_earlier_leave_the_body_out_of_debug() {
     let body = Zeroizing::new(r#"{"text":"meet at noon"}"#.to_string());
     let p = Pending { kind: "message.send".into(), body: body.clone(), id: "i".into(), exp: Utc::now(), retries: 0 };
-    let e = Earlier { body, result: Ok(serde_json::json!({"text": "meet at noon"})) };
+    let e = Earlier { id: "i".into(), body, result: Ok(serde_json::json!({"text": "meet at noon"})) };
     let d = format!("{p:?} {e:?}");
     assert!(!d.contains("noon"), "{d}");
 }
@@ -468,14 +468,19 @@ fn pending_and_earlier_leave_the_body_out_of_debug() {
 #[test]
 fn the_new_codes() {
     assert_eq!((OpError::PageGone.code(), OpError::PageGone.notice()), ("page_gone", OP_NOT_FOUND_NOTICE.to_string()));
-    assert_eq!((OpError::EarlierUnconfirmed.code(), OpError::EarlierUnconfirmed.notice()), ("earlier_unconfirmed", OP_NOT_SENT_NOTICE.to_string()));
+    assert_eq!((OpError::EarlierUnconfirmed.code(), OpError::EarlierUnconfirmed.notice()), ("earlier_unconfirmed", OP_EARLIER_UNCONFIRMED_NOTICE.to_string()));
+    assert!(!OpError::EarlierUnconfirmed.notice().contains("Try again"));
+    assert_eq!((OpError::UnconfirmedExpired.code(), OpError::UnconfirmedExpired.notice()), ("unconfirmed_expired", OP_UNCONFIRMED_EXPIRED_NOTICE.to_string()));
+    assert_eq!((OpError::AnswerUnreadable.code(), OpError::AnswerUnreadable.notice()), ("answer_unreadable", OP_ANSWER_UNREADABLE_NOTICE.to_string()));
+    let locked = OpError::UnconfirmedFor(Box::new(OpError::Locked));
+    assert_eq!((locked.code(), locked.notice(), locked.is_unconfirmed()), ("unconfirmed", VAULT_LOCKED_NOTICE.to_string(), true));
     assert_eq!(OpError::Vault("connection_unavailable".into()).code(), "connection_unavailable");
     assert_eq!(OpError::Vault("connection_unavailable".into()).notice(), OP_FAILED_NOTICE);
 }
 
 /// §8.6: a change is retried under its id at most twice. Through
-/// link_op_with: the 1st and 2nd retries reuse the id; a 3rd attempt is a
-/// new request.
+/// link_op_with: the 1st and 2nd retries reuse the id; a 3rd attempt
+/// within its exp sends nothing (no second id), and stays unconfirmed.
 #[tokio::test]
 async fn a_change_is_retried_under_its_id_at_most_twice() {
     let dir = tempfile::tempdir().unwrap();
@@ -494,17 +499,116 @@ async fn a_change_is_retried_under_its_id_at_most_twice() {
         assert_eq!(kept.exp, first.exp, "with its first exp");
         assert_eq!(vault.deposited_ids("test.change"), std::slice::from_ref(&first.id));
     }
-    // A 3rd attempt doesn't reuse it.
+    // A 3rd attempt within its exp: nothing sent, no second id.
     vault.answer("test.change", Ok("{}"));
-    assert_eq!(go().await, Ok(serde_json::json!({})));
-    let ids = vault.deposited_ids("test.change");
-    assert_eq!(ids.len(), 2, "{ids:?}");
-    assert_ne!(ids[1], first.id);
-    assert!(s.lock().await.as_ref().unwrap().unconfirmed.is_none());
+    let before = vault.deposited().len();
+    assert_eq!(go().await, Err(OpError::Unconfirmed));
+    assert_eq!(vault.deposited().len(), before, "a 3rd attempt was sent");
+    assert_eq!(vault.deposited_ids("test.change"), std::slice::from_ref(&first.id), "no second id");
+    let kept = s.lock().await.as_ref().unwrap().unconfirmed.clone().unwrap();
+    assert_eq!((kept.id, kept.retries), (first.id.clone(), 2), "still kept");
 }
 
-/// A kept change retried twice already isn't retried before another: it
-/// is told as unconfirmed, as one past its exp, and the new one goes.
+/// Past its exp, the kept change is forgotten and said once as
+/// unconfirmed_expired, with nothing sent; only the next same call is a
+/// new request.
+#[tokio::test]
+async fn a_kept_change_past_its_exp_is_said_once_then_forgotten() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await; // taken, never answered
+    let body = serde_json::json!({"n": "p"});
+    assert_eq!(link.op("test.change", &body, any, true).await, Err(OpError::Unconfirmed));
+    let first = link.unconfirmed.clone().unwrap();
+    link.unconfirmed.as_mut().unwrap().exp = Utc::now() - TimeDelta::milliseconds(1);
+    let before = vault.deposited().len();
+    assert_eq!(link.op("test.change", &body, any, true).await, Err(OpError::UnconfirmedExpired));
+    assert_eq!(vault.deposited().len(), before, "sent past its exp");
+    assert!(link.unconfirmed.is_none());
+    vault.answer("test.change", Ok("{}"));
+    assert_eq!(link.op("test.change", &body, any, true).await, Ok(serde_json::json!({})));
+    let ids = vault.deposited_ids("test.change");
+    assert_eq!(ids.len(), 2, "the next one is a new request: {ids:?}");
+    assert_ne!(ids[1], first.id);
+}
+
+/// A kept change's forced retry goes under its id even when its exp has
+/// just passed, never as a new request.
+#[tokio::test]
+async fn a_forced_retry_past_its_exp_keeps_its_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await; // message.send: taken, not answered
+    let body = serde_json::json!({"connection_id": "c-1", "text": "hi"});
+    assert_eq!(link.op("message.send", &body, any, true).await, Err(OpError::Unconfirmed));
+    link.unconfirmed.as_mut().unwrap().exp = Utc::now() - TimeDelta::milliseconds(1);
+    let kept = link.unconfirmed.clone().unwrap();
+    vault.answer("message.send", Ok("{}"));
+    assert_eq!(link.op_as("message.send", &body, any, true, true).await, Ok(serde_json::json!({})));
+    assert_eq!(vault.deposited_ids("message.send"), std::slice::from_ref(&kept.id), "under its id, not a new request");
+    assert_eq!(vault.asked_ids().last().map(|(i, e)| (i.clone(), e.map(|e| e.timestamp_millis()))), Some((kept.id, Some(kept.exp.timestamp_millis()))));
+    // With nothing kept, a forced retry sends nothing.
+    let before = vault.deposited().len();
+    assert_eq!(link.op_as("message.send", &body, any, true, true).await, Err(OpError::Unconfirmed));
+    assert_eq!(vault.deposited().len(), before);
+}
+
+/// A retry that doesn't get to the vault (relay out of reach, or a lock
+/// known before it) stays unconfirmed and kept; the notice names the cause.
+#[tokio::test]
+async fn a_failed_retry_stays_unconfirmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await; // message.send: taken, not answered
+    let body = serde_json::json!({"connection_id": "c-1", "text": "hi"});
+    assert_eq!(link.op("message.send", &body, any, true).await, Err(OpError::Unconfirmed));
+    let kept = link.unconfirmed.clone().unwrap();
+    vault.offline(true);
+    let r = link.op("message.send", &body, any, true).await;
+    assert_eq!(r, Err(OpError::UnconfirmedFor(Box::new(OpError::NotSent))), "{r:?}");
+    assert_eq!(r.unwrap_err().code(), "unconfirmed");
+    assert_eq!(link.unconfirmed.as_ref().map(|p| p.id.clone()), Some(kept.id.clone()), "still kept");
+    // The first try of a change the relay never took stays not_sent.
+    let other = serde_json::json!({"connection_id": "c-1", "text": "another"});
+    assert_eq!(link.op("message.send", &other, any, true).await.map_err(|e| e.code()), Err("not_sent"));
+    assert_eq!(link.unconfirmed.as_ref().map(|p| p.id.clone()), Some(kept.id.clone()), "the kept one stays");
+    vault.offline(false);
+    vault.lock_vault(None);
+    let _ = link.read_status().await; // the lock is known before the retry
+    let r = link.op("message.send", &body, any, true).await;
+    assert_eq!(r, Err(OpError::UnconfirmedFor(Box::new(OpError::Locked))), "{r:?}");
+}
+
+/// A change the vault answered ok, with an answer that doesn't check out:
+/// done, so never "try again", and nothing is kept to go again.
+#[tokio::test]
+async fn an_unreadable_answer_to_a_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await;
+    vault.answer("message.send", Ok(r#"{"message_id":"m-1","sent_at":"yesterday"}"#));
+    let body = serde_json::json!({"connection_id": "c-1", "text": "hi"});
+    let r = link.op("message.send", &body, crate::link::shape::message_sent, true).await;
+    assert_eq!(r, Err(OpError::AnswerUnreadable));
+    assert!(!OpError::AnswerUnreadable.notice().contains("Try again"));
+    assert!(link.unconfirmed.is_none(), "answered: nothing kept");
+    assert_eq!(vault.deposited_ids("message.send").len(), 1, "sent once, nothing more on its own");
+    // A read's is still malformed.
+    vault.answer("connection.list", Ok(r#"{"connections":"x"}"#));
+    assert_eq!(link.op("connection.list", &serde_json::json!({}), crate::link::shape::connection_list, false).await, Err(OpError::Malformed));
+}
+
+/// A change that may have gone, in an exchange that also showed a lock,
+/// stays unconfirmed (said with the lock); a read is said as the lock.
+#[tokio::test]
+async fn a_lock_during_an_unconfirmed_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await;
+    vault.lock_vault(None);
+    let r = link.op("test.change", &serde_json::json!({"n": 1}), any, true).await;
+    assert_eq!(r, Err(OpError::UnconfirmedFor(Box::new(OpError::Locked))), "{r:?}");
+    assert!(link.unconfirmed.is_some(), "kept");
+}
+
+/// A kept change retried twice already, still within its exp, isn't
+/// retried before another, and the other waits (earlier_unconfirmed): it
+/// is never dropped while it can still arrive.
 #[tokio::test]
 async fn a_kept_change_retried_twice_isnt_retried_first() {
     let dir = tempfile::tempdir().unwrap();
@@ -515,9 +619,8 @@ async fn a_kept_change_retried_twice_isnt_retried_first() {
     let kept = link.unconfirmed.clone().unwrap();
     link.unconfirmed.as_mut().unwrap().retries = 2; // §8.6: at most twice
     vault.offline(false);
-    link.op_kept_first("test.change", &serde_json::json!({"n": "b"}), any).await.unwrap();
-    assert_eq!(sent(&vault, "test.change"), 2, "only the stored copy and the new one, no retry");
-    assert_ne!(vault.asked_ids().last().unwrap().0, kept.id);
-    assert_eq!(link.earlier.take().map(|e| e.result), Some(Err(OpError::Unconfirmed)));
-    assert!(link.unconfirmed.is_none());
+    assert_eq!(link.op_kept_first("test.change", &serde_json::json!({"n": "b"}), any).await, Err(OpError::EarlierUnconfirmed));
+    assert_eq!(sent(&vault, "test.change"), 0, "nothing sent: no retry, and not the new one");
+    assert_eq!(link.earlier.take().map(|e| (e.id, e.result)), Some((kept.id.clone(), Err(OpError::Unconfirmed))));
+    assert_eq!(link.unconfirmed.as_ref().map(|p| p.id.clone()), Some(kept.id), "still kept");
 }

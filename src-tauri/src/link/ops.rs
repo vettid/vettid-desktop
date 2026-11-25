@@ -49,6 +49,16 @@ pub const OP_FORBIDDEN_NOTICE: &str = "This is done on your phone.";
 pub const OP_NOT_FOUND_NOTICE: &str = "Your vault doesn't have this any more. Refresh to see what it has now.";
 /// NEW TEXT (owner approval needed): any other error answer.
 pub const OP_FAILED_NOTICE: &str = "Your vault couldn't do this. Try again.";
+// NEW TEXT (owner approval needed): a change left unconfirmed past its
+// `exp` ([`OpError::UnconfirmedExpired`]): it was done by then or never
+// will be, and only a fresh read tells which.
+pub const OP_UNCONFIRMED_EXPIRED_NOTICE: &str = "Your vault didn't confirm this in time. Refresh to see whether it was done before you try again.";
+// NEW TEXT (owner approval needed): a change the vault answered `ok`, with
+// an answer this desktop couldn't read ([`OpError::AnswerUnreadable`]).
+pub const OP_ANSWER_UNREADABLE_NOTICE: &str = "Your vault did this, but this desktop couldn't read its answer. Refresh to see it.";
+// NEW TEXT (owner approval needed): a new message held back while the one
+// before it is unconfirmed ([`OpError::EarlierUnconfirmed`]).
+pub const OP_EARLIER_UNCONFIRMED_NOTICE: &str = "Your vault hasn't confirmed your previous message yet, so this one wasn't sent.";
 
 /// Why a vault operation failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +96,17 @@ pub enum OpError {
     /// A kept change ([`Link::op_kept_first`]) was retried first and is
     /// still unconfirmed, so this one wasn't sent.
     EarlierUnconfirmed,
+    /// A retry of a kept change, or a change that may have gone, that got
+    /// no answer for this reason (not sent, the clock, a lock, a hold): it
+    /// stays unconfirmed and kept. Its code is `unconfirmed`; its notice
+    /// names the reason.
+    UnconfirmedFor(Box<OpError>),
+    /// A kept change past its `exp`, forgotten now: it was carried out by
+    /// then or never will be. The view reads again before a new request.
+    UnconfirmedExpired,
+    /// A change the vault answered `ok`, whose answer doesn't check out:
+    /// it was done. The view reads again; nothing is retried.
+    AnswerUnreadable,
 }
 
 impl OpError {
@@ -99,14 +120,25 @@ impl OpError {
             OpError::Unconfirmed => OP_UNCONFIRMED_NOTICE.into(),
             OpError::Clock(d) => clock_notice(clock_offset(*d)),
             OpError::NotSaved => NOT_SAVED_NOTICE.into(),
-            OpError::NotSent | OpError::EarlierUnconfirmed => OP_NOT_SENT_NOTICE.into(),
+            OpError::NotSent => OP_NOT_SENT_NOTICE.into(),
+            OpError::EarlierUnconfirmed => OP_EARLIER_UNCONFIRMED_NOTICE.into(),
+            OpError::UnconfirmedFor(e) => e.notice(),
+            OpError::UnconfirmedExpired => OP_UNCONFIRMED_EXPIRED_NOTICE.into(),
+            OpError::AnswerUnreadable => OP_ANSWER_UNREADABLE_NOTICE.into(),
             OpError::Refused => REFUSED_NOTICE.into(),
             OpError::Vault(c) if c == "forbidden" => OP_FORBIDDEN_NOTICE.into(),
             OpError::Vault(c) if c == "not_found" => OP_NOT_FOUND_NOTICE.into(),
-            // The view starts again from the newest page without saying so.
+            // A notice, for completeness; the view starts again from the
+            // newest page without showing it.
             OpError::PageGone => OP_NOT_FOUND_NOTICE.into(),
             OpError::Vault(_) | OpError::Malformed | OpError::BadArgument => OP_FAILED_NOTICE.into(),
         }
+    }
+
+    /// Whether it says "unconfirmed": a change that may still be carried
+    /// out, kept under its id.
+    pub fn is_unconfirmed(&self) -> bool {
+        matches!(self, OpError::Unconfirmed | OpError::UnconfirmedFor(_))
     }
 
     /// A stable code for the frontend (it never matches on the text).
@@ -116,7 +148,9 @@ impl OpError {
             OpError::Held => "held",
             OpError::Locked => "locked",
             OpError::Unknown => "unknown",
-            OpError::Unconfirmed => "unconfirmed",
+            OpError::Unconfirmed | OpError::UnconfirmedFor(_) => "unconfirmed",
+            OpError::UnconfirmedExpired => "unconfirmed_expired",
+            OpError::AnswerUnreadable => "answer_unreadable",
             OpError::Clock(_) => "clock",
             OpError::NotSaved => "not_saved",
             OpError::NotSent => "not_sent",
@@ -160,14 +194,26 @@ impl<T: Transport, C: Clock> Link<T, C> {
     ///   one of [`READ_TTL`]. A change not confirmed is remembered, and the
     ///   same change asked again is retried under its id (§8.6), so the
     ///   vault answers it from its cache instead of acting twice. At most
-    ///   [`MAX_RETRIES`] times: asked again after that, it is a new
-    ///   request (only a read tells whether the first was carried out).
+    ///   [`MAX_RETRIES`] times: asked again after that, nothing is sent
+    ///   while its `exp` lasts ([`OpError::Unconfirmed`]); past its `exp`
+    ///   it is forgotten, said once as [`OpError::UnconfirmedExpired`] (the
+    ///   view reads the conversation again), and only the next same call
+    ///   is a new request.
+    /// - A retry that gets no answer from the vault, for any reason (not
+    ///   sent, the clock, a lock or a hold before or during it), stays
+    ///   unconfirmed and kept ([`OpError::UnconfirmedFor`]): the first try
+    ///   may have gone.
     /// - Once the request is stored, any failure is
     ///   [`OpError::Unconfirmed`]: it goes with the next exchange. A
     ///   `message.send` is never stored (its body is plaintext,
     ///   `vettid_device::session::memory_only`): it is unconfirmed once the
     ///   relay may have taken it, and then only this kept change retries it;
-    ///   one the relay certainly didn't take is [`OpError::NotSent`].
+    ///   one the relay certainly didn't take is [`OpError::NotSent`]. A
+    ///   change that may have gone stays unconfirmed when the same exchange
+    ///   showed a lock or a hold ([`OpError::UnconfirmedFor`]); a read is
+    ///   said as the lock or the hold.
+    /// - A change answered `ok` with a body that doesn't check out was
+    ///   done: [`OpError::AnswerUnreadable`], never "try again".
     /// - `owner_check_required` is learned as the hold (§3.6.3);
     ///   `session_required` takes the session as unconfirmed.
     /// - A read answered while the batch it came in also showed a lock,
@@ -178,30 +224,49 @@ impl<T: Transport, C: Clock> Link<T, C> {
     ///   its answer is no longer looked for). [`Link::op_kept_first`]
     ///   retries the kept one first.
     pub async fn op(&mut self, kind: &str, body: &serde_json::Value, shape: impl Fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>, change: bool) -> Result<serde_json::Value, OpError> {
+        self.op_as(kind, body, shape, change, false).await
+    }
+
+    /// [`Link::op`]; with `must_retry`, a retry of the kept change of this
+    /// body under its id and first `exp`, even past that `exp` (the vault
+    /// dedupes or drops it), and never a new request: with no such kept
+    /// change, nothing is sent ([`OpError::Unconfirmed`]).
+    async fn op_as(&mut self, kind: &str, body: &serde_json::Value, shape: impl Fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>, change: bool, must_retry: bool) -> Result<serde_json::Value, OpError> {
         self.check_gap(Utc::now());
-        if let Some(e) = self.not_open_for_an_op() {
-            return Err(e);
-        }
         // SECURITY: a change's body can carry message plaintext: this copy
         // and the kept one are wiped.
         let body = Zeroizing::new(body.to_string());
         let now = Utc::now();
-        // The same change asked again while its first try can still arrive:
-        // its id and its exp.
-        let again = match &self.unconfirmed {
-            Some(p) if change && p.kind == kind && *p.body == *body && p.retriable(now) => Some((p.id.clone(), p.exp)),
-            _ => None,
-        };
-        // How many times this change has been retried under its id.
-        let retries = match (&again, &self.unconfirmed) {
-            (Some(_), Some(p)) => p.retries + 1,
-            _ => 0,
-        };
-        let exp = again.as_ref().map_or_else(|| now + if change { CHANGE_TTL } else { READ_TTL }, |(_, e)| *e);
-        if change {
-            self.sending = Some(Pending { kind: kind.to_string(), body: body.clone(), id: again.as_ref().map(|(i, _)| i.clone()).unwrap_or_default(), exp, retries });
+        // The kept change this one is the same as (kind and body).
+        let same = self.unconfirmed.clone().filter(|p| change && p.kind == kind && *p.body == *body);
+        if let (Some(p), false) = (&same, must_retry) {
+            if now >= p.exp {
+                // Past its exp: it was carried out by then or never will be;
+                // only a read tells which. Said once; the next is new.
+                self.unconfirmed = None;
+                return Err(OpError::UnconfirmedExpired);
+            }
+            if p.retries >= MAX_RETRIES {
+                // Retried as often as §8.6 allows: nothing more goes while
+                // it can still arrive.
+                return Err(OpError::Unconfirmed);
+            }
         }
-        let r = self.session.request_at(&mut self.store, again.as_ref().map(|(i, _)| i.as_str()), kind, &body, OP_TIMEOUT, exp).await;
+        // The same change asked again while its first try can still arrive:
+        // its id, its exp, and how many times it has been retried.
+        let again = same.as_ref().map(|p| (p.id.clone(), p.exp, p.retries + 1));
+        if must_retry && again.is_none() {
+            return Err(OpError::Unconfirmed);
+        }
+        if let Some(e) = self.not_open_for_an_op() {
+            return Err(still_unconfirmed(again.is_some(), e));
+        }
+        let retries = again.as_ref().map_or(0, |(_, _, n)| *n);
+        let exp = again.as_ref().map_or_else(|| now + if change { CHANGE_TTL } else { READ_TTL }, |(_, e, _)| *e);
+        if change {
+            self.sending = Some(Pending { kind: kind.to_string(), body: body.clone(), id: again.as_ref().map(|(i, _, _)| i.clone()).unwrap_or_default(), exp, retries });
+        }
+        let r = self.session.request_at(&mut self.store, again.as_ref().map(|(i, _, _)| i.as_str()), kind, &body, OP_TIMEOUT, exp).await;
         self.sending = None;
         let stored = self.session.last_request_id().map(str::to_string);
         // A sleep during the wait: found before the answer counts.
@@ -221,7 +286,8 @@ impl<T: Transport, C: Clock> Link<T, C> {
                         Some(Ok(v)) => Ok(v),
                         _ => {
                             log::warn!("link: {} answered with a body that doesn't check out ({} bytes)", kind, m.body.len());
-                            Err(OpError::Malformed)
+                            // A change answered ok was done: never "try again".
+                            Err(if change { OpError::AnswerUnreadable } else { OpError::Malformed })
                         }
                     },
                     Some(Status::Error { code, .. }) => {
@@ -244,7 +310,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
                             c => OpError::Vault(c.to_string()),
                         })
                     }
-                    None => Err(OpError::Malformed),
+                    None => Err(if change { OpError::AnswerUnreadable } else { OpError::Malformed }),
                 }
             }
             Err(SessionError::Refused) => Err(OpError::Refused),
@@ -257,7 +323,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
                     if let (true, Some(id)) = (change, stored) {
                         self.unconfirmed = Some(Pending { kind: kind.to_string(), body: body.clone(), id, exp, retries });
                     }
-                    return Err(OpError::Clock(d));
+                    return Err(still_unconfirmed(again.is_some(), OpError::Clock(d)));
                 }
                 match stored {
                     // Stored: it goes with the next exchange (until exp).
@@ -270,23 +336,42 @@ impl<T: Transport, C: Clock> Link<T, C> {
                         }
                         Err(OpError::Unconfirmed)
                     }
-                    None => Err(match &e {
-                        SessionError::Store(_) => OpError::NotSaved,
-                        _ => OpError::NotSent,
-                    }),
+                    None => Err(still_unconfirmed(
+                        again.is_some(),
+                        match &e {
+                            SessionError::Store(_) => OpError::NotSaved,
+                            _ => OpError::NotSent,
+                        },
+                    )),
                 }
             }
         };
         // What the same exchange showed of the vault or the session.
         let out = match out {
-            // Said as the lock or the hold, not as a failure of its own.
-            Err(OpError::Unconfirmed) => Err(self.not_open_for_an_op().filter(|e| *e != OpError::NoSession).unwrap_or(OpError::Unconfirmed)),
+            // A change that may have gone stays unconfirmed, said with the
+            // lock or the hold; a read's is said as the lock or the hold.
+            Err(OpError::Unconfirmed) => Err(match self.not_open_for_an_op().filter(|e| *e != OpError::NoSession) {
+                Some(e) if change => OpError::UnconfirmedFor(Box::new(e)),
+                Some(e) => e,
+                None => OpError::Unconfirmed,
+            }),
             // A read isn't handed on once the session isn't live.
             Ok(_) if !change && !self.views_live(Utc::now()) => Err(self.not_open_for_an_op().unwrap_or(OpError::NoSession)),
             o => o,
         };
         self.note_refused().await;
         out
+    }
+}
+
+/// A failure that isn't the vault's answer: for a retry (`retry`) the kept
+/// change may have gone, so it stays unconfirmed, said with its cause. A
+/// refused device is said as such.
+fn still_unconfirmed(retry: bool, e: OpError) -> OpError {
+    match e {
+        OpError::Refused => e,
+        e if retry => OpError::UnconfirmedFor(Box::new(e)),
+        e => e,
     }
 }
 
@@ -307,16 +392,6 @@ pub struct Pending {
     retries: u32,
 }
 
-impl Pending {
-    /// Whether it may still be retried under its id at `now`: before its
-    /// `exp`, and fewer than [`MAX_RETRIES`] retries so far. Past either,
-    /// a retry would be a new request, and only a read tells whether it
-    /// was carried out.
-    fn retriable(&self, now: DateTime<Utc>) -> bool {
-        now < self.exp && self.retries < MAX_RETRIES
-    }
-}
-
 impl std::fmt::Debug for Pending {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pending").field("kind", &self.kind).field("body_len", &self.body.len()).field("id", &self.id).field("exp", &self.exp).field("retries", &self.retries).finish()
@@ -324,11 +399,13 @@ impl std::fmt::Debug for Pending {
 }
 
 /// What became of a kept change retried before a new one
-/// ([`Link::op_kept_first`]): its body (so the caller can tell which it
-/// was) and its answer, or [`OpError::Unconfirmed`] while it is still not
+/// ([`Link::op_kept_first`]): its request id (an opaque token the view
+/// matches its message by), its body (so the caller can tell which it was)
+/// and its answer, or [`OpError::Unconfirmed`] while it is still not
 /// confirmed. `Debug` leaves the body and the answer's body out.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Earlier {
+    pub id: String,
     pub body: Zeroizing<String>,
     pub result: Result<serde_json::Value, OpError>,
 }
@@ -347,29 +424,37 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// `earlier` for the caller. While it stays unconfirmed, or nothing
     /// could be sent, this change isn't sent:
     /// [`OpError::EarlierUnconfirmed`], or the error that would have
-    /// stopped this one too. A kept change past its `exp`, or retried
-    /// [`MAX_RETRIES`] times already, isn't retried (it
-    /// would be a new request): it is reported unconfirmed, and only a read
-    /// tells whether it happened.
+    /// stopped this one too. The kept one goes only under its id (never as
+    /// a new request). Retried [`MAX_RETRIES`] times already and still
+    /// within its `exp`, it isn't retried, and this one waits
+    /// ([`OpError::EarlierUnconfirmed`]). Past its `exp` it is forgotten,
+    /// reported [`OpError::UnconfirmedExpired`] (only a read tells whether
+    /// it happened), and this one goes.
     pub async fn op_kept_first(&mut self, kind: &str, body: &serde_json::Value, shape: impl Fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>) -> Result<serde_json::Value, OpError> {
         self.earlier = None;
         let this = Zeroizing::new(body.to_string());
         let kept = self.unconfirmed.clone().filter(|p| p.kind == kind && *p.body != *this);
         if let Some(p) = kept {
             // Unconfirmed until its answer is in (a cut-off leaves it so).
-            self.earlier = Some(Earlier { body: p.body.clone(), result: Err(OpError::Unconfirmed) });
-            if !p.retriable(Utc::now()) {
+            self.earlier = Some(Earlier { id: p.id.clone(), body: p.body.clone(), result: Err(OpError::Unconfirmed) });
+            if Utc::now() >= p.exp {
                 self.unconfirmed = None;
+                self.earlier = Some(Earlier { id: p.id, body: p.body, result: Err(OpError::UnconfirmedExpired) });
+            } else if p.retries >= MAX_RETRIES {
+                return Err(OpError::EarlierUnconfirmed);
             } else {
                 let again: serde_json::Value = serde_json::from_str(&p.body).map_err(|_| OpError::Malformed)?;
-                let r = self.op(kind, &again, &shape, true).await;
+                // Under its id, even if its exp passes meanwhile.
+                let r = self.op_as(kind, &again, &shape, true, true).await;
                 if self.unconfirmed.as_ref().is_some_and(|q| q.id == p.id) {
                     return Err(match r {
                         Err(OpError::Unconfirmed) | Ok(_) => OpError::EarlierUnconfirmed,
+                        // Not sent for a reason that stops this one too.
+                        Err(OpError::UnconfirmedFor(e)) => *e,
                         Err(e) => e,
                     });
                 }
-                self.earlier = Some(Earlier { body: p.body, result: r });
+                self.earlier = Some(Earlier { id: p.id, body: p.body, result: r });
             }
         }
         self.op(kind, body, &shape, true).await
@@ -420,7 +505,7 @@ pub async fn link_op_with<T: Transport, C: Clock>(
     change: bool,
 ) -> Result<serde_json::Value, OpError> {
     let how = if change { How::Change } else { How::Read };
-    link_run_with(link, screen_live, overtaken, publish, stop, kind, body, shape, how).await.0
+    link_run_with(link, screen_live, overtaken, publish, stop, kind, body, shape, how).await.result
 }
 
 /// How [`link_run_with`] sends: a read or a change ([`Link::op`]), or a
@@ -432,8 +517,20 @@ pub enum How {
     KeptFirst,
 }
 
-/// [`link_op_with`]; with [`How::KeptFirst`], also what became of the kept
-/// change retried first ([`Earlier`]), if there was one.
+/// What [`link_run_with`] answers.
+#[derive(Debug)]
+pub struct Ran {
+    pub result: Result<serde_json::Value, OpError>,
+    /// With [`How::KeptFirst`]: what became of the kept change retried
+    /// first, if there was one.
+    pub earlier: Option<Earlier>,
+    /// When `result` is unconfirmed: the request id this change is kept
+    /// under, an opaque token the view matches its message by (and finds
+    /// again in a later `earlier`).
+    pub pending_id: Option<String>,
+}
+
+/// [`link_op_with`], with the [`Ran`] details.
 #[allow(clippy::too_many_arguments)]
 pub async fn link_run_with<T: Transport, C: Clock>(
     link: &Mutex<Option<Link<T, C>>>,
@@ -445,15 +542,16 @@ pub async fn link_run_with<T: Transport, C: Clock>(
     body: serde_json::Value,
     shape: impl Fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>,
     how: How,
-) -> (Result<serde_json::Value, OpError>, Option<Earlier>) {
+) -> Ran {
     let change = how != How::Read;
+    let none = || Ran { result: Err(OpError::NoSession), earlier: None, pending_id: None };
     if overtaken() || !screen_live() {
-        return (Err(OpError::NoSession), None);
+        return none();
     }
     let mut slot = link.lock().await;
-    let Some(l) = slot.as_mut() else { return (Err(OpError::NoSession), None) };
+    let Some(l) = slot.as_mut() else { return none() };
     if overtaken() {
-        return (Err(OpError::NoSession), None);
+        return none();
     }
     l.earlier = None;
     let r = {
@@ -476,16 +574,21 @@ pub async fn link_run_with<T: Transport, C: Clock>(
         }
     };
     let earlier = l.earlier.take();
+    let this = Zeroizing::new(body.to_string());
+    let pending_id = match &r {
+        Err(e) if e.is_unconfirmed() => l.unconfirmed.as_ref().filter(|p| p.kind == kind && *p.body == *this).map(|p| p.id.clone()),
+        _ => None,
+    };
     if overtaken() {
-        let r = match r {
+        let result = match r {
             Ok(v) if change => Ok(v),
             Ok(_) => Err(OpError::NoSession),
             e => e,
         };
-        return (r, earlier);
+        return Ran { result, earlier, pending_id };
     }
     publish(l.snapshot(Utc::now()));
-    (r, earlier)
+    Ran { result: r, earlier, pending_id }
 }
 
 #[cfg(test)]
