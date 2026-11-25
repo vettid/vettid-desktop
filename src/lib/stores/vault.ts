@@ -131,6 +131,24 @@ export function reloadConnectionViews(): void {
     void loadConnectionRequests();
 }
 
+/** Shown in place of the list and the requests while no session is live. */
+export const NOT_LIVE_TEXT = "Your session isn't live, so your connections aren't shown.";
+
+/**
+ * Clear the list, the requests and the selected connection at once when the
+ * session stops being live. An answer to a read already under way is not
+ * applied (its count is no longer the latest).
+ */
+export function clearConnectionViews(): void {
+    connectionsSeq++;
+    requestsSeq++;
+    connectionsStore.set([]);
+    connectionsErrorStore.set(NOT_LIVE_TEXT);
+    connectionRequestsStore.set(null);
+    connectionRequestsErrorStore.set(NOT_LIVE_TEXT);
+    selectedConnectionStore.set(null);
+}
+
 // ---------------------------------------------------------------------------
 // Real-time event listeners (called once on app init)
 // ---------------------------------------------------------------------------
@@ -141,15 +159,19 @@ export function initVaultListeners(): void {
     if (listenersInitialized) return;
     listenersInitialized = true;
 
-    // The connection views read again when the session goes live (and when
-    // it stops being live, so what was shown is cleared by the failed read),
-    // as the window's own session state shows it (`vault:changed`, then the
-    // session snapshot).
+    // The connection views read again when the session goes live, and are
+    // cleared when it stops being live, as the window's own session state
+    // shows it (`vault:changed`, then the session snapshot). A new
+    // `session_id` without a change in liveness needs nothing here: a new
+    // grant drops the backend's queue and sends a resync, which reads the
+    // views again (below).
     let lastSession: string | undefined;
     sessionStore.subscribe((s) => {
         const prev = lastSession;
         lastSession = s.state;
-        if (prev !== undefined && livenessChanged(prev, s.state)) reloadConnectionViews();
+        if (prev === undefined || !livenessChanged(prev, s.state)) return;
+        if (s.state === 'active') reloadConnectionViews();
+        else clearConnectionViews();
     });
 
     // What the vault sent this desktop (Phase 5, 5.1): dropped while the

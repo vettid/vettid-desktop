@@ -157,8 +157,7 @@ export function inboundAction(batch, live) {
 
 /**
  * Whether the session's liveness changed between two session states: the
- * views read again then (to live: fresh data; to not live: the read fails and
- * clears what was shown).
+ * views read again then (to live: fresh data), or are cleared (to not live).
  * @param {string | undefined} prev
  * @param {string} next
  */
