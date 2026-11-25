@@ -56,15 +56,34 @@ impl VaultOpResponse {
     }
 }
 
-/// Run `kind` with `body` over the link, and publish what the link then
-/// knows (a hold or an ended session learned from the answer).
+/// Run `kind` with `body` over the link, only while the screen shows a
+/// live session and no End session, lock or log-out is under way; then
+/// publish what the link learned (a hold, an ended session), unless one
+/// started meanwhile or a newer snapshot was published (then the answer
+/// isn't handed on either: the screen has moved on).
 async fn link_op(state: &AppState, kind: &str, body: serde_json::Value) -> VaultOpResponse {
+    let mark = crate::commands::auth::reset_mark(state);
+    let seen = state.snapshot();
+    if crate::commands::auth::overtaken_by_reset(state, mark) || !seen.active_at(chrono::Utc::now()) {
+        return VaultOpResponse::from_link(Err(OpError::NoSession));
+    }
     let mut slot = state.link.lock().await;
     let Some(link) = slot.as_mut() else {
         return VaultOpResponse::from_link(Err(OpError::NoSession));
     };
+    if crate::commands::auth::overtaken_by_reset(state, mark) {
+        return VaultOpResponse::from_link(Err(OpError::NoSession));
+    }
     let result = link.op(kind, &body).await;
-    state.publish(link.snapshot(chrono::Utc::now()));
+    let snap = link.snapshot(chrono::Utc::now());
+    drop(slot);
+    if crate::commands::auth::overtaken_by_reset(state, mark) || !state.shared().publish_if(seen.seq, snap) {
+        // A reset or a newer snapshot came first: what it shows stands.
+        return VaultOpResponse::from_link(match result {
+            Ok(_) => Err(OpError::NoSession),
+            Err(e) => Err(e),
+        });
+    }
     VaultOpResponse::from_link(result)
 }
 
@@ -97,9 +116,9 @@ pub async fn decline_connection_request(
     connection_id: Option<String>,
 ) -> Result<VaultOpResponse, String> {
     let body = match (pending_id, connection_id) {
-        (Some(p), None) => serde_json::json!({ "pending_id": p }),
-        (None, Some(c)) => serde_json::json!({ "connection_id": c }),
-        _ => return Err("decline_connection_request: give exactly one of pending_id and connection_id".into()),
+        (Some(p), None) if !p.is_empty() => serde_json::json!({ "pending_id": p }),
+        (None, Some(c)) if !c.is_empty() => serde_json::json!({ "connection_id": c }),
+        _ => return Ok(VaultOpResponse::from_link(Err(OpError::Vault("bad_request".into())))),
     };
     Ok(link_op(&state, "connection.decline", body).await)
 }
