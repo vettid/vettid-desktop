@@ -748,10 +748,17 @@ impl<T: Transport, C: Clock> Link<T, C> {
                 Collected::Failed { retry_after: retry_after_of(&e) }
             }
         };
+        self.settle_inbound();
+        out
+    }
+
+    /// After a collect: if no session is live as the screen shows it now,
+    /// nothing collected is kept, and the views read again (whether or not
+    /// anything was queued).
+    fn settle_inbound(&mut self) {
         if !self.views_live(Utc::now()) {
             self.inbound.clear_changed();
         }
-        out
     }
 
     /// What the vault sent for the views since the last call (see
@@ -1351,7 +1358,8 @@ pub const CHANGED_EVENT: &str = "vault:changed";
 
 /// Hands what [`collect_loop`] took to the frontend, as
 /// [`inbound::INBOUND_EVENT`].
-pub type Deliver = Arc<RwLock<Option<Arc<dyn Fn(inbound::InboundBatch) + Send + Sync>>>>;
+/// `true` if the batch reached the window.
+pub type Deliver = Arc<RwLock<Option<Arc<dyn Fn(inbound::InboundBatch) -> bool + Send + Sync>>>>;
 
 /// How often the mailbox is collected while an access session runs
 /// (Phase 5, 5.1; chosen; not in the spec).
@@ -1396,6 +1404,29 @@ impl Shared {
                 f();
             }
         }
+    }
+
+    /// [`Shared::publish`], but only if the published snapshot is still the
+    /// one numbered `seen` (nothing newer was published since it was read):
+    /// under one write lock. `false` if it wasn't published.
+    pub fn publish_if(&self, seen: u64, s: Snapshot) -> bool {
+        let now = Utc::now();
+        let (before, after) = {
+            let mut g = self.snapshot.write().unwrap_or_else(|p| p.into_inner());
+            if g.seq != seen {
+                return false;
+            }
+            let before = shown(&g, now);
+            let seq = g.seq + 1;
+            *g = Snapshot { seq, ..s };
+            (before, shown(&g, now))
+        };
+        if before != after {
+            if let Some(f) = self.changed.read().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                f();
+            }
+        }
+        true
     }
 
     pub fn read(&self) -> Snapshot {
@@ -1605,17 +1636,22 @@ fn retry_after_of(e: &SessionError) -> Option<u64> {
     }
 }
 
-/// The longest wait between collects after failures.
+/// The longest wait the doubling reaches between failed collects.
 pub const COLLECT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The longest `retry_after` taken as given (chosen; a relay that asks for
+/// more is asked again after this).
+pub const COLLECT_RETRY_AFTER_MAX: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// The wait before the next collect: [`COLLECT_EVERY`] after one that
 /// worked or had no session; after a failure, the relay's `retry_after`
-/// if it gave one, else double the last wait, at most
-/// [`COLLECT_BACKOFF_MAX`] (RELAY-PROTOCOL §7.2).
+/// as given if it gave one (at most [`COLLECT_RETRY_AFTER_MAX`]), else
+/// double the last wait, at most [`COLLECT_BACKOFF_MAX`] (RELAY-PROTOCOL
+/// §7.2).
 pub fn next_collect_wait(last: std::time::Duration, c: Collected) -> std::time::Duration {
     match c {
         Collected::Ok | Collected::NoSession => COLLECT_EVERY,
-        Collected::Failed { retry_after: Some(s) } => std::time::Duration::from_secs(s).clamp(COLLECT_EVERY, COLLECT_BACKOFF_MAX),
+        Collected::Failed { retry_after: Some(s) } => std::time::Duration::from_secs(s).clamp(COLLECT_EVERY, COLLECT_RETRY_AFTER_MAX),
         Collected::Failed { retry_after: None } => (last * 2).clamp(COLLECT_EVERY, COLLECT_BACKOFF_MAX),
     }
 }
@@ -1640,7 +1676,10 @@ pub async fn collect_loop<T: Transport, C: Clock>(
             let Ok(mut slot) = link.try_lock() else { continue };
             let Some(l) = slot.as_mut() else { return };
             let c = l.collect().await;
-            wait = if c == Collected::Ok || c == Collected::NoSession { every } else { next_collect_wait(wait, c) };
+            wait = match c {
+                Collected::Ok | Collected::NoSession => every,
+                Collected::Failed { .. } => next_collect_wait(wait, c),
+            };
             (l.take_inbound(), l.snapshot(Utc::now()))
         };
         deliver(batch, snap);
@@ -1663,27 +1702,60 @@ pub fn gate(b: inbound::InboundBatch, published_live: bool, link_live: bool) -> 
     (any.then_some(b), false)
 }
 
-/// [`collect_loop`] as a task over the shared link. Each round goes
-/// through [`gate`]; a batch is handed on while the published snapshot is
-/// held for reading, so an End session or a lock published meanwhile comes
-/// after it, never before.
+/// One round of [`spawn_collect`]: through [`gate`] against the published
+/// `snapshot` (read at `now()`); the link's `snap` is published (`publish`,
+/// only over the snapshot read) if the collect found the session over;
+/// then the batch is handed to `deliver` while `snapshot` is held for
+/// reading, and only if it is still live then (read at `now()` again), so
+/// an End session or a lock published meanwhile comes after it, never
+/// before. `owed`: a batch didn't reach the window, so a resync is owed,
+/// sent with the next batch or on its own.
+pub fn hand_on(
+    snapshot: &RwLock<Snapshot>,
+    b: inbound::InboundBatch,
+    snap: Snapshot,
+    now: impl Fn() -> DateTime<Utc>,
+    publish: impl FnOnce(u64, Snapshot),
+    deliver: Option<&(dyn Fn(inbound::InboundBatch) -> bool + Send + Sync)>,
+    owed: &std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (published_live, seen) = {
+        let g = snapshot.read().unwrap_or_else(|p| p.into_inner());
+        (g.active_at(now()), g.seq)
+    };
+    let (b, publish_snap) = gate(b, published_live, snap.active_at(now()));
+    if publish_snap {
+        publish(seen, snap);
+    }
+    let b = match b {
+        Some(mut b) => {
+            b.resync |= owed.load(SeqCst);
+            b
+        }
+        None if owed.load(SeqCst) => inbound::InboundBatch { messages: Vec::new(), resync: true },
+        None => return,
+    };
+    let Some(d) = deliver else {
+        owed.store(true, SeqCst);
+        return;
+    };
+    let guard = snapshot.read().unwrap_or_else(|p| p.into_inner());
+    let b = if guard.active_at(now()) { b } else { inbound::InboundBatch { messages: Vec::new(), resync: true } };
+    owed.store(!d(b), SeqCst);
+    drop(guard);
+}
+
+/// [`collect_loop`] as a task over the shared link, each round through
+/// [`hand_on`].
 pub fn spawn_collect(shared: Shared) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let owed = std::sync::atomic::AtomicBool::new(false);
         collect_loop(&shared.link, COLLECT_EVERY, |b, snap| {
-            let now = Utc::now();
-            let published_live = shared.snapshot.read().unwrap_or_else(|p| p.into_inner()).active_at(now);
-            let (b, publish) = gate(b, published_live, snap.active_at(now));
-            if publish {
-                shared.publish(snap);
-            }
-            let Some(b) = b else { return };
             let d = shared.deliver.read().unwrap_or_else(|p| p.into_inner()).clone();
-            let guard = shared.snapshot.read().unwrap_or_else(|p| p.into_inner());
-            let b = if guard.active_at(Utc::now()) { b } else { inbound::InboundBatch { messages: Vec::new(), resync: true } };
-            if let Some(d) = d {
-                d(b);
-            }
-            drop(guard);
+            hand_on(&shared.snapshot, b, snap, Utc::now, |seen, s| {
+                shared.publish_if(seen, s);
+            }, d.as_deref(), &owed);
         })
         .await;
     })

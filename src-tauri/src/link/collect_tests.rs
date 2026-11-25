@@ -277,7 +277,8 @@ fn collects_back_off() {
     assert_eq!(next_collect_wait(s(40), Collected::Failed { retry_after: None }), COLLECT_BACKOFF_MAX);
     assert_eq!(next_collect_wait(s(5), Collected::Failed { retry_after: Some(30) }), s(30));
     assert_eq!(next_collect_wait(s(5), Collected::Failed { retry_after: Some(1) }), COLLECT_EVERY);
-    assert_eq!(next_collect_wait(s(5), Collected::Failed { retry_after: Some(900) }), COLLECT_BACKOFF_MAX);
+    assert_eq!(next_collect_wait(s(5), Collected::Failed { retry_after: Some(900) }), s(900), "taken as given");
+    assert_eq!(next_collect_wait(s(5), Collected::Failed { retry_after: Some(2000) }), COLLECT_RETRY_AFTER_MAX);
 }
 
 /// In the loop: an unreachable relay is collected less and less often.
@@ -302,4 +303,173 @@ async fn the_loop_backs_off_while_the_relay_is_away() {
     // 5, 15, 35, 75 s: four, where a fixed 5 s would make fifteen.
     let n = rounds.load(std::sync::atomic::Ordering::SeqCst);
     assert!((3..=5).contains(&n), "{n} collects in 76 s");
+}
+
+/// Each of noted's clears on its own (the after-collect check is a second
+/// layer, tested apart below): a queued message goes, and the views read
+/// again.
+#[tokio::test]
+async fn noted_clears_on_every_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await;
+    let events: Vec<Result<Option<AccessEvent>, AccessError>> = vec![
+        Ok(Some(AccessEvent::Held)),
+        Ok(Some(AccessEvent::Locked)),
+        Ok(Some(AccessEvent::Ended)),
+        Ok(Some(AccessEvent::Denied)),
+        Ok(Some(AccessEvent::ReadStatus)),
+        Err(AccessError::Malformed),
+    ];
+    for e in events {
+        vault.event("message.new", MSG, Utc::now());
+        link.read_status().await.unwrap();
+        assert_eq!(link.take_inbound().messages.len(), 1, "queued before {e:?}");
+        vault.event("message.new", MSG, Utc::now());
+        link.read_status().await.unwrap();
+        link.noted(&e);
+        assert_eq!(link.take_inbound(), InboundBatch { messages: vec![], resync: true }, "{e:?}");
+    }
+}
+
+/// The after-collect check on its own: no session live as the screen
+/// shows it, so the queue goes and the views read again, even when it was
+/// empty.
+#[tokio::test]
+async fn the_after_collect_check_clears_and_asks_for_a_resync() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await;
+    vault.event("message.new", MSG, Utc::now());
+    link.read_status().await.unwrap();
+    link.settle_inbound();
+    assert_eq!(link.take_inbound().messages.len(), 1, "live: kept");
+    vault.event("message.new", MSG, Utc::now());
+    link.read_status().await.unwrap();
+    link.resumed(); // the vault's state unconfirmed: not live
+    link.settle_inbound();
+    assert_eq!(link.take_inbound(), InboundBatch { messages: vec![], resync: true });
+    link.settle_inbound();
+    assert_eq!(link.take_inbound(), InboundBatch { messages: vec![], resync: true }, "an empty queue too");
+}
+
+/// The engine's poll_now returns what a request held first.
+#[tokio::test]
+async fn poll_now_returns_held_messages_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await;
+    vault.event("message.new", MSG, Utc::now());
+    link.session.request(&mut link.store, "vault.status", "{}", TimeDelta::seconds(5)).await.unwrap();
+    let before = vault.collects();
+    let got = link.session.poll_now(&mut link.store).await.unwrap();
+    assert_eq!(vault.collects(), before, "held messages come back without a collect");
+    assert!(got.iter().any(|m| m.kind == "message.new"), "{got:?}");
+}
+
+/// After a failure, the first collect that works goes back to every 5 s.
+#[tokio::test(start_paused = true)]
+async fn the_loop_comes_back_to_every_5_s() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, link) = live(dir.path()).await;
+    let slot = Arc::new(Mutex::new(Some(link)));
+    vault.offline(true);
+    let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task = {
+        let (slot, rounds) = (slot.clone(), rounds.clone());
+        tokio::spawn(async move {
+            collect_loop(&slot, COLLECT_EVERY, |_, _| {
+                rounds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await
+        })
+    };
+    // Rounds at 5, 15, 35 s; the next is due at 75 s.
+    tokio::time::sleep(std::time::Duration::from_secs(36)).await;
+    vault.offline(false);
+    tokio::time::sleep(std::time::Duration::from_secs(40)).await; // the round at 75 s works
+    let at_76 = rounds.load(std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_secs(21)).await;
+    task.abort();
+    let more = rounds.load(std::sync::atomic::Ordering::SeqCst) - at_76;
+    assert!((3..=5).contains(&more), "{more} rounds in the 21 s after a collect worked");
+}
+
+fn live_snap(t: DateTime<Utc>, seq: u64) -> Snapshot {
+    Snapshot { link_open: true, live_until: Some(t + TimeDelta::hours(1)), vault: VaultView::open(t), seq, ..Default::default() }
+}
+
+/// hand_on, round by round: what reaches the window, what is published.
+#[test]
+fn hand_on_gates_publishes_and_owes_resyncs() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let t = Utc::now();
+    let got = std::sync::Mutex::new(Vec::<InboundBatch>::new());
+    let ok = AtomicBool::new(true);
+    let deliver = |b: InboundBatch| {
+        got.lock().unwrap().push(b);
+        ok.load(SeqCst)
+    };
+    let take = || std::mem::take(&mut *got.lock().unwrap());
+    let resync = InboundBatch { messages: vec![], resync: true };
+    let owed = AtomicBool::new(false);
+
+    // Both live: the messages go; nothing is published.
+    let published = RwLock::new(live_snap(t, 7));
+    let mut publishes = Vec::new();
+    hand_on(&published, msg_batch(), live_snap(t, 0), || t, |seen, _| publishes.push(seen), Some(&deliver), &owed);
+    assert_eq!(take(), vec![msg_batch()]);
+    assert!(publishes.is_empty());
+
+    // The link found it over: published (over the snapshot read), and
+    // only the resync goes.
+    hand_on(&published, msg_batch(), Snapshot::default(), || t, |seen, _| publishes.push(seen), Some(&deliver), &owed);
+    assert_eq!(publishes, vec![7]);
+    assert_eq!(take(), vec![resync.clone()]);
+
+    // The screen isn't live: only the resync, nothing published.
+    let dark = RwLock::new(Snapshot::default());
+    hand_on(&dark, msg_batch(), live_snap(t, 0), || t, |_, _| panic!("published"), Some(&deliver), &owed);
+    assert_eq!(take(), vec![resync.clone()]);
+
+    // Live at the gate, not by the time it is handed on: the re-check
+    // under the read guard sends only the resync.
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let later = || if calls.fetch_add(1, SeqCst) < 2 { t } else { t + TimeDelta::hours(2) };
+    hand_on(&published, msg_batch(), live_snap(t, 0), later, |_, _| panic!("published"), Some(&deliver), &owed);
+    assert_eq!(take(), vec![resync.clone()]);
+
+    // A batch that didn't reach the window: a resync is owed, and sent on
+    // its own next round, though nothing else comes.
+    ok.store(false, SeqCst);
+    hand_on(&published, msg_batch(), live_snap(t, 0), || t, |_, _| {}, Some(&deliver), &owed);
+    assert!(owed.load(SeqCst));
+    ok.store(true, SeqCst);
+    take();
+    hand_on(&published, InboundBatch::default(), live_snap(t, 0), || t, |_, _| {}, Some(&deliver), &owed);
+    assert_eq!(take(), vec![resync.clone()]);
+    assert!(!owed.load(SeqCst), "paid");
+    // With messages, the owed resync rides along.
+    owed.store(true, SeqCst);
+    hand_on(&published, msg_batch(), live_snap(t, 0), || t, |_, _| {}, Some(&deliver), &owed);
+    assert_eq!(take(), vec![InboundBatch { resync: true, ..msg_batch() }]);
+    // No window yet: owed.
+    hand_on(&published, msg_batch(), live_snap(t, 0), || t, |_, _| {}, None, &owed);
+    assert!(owed.load(SeqCst));
+}
+
+/// publish_if publishes only over the snapshot it was given.
+#[test]
+fn publish_if_doesnt_overwrite_a_newer_snapshot() {
+    let t = Utc::now();
+    let shared = Shared {
+        link: Arc::new(Mutex::new(None)),
+        snapshot: Arc::new(RwLock::new(live_snap(t, 3))),
+        is_registered: Arc::default(),
+        notify: Arc::default(),
+        changed: Arc::default(),
+        deliver: Arc::default(),
+    };
+    assert!(!shared.publish_if(2, Snapshot::default()), "a newer one was published since");
+    assert!(shared.read().active_at(t));
+    assert!(shared.publish_if(3, Snapshot::default()));
+    assert!(!shared.read().active_at(t));
+    assert_eq!(shared.read().seq, 4);
 }
