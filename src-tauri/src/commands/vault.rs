@@ -6,7 +6,7 @@ use tauri::State;
 // link (DESKTOP-REWORK-PLAN Phase 5, 5.2; `link::ops`).
 use crate::commands::unavailable as operations;
 use crate::link::inbound::{MAX_ID_LEN, MAX_TEXT_LEN};
-use crate::link::ops::{link_run_with, How, OpError, Ran};
+use crate::link::ops::{link_run_with, Earlier, How, OpError, Ran};
 use crate::link::shape::{self, BadShape};
 use crate::state::AppState;
 
@@ -463,37 +463,51 @@ pub async fn mark_message_read(state: State<'_, AppState>, connection_id: String
 }
 
 /// Send a text message (`message.send`, §10.5): `text` of 1 B to 16 KiB
-/// of UTF-8. Answers `{message_id, sent_at}`, all the view needs besides
-/// what it sent, since the vault sends no `message.new` back to the
-/// desktop that sent it; and `earlier` when a send left unconfirmed was
-/// retried first (see [`sent_response`]).
+/// of UTF-8. Always a new message. Its text is held in memory only, never
+/// in the store or `device.enc`.
 ///
-/// A change: one left unanswered is kept, in memory only (the text never
-/// reaches the store or `device.enc`), and retried under its id, with its
-/// first `exp`, when the same text is sent again, so the vault sends it
-/// once (§8.2), at most twice (§8.6). After that, the same text gets
-/// `unconfirmed` again with nothing sent until its `exp` plus a margin
-/// for the vault's clock (`ops::KEPT_MARGIN`, 5 minutes), then
-/// `unconfirmed_expired` once: the view reads the conversation before it
-/// offers the text again (a new request). A retry that doesn't reach the
-/// vault stays `unconfirmed`. A first send with the relay out of reach
-/// isn't kept to go later: it is `not_sent`, and stays the view's draft.
-/// Another message while one is kept retries the kept one first
-/// ([`How::KeptFirst`]); while that stays unconfirmed, the new one isn't
-/// sent (`earlier_unconfirmed`). `answer_unreadable`: the vault did it,
-/// but its answer couldn't be read; the view reads the conversation
-/// before it offers another send.
+/// **Answers** (`VaultOpResponse`; `data` may come with `success: false`):
+/// - sent: `data: {message_id, sent_at}`, all the view needs besides what
+///   it sent (the vault sends no `message.new` back to the desktop that
+///   sent it);
+/// - kept: `data: {pending_id, expires_at}`, whatever the `error_code`
+///   (`unconfirmed`, or `clock` for one stored before the clock was
+///   refused). `pending_id` is an opaque token (the request id) the view
+///   keeps with the message; `expires_at` (RFC 3339) is until when it may
+///   still arrive (`exp` plus `ops::KEPT_MARGIN`);
+/// - `data.earlier`, when a kept send went first (also on an error):
+///   `{pending_id, expires_at, connection_id, success, data?: {message_id,
+///   sent_at}, settled?: "done" | "not_done", vault_code?, error?,
+///   error_code?}` (see [`earlier_json`]).
 ///
-/// The view's rule for a message that holds a `pending_id` (5.3b): it
-/// stays unconfirmed on every answer except success (it is sent),
-/// `unconfirmed_expired` and `answer_unreadable` (read the conversation
-/// again before offering it), or an `earlier` with its `pending_id` that
-/// settles it. In particular `no_session`, `locked`, `held`, `not_sent`,
-/// `clock` and `earlier_unconfirmed` never turn it back into a draft: it
-/// may still be carried out.
+/// **The kept-first gate.** A kept send of this connection or another is
+/// retried first, under its id and first `exp` ([`How::KeptFirst`]),
+/// whatever its text: the same text twice is two messages. While it stays
+/// unconfirmed this one isn't sent: `earlier_unconfirmed` (with `earlier`),
+/// or the reason that stops this one too (`not_sent`, `locked`, ...).
+/// Retried twice already (§8.6) and not yet past `expires_at`, it isn't
+/// retried, and this one waits the same way.
 ///
-/// A service connection takes no messages: the vault answers `forbidden`,
-/// passed on as such (the view shows no conversation for one).
+/// **The view's rule (5.3b).**
+/// - A message whose answer carried a `pending_id` is unconfirmed until
+///   `expires_at`. It stays so on every answer about it except: success or
+///   `settled: "done"` (sent), `settled: "not_done"` (not sent: back to a
+///   draft, with the vault's code), `unconfirmed_expired` and
+///   `answer_unreadable` (read the conversation again before offering it).
+///   `no_session`, `locked`, `held`, `not_sent`, `clock` and
+///   `earlier_unconfirmed` never turn it back into a draft: it may still be
+///   carried out.
+/// - To try it again, the view calls [`retry_send`] with its
+///   `pending_id`, never `send_message` with its text (that is a new
+///   message).
+/// - Past `expires_at` the view reads the conversation (`get_conversation`)
+///   to see whether it went; only then may it offer the text as a new
+///   message.
+/// - Other codes: `not_sent` (nothing reached the relay: a draft),
+///   `answer_unreadable` (done, unread: read the conversation before
+///   another send), `forbidden` (a service connection takes no messages;
+///   the view shows no conversation for one), `not_found`,
+///   `connection_unavailable`, `vault_error`, `bad_argument`.
 #[tauri::command]
 pub async fn send_message(state: State<'_, AppState>, connection_id: String, text: String) -> Result<VaultOpResponse, String> {
     // SECURITY: plaintext; this copy is wiped. The JSON body's copies are
@@ -503,7 +517,35 @@ pub async fn send_message(state: State<'_, AppState>, connection_id: String, tex
         Ok(b) => b,
         Err(e) => return Ok(VaultOpResponse::from_link(Err(e))),
     };
-    Ok(sent_response(link_run(&state, "message.send", body, shape::message_sent, How::KeptFirst).await))
+    Ok(sent_response(link_run(&state, "message.send", body, shape::message_sent, How::KeptFirst).await, false))
+}
+
+/// Try a kept send again (`message.send`, §8.6): the one whose answer gave
+/// `pending_id`, under that request id and its first `exp`, with its own
+/// text (the view sends none). At most twice.
+///
+/// **Answers:**
+/// - sent: `data: {message_id, sent_at, pending_id, settled: "done"}`;
+/// - the vault refused it: `success: false`, `data: {pending_id, settled:
+///   "not_done", vault_code}`, with `error_code` as for any vault answer
+///   (`forbidden`, `not_found`, `connection_unavailable`, `vault_error`).
+///   Not done: back to a draft;
+/// - `answer_unreadable`: `data: {pending_id, settled: "done"}`; read the
+///   conversation again;
+/// - still not confirmed: `unconfirmed`, `data: {pending_id, expires_at}`,
+///   also when it was retried twice already (nothing sent) or couldn't be
+///   sent now (the notice says why);
+/// - `unconfirmed_expired`, nothing sent: `pending_id` isn't the kept send
+///   of `connection_id` any more (past `expires_at`, settled, or never
+///   kept here). Read the conversation to see whether it went.
+/// - `bad_argument`: an empty or overlong id.
+#[tauri::command]
+pub async fn retry_send(state: State<'_, AppState>, connection_id: String, pending_id: String) -> Result<VaultOpResponse, String> {
+    if [connection_id.as_str(), pending_id.as_str()].iter().any(|i| i.is_empty() || i.len() > MAX_ID_LEN) {
+        return Ok(VaultOpResponse::from_link(Err(OpError::BadArgument)));
+    }
+    let how = How::Retry { pending_id: pending_id.clone(), connection_id };
+    Ok(retried_response(link_run(&state, "message.send", serde_json::Value::Null, shape::message_sent, how).await, &pending_id))
 }
 
 /// `message.send`'s body, once its arguments check out: a connection id,
@@ -524,39 +566,74 @@ fn read_body(connection_id: &str, message_id: &str) -> Result<serde_json::Value,
     Ok(serde_json::json!({ "connection_id": connection_id, "message_id": message_id }))
 }
 
-/// What `send_message` answers. `data` may be there when `success` is
-/// false:
-/// - `data.pending_id` with `error_code` `unconfirmed`: the request id this
-///   send is kept under, an opaque token the view keeps with its message;
-/// - `data.earlier`, when a kept send was retried first (also on an
-///   error): `{pending_id, connection_id, success, data?: {message_id,
-///   sent_at}, error?, error_code?}`. `pending_id` is the one an earlier
-///   `unconfirmed` answer gave, so the view finds its message by it.
-///   `error_code` `unconfirmed`: still not confirmed; `unconfirmed_expired`:
-///   past its `exp`, forgotten, and only the next `get_conversation` tells
-///   whether it was sent.
-fn sent_response(ran: Ran) -> VaultOpResponse {
-    let unconfirmed = ran.result.as_ref().err().is_some_and(OpError::is_unconfirmed);
-    let mut resp = VaultOpResponse::from_link(ran.result);
-    if let (true, Some(id)) = (unconfirmed, ran.pending_id) {
-        resp.data.get_or_insert_with(|| serde_json::json!({}))["pending_id"] = id.into();
+/// How a retried send's answer settles it: `done` (sent, or done with an
+/// unreadable answer), `not_done` with the vault's code (it refused it), or
+/// nothing (still unknown).
+fn settled(result: &Result<serde_json::Value, OpError>) -> Option<(&'static str, Option<String>)> {
+    match result {
+        Ok(_) | Err(OpError::AnswerUnreadable) => Some(("done", None)),
+        Err(OpError::Vault(c)) => Some(("not_done", Some(c.clone()))),
+        Err(_) => None,
     }
-    if let Some(e) = ran.earlier {
-        // Only the id is read out of the kept body; its text is skipped.
-        #[derive(serde::Deserialize)]
-        struct Named {
-            connection_id: String,
+}
+
+fn data(resp: &mut VaultOpResponse) -> &mut serde_json::Value {
+    resp.data.get_or_insert_with(|| serde_json::json!({}))
+}
+
+/// `data.earlier` ([`send_message`]): what became of the kept send retried
+/// first. Its text is never in it.
+fn earlier_json(e: Earlier) -> serde_json::Value {
+    let mut o = serde_json::json!({
+        "pending_id": e.id,
+        "expires_at": vettid_vms::envelope::format_ts(e.expires_at),
+        "connection_id": e.connection_id,
+        "success": e.result.is_ok(),
+    });
+    if let Some((s, code)) = settled(&e.result) {
+        o["settled"] = s.into();
+        if let Some(c) = code {
+            o["vault_code"] = c.into();
         }
-        let named = serde_json::from_str::<Named>(&e.body).map(|n| n.connection_id).ok();
-        let mut o = serde_json::json!({ "pending_id": e.id, "connection_id": named, "success": e.result.is_ok() });
-        match &e.result {
-            Ok(v) => o["data"] = v.clone(),
-            Err(err) => {
-                o["error"] = err.notice().into();
-                o["error_code"] = err.code().into();
-            }
+    }
+    match &e.result {
+        Ok(v) => o["data"] = v.clone(),
+        Err(err) => {
+            o["error"] = err.notice().into();
+            o["error_code"] = err.code().into();
         }
-        resp.data.get_or_insert_with(|| serde_json::json!({}))["earlier"] = o;
+    }
+    o
+}
+
+/// What `send_message` answers (`retry`: false) or a retry's common part:
+/// the answer, `pending_id` and `expires_at` when this change is kept, and
+/// `earlier`.
+fn sent_response(ran: Ran, retry: bool) -> VaultOpResponse {
+    let mut resp = VaultOpResponse::from_link(ran.result);
+    if let Some((id, until)) = ran.pending {
+        let d = data(&mut resp);
+        d["pending_id"] = id.into();
+        d["expires_at"] = vettid_vms::envelope::format_ts(until).into();
+    }
+    if let (Some(e), false) = (ran.earlier, retry) {
+        data(&mut resp)["earlier"] = earlier_json(e);
+    }
+    resp
+}
+
+/// What [`retry_send`] answers: as [`sent_response`], with `pending_id`
+/// always, and `settled` when the vault's answer settles it.
+fn retried_response(ran: Ran, pending_id: &str) -> VaultOpResponse {
+    let s = settled(&ran.result);
+    let mut resp = sent_response(ran, true);
+    let d = data(&mut resp);
+    d["pending_id"] = pending_id.into();
+    if let Some((s, code)) = s {
+        d["settled"] = s.into();
+        if let Some(c) = code {
+            d["vault_code"] = c.into();
+        }
     }
     resp
 }
@@ -1091,10 +1168,21 @@ mod tests {
         match send_body(id, text) {
             Ok(b) => {
                 let ran = run(s, "message.send", b, shape::message_sent, How::KeptFirst).await;
-                sent_response(ran)
+                sent_response(ran, false)
             }
             Err(e) => VaultOpResponse::from_link(Err(e)),
         }
+    }
+
+    /// retry_send as the command runs it.
+    async fn retry(s: &Slot, id: &str, pending_id: &str) -> VaultOpResponse {
+        let how = How::Retry { pending_id: pending_id.into(), connection_id: id.into() };
+        retried_response(run(s, "message.send", serde_json::Value::Null, shape::message_sent, how).await, pending_id)
+    }
+
+    fn pending(r: &VaultOpResponse) -> (String, String) {
+        let d = r.data.as_ref().expect("data");
+        (d["pending_id"].as_str().expect("a pending_id").into(), d["expires_at"].as_str().expect("an expires_at").into())
     }
 
     const PAGE: &str = r#"{"messages":[{"message_id":"m-1","direction":"out","text":"first","sent_at":"2026-11-25T10:00:00Z","delivered":true,"read":true},
@@ -1184,65 +1272,118 @@ mod tests {
     const SENT: &str = r#"{"message_id":"m-9","sent_at":"2026-11-25T10:00:00Z"}"#;
 
     /// A send the relay took but the vault didn't answer in time is kept in
-    /// memory (never in the stored outbox): the same text again goes under
-    /// its id, so the vault sees one message; another text first retries
-    /// it, and the answer says what became of it.
+    /// memory (never in the stored outbox), with a pending_id and an
+    /// expires_at. retry_send goes under its id, so the vault sees one
+    /// message; another send first retries it, and `earlier` says what
+    /// became of it.
     #[tokio::test]
     async fn an_unanswered_send_is_kept_and_retried_under_its_id() {
         let dir = tempfile::tempdir().unwrap();
         let (vault, s) = live(dir.path()).await; // message.send taken, not answered
         let r = send(&s, "c-1", "first").await;
         assert_eq!((r.success, r.error_code), (false, Some("unconfirmed")));
-        // The token the view keeps with its message.
-        let token = r.data.as_ref().and_then(|d| d["pending_id"].as_str()).expect("a pending_id").to_string();
+        let (token, until) = pending(&r);
         assert_eq!(vault.deposited_ids("message.send"), std::slice::from_ref(&token), "the request id");
+        assert!(chrono::DateTime::parse_from_rfc3339(&until).is_ok(), "{until}");
         // Still unanswered: another message isn't sent behind it.
         let r = send(&s, "c-2", "second").await;
         assert_eq!(r.error_code, Some("earlier_unconfirmed"));
-        assert_eq!(r.data.as_ref().map(|d| d["earlier"].clone()), Some(json!({"pending_id": token, "connection_id": "c-1", "success": false, "error_code": "unconfirmed", "error": crate::link::ops::OP_UNCONFIRMED_NOTICE})));
+        assert_eq!(r.data.as_ref().map(|d| d["earlier"].clone()), Some(json!({"pending_id": token, "expires_at": until, "connection_id": "c-1", "success": false, "error_code": "unconfirmed", "error": crate::link::ops::OP_UNCONFIRMED_NOTICE})));
         assert!(r.data.as_ref().unwrap().get("pending_id").is_none(), "the second one isn't kept");
+        // The explicit retry, by its token: sent, settled done, one message.
         vault.answer("message.send", Ok(SENT));
-        let r = send(&s, "c-1", "first").await;
-        assert!(r.success && r.data.as_ref().unwrap().get("earlier").is_none(), "{r:?}");
+        let r = retry(&s, "c-1", &token).await;
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.data, Some(json!({"message_id": "m-9", "sent_at": "2026-11-25T10:00:00Z", "pending_id": token, "settled": "done"})));
         assert_eq!(vault.deposited_ids("message.send").len(), 1, "one message to the vault, under the kept id: {:?}", vault.deposited());
+        // Settled: a retry of it now sends nothing.
+        let r = retry(&s, "c-1", &token).await;
+        assert_eq!(r.error_code, Some("unconfirmed_expired"));
+        assert_eq!(vault.deposited_ids("message.send").len(), 1);
         // Kept again, then another text: the kept one first, then the new one.
         vault.unanswer("message.send");
-        let third = send(&s, "c-1", "third").await.data.unwrap()["pending_id"].clone();
+        let (third, third_until) = pending(&send(&s, "c-1", "third").await);
         vault.answer("message.send", Ok(SENT));
         let r = send(&s, "c-1", "fourth").await;
         assert!(r.success, "{r:?}");
         let d = r.data.unwrap();
-        assert_eq!(d["earlier"], json!({"pending_id": third, "connection_id": "c-1", "success": true, "data": {"message_id": "m-9", "sent_at": "2026-11-25T10:00:00Z"}}));
+        assert_eq!(d["earlier"], json!({"pending_id": third, "expires_at": third_until, "connection_id": "c-1", "success": true, "settled": "done", "data": {"message_id": "m-9", "sent_at": "2026-11-25T10:00:00Z"}}));
         assert_eq!(d["message_id"], "m-9");
         assert_eq!(vault.deposited_ids("message.send").len(), 3, "the first, the kept third, the fourth");
         assert!(!serde_json::to_string(&d).unwrap().contains("third"), "the kept text isn't echoed");
     }
 
-    /// A send taken but unanswered, then the relay out of reach: the same
-    /// text again is still `unconfirmed` (never `not_sent`), and kept.
+    /// The same text twice while the first is kept: never merged.
+    #[tokio::test]
+    async fn the_same_text_twice_is_never_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, s) = live(dir.path()).await; // taken, not answered
+        let first = send(&s, "c-1", "ok").await;
+        let (token, _) = pending(&first);
+        let second = send(&s, "c-1", "ok").await;
+        assert_eq!(second.error_code, Some("earlier_unconfirmed"), "held back, not merged");
+        assert_eq!(vault.deposited_ids("message.send"), std::slice::from_ref(&token));
+        vault.answer("message.send", Ok(SENT));
+        let third = send(&s, "c-1", "ok").await;
+        assert!(third.success);
+        assert_eq!(vault.deposited_ids("message.send").len(), 2, "two messages");
+    }
+
+    /// A vault error answered to a retry, or to the kept-first retry,
+    /// settles it as not done, with the vault's code.
+    #[tokio::test]
+    async fn a_refused_retry_is_settled_not_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, s) = live(dir.path()).await; // taken, not answered
+        let (token, _) = pending(&send(&s, "c-1", "first").await);
+        vault.answer("message.send", Err("connection_unavailable"));
+        let r = retry(&s, "c-1", &token).await;
+        assert_eq!((r.success, r.error_code), (false, Some("connection_unavailable")));
+        assert_eq!(r.data, Some(json!({"pending_id": token, "settled": "not_done", "vault_code": "connection_unavailable"})));
+        // Through the kept-first gate.
+        vault.unanswer("message.send");
+        let (token, until) = pending(&send(&s, "c-1", "second").await);
+        vault.answer("message.send", Err("forbidden"));
+        let r = send(&s, "c-1", "third").await;
+        let e = r.data.as_ref().unwrap()["earlier"].clone();
+        assert_eq!((e["pending_id"].as_str(), e["expires_at"].as_str(), e["settled"].as_str(), e["vault_code"].as_str(), e["error_code"].as_str()), (Some(token.as_str()), Some(until.as_str()), Some("not_done"), Some("forbidden"), Some("forbidden")));
+    }
+
+    /// A kept send, then the relay out of reach: retry_send is still
+    /// `unconfirmed` (never `not_sent`), and kept; and a lock known before
+    /// it. No unconfirmed text says the opposite.
     #[tokio::test]
     async fn a_retry_with_the_relay_out_of_reach_stays_unconfirmed() {
         let dir = tempfile::tempdir().unwrap();
         let (vault, s) = live(dir.path()).await; // taken, not answered
         let first = send(&s, "c-1", "first").await;
         assert_eq!(first.error_code, Some("unconfirmed"));
+        let (token, until) = pending(&first);
         vault.offline(true);
-        let r = send(&s, "c-1", "first").await;
+        let r = retry(&s, "c-1", &token).await;
         assert_eq!((r.success, r.error_code), (false, Some("unconfirmed")), "{r:?}");
-        assert_eq!(r.data.as_ref().map(|d| d["pending_id"].clone()), first.data.as_ref().map(|d| d["pending_id"].clone()), "the same token");
+        assert_eq!(pending(&r), (token.clone(), until.clone()), "the same token");
         // Locked, known before the retry: still unconfirmed.
         vault.offline(false);
         vault.lock_vault(None);
         let _ = s.lock().await.as_mut().unwrap().read_status().await;
-        let locked = send(&s, "c-1", "first").await;
+        let locked = retry(&s, "c-1", &token).await;
         assert_eq!((locked.success, locked.error_code), (false, Some("unconfirmed")), "{locked:?}");
-        // No unconfirmed answer says the opposite.
+        assert_eq!(pending(&locked), (token, until));
         for a in [&first, &r, &locked] {
             let n = a.error.as_deref().unwrap_or("");
             assert!(n.contains("may still happen") && !n.contains("Try again") && !n.contains("couldn't send"), "{n}");
         }
         assert_eq!(r.error.as_deref(), Some(crate::link::ops::OP_UNCONFIRMED_UNREACHABLE_NOTICE));
         assert!(locked.error.as_deref().unwrap_or("").starts_with(crate::link::VAULT_LOCKED_NOTICE));
+    }
+
+    #[tokio::test]
+    async fn retry_send_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, s) = live(dir.path()).await;
+        assert_eq!(retry(&s, "c-1", "unknown").await.error_code, Some("unconfirmed_expired"), "nothing kept");
+        assert!(vault.deposited().iter().all(|k| k != "message.send"));
     }
 
     /// The vault answered ok, but its answer doesn't read: never a "try
@@ -1257,6 +1398,8 @@ mod tests {
         assert_eq!((r.success, r.error_code), (false, Some("answer_unreadable")));
         assert!(!r.error.as_deref().unwrap_or("").contains("Try again"), "{r:?}");
         assert!(r.data.is_none(), "nothing kept: no pending_id");
+        // The view reads the conversation first; a send after that is a new
+        // message.
         assert_eq!(vault.deposited_ids("message.send").len(), 1);
     }
 

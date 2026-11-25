@@ -99,9 +99,11 @@ export interface ConnectionRequests {
 /** What every vault command answers (`VaultOpResponse` in Rust). */
 export interface VaultOpResponse<T> {
   success: boolean;
-  /** The answer. `send_message` may carry `data` when `success` is false:
-   *  `pending_id` with `unconfirmed`, and `earlier` (a kept send retried
-   *  first), as `sent_response` in commands/vault.rs says. */
+  /** The answer. `send_message` and `retry_send` may carry `data` when
+   *  `success` is false: `pending_id` and `expires_at` for a kept send,
+   *  `earlier` (a kept send retried first), and `settled` ("done" or
+   *  "not_done", with `vault_code`), as the doc comments of `send_message`
+   *  and `retry_send` in commands/vault.rs say. */
   data?: T;
   error?: string;
   /** Stable codes: no_session, held, locked, unknown, unconfirmed (it may
