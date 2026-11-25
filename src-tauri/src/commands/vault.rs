@@ -67,12 +67,18 @@ async fn link_op(
     shape: fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>,
     change: bool,
 ) -> VaultOpResponse {
+    // Registered before the reset mark is read, so a reset that starts any
+    // time after it wakes the operation.
+    let stop = state.reset_notify.notified();
+    tokio::pin!(stop);
+    stop.as_mut().enable();
     let mark = crate::commands::auth::reset_mark(state);
     let r = link_op_with(
         &state.link,
         || state.snapshot().active_at(chrono::Utc::now()),
         || crate::commands::auth::overtaken_by_reset(state, mark),
         |s| state.publish(s),
+        stop,
         kind,
         body,
         shape,

@@ -869,6 +869,25 @@ impl<T: Transport, C: Clock> Session<T, C> {
         self.wait_for(store, id, timeout).await
     }
 
+    /// A request with `exp` (§8.5), under `id` if given (an application
+    /// retry, §8.6: the vault answers it from its cache), else a new one.
+    /// A retry keeps its first `exp`, so it never waits longer than that.
+    pub async fn request_at(
+        &mut self,
+        store: &mut impl Persist,
+        id: Option<&str>,
+        kind: &str,
+        body: &str,
+        timeout: TimeDelta,
+        exp: DateTime<Utc>,
+    ) -> Result<Inner, SessionError> {
+        self.last_request = None;
+        let inner = self.inner(id, kind, body.to_string(), None, Some(exp))?;
+        let id = self.send_inner(store, inner, true).await?;
+        self.last_request = Some(id.clone());
+        self.wait_for(store, id, timeout).await
+    }
+
     /// [`Session::request`] again under the same inner `id` (an
     /// application retry, §8.6): the vault answers it from its cache
     /// instead of acting twice.

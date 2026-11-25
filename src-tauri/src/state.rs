@@ -38,6 +38,10 @@ pub struct AppState {
     /// message views (Phase 5, 5.1; set up in `lib.rs`).
     pub deliver: Deliver,
 
+    /// Woken when a reset (End session, lock, log-out) starts, so an
+    /// operation in flight lets go of the link at once (`link::ops`).
+    pub reset_notify: Arc<tokio::sync::Notify>,
+
     /// The mailbox collector (`link::spawn_collect`), running alongside the
     /// refresh and stopped with it.
     pub collect_task: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
@@ -107,6 +111,7 @@ impl AppState {
             changed: Arc::new(std::sync::RwLock::new(None)),
             deliver: Arc::new(std::sync::RwLock::new(None)),
             collect_task: Arc::default(),
+            reset_notify: Arc::default(),
             delegation: Arc::new(Mutex::new(DelegationManager::new())),
             is_registered: Arc::new(RwLock::new(false)),
             pairing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),

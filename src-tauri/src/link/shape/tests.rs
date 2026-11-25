@@ -78,6 +78,35 @@ fn requests_are_checked_too() {
     assert_eq!(v["incoming"][0]["pending_id"], "p-1");
     let mut bad = inc;
     bad["profile"]["ik"] = json!("x");
-    assert_eq!(request_list(&json!({"incoming": [bad], "outgoing": []})), Err(BadShape), "a stranger's profile is checked");
+    let v = request_list(&json!({"incoming": [bad], "outgoing": []})).unwrap();
+    assert_eq!(v["incoming"][0], json!({"pending_id": "p-1", "unreadable": true}), "a stranger's profile is checked, and not passed on");
     assert_eq!(request_list(&json!({"incoming": []})), Err(BadShape));
+}
+
+/// One bad entry doesn't blank the list: a connection is left out and
+/// counted; a request is kept by its id, marked, so it can be declined.
+#[test]
+fn a_bad_entry_doesnt_blank_the_list() {
+    let mut bad = conn();
+    bad["ik"] = json!("short");
+    let l = connection_list(&json!({"connections": [conn(), bad]})).unwrap();
+    assert_eq!(l["connections"].as_array().unwrap().len(), 1);
+    assert_eq!(l["unreadable"], 1);
+    let good = json!({"pending_id": "p-1", "invite_id": "i", "sas": "1", "remote": "r", "state": "pending",
+        "peer_approved": false, "created_at": "t", "exp": "t"});
+    let mut stranger = good.clone();
+    stranger["pending_id"] = json!("p-2");
+    stranger["profile"] = json!({"first_name": 7});
+    let v = request_list(&json!({"incoming": [good, stranger, {"no": "id"}], "outgoing": []})).unwrap();
+    let inc = v["incoming"].as_array().unwrap();
+    assert_eq!(inc.len(), 2, "the one without an id is dropped");
+    assert_eq!(inc[1], json!({"pending_id": "p-2", "unreadable": true}));
+}
+
+/// An ik of 44 characters that isn't 32 bytes is refused.
+#[test]
+fn an_ik_of_the_wrong_length() {
+    let mut c = conn();
+    c["ik"] = json!("A".repeat(44)); // 33 bytes
+    assert_eq!(connection(&c), Err(BadShape));
 }
