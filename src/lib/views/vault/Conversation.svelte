@@ -26,6 +26,7 @@
         EMPTY_MESSAGE,
         LINE_ISOLATE,
         LINK_NOT_OPENED,
+        linkOutcomeText,
         EDIT_NEEDS_EMPTY_BOX,
         returnedElsewhereText,
         knownOutgoing,
@@ -87,6 +88,7 @@
     let olderLoading = $state(false);
     let olderError = $state('');
     let linkError = $state('');
+    let linkNote = $state('');
     let scrollEl: HTMLDivElement | undefined = $state();
 
     /** Counts newest-page reads: only the latest one's answer is applied,
@@ -144,6 +146,7 @@
         olderLoading = false;
         olderError = '';
         linkError = '';
+        linkNote = '';
         tried.clear();
         // No cleaned message text stays in memory for a conversation not shown.
         contentCache.clear();
@@ -495,10 +498,12 @@
 
     async function openLink(p: { text: string }): Promise<void> {
         linkError = '';
+        linkNote = '';
         try {
-            // `opened`, or nothing to say: cancelled, or "Open" too soon
-            // after the prompt showed (MIN_CONFIRM_MS in commands/links.rs).
-            await invoke<string>('open_message_link', { text: p.text });
+            // `too_fast` ("Open" too soon after the prompt showed,
+            // MIN_CONFIRM_MS in commands/links.rs) says to try again;
+            // `opened` and `not_confirmed` say nothing.
+            linkNote = linkOutcomeText(await invoke<string>('open_message_link', { text: p.text }));
         } catch {
             // Refused, busy (another link's prompt shown, or one declined
             // just now), the prompt not shown, or not opened.
@@ -663,6 +668,8 @@
             <div aria-live="polite">
                 {#if linkError}
                     <div class="compose-note error">{linkError}</div>
+                {:else if linkNote}
+                    <div class="compose-note">{linkNote}</div>
                 {/if}
             </div>
 

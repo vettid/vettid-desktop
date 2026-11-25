@@ -44,6 +44,8 @@ import {
   linkPieces,
   MAX_LINK_BYTES,
   MAX_HOST_BYTES,
+  LINK_TOO_FAST,
+  linkOutcomeText,
   bubbleLines,
   bubbleContent,
   textBytes,
@@ -634,6 +636,13 @@ test('§10.5 links: what open_message_link would refuse is text, not a link', ()
     assert.deepEqual(linkPieces(`https://${host}/`), [{ text: `https://${host}/` }], host.slice(0, 20));
   }
   assert.equal(/** @type {any} */ (linkPieces('https://[2001:db8::1]:8443/')[0]).host, '[2001:db8::1]:8443');
+  // A host name of a-z, 0-9, dots and dashes only, once parsed.
+  for (const t of ['https://a_b.example/', 'https://a*b.example/', 'https://a~b.example/', 'https://a!b.example/']) {
+    assert.deepEqual(linkPieces(t), [{ text: t }], t);
+  }
+  for (const t of ['https://a-b.example-1.com/', 'https://EXAMPLE.com/', 'https://192.0.2.1:8443/']) {
+    assert.equal(/** @type {any} */ (linkPieces(t)[0]).text, t, t);
+  }
 });
 
 test('bubble lines and content: attachment placeholder, caption under it, never an empty bubble', () => {
@@ -680,6 +689,12 @@ test('inbound batches: dropped while not live, a resync reads the newest page', 
   assert.equal(conversationAction({ resync: true }, true), 'reload');
   assert.equal(conversationAction({ resync: false }, true), 'apply');
   assert.equal(conversationAction(null, true), 'drop');
+});
+
+test('after open_message_link: a line only for an Open too soon', () => {
+  assert.equal(linkOutcomeText('too_fast'), LINK_TOO_FAST);
+  assert.equal(LINK_TOO_FAST, 'Click the link again, then choose Open.');
+  for (const o of ['opened', 'not_confirmed', undefined, null, '', 'refused']) assert.equal(linkOutcomeText(o), '', String(o));
 });
 
 test('the link question names the host, isolated', () => {

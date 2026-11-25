@@ -962,15 +962,16 @@ const MAX_LABEL_BYTES = 63;
 
 /**
  * The checks commands/links.rs makes on the parsed URL that `linkable`
- * can't: its host (punycode, as the prompt shows it) at most
- * MAX_HOST_BYTES with labels of at most 63, and the URL as written out at
- * most MAX_LINK_BYTES.
+ * can't: its host (punycode, as the prompt shows it) an IP address, or a
+ * name of a-z, 0-9, dots and dashes of at most MAX_HOST_BYTES with labels
+ * of at most 63; and the URL as written out at most MAX_LINK_BYTES.
  * @param {URL} url
  */
 function parsedFits(url) {
   if (new TextEncoder().encode(url.href).length > MAX_LINK_BYTES) return false;
   const host = url.hostname;
   if (host.startsWith('[')) return true;
+  if (!/^[a-z0-9.-]+$/.test(host)) return false;
   return host.length <= MAX_HOST_BYTES && host.split('.').every((label) => label.length <= MAX_LABEL_BYTES);
 }
 
@@ -1131,3 +1132,17 @@ export const EDIT_NEEDS_EMPTY_BOX = 'Edit puts this text in the message box once
 // NEW TEXT (owner approval needed)
 /** When a link wasn't opened: refused, busy, its prompt not shown, or the system didn't open it. */
 export const LINK_NOT_OPENED = "This desktop couldn't open this link.";
+
+// NEW TEXT (owner approval needed)
+/** When Open came too soon after the link's prompt showed (`too_fast`): nothing opened. */
+export const LINK_TOO_FAST = 'Click the link again, then choose Open.';
+
+/**
+ * What the view says after `open_message_link` answered: only for
+ * `too_fast`; nothing for `opened` or `not_confirmed` (cancelled, closed,
+ * or no answer in time). Its errors show LINK_NOT_OPENED.
+ * @param {unknown} outcome
+ */
+export function linkOutcomeText(outcome) {
+  return outcome === 'too_fast' ? LINK_TOO_FAST : '';
+}
