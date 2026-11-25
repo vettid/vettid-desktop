@@ -27,6 +27,13 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-shell = "2"
 tauri-plugin-notification = "2"
+# The native prompt before a link in a message opens in the browser
+# (commands/links.rs, VAULT-MESSAGING §10.5). rfd itself rather than
+# tauri-plugin-dialog: the plugin turns a dismissed dialog into its second
+# button's answer, so Cancel couldn't be the first (default) button. The
+# Windows task dialog (common-controls-v6, in tauri's manifest) and GTK on
+# Linux, as tauri-plugin-dialog builds it.
+rfd = { version = "=0.16.1", default-features = false, features = ["common-controls-v6", "gtk3"] }
 # Single-instance: a second launch of the binary doesn't open a new
 # window — it fires a callback in the running process so we can focus
 # the existing window instead. Prevents two VettID Desktops running at
