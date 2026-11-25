@@ -1,18 +1,27 @@
 <script lang="ts">
     import { onMount } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
-    import type { Connection, IncomingRequest, OutgoingRequest, VaultOpResponse } from '../../connections';
+    import type { Connection, VaultOpResponse } from '../../connections';
     import { selectedConnectionStore } from '../../stores/navigation';
     import {
         connectionsStore,
         connectionsErrorStore,
+        connectionsUnreadableStore,
         connectionRequestsStore,
         connectionRequestsErrorStore,
         loadConnections,
         loadConnectionRequests,
         reloadConnectionViews,
+        NOT_LIVE_TEXT,
     } from '../../stores/vault';
-    import { connectionTitle, secondaryNames, requestTitle, requestSecondary, declineArgs } from '../../connectionView.js';
+    import {
+        connectionTitle,
+        secondaryNames,
+        requestRow,
+        declineArgs,
+        UNREADABLE_CONNECTIONS,
+        hasUnreadableConnections,
+    } from '../../connectionView.js';
     import { formatRelativeOrAbsolute } from '../../time';
     import Avatar from '../../components/Avatar.svelte';
 
@@ -24,7 +33,9 @@
     let loading = $state(true);
     let error = $derived($connectionsErrorStore);
     let requests = $derived($connectionRequestsStore);
-    let requestsError = $derived($connectionRequestsErrorStore);
+    // While the session isn't live the list says so; the requests don't say it again.
+    let requestsError = $derived($connectionRequestsErrorStore === NOT_LIVE_TEXT ? '' : $connectionRequestsErrorStore);
+    let someUnreadable = $derived(hasUnreadableConnections($connectionsUnreadableStore));
     let search = $state('');
 
     type SortOrder = 'recent' | 'alpha' | 'created';
@@ -84,7 +95,7 @@
     let declining = $state<string | null>(null);
     let declineErrors = $state<Record<string, string>>({});
 
-    async function decline(side: 'incoming' | 'outgoing', key: string, req: IncomingRequest | OutgoingRequest) {
+    async function decline(side: 'incoming' | 'outgoing', key: string, req: { pending_id?: string; connection_id?: string }) {
         const args = declineArgs(side, req);
         if (!args || declining) return;
         declining = key;
@@ -122,10 +133,11 @@
                     <ul class="req-list">
                         {#each requests.incoming as req (req.pending_id)}
                             {@const key = `in:${req.pending_id}`}
-                            <li class="req">
+                            {@const row = requestRow(req)}
+                            <li class="req" class:unreadable={row.unreadable}>
                                 <div class="req-text">
-                                    <div class="name"><bdi>{requestTitle(req)}</bdi></div>
-                                    {#each requestSecondary(req) as s}<div class="row2"><bdi>{s}</bdi></div>{/each}
+                                    <div class="name"><bdi>{row.title}</bdi></div>
+                                    {#each row.secondary as s}<div class="row2"><bdi>{s}</bdi></div>{/each}
                                     {#if declineErrors[key]}<div class="req-error">{declineErrors[key]}</div>{/if}
                                 </div>
                                 <button class="decline" disabled={declining !== null} onclick={() => decline('incoming', key, req)}>
@@ -140,10 +152,11 @@
                     <ul class="req-list">
                         {#each requests.outgoing as req (req.connection_id)}
                             {@const key = `out:${req.connection_id}`}
-                            <li class="req">
+                            {@const row = requestRow(req)}
+                            <li class="req" class:unreadable={row.unreadable}>
                                 <div class="req-text">
-                                    <div class="name"><bdi>{requestTitle(req)}</bdi></div>
-                                    {#each requestSecondary(req) as s}<div class="row2"><bdi>{s}</bdi></div>{/each}
+                                    <div class="name"><bdi>{row.title}</bdi></div>
+                                    {#each row.secondary as s}<div class="row2"><bdi>{s}</bdi></div>{/each}
                                     {#if declineErrors[key]}<div class="req-error">{declineErrors[key]}</div>{/if}
                                 </div>
                                 <button class="decline" disabled={declining !== null} onclick={() => decline('outgoing', key, req)}>
@@ -172,6 +185,11 @@
         </select>
     </div>
 
+    <!-- The count is 0 after a failed load, so this never sits beside an error. -->
+    {#if someUnreadable}
+        <div class="status error unreadable-note">{UNREADABLE_CONNECTIONS}</div>
+    {/if}
+
     {#if loading && connections.length === 0}
         <div class="status">Loading connections…</div>
     {:else if error}
@@ -179,7 +197,7 @@
     {:else if visible.length === 0}
         {#if search.trim()}
             <div class="status">No connections match "{search}".</div>
-        {:else}
+        {:else if !someUnreadable}
             <div class="empty">
                 <div class="empty-icon" aria-hidden="true">👥</div>
                 <p class="empty-title">No connections yet</p>
@@ -263,6 +281,7 @@
 
     .status { color: var(--text-muted); padding: 16px; text-align: center; }
     .status.error { color: var(--error); }
+    .unreadable-note { padding: 0 0 10px; text-align: left; font-size: 0.85rem; }
 
     .empty {
         flex: 1;
@@ -352,6 +371,7 @@
         padding: 8px 12px;
     }
     .req-text { flex: 1; min-width: 0; }
+    .req.unreadable .name { color: var(--text-muted); font-style: italic; }
     .req-error { margin-top: 4px; font-size: 0.8rem; color: var(--error); }
     .decline {
         background: none;

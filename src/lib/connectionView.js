@@ -101,6 +101,36 @@ export function requestSecondary(r) {
   return display && display !== namesOf(r.profile) ? [display] : [];
 }
 
+// NEW TEXT (owner approval needed)
+/** The title of a request the vault sent in a form this desktop can't read. */
+export const UNREADABLE_REQUEST = 'Unreadable request';
+
+/**
+ * What a request row shows. A request marked `unreadable` (it didn't check
+ * out, and only its id is kept) is titled "Unreadable request" and shows no
+ * profile fields; any other is titled by `requestTitle`, with
+ * `requestSecondary` under it. Either can be declined (`declineArgs`).
+ * @param {{ unreadable?: unknown, name?: string, profile?: { first_name?: string, last_name?: string, name?: string } | null }} r
+ * @returns {{ unreadable: boolean, title: string, secondary: string[] }}
+ */
+export function requestRow(r) {
+  if (r.unreadable) return { unreadable: true, title: UNREADABLE_REQUEST, secondary: [] };
+  return { unreadable: false, title: requestTitle(r), secondary: requestSecondary(r) };
+}
+
+// NEW TEXT (owner approval needed)
+/** Shown once above the list when connections were left out of it. */
+export const UNREADABLE_CONNECTIONS =
+  "Some connections couldn't be shown: your vault sent them in a form this desktop can't read.";
+
+/**
+ * Whether the list answer's `unreadable` count says connections were left out.
+ * @param {unknown} count
+ */
+export function hasUnreadableConnections(count) {
+  return typeof count === 'number' && count > 0;
+}
+
 /**
  * Text received from another party, put inside a sentence: wrapped in FSI ...
  * PDI (§10.8 step 5); "a connection" when it is the placeholder or empty.

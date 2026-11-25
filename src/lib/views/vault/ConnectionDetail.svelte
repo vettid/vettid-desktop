@@ -125,7 +125,7 @@
                 <h4>Connection</h4>
                 <dl class="fields">
                     {#if fingerprint}
-                        <dt>Fingerprint</dt>
+                        <dt>Vault key fingerprint</dt>
                         <dd class="fp">{fingerprint}</dd>
                     {/if}
                     <dt>Created</dt>

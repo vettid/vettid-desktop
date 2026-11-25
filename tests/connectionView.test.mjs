@@ -14,6 +14,10 @@ import {
   declineArgs,
   inboundAction,
   livenessChanged,
+  UNREADABLE_REQUEST,
+  UNREADABLE_CONNECTIONS,
+  requestRow,
+  hasUnreadableConnections,
 } from '../src/lib/connectionView.js';
 
 const FSI = '\u2068';
@@ -111,4 +115,31 @@ test('liveness: a change either way reads again; no change does not', () => {
   assert.ok(livenessChanged('active', 'suspended'));
   assert.ok(!livenessChanged('active', 'active'));
   assert.ok(!livenessChanged('expired', 'suspended'));
+});
+
+test('unreadable request: its own title, no profile fields, still declinable', () => {
+  assert.equal(UNREADABLE_REQUEST, 'Unreadable request');
+  const inc = { pending_id: 'p1', unreadable: true };
+  assert.deepEqual(requestRow(inc), { unreadable: true, title: 'Unreadable request', secondary: [] });
+  assert.deepEqual(declineArgs('incoming', inc), { pendingId: 'p1' });
+  const out = { connection_id: 'c1', unreadable: true };
+  assert.deepEqual(requestRow(out), { unreadable: true, title: 'Unreadable request', secondary: [] });
+  assert.deepEqual(declineArgs('outgoing', out), { connectionId: 'c1' });
+  // Never the placeholder, even if other fields came with it.
+  assert.equal(requestRow({ pending_id: 'p2', unreadable: true, profile: ada, name: 'Ada' }).title, UNREADABLE_REQUEST);
+  assert.notEqual(requestRow(inc).title, NAME_NOT_SHARED);
+});
+
+test('readable request: titled and described as before', () => {
+  assert.deepEqual(requestRow({ pending_id: 'p', profile: ada }), { unreadable: false, title: 'Ada King', secondary: ['Ada'] });
+  assert.deepEqual(requestRow({ connection_id: 'c', name: 'Bob' }), { unreadable: false, title: NAME_NOT_SHARED, secondary: ['Bob'] });
+});
+
+test('unreadable connections: one line, only when the count is above 0', () => {
+  assert.equal(UNREADABLE_CONNECTIONS, "Some connections couldn't be shown: your vault sent them in a form this desktop can't read.");
+  assert.ok(hasUnreadableConnections(1));
+  assert.ok(hasUnreadableConnections(3));
+  assert.ok(!hasUnreadableConnections(0));
+  assert.ok(!hasUnreadableConnections(undefined));
+  assert.ok(!hasUnreadableConnections('2'));
 });

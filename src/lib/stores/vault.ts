@@ -1,7 +1,7 @@
 import { writable, derived, get, type Writable, type Readable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
-import type { Connection, ConnectionRequests, VaultOpResponse } from '../connections';
+import type { Connection, ConnectionList, ConnectionRequests, VaultOpResponse } from '../connections';
 import { INBOUND_EVENT, type InboundBatch } from '../inbound';
 import { inboundAction, livenessChanged } from '../connectionView.js';
 import { decodeEventPayload } from '../events';
@@ -60,6 +60,9 @@ export const pendingGrantCountStore: Writable<number | null> = writable(null);
 /** Why the last `loadConnections` failed (the backend's own text), or ''. */
 export const connectionsErrorStore: Writable<string> = writable('');
 
+/** How many connections the last load left out as unreadable (0 on failure). */
+export const connectionsUnreadableStore: Writable<number> = writable(0);
+
 /** Counts `loadConnections` calls: only the latest one's answer is applied. */
 let connectionsSeq = 0;
 
@@ -73,16 +76,20 @@ let connectionsSeq = 0;
 export async function loadConnections(): Promise<void> {
     const seq = ++connectionsSeq;
     let list: Connection[] = [];
+    let unreadable = 0;
     let error = '';
     try {
-        const resp: VaultOpResponse<{ connections?: Connection[] }> = await invoke('list_connections');
-        if (resp.success && resp.data) list = resp.data.connections ?? [];
-        else error = resp.error ?? 'Failed to load connections';
+        const resp: VaultOpResponse<Partial<ConnectionList>> = await invoke('list_connections');
+        if (resp.success && resp.data) {
+            list = resp.data.connections ?? [];
+            unreadable = resp.data.unreadable ?? 0;
+        } else error = resp.error ?? 'Failed to load connections';
     } catch (e) {
         error = String(e);
     }
     if (seq !== connectionsSeq) return;
     connectionsStore.set(list);
+    connectionsUnreadableStore.set(unreadable);
     connectionsErrorStore.set(error);
     const selected = get(selectedConnectionStore);
     if (selected) selectedConnectionStore.set(list.find((c) => c.id === selected.id) ?? null);
@@ -131,7 +138,7 @@ export function reloadConnectionViews(): void {
     void loadConnectionRequests();
 }
 
-/** Shown in place of the list and the requests while no session is live. */
+/** Shown once, in place of the list, while no session is live (the requests view does not repeat it). */
 export const NOT_LIVE_TEXT = "Your session isn't live, so your connections aren't shown.";
 
 /**
@@ -143,6 +150,7 @@ export function clearConnectionViews(): void {
     connectionsSeq++;
     requestsSeq++;
     connectionsStore.set([]);
+    connectionsUnreadableStore.set(0);
     connectionsErrorStore.set(NOT_LIVE_TEXT);
     connectionRequestsStore.set(null);
     connectionRequestsErrorStore.set(NOT_LIVE_TEXT);

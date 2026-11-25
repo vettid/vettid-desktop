@@ -41,6 +41,13 @@ export interface Connection {
   relay_held?: { since: string };
 }
 
+/** `connection.list` as the backend passes it on: a connection that didn't
+ *  check out is left out and counted in `unreadable`. */
+export interface ConnectionList {
+  connections: Connection[];
+  unreadable?: number;
+}
+
 /** An incoming request (`connection.request.list`). */
 export interface IncomingRequest {
   pending_id: string;
@@ -70,9 +77,22 @@ export interface OutgoingRequest {
   introduced_by?: string;
 }
 
+/** A request that didn't check out: kept by its id only, so it can still
+ *  be declined. */
+export interface UnreadableIncomingRequest {
+  pending_id: string;
+  unreadable: true;
+}
+
+/** An outgoing request that didn't check out, kept by its id only. */
+export interface UnreadableOutgoingRequest {
+  connection_id: string;
+  unreadable: true;
+}
+
 export interface ConnectionRequests {
-  incoming: IncomingRequest[];
-  outgoing: OutgoingRequest[];
+  incoming: (IncomingRequest | UnreadableIncomingRequest)[];
+  outgoing: (OutgoingRequest | UnreadableOutgoingRequest)[];
 }
 
 /** What every vault command answers (`VaultOpResponse` in Rust). */
