@@ -291,18 +291,34 @@ export function knownOutgoing(messages, locals, connectionId) {
 /** How long the view waits between two reads it makes on its own (chosen). */
 export const RECHECK_MS = 5_000;
 
+/** The longest wait between two such reads while they keep failing (chosen). */
+export const RECHECK_MAX_MS = 60_000;
+
+/**
+ * The wait before the next read the view makes on its own, after
+ * `failures` reads in a row that failed: RECHECK_MS, doubled for each
+ * failure, at most RECHECK_MAX_MS. A read that succeeds resets `failures`.
+ * @param {number} failures
+ */
+export function rereadDelay(failures) {
+  const n = Math.max(0, Math.min(failures, 16));
+  return Math.min(RECHECK_MS * 2 ** n, RECHECK_MAX_MS);
+}
+
 /**
  * Whether the view should read the newest page again on its own: a send of
  * this connection is past its deadline, or expired or unreadable and not
  * yet settled by a read (one that failed leaves it so), and the last read
- * began at least RECHECK_MS ago (`sinceLastRead`, by `performance.now()`).
+ * began at least `rereadDelay(failures)` ago (`sinceLastRead`, by
+ * `performance.now()`).
  * @param {Local[]} locals
  * @param {string} connectionId
  * @param {number} now
  * @param {number} sinceLastRead
+ * @param {number} [failures] reads in a row that failed
  */
-export function shouldReread(locals, connectionId, now, sinceLastRead) {
-  if (sinceLastRead < RECHECK_MS) return false;
+export function shouldReread(locals, connectionId, now, sinceLastRead, failures = 0) {
+  if (sinceLastRead < rereadDelay(failures)) return false;
   return locals.some(
     (l) =>
       l.connection_id === connectionId &&

@@ -33,6 +33,7 @@
         seenInView,
         shouldReread,
         mergeNewest,
+        rereadDelay,
         DELIVERY_TEXT,
         mergeMessages,
         applySyncEvent,
@@ -96,6 +97,9 @@
     let seq = 0;
     /** When the last newest-page read began, by `performance.now()`. */
     let lastReadAt = -Infinity;
+    /** Newest-page reads in a row that failed: the reads the view makes on
+     *  its own back off (rereadDelay). */
+    let readFailures = 0;
     /** `message.new` and receipts that arrive while the newest page is read. */
     let buffer: { messages: Message[]; events: SyncEv[] } | null = null;
 
@@ -145,6 +149,8 @@
         linkAsk = null;
         linkError = '';
         tried.clear();
+        // No cleaned message text stays in memory for a conversation not shown.
+        contentCache.clear();
         // Receipts held for messages not known yet are stale by the next read.
         kept.held = [];
     }
@@ -228,13 +234,14 @@
             const after = afterReload(kept.locals, cid, next, startedAt);
             kept.locals = after.locals;
             releaseNow();
+            readFailures = 0;
             await tick();
             // Someone reading history stays where they are.
             if (firstRead || atBottom) scrollToBottom();
             // A send that expired or came back unreadable during this read
-            // is read about once more.
-            if (after.recheck) void loadNewest();
+            // is read about again by the timer (shouldReread).
         } else {
+            readFailures += 1;
             // Nothing that wasn't confirmed stays on screen.
             messages = [];
             nextBefore = null;
@@ -488,19 +495,32 @@
 
     // ---- Links (§10.5): the host is shown and the member asked first.
 
-    /** Moves focus into the link prompt when it opens. */
+    /** Moves focus into the link prompt when it opens: to Cancel, so that
+     *  a repeated Enter can't open the link before the host is read. */
     function focusFirst(node: HTMLElement) {
         node.focus();
+    }
+
+    /** The link that opened the prompt: focus goes back to it on Cancel. */
+    let opener: HTMLElement | null = null;
+
+    async function cancelAsk(): Promise<void> {
+        linkAsk = null;
+        const back = opener;
+        opener = null;
+        await tick();
+        if (back?.isConnected) back.focus();
     }
 
     function onAskKeydown(e: KeyboardEvent): void {
         if (e.key === 'Escape') {
             e.preventDefault();
-            linkAsk = null;
+            void cancelAsk();
         }
     }
 
-    function askOpen(p: { href: string; host: string }): void {
+    function askOpen(p: { href: string; host: string }, from?: EventTarget | null): void {
+        opener = from instanceof HTMLElement ? from : null;
         linkError = '';
         linkAsk = { href: p.href, host: p.host };
     }
@@ -541,7 +561,7 @@
         // failed leaves it so), is read about again, every few seconds.
         const timer = setInterval(() => {
             if (!live || !takes || loading) return;
-            if (shouldReread(kept.locals, cid, Date.now(), performance.now() - lastReadAt)) void loadNewest();
+            if (shouldReread(kept.locals, cid, Date.now(), performance.now() - lastReadAt, readFailures)) void loadNewest();
         }, 1_000);
         const onVisible = () => noteSeen();
         document.addEventListener('visibilitychange', onVisible);
@@ -551,6 +571,7 @@
         return () => {
             closed = true;
             seq++;
+            contentCache.clear();
             clearInterval(timer);
             document.removeEventListener('visibilitychange', onVisible);
             window.removeEventListener('focus', onVisible);
@@ -626,7 +647,7 @@
                                 {:else}
                                     <div class="text" class:caption={!!content.placeholder}>
                                         {#each content.body.lines as line}
-                                            <div class="line">{LINE_ISOLATE.start}{#each line as p}{#if 'href' in p}<button type="button" class="link" onclick={() => askOpen(p)}>{p.text}</button>{:else}{p.text}{/if}{/each}{LINE_ISOLATE.end}</div>
+                                            <div class="line">{LINE_ISOLATE.start}{#each line as p}{#if 'href' in p}<button type="button" class="link" onclick={(e) => askOpen(p, e.currentTarget)}>{p.text}</button>{:else}{p.text}{/if}{/each}{LINE_ISOLATE.end}</div>
                                         {/each}
                                     </div>
                                 {/if}
@@ -674,8 +695,8 @@
                 <div class="link-ask" role="dialog" aria-modal="false" aria-labelledby="{cid}-link-ask" tabindex="-1" onkeydown={onAskKeydown}>
                     <span id="{cid}-link-ask">{openLinkQuestion(linkAsk.host)}</span>
                     <!-- NEW TEXT (owner approval needed): "Open" -->
-                    <button type="button" class="primary" use:focusFirst onclick={() => void openAsked()}>Open</button>
-                    <button type="button" onclick={() => (linkAsk = null)}>Cancel</button>
+                    <button type="button" class="primary" onclick={() => void openAsked()}>Open</button>
+                    <button type="button" use:focusFirst onclick={() => void cancelAsk()}>Cancel</button>
                 </div>
             {/if}
             <div aria-live="polite">
