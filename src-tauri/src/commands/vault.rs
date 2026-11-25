@@ -59,7 +59,8 @@ impl VaultOpResponse {
 
 /// Run `kind` with `body` over the link ([`link_op_with`]): only while
 /// the screen shows a live session and no End session, lock or log-out is
-/// under way; its answer checked by `shape`.
+/// under way; its answer checked by `shape`. Every caller here is a read
+/// (`change: false`); the kept-change path is for messaging (5.3).
 async fn link_op(
     state: &AppState,
     kind: &str,

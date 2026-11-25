@@ -133,6 +133,6 @@ test('unreadable connections: one line, only when the count is above 0', () => {
   assert.ok(!hasUnreadableConnections('2'));
 });
 
-test('requests: answered on the phone, said once', () => {
+test('requests: the answered-on-the-phone line is the approved text', () => {
   assert.equal(ANSWERED_ON_PHONE, 'This is done on your phone.');
 });

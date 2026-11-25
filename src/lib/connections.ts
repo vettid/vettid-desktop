@@ -1,7 +1,8 @@
 // The vault's connections as a desktop reads them (DESKTOP-REWORK-PLAN
 // Phase 5, 5.2): VAULT-MESSAGING 0.94.1 §10.4's `<connection>` and
 // `connection.request.list`. Read-only: a desktop never creates or accepts
-// a connection (§3.1); requests are shown read-only and answered on the phone.
+// a connection (§3.1); requests are shown read-only and answered on the
+// phone (0.95.0: `connection.decline` is app-only).
 //
 // These hold personal data (names, profiles): keep them in memory, never
 // in storage or logs.
