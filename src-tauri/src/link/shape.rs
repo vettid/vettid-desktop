@@ -170,20 +170,29 @@ pub fn connection(v: &Value) -> R<Value> {
     Ok(Value::Object(out))
 }
 
-fn list(v: &Value, key: &str, each: impl Fn(&Value) -> R<Value>) -> R<Value> {
-    let o = obj(v)?;
-    let a = o.get(key).and_then(Value::as_array).ok_or(BadShape)?;
+/// `connection.list`'s answer. A connection that doesn't check out is
+/// left out, and counted in `unreadable`; only a malformed top level
+/// fails the list.
+pub fn connection_list(v: &Value) -> R<Value> {
+    let a = obj(v)?.get("connections").and_then(Value::as_array).ok_or(BadShape)?;
     if a.len() > LIST_MAX {
         return Err(BadShape);
     }
+    let ok: Vec<Value> = a.iter().filter_map(|c| connection(c).ok()).collect();
     let mut out = Map::new();
-    out.insert(key.into(), Value::Array(a.iter().map(each).collect::<R<Vec<_>>>()?));
+    out.insert("unreadable".into(), Value::from(a.len() - ok.len()));
+    out.insert("connections".into(), Value::Array(ok));
     Ok(Value::Object(out))
 }
 
-/// `connection.list`'s answer.
-pub fn connection_list(v: &Value) -> R<Value> {
-    list(v, "connections", connection)
+/// A request that doesn't check out, kept with its id (so it can still be
+/// declined) and marked `unreadable`; dropped if even its id doesn't.
+fn unreadable(v: &Value, id_key: &str) -> Option<Value> {
+    let o = v.as_object()?;
+    let mut out = Map::new();
+    s(o, &mut out, id_key, ID_MAX).ok()?;
+    out.insert("unreadable".into(), Value::Bool(true));
+    Some(Value::Object(out))
 }
 
 fn request_common(o: &Map<String, Value>, out: &mut Map<String, Value>) -> R<()> {
@@ -222,16 +231,17 @@ fn outgoing(v: &Value) -> R<Value> {
     Ok(Value::Object(out))
 }
 
-/// `connection.request.list`'s answer.
+/// `connection.request.list`'s answer: a request that doesn't check out
+/// (a stranger's profile, say) is kept by its id, marked `unreadable`.
 pub fn request_list(v: &Value) -> R<Value> {
     let o = obj(v)?;
     let mut out = Map::new();
-    for (k, f) in [("incoming", incoming as fn(&Value) -> R<Value>), ("outgoing", outgoing)] {
+    for (k, f, id) in [("incoming", incoming as fn(&Value) -> R<Value>, "pending_id"), ("outgoing", outgoing, "connection_id")] {
         let a = o.get(k).and_then(Value::as_array).ok_or(BadShape)?;
         if a.len() > LIST_MAX {
             return Err(BadShape);
         }
-        out.insert(k.into(), Value::Array(a.iter().map(f).collect::<R<Vec<_>>>()?));
+        out.insert(k.into(), Value::Array(a.iter().filter_map(|r| f(r).ok().or_else(|| unreadable(r, id))).collect()));
     }
     Ok(Value::Object(out))
 }

@@ -1154,6 +1154,7 @@ fn end_notice<T: vettid_device::transport::Transport, C: vettid_device::pairing:
 /// First, before anything is cleared.
 fn begin_reset(state: &AppState) {
     state.resets_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state.reset_notify.notify_waiters();
 }
 
 /// #43: a memory reset is done, after everything is cleared.

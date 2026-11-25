@@ -65,10 +65,14 @@ struct State {
     deny: bool,
     collects: usize,
     waits: Vec<u64>,
+    /// Each collect first waits this long (a stalled relay).
+    stall: Option<std::time::Duration>,
     /// Scripted answers by request type: `Ok(body)` or `Err(code)`.
     answers: std::collections::HashMap<String, Result<String, String>>,
     /// The type and body of every scripted request answered.
     asked: Vec<(String, String)>,
+    /// The inner id and exp of each of those.
+    asked_ids: Vec<(String, Option<DateTime<Utc>>)>,
     n: u64,
     /// The `unlock_id` `vault.status` names (written as is, so a test can
     /// give a malformed one); `None`: no member (a vault before release L).
@@ -259,8 +263,10 @@ impl FakeVault {
             deny: false,
             collects: 0,
             waits: Vec::new(),
+            stall: None,
             answers: std::collections::HashMap::new(),
             asked: Vec::new(),
+            asked_ids: Vec::new(),
             n: 0,
             unlock_id: Some(UNLOCK_1.into()),
             owner_check: Some(owner_check("ok", false, "")),
@@ -417,6 +423,16 @@ impl FakeVault {
         self.lock().asked.clone()
     }
 
+    /// Make each collect wait `d` first (`None`: answer at once).
+    pub(crate) fn stall(&self, d: Option<std::time::Duration>) {
+        self.lock().stall = d;
+    }
+
+    /// The inner id and exp of each scripted request answered.
+    pub(crate) fn asked_ids(&self) -> Vec<(String, Option<DateTime<Utc>>)> {
+        self.lock().asked_ids.clone()
+    }
+
     /// The `wait` of every collect so far.
     pub(crate) fn waits(&self) -> Vec<u64> {
         self.lock().waits.clone()
@@ -465,6 +481,7 @@ impl Transport for FakeVault {
         if inner.response.is_none() {
             if let Some(a) = s.answers.get(&inner.kind).cloned() {
                 s.asked.push((inner.kind.clone(), inner.body.to_string()));
+                s.asked_ids.push((inner.id.clone(), inner.exp));
                 let answer = match a {
                     Ok(body) => s.inner(&inner.kind, ok(&inner), body),
                     Err(code) => s.inner(&inner.kind, Some(Response { re: inner.id.clone(), status: Status::Error { code, message: None } }), "{}".into()),
@@ -525,6 +542,12 @@ impl Transport for FakeVault {
     }
 
     async fn collect(&self, _base: &str, wait_secs: u64, _max: u32) -> Result<Vec<Message>, RelayError> {
+        // A relay that really stalls: the wait yields, as a network call's
+        // does.
+        let stall = self.lock().stall;
+        if let Some(d) = stall {
+            tokio::time::sleep(d).await;
+        }
         let mut s = self.lock();
         if s.offline {
             return Err(RelayError::Connect);

@@ -32,7 +32,11 @@ async fn an_answer_is_its_body_checked() {
     let (k, b) = read("connection.list");
     let v = link.op(&k, &b, any, false).await.unwrap();
     assert_eq!(v["connections"][0]["id"], "c-1");
-    // The same answer through the real shape doesn't check out.
+    // Through the real shape, the entry doesn't check out and is left out.
+    let v = link.op(&k, &b, crate::link::shape::connection_list, false).await.unwrap();
+    assert_eq!((v["connections"].as_array().unwrap().len(), v["unreadable"].as_u64()), (0, Some(1)));
+    // A top level that doesn't check out fails the answer.
+    vault.answer(&k, Ok(r#"{"connections":"x"}"#));
     assert_eq!(link.op(&k, &b, crate::link::shape::connection_list, false).await, Err(OpError::Malformed));
 }
 
@@ -177,7 +181,7 @@ async fn two_operations_at_once() {
     vault.answer("connection.request.list", Ok("{}"));
     let s = slot(link);
     let published = AtomicUsize::new(0);
-    let go = |k: &'static str| link_op_with(&s, || true, || false, |_| { published.fetch_add(1, SeqCst); }, k, serde_json::json!({}), any, false);
+    let go = |k: &'static str| link_op_with(&s, || true, || false, |_| { published.fetch_add(1, SeqCst); }, std::future::pending(), k, serde_json::json!({}), any, false);
     let (a, b) = tokio::join!(go("connection.list"), go("connection.request.list"));
     assert!(a.is_ok() && b.is_ok(), "{a:?} {b:?}");
     assert_eq!(published.load(SeqCst), 2);
@@ -190,9 +194,9 @@ async fn link_op_checks_the_screen_and_resets() {
     let (vault, link) = live(dir.path()).await;
     vault.answer("connection.list", Ok("{}"));
     let s = slot(link);
-    let r = link_op_with(&s, || false, || false, |_| panic!("published"), "connection.list", serde_json::json!({}), any, false).await;
+    let r = link_op_with(&s, || false, || false, |_| panic!("published"), std::future::pending(), "connection.list", serde_json::json!({}), any, false).await;
     assert_eq!(r, Err(OpError::NoSession));
-    let r = link_op_with(&s, || true, || true, |_| panic!("published"), "connection.list", serde_json::json!({}), any, false).await;
+    let r = link_op_with(&s, || true, || true, |_| panic!("published"), std::future::pending(), "connection.list", serde_json::json!({}), any, false).await;
     assert_eq!(r, Err(OpError::NoSession));
     assert_eq!(sent(&vault, "connection.list"), 0);
 }
@@ -210,7 +214,7 @@ async fn a_reset_during_the_wait() {
     for (kind, change, want) in [("connection.list", false, Err(OpError::NoSession)), ("connection.decline", true, Ok(serde_json::json!({})))] {
         let calls = AtomicUsize::new(0);
         let overtaken = || calls.fetch_add(1, SeqCst) >= 2;
-        let r = link_op_with(&s, || true, overtaken, |_| panic!("published over a reset"), kind, serde_json::json!({}), any, change).await;
+        let r = link_op_with(&s, || true, overtaken, |_| panic!("published over a reset"), std::future::pending(), kind, serde_json::json!({}), any, change).await;
         assert_eq!(r, want, "{kind}");
     }
 }
@@ -224,9 +228,72 @@ async fn a_stalled_operation_lets_go_of_the_link_in_time() {
     let s = slot(link);
     let done = Arc::new(AtomicBool::new(false));
     let start = std::time::Instant::now();
-    let r = link_op_with(&s, || true, || false, |_| {}, "connection.decline", serde_json::json!({"pending_id": "p"}), any, true).await;
+    let r = link_op_with(&s, || true, || false, |_| {}, std::future::pending(), "connection.decline", serde_json::json!({"pending_id": "p"}), any, true).await;
     done.store(true, SeqCst);
     assert_eq!(r, Err(OpError::Unconfirmed));
     assert!(start.elapsed() <= OP_HOLD_MAX + std::time::Duration::from_secs(1), "held the link {:?}", start.elapsed());
     assert!(s.try_lock().is_ok(), "the link is free");
+}
+
+/// A reset that starts while an operation waits gets the link at once;
+/// a change cut off this way is kept, and retried under its id.
+#[tokio::test]
+async fn a_reset_stops_a_stalled_operation_and_keeps_the_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, link) = live(dir.path()).await; // no answer is scripted: it never comes
+    vault.stall(Some(std::time::Duration::from_secs(2))); // and the relay stalls each collect
+    let s = slot(link);
+    let body = serde_json::json!({"pending_id": "p"});
+    let start = std::time::Instant::now();
+    let stop = tokio::time::sleep(std::time::Duration::from_millis(300));
+    let r = link_op_with(&s, || true, || false, |_| {}, stop, "connection.decline", body.clone(), any, true).await;
+    assert_eq!(r, Err(OpError::Unconfirmed));
+    assert!(start.elapsed() < std::time::Duration::from_secs(3), "held the link {:?} past the reset", start.elapsed());
+    let mut g = s.lock().await;
+    let l = g.as_mut().unwrap();
+    let kept = l.unconfirmed.clone().expect("the cut-off change is kept");
+    vault.stall(None);
+    vault.answer("connection.decline", Ok("{}"));
+    assert_eq!(l.op("connection.decline", &body, any, true).await, Ok(serde_json::json!({})));
+    let ids = vault.asked_ids();
+    assert_eq!(ids.last().map(|(i, _)| i.clone()), Some(kept.id.clone()), "retried under its id");
+    assert_eq!(ids.last().and_then(|(_, e)| *e).map(|e| e.timestamp_millis()), Some(kept.exp.timestamp_millis()), "with its first exp");
+}
+
+/// The bound, too, keeps a cut-off change.
+#[tokio::test]
+async fn the_hold_bound_keeps_the_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, link) = live(dir.path()).await;
+    vault.stall(Some(OP_HOLD_MAX + std::time::Duration::from_secs(2))); // past the bound, not the answer wait
+    let s = slot(link);
+    let r = link_op_with(&s, || true, || false, |_| {}, std::future::pending(), "connection.decline", serde_json::json!({"pending_id": "p"}), any, true).await;
+    assert_eq!(r, Err(OpError::Unconfirmed));
+    assert!(s.lock().await.as_ref().unwrap().unconfirmed.is_some());
+}
+
+/// A change carries CHANGE_TTL, a read READ_TTL; another body is a new
+/// request, never a retry of the pending one.
+#[tokio::test]
+async fn exps_and_new_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await;
+    vault.answer("connection.decline", Ok("{}"));
+    vault.answer("connection.list", Ok("{}"));
+    let t = Utc::now();
+    link.op("connection.decline", &serde_json::json!({"pending_id": "a"}), any, true).await.unwrap();
+    link.op("connection.list", &serde_json::json!({}), any, false).await.unwrap();
+    let ids = vault.asked_ids();
+    let ttl = |i: usize| ids[i].1.unwrap() - t;
+    // exp is kept to the millisecond (format_ts): within a few seconds of the TTL.
+    let near = |d: TimeDelta, want: TimeDelta| d >= want - TimeDelta::seconds(1) && d <= want + TimeDelta::seconds(5);
+    assert!(near(ttl(0), CHANGE_TTL), "{:?}", ttl(0));
+    assert!(near(ttl(1), READ_TTL), "{:?}", ttl(1));
+    // An unconfirmed decline of "b", then a decline of "c": a new id.
+    vault.offline(true);
+    assert_eq!(link.op("connection.decline", &serde_json::json!({"pending_id": "b"}), any, true).await, Err(OpError::Unconfirmed));
+    let pending = link.unconfirmed.clone().unwrap().id;
+    vault.offline(false);
+    link.op("connection.decline", &serde_json::json!({"pending_id": "c"}), any, true).await.unwrap();
+    assert_ne!(vault.asked_ids().last().unwrap().0, pending, "another change reused the pending one's id");
 }

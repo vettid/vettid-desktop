@@ -162,17 +162,18 @@ impl<T: Transport, C: Clock> Link<T, C> {
         }
         let body = body.to_string();
         let now = Utc::now();
+        // The same change asked again while its first try can still arrive:
+        // its id and its exp.
         let again = match &self.unconfirmed {
-            Some(p) if change && p.kind == kind && p.body == body && now < p.until => Some(p.id.clone()),
+            Some(p) if change && p.kind == kind && p.body == body && now < p.exp => Some((p.id.clone(), p.exp)),
             _ => None,
         };
-        let r = match &again {
-            Some(id) => self.session.request_again(&mut self.store, id, kind, &body, OP_TIMEOUT).await,
-            None => {
-                let ttl = if change { CHANGE_TTL } else { READ_TTL };
-                self.session.request_expiring(&mut self.store, kind, &body, OP_TIMEOUT, ttl).await
-            }
-        };
+        let exp = again.as_ref().map_or_else(|| now + if change { CHANGE_TTL } else { READ_TTL }, |(_, e)| *e);
+        if change {
+            self.sending = Some(Pending { kind: kind.to_string(), body: body.clone(), id: again.as_ref().map(|(i, _)| i.clone()).unwrap_or_default(), exp });
+        }
+        let r = self.session.request_at(&mut self.store, again.as_ref().map(|(i, _)| i.as_str()), kind, &body, OP_TIMEOUT, exp).await;
+        self.sending = None;
         let stored = self.session.last_request_id().map(str::to_string);
         // A sleep during the wait: found before the answer counts.
         self.check_gap(Utc::now());
@@ -227,7 +228,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
                             self.reachable = false;
                         }
                         if change {
-                            self.unconfirmed = Some(Pending { kind: kind.to_string(), body: body.clone(), id, until: now + CHANGE_TTL });
+                            self.unconfirmed = Some(Pending { kind: kind.to_string(), body: body.clone(), id, exp });
                         }
                         Err(OpError::Unconfirmed)
                     }
@@ -252,18 +253,32 @@ impl<T: Transport, C: Clock> Link<T, C> {
     }
 }
 
-/// A change sent and not confirmed: retried under its id until `until`.
+/// A change sent and not confirmed: retried under its id, with its first
+/// `exp`, until then.
 #[derive(Debug, Clone)]
 pub struct Pending {
     kind: String,
     body: String,
     id: String,
-    until: DateTime<Utc>,
+    exp: DateTime<Utc>,
+}
+
+impl<T: Transport, C: Clock> Link<T, C> {
+    /// An operation's wait was cut off (its bound, or a reset): a change
+    /// that was stored is kept as unconfirmed, to be retried under its id.
+    fn cut_off(&mut self) {
+        if let (Some(mut p), Some(id)) = (self.sending.take(), self.session.last_request_id()) {
+            p.id = id.to_string();
+            self.unconfirmed = Some(p);
+        }
+    }
 }
 
 /// An operation as a command runs it: only while the screen shows a live
 /// session (`screen_live`) and no End session, lock or log-out has started
-/// (`overtaken`); with the link held for at most [`OP_HOLD_MAX`]; then what
+/// (`overtaken`); with the link held for at most [`OP_HOLD_MAX`], and let
+/// go at once when a reset starts (`stop` completes: the reset gets the
+/// link without waiting); then what
 /// the link learned is published (`publish`, under the link's lock, so it
 /// is ordered with every other holder's), unless a reset came first. Then
 /// a read's answer isn't handed on; a change the vault confirmed is still
@@ -274,6 +289,7 @@ pub async fn link_op_with<T: Transport, C: Clock>(
     screen_live: impl Fn() -> bool,
     overtaken: impl Fn() -> bool,
     publish: impl Fn(Snapshot),
+    stop: impl std::future::Future<Output = ()>,
     kind: &str,
     body: serde_json::Value,
     shape: fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>,
@@ -287,10 +303,18 @@ pub async fn link_op_with<T: Transport, C: Clock>(
     if overtaken() {
         return Err(OpError::NoSession);
     }
-    let r = match tokio::time::timeout(OP_HOLD_MAX, l.op(kind, &body, shape, change)).await {
-        Ok(r) => r,
-        Err(_) => {
-            log::info!("link: {} held the link too long; it may still be carried out", kind);
+    let r = tokio::select! {
+        r = tokio::time::timeout(OP_HOLD_MAX, l.op(kind, &body, shape, change)) => match r {
+            Ok(r) => r,
+            Err(_) => {
+                log::info!("link: {} held the link too long; it may still be carried out", kind);
+                l.cut_off();
+                Err(OpError::Unconfirmed)
+            }
+        },
+        () = stop => {
+            log::info!("link: {} stopped for a reset; it may still be carried out", kind);
+            l.cut_off();
             Err(OpError::Unconfirmed)
         }
     };
