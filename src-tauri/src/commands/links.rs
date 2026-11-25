@@ -8,21 +8,23 @@
 //! nothing it does can open a link without this prompt.
 //!
 //! - The text is checked as it is (length, control and bidi characters,
-//!   whitespace, `https://`, no user or password), then parsed with the
-//!   `url` crate and checked again (scheme exactly `https`, no user or
-//!   password, a host). What opens is the parsed URL as `url` writes it,
-//!   never the window's text.
+//!   whitespace, `https://`, no user or password, the host's length), then
+//!   parsed with the `url` crate and checked again (scheme exactly `https`,
+//!   no user or password, a host of at most 253 bytes and labels of at most
+//!   63). What opens is the parsed URL as `url` writes it, never the
+//!   window's text.
 //! - The prompt shows the parsed host: an internationalised name as
 //!   punycode, with the port when it isn't 443.
-//! - One prompt at a time: another call while one is shown answers busy.
-//! - An "Open" sooner than `MIN_CONFIRM_MS` after the prompt appeared
+//! - One prompt at a time: another call while one is shown answers busy,
+//!   and so does one within `QUIET_MS` of a prompt that wasn't confirmed.
+//! - An "Open" sooner than `MIN_CONFIRM_MS` after the prompt was asked for
 //!   counts as not confirmed (a held key's repeats).
 //! - Where the dialog's first button is its default (Windows, macOS),
 //!   Cancel is first, so Return or Enter cancels.
 //!
 //! The URL is never logged: its path or query can hold anything.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use rfd::{MessageButtons, MessageDialogResult};
@@ -36,13 +38,35 @@ use tauri::{AppHandle, Url, WebviewWindow};
 /// to hide its real end than to be one, and a member can still copy it.
 pub const MAX_LINK_LEN: usize = 2048;
 
-/// An "Open" answered sooner than this after the prompt appeared is not a
-/// confirmation. A member who opens a link with Enter and holds it a moment
-/// too long sends repeats of Enter to the prompt as soon as it shows; this
-/// keeps those repeats from answering it before the host can be read. The
-/// prompt is then closed with nothing opened, and the member clicks the
-/// link again.
+/// The longest host the prompt shows, in bytes once in punycode, and the
+/// longest label in it: DNS's own bounds (RFC 1035). A longer host would
+/// wrap across the prompt, and the member would read only its first line.
+pub const MAX_HOST_LEN: usize = 253;
+pub const MAX_LABEL_LEN: usize = 63;
+
+/// An "Open" answered sooner than this after the prompt was asked for is
+/// not a confirmation. A member who opens a link with Enter and holds it a
+/// moment too long sends repeats of Enter to the prompt as soon as it
+/// shows; this keeps those repeats from answering it before the host can
+/// be read. The prompt is then closed with nothing opened, and the member
+/// clicks the link again.
+///
+/// It is measured from just before the dialog is asked for, not from when
+/// it is on screen: rfd has no "shown" callback, so the time the dialog
+/// takes to appear counts toward it.
+///
+/// On Linux it is 1000 ms: rfd's GTK dialog sets no default button and
+/// Cancel can't safely go first there (see `CANCEL_FIRST`), so this is the
+/// only guard against a held key.
+#[cfg(not(target_os = "linux"))]
 pub const MIN_CONFIRM_MS: u64 = 500;
+#[cfg(target_os = "linux")]
+pub const MIN_CONFIRM_MS: u64 = 1000;
+
+/// After a prompt that wasn't confirmed (Cancel, closed, or too fast),
+/// another call answers busy for this long, so a script can't put the
+/// prompt straight back up.
+pub const QUIET_MS: u64 = 1000;
 
 /// The prompt's buttons (the view's words for them).
 pub const OPEN_LABEL: &str = "Open";
@@ -53,7 +77,8 @@ const FSI: char = '\u{2068}';
 const PDI: char = '\u{2069}';
 
 /// The prompt's text (§10.5: "show its host and ask"), word for word the
-/// view's `openLinkQuestion`.
+/// view's `openLinkQuestion` (both are tested against
+/// tests/fixtures/link-question.json).
 pub fn question(host: &str) -> String {
     format!("Open this link in your browser? It goes to {FSI}{host}{PDI}.")
 }
@@ -63,6 +88,9 @@ pub fn question(host: &str) -> String {
 pub enum Refusal {
     /// Longer than `MAX_LINK_LEN` (as given, or once parsed).
     TooLong,
+    /// A host longer than `MAX_HOST_LEN`, or a label in it longer than
+    /// `MAX_LABEL_LEN`.
+    HostTooLong,
     /// A control character (Unicode Cc) or a bidi formatting character.
     ControlOrBidi,
     /// White space (the view never makes a link of text that has it).
@@ -82,6 +110,7 @@ impl Refusal {
     pub fn as_str(self) -> &'static str {
         match self {
             Refusal::TooLong => "too long",
+            Refusal::HostTooLong => "host too long",
             Refusal::ControlOrBidi => "control or bidi character",
             Refusal::WhiteSpace => "white space",
             Refusal::NotHttps => "not https",
@@ -120,6 +149,21 @@ fn is_bidi(c: char) -> bool {
     )
 }
 
+/// Whether a host name is within `MAX_HOST_LEN` and `MAX_LABEL_LEN`, its
+/// length counted by `len` and its labels split at `is_dot`.
+fn host_fits(name: &str, len: fn(&str) -> usize, is_dot: fn(char) -> bool) -> bool {
+    len(name) <= MAX_HOST_LEN && name.split(is_dot).all(|label| len(label) <= MAX_LABEL_LEN)
+}
+
+/// The dots IDNA maps to `.` (full stop, ideographic, fullwidth, halfwidth).
+fn is_any_dot(c: char) -> bool {
+    matches!(c, '.' | '\u{3002}' | '\u{FF0E}' | '\u{FF61}')
+}
+
+fn char_len(s: &str) -> usize {
+    s.chars().count()
+}
+
 /// The checks on the text as given, before it is parsed.
 pub fn check_raw(raw: &str) -> Result<(), Refusal> {
     if raw.len() > MAX_LINK_LEN {
@@ -145,6 +189,15 @@ pub fn check_raw(raw: &str) -> Result<(), Refusal> {
     if authority.is_empty() {
         return Err(Refusal::NoHost);
     }
+    // The host as written, without its port. Counted in characters: a
+    // name's punycode is never shorter than its characters, so a host
+    // refused here would be refused once parsed too.
+    if !authority.starts_with('[') {
+        let name = authority.split(':').next().unwrap_or(authority);
+        if !host_fits(name, char_len, is_any_dot) {
+            return Err(Refusal::HostTooLong);
+        }
+    }
     Ok(())
 }
 
@@ -160,6 +213,12 @@ pub fn check_parsed(url: Url) -> Result<Link, Refusal> {
         (Some(_), Some(h)) if !h.is_empty() => h.to_owned(),
         _ => return Err(Refusal::NoHost),
     };
+    // A name (not an address), in punycode.
+    if let Some(d) = url.domain() {
+        if !host_fits(d, str::len, |c| c == '.') {
+            return Err(Refusal::HostTooLong);
+        }
+    }
     if url.as_str().len() > MAX_LINK_LEN {
         return Err(Refusal::TooLong);
     }
@@ -177,9 +236,14 @@ pub fn check(raw: &str) -> Result<Link, Refusal> {
     check_parsed(url)
 }
 
-/// Asks the member; `true` only for "Open".
+/// The prompt couldn't be shown, or gave no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptFailed;
+
+/// Asks the member: `Ok(true)` only for "Open"; `Err` when the prompt
+/// couldn't be shown or gave no answer.
 pub trait Prompt {
-    fn confirm(&self, question: &str) -> bool;
+    fn confirm(&self, question: &str) -> Result<bool, PromptFailed>;
 }
 
 /// The system didn't open a URL.
@@ -212,8 +276,10 @@ pub enum Outcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkError {
     Refused(Refusal),
-    /// Another link's prompt is shown.
+    /// Another link's prompt is shown, or one wasn't confirmed just now.
     Busy,
+    /// The prompt couldn't be shown, or gave no answer.
+    NoPrompt,
     /// Confirmed, but the system didn't open it.
     NotOpened,
 }
@@ -224,6 +290,7 @@ impl LinkError {
         match self {
             LinkError::Refused(_) => "refused",
             LinkError::Busy => "busy",
+            LinkError::NoPrompt => "no_prompt",
             LinkError::NotOpened => "not_opened",
         }
     }
@@ -232,52 +299,98 @@ impl LinkError {
     pub fn reason(self) -> &'static str {
         match self {
             LinkError::Refused(r) => r.as_str(),
-            LinkError::Busy => "another link's prompt is shown",
+            LinkError::Busy => "another link's prompt is shown, or was just declined",
+            LinkError::NoPrompt => "the prompt couldn't be shown",
             LinkError::NotOpened => "the system didn't open it",
         }
     }
 }
 
-/// Holds the one-prompt-at-a-time flag while a prompt is shown.
-struct Held<'a>(&'a AtomicBool);
+/// One prompt at a time, and a quiet time after one that wasn't confirmed.
+pub struct Gate(Mutex<GateState>);
 
-impl<'a> Held<'a> {
-    fn take(flag: &'a AtomicBool) -> Option<Self> {
-        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| Held(flag))
+struct GateState {
+    showing: bool,
+    quiet_until: Option<Instant>,
+}
+
+impl Gate {
+    pub const fn new() -> Self {
+        Gate(Mutex::new(GateState { showing: false, quiet_until: None }))
     }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Whether a prompt is shown.
+    pub fn showing(&self) -> bool {
+        self.state().showing
+    }
+
+    /// The gate for one prompt, if none is shown and the quiet time is over.
+    fn take(&self, now: Instant) -> Option<Held<'_>> {
+        let mut s = self.state();
+        if s.showing || s.quiet_until.is_some_and(|until| now < until) {
+            return None;
+        }
+        s.showing = true;
+        s.quiet_until = None;
+        Some(Held { gate: self, quiet_until: None })
+    }
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Gate::new()
+    }
+}
+
+/// Holds the gate while a prompt is shown; on release, the quiet time.
+struct Held<'a> {
+    gate: &'a Gate,
+    quiet_until: Option<Instant>,
 }
 
 impl Drop for Held<'_> {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        let mut s = self.gate.state();
+        s.showing = false;
+        s.quiet_until = self.quiet_until;
     }
 }
 
 /// Checks `raw`, asks the member, and opens the checked URL only on an
-/// "Open" given at least `MIN_CONFIRM_MS` after the prompt appeared.
-/// `showing` is set while a prompt is shown: a call meanwhile is busy.
+/// "Open" given at least `MIN_CONFIRM_MS` after the prompt was asked for.
 pub fn open_link(
     raw: &str,
-    showing: &AtomicBool,
+    gate: &Gate,
     prompt: &dyn Prompt,
     browser: &dyn Browser,
     clock: &dyn Clock,
 ) -> Result<Outcome, LinkError> {
     let link = check(raw).map_err(LinkError::Refused)?;
-    let _held = Held::take(showing).ok_or(LinkError::Busy)?;
-    let shown = clock.now();
-    let yes = prompt.confirm(&question(link.host()));
-    let waited = clock.now().saturating_duration_since(shown);
-    if !yes {
-        return Ok(Outcome::NotConfirmed);
+    let mut held = gate.take(clock.now()).ok_or(LinkError::Busy)?;
+    let asked = clock.now();
+    let answer = prompt.confirm(&question(link.host()));
+    let answered = clock.now();
+    let waited = answered.saturating_duration_since(asked);
+    let quiet = || Some(answered + Duration::from_millis(QUIET_MS));
+    match answer {
+        Err(PromptFailed) => Err(LinkError::NoPrompt),
+        Ok(false) => {
+            held.quiet_until = quiet();
+            Ok(Outcome::NotConfirmed)
+        }
+        Ok(true) if waited < Duration::from_millis(MIN_CONFIRM_MS) => {
+            held.quiet_until = quiet();
+            Ok(Outcome::TooFast)
+        }
+        Ok(true) => {
+            browser.open(link.url()).map_err(|_| LinkError::NotOpened)?;
+            Ok(Outcome::Opened)
+        }
     }
-    if waited < Duration::from_millis(MIN_CONFIRM_MS) {
-        return Ok(Outcome::TooFast);
-    }
-    browser.open(link.url()).map_err(|_| LinkError::NotOpened)?;
-    Ok(Outcome::Opened)
 }
 
 /// Whether the dialog backend makes its first button the default (Return
@@ -309,29 +422,31 @@ struct NativePrompt {
 }
 
 impl Prompt for NativePrompt {
-    fn confirm(&self, question: &str) -> bool {
+    /// A failure we can see is an error: the main thread not taking the
+    /// dialog, or no answer coming back (the dialog's thread gone). rfd
+    /// answers some failures of the dialog itself as Cancel (on Windows, a
+    /// `TaskDialogIndirect` that fails), and those can't be told from one.
+    fn confirm(&self, question: &str) -> Result<bool, PromptFailed> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let title = self.app.package_info().name.clone();
         let question = question.to_owned();
         let window = self.window.clone();
         // Made on the main thread (macOS needs it there), answered on
         // another, as tauri-plugin-dialog does.
-        let ran = self.app.run_on_main_thread(move || {
-            let answer = rfd::AsyncMessageDialog::new()
-                .set_title(title)
-                .set_description(question)
-                .set_buttons(buttons_for(CANCEL_FIRST))
-                .set_parent(&window)
-                .show();
-            std::thread::spawn(move || {
-                let _ = tx.send(tauri::async_runtime::block_on(answer));
-            });
-        });
-        if ran.is_err() {
-            return false;
-        }
-        // No answer (the app closing) is not a confirmation.
-        rx.recv().is_ok_and(|answer| confirmed(&answer))
+        self.app
+            .run_on_main_thread(move || {
+                let answer = rfd::AsyncMessageDialog::new()
+                    .set_title(title)
+                    .set_description(question)
+                    .set_buttons(buttons_for(CANCEL_FIRST))
+                    .set_parent(&window)
+                    .show();
+                std::thread::spawn(move || {
+                    let _ = tx.send(tauri::async_runtime::block_on(answer));
+                });
+            })
+            .map_err(|_| PromptFailed)?;
+        rx.recv().map(|answer| confirmed(&answer)).map_err(|_| PromptFailed)
     }
 }
 
@@ -344,6 +459,9 @@ struct ShellBrowser {
 impl Browser for ShellBrowser {
     fn open(&self, url: &str) -> Result<(), OpenFailed> {
         use tauri_plugin_shell::ShellExt;
+        // The `open` crate's `that_detached`: on Windows `ShellExecuteExW`
+        // with the default verb, which hands an https URL to the default
+        // browser; `open` on macOS, xdg-open and the like on Linux.
         #[allow(deprecated)]
         self.app.shell().open(url, None).map_err(|_| OpenFailed)
     }
@@ -357,13 +475,13 @@ impl Clock for SystemClock {
     }
 }
 
-/// Set while a link's prompt is shown.
-static SHOWING: AtomicBool = AtomicBool::new(false);
+/// The links' one prompt.
+static GATE: Gate = Gate::new();
 
 /// Opens a link in a message, after the member's "Open" in a native prompt
 /// showing its host. `text` is the link as the message shows it. Answers
-/// `opened`, `not_confirmed` or `too_fast`; or the error `refused`, `busy`
-/// or `not_opened`.
+/// `opened`, `not_confirmed` or `too_fast`; or the error `refused`, `busy`,
+/// `no_prompt` or `not_opened`.
 #[tauri::command]
 pub async fn open_message_link(
     app: AppHandle,
@@ -373,7 +491,7 @@ pub async fn open_message_link(
     let done = tauri::async_runtime::spawn_blocking(move || {
         let prompt = NativePrompt { app: app.clone(), window };
         let browser = ShellBrowser { app };
-        open_link(&text, &SHOWING, &prompt, &browser, &SystemClock)
+        open_link(&text, &GATE, &prompt, &browser, &SystemClock)
     })
     .await;
     match done {
@@ -384,7 +502,7 @@ pub async fn open_message_link(
         }
         Err(_) => {
             log::warn!("message link not opened: its prompt failed");
-            Err(LinkError::NotOpened.code().to_owned())
+            Err(LinkError::NoPrompt.code().to_owned())
         }
     }
 }
@@ -521,6 +639,42 @@ mod tests {
         assert_eq!(check(&grows), Err(Refusal::TooLong));
     }
 
+    /// A host of `labels` labels of `len` letters each, joined by dots.
+    fn host_of(labels: usize, len: usize) -> String {
+        vec!["a".repeat(len); labels].join(".")
+    }
+
+    #[test]
+    fn a_host_over_253_bytes_or_a_label_over_63_is_refused() {
+        // 4 labels of 63 and dots: 255; of 62: 251.
+        let fits = format!("{}.{}", host_of(3, 63), "a".repeat(61));
+        assert_eq!(fits.len(), MAX_HOST_LEN);
+        assert!(check(&format!("https://{fits}/")).is_ok());
+        assert!(check(&format!("https://{fits}:8443/")).is_ok());
+        let long = format!("{fits}a");
+        assert_eq!(refused(&format!("https://{long}/")), Refusal::HostTooLong);
+        assert_eq!(check_raw(&format!("https://{long}/")), Err(Refusal::HostTooLong));
+        let label = format!("{}.example", "a".repeat(MAX_LABEL_LEN + 1));
+        assert_eq!(check_raw(&format!("https://{label}/")), Err(Refusal::HostTooLong));
+        assert!(check(&format!("https://{}.example/", "a".repeat(MAX_LABEL_LEN))).is_ok());
+        // A 2,000-character host.
+        assert_eq!(refused(&format!("https://{}/", host_of(40, 49))), Refusal::HostTooLong);
+        // Once parsed, in punycode: a label of 60 characters with one
+        // non-ASCII passes as written and is too long as punycode.
+        let idn = format!("{}\u{FC}.example", "a".repeat(59));
+        assert!(check_raw(&format!("https://{idn}/")).is_ok());
+        assert_eq!(refused(&format!("https://{idn}/")), Refusal::HostTooLong);
+        // And the host as a whole: five labels of 48 characters, 244 as
+        // written, each longer in punycode (xn--, a dash, the encoding).
+        let whole = vec![format!("{}\u{FC}", "a".repeat(47)); 5].join(".");
+        assert_eq!(whole.chars().count(), 244);
+        assert!(check_raw(&format!("https://{whole}/")).is_ok());
+        assert_eq!(check_parsed(parsed(&format!("https://{whole}/"))), Err(Refusal::HostTooLong));
+        // An address isn't a name: no label rule.
+        assert!(check("https://[2001:db8::1]:8443/").is_ok());
+        assert!(check("https://192.0.2.1/").is_ok());
+    }
+
     #[test]
     fn unparsable_is_refused() {
         for raw in ["https://exa%mple.com/", "https://[::1/", "https://example.com:99999/"] {
@@ -539,6 +693,17 @@ mod tests {
         assert_eq!(check("https://example.com:443/x").expect("443").host(), "example.com");
         assert_eq!(check("HTTPS://EXAMPLE.com/").expect("case").host(), "example.com");
         assert_eq!(check("https://[::1]:8443/").expect("v6").host(), "[::1]:8443");
+    }
+
+    /// The prompt's text is the fixture's, which the view's test checks too.
+    #[test]
+    fn the_question_is_the_shared_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/link-question.json"
+        ))
+        .expect("fixture");
+        let host = fixture["host"].as_str().expect("host");
+        assert_eq!(question(host), fixture["question"].as_str().expect("question"));
         assert_eq!(
             question("xn--bcher-kva.example:8443"),
             "Open this link in your browser? It goes to \u{2068}xn--bcher-kva.example:8443\u{2069}."
@@ -551,29 +716,35 @@ mod tests {
         at: Cell<Duration>,
     }
 
+    impl FakeClock {
+        fn advance(&self, ms: u64) {
+            self.at.set(self.at.get() + Duration::from_millis(ms));
+        }
+    }
+
     impl Clock for FakeClock {
         fn now(&self) -> Instant {
             self.start + self.at.get()
         }
     }
 
-    /// A prompt that answers `yes` after `after`, recording what it asked.
+    /// A prompt that answers after `after`, recording what it asked.
     struct FakePrompt<'a> {
         clock: &'a FakeClock,
-        yes: bool,
+        answer: Result<bool, PromptFailed>,
         after: Duration,
         asked: RefCell<Vec<String>>,
         during: Option<Box<dyn Fn() + 'a>>,
     }
 
     impl Prompt for FakePrompt<'_> {
-        fn confirm(&self, question: &str) -> bool {
+        fn confirm(&self, question: &str) -> Result<bool, PromptFailed> {
             self.asked.borrow_mut().push(question.to_owned());
             if let Some(f) = &self.during {
                 f();
             }
             self.clock.at.set(self.clock.at.get() + self.after);
-            self.yes
+            self.answer
         }
     }
 
@@ -601,7 +772,7 @@ mod tests {
     fn prompt(clock: &FakeClock, yes: bool, after_ms: u64) -> FakePrompt<'_> {
         FakePrompt {
             clock,
-            yes,
+            answer: Ok(yes),
             after: Duration::from_millis(after_ms),
             asked: RefCell::new(Vec::new()),
             during: None,
@@ -616,11 +787,11 @@ mod tests {
         let c = clock();
         let p = prompt(&c, false, 2000);
         let b = FakeBrowser::default();
-        let flag = AtomicBool::new(false);
-        assert_eq!(open_link(RAW, &flag, &p, &b, &c), Ok(Outcome::NotConfirmed));
+        let gate = Gate::new();
+        assert_eq!(open_link(RAW, &gate, &p, &b, &c), Ok(Outcome::NotConfirmed));
         assert!(b.opened.borrow().is_empty());
         assert_eq!(*p.asked.borrow(), vec![question("xn--bcher-kva.example:8443")]);
-        assert!(!flag.load(Ordering::Acquire));
+        assert!(!gate.showing());
     }
 
     #[test]
@@ -628,10 +799,13 @@ mod tests {
         let c = clock();
         let p = prompt(&c, true, MIN_CONFIRM_MS);
         let b = FakeBrowser::default();
-        let flag = AtomicBool::new(false);
-        assert_eq!(open_link(RAW, &flag, &p, &b, &c), Ok(Outcome::Opened));
+        let gate = Gate::new();
+        assert_eq!(open_link(RAW, &gate, &p, &b, &c), Ok(Outcome::Opened));
         assert_eq!(*b.opened.borrow(), vec![OPENS.to_owned()]);
-        assert!(!flag.load(Ordering::Acquire));
+        assert!(!gate.showing());
+        // No quiet time after an Open: the next link asks at once.
+        assert_eq!(open_link(RAW, &gate, &p, &b, &c), Ok(Outcome::Opened));
+        assert_eq!(p.asked.borrow().len(), 2);
     }
 
     #[test]
@@ -640,10 +814,10 @@ mod tests {
             let c = clock();
             let p = prompt(&c, true, ms);
             let b = FakeBrowser::default();
-            let flag = AtomicBool::new(false);
-            assert_eq!(open_link(RAW, &flag, &p, &b, &c), Ok(Outcome::TooFast), "{ms} ms");
+            let gate = Gate::new();
+            assert_eq!(open_link(RAW, &gate, &p, &b, &c), Ok(Outcome::TooFast), "{ms} ms");
             assert!(b.opened.borrow().is_empty(), "{ms} ms");
-            assert!(!flag.load(Ordering::Acquire));
+            assert!(!gate.showing());
         }
     }
 
@@ -652,9 +826,9 @@ mod tests {
         let c = clock();
         let p = prompt(&c, true, 2000);
         let b = FakeBrowser::default();
-        let flag = AtomicBool::new(false);
+        let gate = Gate::new();
         for raw in ["http://example.com/", "https://u@example.com/", "https://example.com/\u{202E}"] {
-            assert!(matches!(open_link(raw, &flag, &p, &b, &c), Err(LinkError::Refused(_))), "{raw:?}");
+            assert!(matches!(open_link(raw, &gate, &p, &b, &c), Err(LinkError::Refused(_))), "{raw:?}");
         }
         assert!(p.asked.borrow().is_empty());
         assert!(b.opened.borrow().is_empty());
@@ -662,35 +836,65 @@ mod tests {
 
     #[test]
     fn busy_while_a_prompt_is_shown() {
-        // Already showing: busy, and no second prompt.
+        // A call made while a prompt is up is busy and shows nothing; the
+        // first one goes on.
         let c = clock();
-        let p = prompt(&c, true, 2000);
-        let b = FakeBrowser::default();
-        let flag = AtomicBool::new(true);
-        assert_eq!(open_link(RAW, &flag, &p, &b, &c), Err(LinkError::Busy));
-        assert!(p.asked.borrow().is_empty());
-        assert!(b.opened.borrow().is_empty());
-        assert!(flag.load(Ordering::Acquire), "a busy call left the other prompt's flag");
-
-        // A call made while a prompt is up is busy; the first one goes on.
-        let c = clock();
-        let flag = AtomicBool::new(false);
+        let gate = Gate::new();
         let inner_b = FakeBrowser::default();
         let inner_c = clock();
         let inner_p = prompt(&inner_c, true, 2000);
         let inner: RefCell<Option<Result<Outcome, LinkError>>> = RefCell::new(None);
         let mut p = prompt(&c, true, 2000);
         p.during = Some(Box::new(|| {
-            assert!(flag.load(Ordering::Acquire));
-            *inner.borrow_mut() = Some(open_link(RAW, &flag, &inner_p, &inner_b, &inner_c));
+            assert!(gate.showing());
+            *inner.borrow_mut() = Some(open_link(RAW, &gate, &inner_p, &inner_b, &inner_c));
         }));
         let b = FakeBrowser::default();
-        assert_eq!(open_link(RAW, &flag, &p, &b, &c), Ok(Outcome::Opened));
+        assert_eq!(open_link(RAW, &gate, &p, &b, &c), Ok(Outcome::Opened));
         assert_eq!(*inner.borrow(), Some(Err(LinkError::Busy)));
         assert!(inner_p.asked.borrow().is_empty());
         assert!(inner_b.opened.borrow().is_empty());
         assert_eq!(*b.opened.borrow(), vec![OPENS.to_owned()]);
-        assert!(!flag.load(Ordering::Acquire));
+        assert!(!gate.showing());
+    }
+
+    #[test]
+    fn busy_for_a_second_after_a_prompt_that_wasnt_confirmed() {
+        // Cancelled (yes = false, after 2 s) or too fast (yes = true, at once).
+        for (yes, after, first) in [(false, 2000, Outcome::NotConfirmed), (true, 0, Outcome::TooFast)] {
+            let c = clock();
+            let gate = Gate::new();
+            let b = FakeBrowser::default();
+            let p = prompt(&c, yes, after);
+            assert_eq!(open_link(RAW, &gate, &p, &b, &c), Ok(first));
+            // Within QUIET_MS of the answer: busy, no prompt.
+            let later = prompt(&c, true, MIN_CONFIRM_MS);
+            assert_eq!(open_link(RAW, &gate, &later, &b, &c), Err(LinkError::Busy), "{first:?}");
+            c.advance(QUIET_MS - 1);
+            assert_eq!(open_link(RAW, &gate, &later, &b, &c), Err(LinkError::Busy), "{first:?}");
+            assert!(later.asked.borrow().is_empty());
+            // A busy answer doesn't make the quiet time longer.
+            c.advance(1);
+            assert_eq!(open_link(RAW, &gate, &later, &b, &c), Ok(Outcome::Opened), "{first:?}");
+            assert_eq!(later.asked.borrow().len(), 1);
+            assert_eq!(*b.opened.borrow(), vec![OPENS.to_owned()]);
+        }
+    }
+
+    #[test]
+    fn a_failed_prompt_is_its_own_error_and_opens_nothing() {
+        let c = clock();
+        let gate = Gate::new();
+        let b = FakeBrowser::default();
+        let mut p = prompt(&c, true, 2000);
+        p.answer = Err(PromptFailed);
+        assert_eq!(open_link(RAW, &gate, &p, &b, &c), Err(LinkError::NoPrompt));
+        assert!(b.opened.borrow().is_empty());
+        assert!(!gate.showing());
+        assert_eq!(LinkError::NoPrompt.code(), "no_prompt");
+        // Not a member's answer: no quiet time after it.
+        let next = prompt(&c, true, MIN_CONFIRM_MS);
+        assert_eq!(open_link(RAW, &gate, &next, &b, &c), Ok(Outcome::Opened));
     }
 
     #[test]
@@ -698,8 +902,8 @@ mod tests {
         let c = clock();
         let p = prompt(&c, true, 2000);
         let b = FakeBrowser { fail: true, ..Default::default() };
-        let flag = AtomicBool::new(false);
-        assert_eq!(open_link(RAW, &flag, &p, &b, &c), Err(LinkError::NotOpened));
+        let gate = Gate::new();
+        assert_eq!(open_link(RAW, &gate, &p, &b, &c), Err(LinkError::NotOpened));
         assert_eq!(LinkError::NotOpened.code(), "not_opened");
         assert_eq!(LinkError::Busy.code(), "busy");
         assert_eq!(LinkError::Refused(Refusal::NoHost).code(), "refused");
@@ -741,6 +945,7 @@ mod tests {
             assert!(!confirmed(&other), "{other:?}");
         }
         assert!(CANCEL_FIRST == cfg!(any(windows, target_os = "macos")));
+        assert_eq!(MIN_CONFIRM_MS, if cfg!(target_os = "linux") { 1000 } else { 500 });
     }
 
     /// Through the prompt trait: a prompt built like the native one, over
@@ -753,9 +958,9 @@ mod tests {
             pressed: Option<usize>,
         }
         impl Prompt for Backend<'_> {
-            fn confirm(&self, _: &str) -> bool {
-                self.clock.at.set(self.clock.at.get() + Duration::from_millis(MIN_CONFIRM_MS + 100));
-                confirmed(&answer(&self.buttons, self.pressed))
+            fn confirm(&self, _: &str) -> Result<bool, PromptFailed> {
+                self.clock.advance(MIN_CONFIRM_MS + 100);
+                Ok(confirmed(&answer(&self.buttons, self.pressed)))
             }
         }
         for cancel_first in [true, false] {
@@ -768,8 +973,8 @@ mod tests {
                 let c = clock();
                 let p = Backend { clock: &c, buttons: buttons_for(cancel_first), pressed };
                 let b = FakeBrowser::default();
-                let flag = AtomicBool::new(false);
-                assert_eq!(open_link(RAW, &flag, &p, &b, &c), Ok(want), "{cancel_first} {pressed:?}");
+                let gate = Gate::new();
+                assert_eq!(open_link(RAW, &gate, &p, &b, &c), Ok(want), "{cancel_first} {pressed:?}");
                 let opened = b.opened.borrow().clone();
                 if want == Outcome::Opened {
                     assert_eq!(opened, vec![OPENS.to_owned()]);

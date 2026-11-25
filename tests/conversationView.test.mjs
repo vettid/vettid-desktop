@@ -2,6 +2,7 @@
 // pages and live messages, receipts, the send states, bubble text and links. Run with `npm test`.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   MAX_TEXT_BYTES,
   RECEIPT_HOLD_MS,
@@ -42,6 +43,7 @@ import {
   cleanBubble,
   linkPieces,
   MAX_LINK_BYTES,
+  MAX_HOST_BYTES,
   bubbleLines,
   bubbleContent,
   textBytes,
@@ -620,6 +622,18 @@ test('§10.5 links: what open_message_link would refuse is text, not a link', ()
   const wide = base + '\u00E9'.repeat((MAX_LINK_BYTES - base.length) / 2 + 1);
   assert.deepEqual(linkPieces(wide), [{ text: wide }]);
   assert.equal(MAX_LINK_BYTES, 2048);
+  // Written out longer than MAX_LINK_BYTES (percent-encoding).
+  const grows = base + 'é'.repeat((MAX_LINK_BYTES - base.length) / 2);
+  assert.ok(new TextEncoder().encode(grows).length <= MAX_LINK_BYTES);
+  assert.deepEqual(linkPieces(grows), [{ text: grows }]);
+  // A host over MAX_HOST_BYTES, or a label over 63, in punycode.
+  const fits = 'a'.repeat(63) + '.' + 'a'.repeat(63) + '.' + 'a'.repeat(63) + '.' + 'a'.repeat(61);
+  assert.equal(fits.length, MAX_HOST_BYTES);
+  assert.equal(/** @type {any} */ (linkPieces(`https://${fits}/`)[0]).host, fits);
+  for (const host of [fits + 'a', 'a'.repeat(64) + '.example', 'a'.repeat(59) + 'ü.example', Array(40).fill('a'.repeat(49)).join('.')]) {
+    assert.deepEqual(linkPieces(`https://${host}/`), [{ text: `https://${host}/` }], host.slice(0, 20));
+  }
+  assert.equal(/** @type {any} */ (linkPieces('https://[2001:db8::1]:8443/')[0]).host, '[2001:db8::1]:8443');
 });
 
 test('bubble lines and content: attachment placeholder, caption under it, never an empty bubble', () => {
@@ -670,6 +684,9 @@ test('inbound batches: dropped while not live, a resync reads the newest page', 
 
 test('the link question names the host, isolated', () => {
   assert.equal(openLinkQuestion('example.com'), `Open this link in your browser? It goes to ${FSI}example.com${PDI}.`);
+  // The same text as the native prompt's (commands/links.rs checks this fixture too).
+  const fixture = JSON.parse(readFileSync(new URL('./fixtures/link-question.json', import.meta.url), 'utf8'));
+  assert.equal(openLinkQuestion(fixture.host), fixture.question);
 });
 
 test('L3: kept sends and drafts go only when the log-out wiped this desktop', () => {

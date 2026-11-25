@@ -945,7 +945,8 @@ const NOT_IN_LINK = /[\u0000-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\
  * The checks commands/links.rs makes on a link's text before it asks to
  * open it, as far as they are cheap here, so that a link it would refuse
  * isn't shown as one (Rust decides): at most MAX_LINK_BYTES, no control
- * or bidi character, a host and no user or password before it.
+ * or bidi character, a host and no user or password before it. The
+ * parsed URL's checks are `parsedFits`.
  * @param {string} raw text that starts with `https://` (any case)
  */
 function linkable(raw) {
@@ -953,6 +954,24 @@ function linkable(raw) {
   if (NOT_IN_LINK.test(raw)) return false;
   const authority = raw.slice(8).split(/[/?#\\]/)[0];
   return authority !== '' && !authority.includes('@');
+}
+
+/** The longest host, in punycode, and label in it (`MAX_HOST_LEN`, `MAX_LABEL_LEN` in commands/links.rs). */
+export const MAX_HOST_BYTES = 253;
+const MAX_LABEL_BYTES = 63;
+
+/**
+ * The checks commands/links.rs makes on the parsed URL that `linkable`
+ * can't: its host (punycode, as the prompt shows it) at most
+ * MAX_HOST_BYTES with labels of at most 63, and the URL as written out at
+ * most MAX_LINK_BYTES.
+ * @param {URL} url
+ */
+function parsedFits(url) {
+  if (new TextEncoder().encode(url.href).length > MAX_LINK_BYTES) return false;
+  const host = url.hostname;
+  if (host.startsWith('[')) return true;
+  return host.length <= MAX_HOST_BYTES && host.split('.').every((label) => label.length <= MAX_LABEL_BYTES);
 }
 
 /**
@@ -978,7 +997,7 @@ export function linkPieces(line) {
     } catch {
       url = null;
     }
-    if (!url || url.protocol !== 'https:' || !url.hostname || url.username || url.password || !linkable(raw)) continue;
+    if (!url || url.protocol !== 'https:' || !url.hostname || url.username || url.password || !linkable(raw) || !parsedFits(url)) continue;
     if (start > last) out.push({ text: line.slice(last, start) });
     out.push({ text: raw, href: url.href, host: url.host });
     last = start + raw.length;
@@ -1110,5 +1129,5 @@ export function logoutWiped(result) {
 export const EDIT_NEEDS_EMPTY_BOX = 'Edit puts this text in the message box once the box is empty.';
 
 // NEW TEXT (owner approval needed)
-/** When a link wasn't opened: refused, another link's prompt shown, or the system didn't open it. */
+/** When a link wasn't opened: refused, busy, its prompt not shown, or the system didn't open it. */
 export const LINK_NOT_OPENED = "This desktop couldn't open this link.";

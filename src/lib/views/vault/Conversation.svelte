@@ -500,7 +500,8 @@
             // after the prompt showed (MIN_CONFIRM_MS in commands/links.rs).
             await invoke<string>('open_message_link', { text: p.text });
         } catch {
-            // Refused, another link's prompt shown, or not opened.
+            // Refused, busy (another link's prompt shown, or one declined
+            // just now), the prompt not shown, or not opened.
             linkError = LINK_NOT_OPENED;
         }
     }

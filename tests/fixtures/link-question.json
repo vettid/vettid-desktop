@@ -1,0 +1,5 @@
+{
+  "_comment": "The link prompt's text (VAULT-MESSAGING §10.5), checked by commands/links.rs (question) and conversationView.js (openLinkQuestion).",
+  "host": "xn--bcher-kva.example:8443",
+  "question": "Open this link in your browser? It goes to \u2068xn--bcher-kva.example:8443\u2069."
+}
