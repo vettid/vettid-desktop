@@ -1,5 +1,5 @@
 // The connection views' rules (src/lib/connectionView.js, DESKTOP-REWORK-PLAN Phase 5, 5.2): the §10.8
-// title, the decline arguments, and when the views read again or drop a batch. Run with `npm test`.
+// title, the request rows, and when the views read again or drop a batch. Run with `npm test`.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -11,7 +11,7 @@ import {
   requestTitle,
   requestSecondary,
   relayHeldText,
-  declineArgs,
+  ANSWERED_ON_PHONE,
   inboundAction,
   livenessChanged,
   UNREADABLE_REQUEST,
@@ -81,15 +81,6 @@ test('relay_held: the owner-approved text, the title isolated inside it', () => 
   assert.equal(relayHeldText(NAME_NOT_SHARED), "Waiting to reach a connection at their vault's new address.");
 });
 
-test('decline: incoming by pending_id, outgoing by connection_id, never both, nothing without an id', () => {
-  const both = { pending_id: 'p1', connection_id: 'c1' };
-  assert.deepEqual(declineArgs('incoming', both), { pendingId: 'p1' });
-  assert.deepEqual(declineArgs('outgoing', both), { connectionId: 'c1' });
-  assert.equal(declineArgs('incoming', { connection_id: 'c1' }), null);
-  assert.equal(declineArgs('outgoing', { pending_id: 'p1' }), null);
-  assert.equal(declineArgs('incoming', { pending_id: '' }), null);
-});
-
 test('inbound: dropped while not live, whatever it carries', () => {
   assert.equal(inboundAction({ messages: [], resync: true }, false), 'drop');
   const ev = { type: 'sync.event', body: { kind: 'connection.changed', members: {} } };
@@ -117,14 +108,12 @@ test('liveness: a change either way reads again; no change does not', () => {
   assert.ok(!livenessChanged('expired', 'suspended'));
 });
 
-test('unreadable request: its own title, no profile fields, still declinable', () => {
+test('unreadable request: its own title, no profile fields, still listed', () => {
   assert.equal(UNREADABLE_REQUEST, 'Unreadable request');
   const inc = { pending_id: 'p1', unreadable: true };
   assert.deepEqual(requestRow(inc), { unreadable: true, title: 'Unreadable request', secondary: [] });
-  assert.deepEqual(declineArgs('incoming', inc), { pendingId: 'p1' });
   const out = { connection_id: 'c1', unreadable: true };
   assert.deepEqual(requestRow(out), { unreadable: true, title: 'Unreadable request', secondary: [] });
-  assert.deepEqual(declineArgs('outgoing', out), { connectionId: 'c1' });
   // Never the placeholder, even if other fields came with it.
   assert.equal(requestRow({ pending_id: 'p2', unreadable: true, profile: ada, name: 'Ada' }).title, UNREADABLE_REQUEST);
   assert.notEqual(requestRow(inc).title, NAME_NOT_SHARED);
@@ -142,4 +131,8 @@ test('unreadable connections: one line, only when the count is above 0', () => {
   assert.ok(!hasUnreadableConnections(0));
   assert.ok(!hasUnreadableConnections(undefined));
   assert.ok(!hasUnreadableConnections('2'));
+});
+
+test('requests: answered on the phone, said once', () => {
+  assert.equal(ANSWERED_ON_PHONE, 'This is done on your phone.');
 });

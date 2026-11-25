@@ -1,7 +1,7 @@
 // The vault's connections as a desktop reads them (DESKTOP-REWORK-PLAN
 // Phase 5, 5.2): VAULT-MESSAGING 0.94.1 §10.4's `<connection>` and
 // `connection.request.list`. Read-only: a desktop never creates or accepts
-// a connection (§3.1); it may decline a request.
+// a connection (§3.1); requests are shown read-only and answered on the phone.
 //
 // These hold personal data (names, profiles): keep them in memory, never
 // in storage or logs.
@@ -77,8 +77,8 @@ export interface OutgoingRequest {
   introduced_by?: string;
 }
 
-/** A request that didn't check out: kept by its id only, so it can still
- *  be declined. */
+/** A request that didn't check out: kept by its id only, and still listed
+ *  read-only. */
 export interface UnreadableIncomingRequest {
   pending_id: string;
   unreadable: true;
