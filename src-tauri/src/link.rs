@@ -575,6 +575,9 @@ pub struct Link<T: Transport = Http, C: Clock = SystemClock> {
     unconfirmed: Option<ops::Pending>,
     /// The change being sent now (ops.rs): kept if its wait is cut off.
     sending: Option<ops::Pending>,
+    /// What became of a kept change retried before a new one
+    /// ([`Link::op_kept_first`]), until the caller takes it.
+    earlier: Option<ops::Earlier>,
 }
 
 /// What the refresh loop records of its own rounds, by the wall clock.
@@ -648,6 +651,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
             inbound: inbound::Queue::default(),
             unconfirmed: None,
             sending: None,
+            earlier: None,
         }
     }
 

@@ -15,6 +15,7 @@ use vettid_device::pairing::Clock;
 use vettid_device::session::SessionError;
 use vettid_device::transport::Transport;
 use vettid_vms::envelope::Status;
+use zeroize::Zeroizing;
 
 use super::shape::BadShape;
 use super::{clock_notice, clock_offset, Link, Snapshot, NOT_SAVED_NOTICE, PAIRED_NO_ACCESS_NOTICE, REFUSED_NOTICE, VAULT_HELD_NOTICE, VAULT_LOCKED_NOTICE, VAULT_UNKNOWN_NOTICE};
@@ -79,6 +80,12 @@ pub enum OpError {
     Malformed,
     /// The desktop's own call was wrong (an empty id): nothing was sent.
     BadArgument,
+    /// A page asked for with `before` that the vault no longer holds
+    /// (`not_found`, §10.5.2): the view starts again from the newest page.
+    PageGone,
+    /// A kept change ([`Link::op_kept_first`]) was retried first and is
+    /// still unconfirmed, so this one wasn't sent.
+    EarlierUnconfirmed,
 }
 
 impl OpError {
@@ -92,10 +99,12 @@ impl OpError {
             OpError::Unconfirmed => OP_UNCONFIRMED_NOTICE.into(),
             OpError::Clock(d) => clock_notice(clock_offset(*d)),
             OpError::NotSaved => NOT_SAVED_NOTICE.into(),
-            OpError::NotSent => OP_NOT_SENT_NOTICE.into(),
+            OpError::NotSent | OpError::EarlierUnconfirmed => OP_NOT_SENT_NOTICE.into(),
             OpError::Refused => REFUSED_NOTICE.into(),
             OpError::Vault(c) if c == "forbidden" => OP_FORBIDDEN_NOTICE.into(),
             OpError::Vault(c) if c == "not_found" => OP_NOT_FOUND_NOTICE.into(),
+            // The view starts again from the newest page without saying so.
+            OpError::PageGone => OP_NOT_FOUND_NOTICE.into(),
             OpError::Vault(_) | OpError::Malformed | OpError::BadArgument => OP_FAILED_NOTICE.into(),
         }
     }
@@ -114,9 +123,12 @@ impl OpError {
             OpError::Refused => "refused",
             OpError::Vault(c) if c == "forbidden" => "forbidden",
             OpError::Vault(c) if c == "not_found" => "not_found",
+            OpError::Vault(c) if c == "connection_unavailable" => "connection_unavailable",
             OpError::Vault(_) => "vault_error",
             OpError::Malformed => "malformed",
             OpError::BadArgument => "bad_argument",
+            OpError::PageGone => "page_gone",
+            OpError::EarlierUnconfirmed => "earlier_unconfirmed",
         }
     }
 }
@@ -155,17 +167,23 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// - A read answered while the batch it came in also showed a lock,
     ///   a hold or an end is dropped: the state's error instead. A change
     ///   the vault confirmed is reported done.
-    pub async fn op(&mut self, kind: &str, body: &serde_json::Value, shape: fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>, change: bool) -> Result<serde_json::Value, OpError> {
+    /// - One change is kept at a time: another change left unconfirmed
+    ///   takes its place (the first still goes with the next exchange, but
+    ///   its answer is no longer looked for). [`Link::op_kept_first`]
+    ///   retries the kept one first.
+    pub async fn op(&mut self, kind: &str, body: &serde_json::Value, shape: impl Fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>, change: bool) -> Result<serde_json::Value, OpError> {
         self.check_gap(Utc::now());
         if let Some(e) = self.not_open_for_an_op() {
             return Err(e);
         }
-        let body = body.to_string();
+        // SECURITY: a change's body can carry message plaintext: this copy
+        // and the kept one are wiped.
+        let body = Zeroizing::new(body.to_string());
         let now = Utc::now();
         // The same change asked again while its first try can still arrive:
         // its id and its exp.
         let again = match &self.unconfirmed {
-            Some(p) if change && p.kind == kind && p.body == body && now < p.exp => Some((p.id.clone(), p.exp)),
+            Some(p) if change && p.kind == kind && *p.body == *body && now < p.exp => Some((p.id.clone(), p.exp)),
             _ => None,
         };
         let exp = again.as_ref().map_or_else(|| now + if change { CHANGE_TTL } else { READ_TTL }, |(_, e)| *e);
@@ -262,22 +280,91 @@ impl<T: Transport, C: Clock> Link<T, C> {
 }
 
 /// A change sent and not confirmed: retried under its id, with its first
-/// `exp`, until then.
-#[derive(Debug, Clone)]
+/// `exp`, until then. `Debug` leaves the body out (message plaintext).
+#[derive(Clone)]
 pub struct Pending {
     kind: String,
-    body: String,
+    body: Zeroizing<String>,
     id: String,
     exp: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for Pending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pending").field("kind", &self.kind).field("body_len", &self.body.len()).field("id", &self.id).field("exp", &self.exp).finish()
+    }
+}
+
+/// What became of a kept change retried before a new one
+/// ([`Link::op_kept_first`]): its body (so the caller can tell which it
+/// was) and its answer, or [`OpError::Unconfirmed`] while it is still not
+/// confirmed. `Debug` leaves the body and the answer's body out.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Earlier {
+    pub body: Zeroizing<String>,
+    pub result: Result<serde_json::Value, OpError>,
+}
+
+impl std::fmt::Debug for Earlier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Earlier").field("body_len", &self.body.len()).field("error", &self.result.as_ref().err()).finish()
+    }
+}
+
+impl<T: Transport, C: Clock> Link<T, C> {
+    /// A change as [`Link::op`] sends it, except that a kept change of the
+    /// same `kind` with another body (a send left unconfirmed, then another
+    /// message) is retried first, under its id and with its first `exp`, so
+    /// that it is never dropped unseen; what became of it is kept in
+    /// `earlier` for the caller. While it stays unconfirmed, or nothing
+    /// could be sent, this change isn't sent:
+    /// [`OpError::EarlierUnconfirmed`], or the error that would have
+    /// stopped this one too. A kept change past its `exp` isn't retried (it
+    /// would be a new request): it is reported unconfirmed, and only a read
+    /// tells whether it happened.
+    pub async fn op_kept_first(&mut self, kind: &str, body: &serde_json::Value, shape: impl Fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>) -> Result<serde_json::Value, OpError> {
+        self.earlier = None;
+        let this = Zeroizing::new(body.to_string());
+        let kept = self.unconfirmed.clone().filter(|p| p.kind == kind && *p.body != *this);
+        if let Some(p) = kept {
+            // Unconfirmed until its answer is in (a cut-off leaves it so).
+            self.earlier = Some(Earlier { body: p.body.clone(), result: Err(OpError::Unconfirmed) });
+            if Utc::now() >= p.exp {
+                self.unconfirmed = None;
+            } else {
+                let again: serde_json::Value = serde_json::from_str(&p.body).map_err(|_| OpError::Malformed)?;
+                let r = self.op(kind, &again, &shape, true).await;
+                if self.unconfirmed.as_ref().is_some_and(|q| q.id == p.id) {
+                    return Err(match r {
+                        Err(OpError::Unconfirmed) | Ok(_) => OpError::EarlierUnconfirmed,
+                        Err(e) => e,
+                    });
+                }
+                self.earlier = Some(Earlier { body: p.body, result: r });
+            }
+        }
+        self.op(kind, body, &shape, true).await
+    }
 }
 
 impl<T: Transport, C: Clock> Link<T, C> {
     /// An operation's wait was cut off (its bound, or a reset): a change
     /// that was stored is kept as unconfirmed, to be retried under its id.
-    fn cut_off(&mut self) {
-        if let (Some(mut p), Some(id)) = (self.sending.take(), self.session.last_request_id()) {
+    /// What the operation of `body` is told: unconfirmed, unless it was cut
+    /// off while the kept change before it was retried
+    /// ([`Link::op_kept_first`]), so that it wasn't sent itself.
+    fn cut_off(&mut self, body: &serde_json::Value) -> OpError {
+        let sending = self.sending.take();
+        let this = Zeroizing::new(body.to_string());
+        let earlier_only = sending.as_ref().is_some_and(|p| *p.body != *this && self.earlier.as_ref().is_some_and(|e| e.body == p.body));
+        if let (Some(mut p), Some(id)) = (sending, self.session.last_request_id()) {
             p.id = id.to_string();
             self.unconfirmed = Some(p);
+        }
+        if earlier_only {
+            OpError::EarlierUnconfirmed
+        } else {
+            OpError::Unconfirmed
         }
     }
 }
@@ -300,41 +387,76 @@ pub async fn link_op_with<T: Transport, C: Clock>(
     stop: impl std::future::Future<Output = ()>,
     kind: &str,
     body: serde_json::Value,
-    shape: fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>,
+    shape: impl Fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>,
     change: bool,
 ) -> Result<serde_json::Value, OpError> {
+    let how = if change { How::Change } else { How::Read };
+    link_run_with(link, screen_live, overtaken, publish, stop, kind, body, shape, how).await.0
+}
+
+/// How [`link_run_with`] sends: a read or a change ([`Link::op`]), or a
+/// change after the kept one ([`Link::op_kept_first`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum How {
+    Read,
+    Change,
+    KeptFirst,
+}
+
+/// [`link_op_with`]; with [`How::KeptFirst`], also what became of the kept
+/// change retried first ([`Earlier`]), if there was one.
+#[allow(clippy::too_many_arguments)]
+pub async fn link_run_with<T: Transport, C: Clock>(
+    link: &Mutex<Option<Link<T, C>>>,
+    screen_live: impl Fn() -> bool,
+    overtaken: impl Fn() -> bool,
+    publish: impl Fn(Snapshot),
+    stop: impl std::future::Future<Output = ()>,
+    kind: &str,
+    body: serde_json::Value,
+    shape: impl Fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>,
+    how: How,
+) -> (Result<serde_json::Value, OpError>, Option<Earlier>) {
+    let change = how != How::Read;
     if overtaken() || !screen_live() {
-        return Err(OpError::NoSession);
+        return (Err(OpError::NoSession), None);
     }
     let mut slot = link.lock().await;
-    let Some(l) = slot.as_mut() else { return Err(OpError::NoSession) };
+    let Some(l) = slot.as_mut() else { return (Err(OpError::NoSession), None) };
     if overtaken() {
-        return Err(OpError::NoSession);
+        return (Err(OpError::NoSession), None);
     }
-    let r = tokio::select! {
-        r = tokio::time::timeout(OP_HOLD_MAX, l.op(kind, &body, shape, change)) => match r {
-            Ok(r) => r,
-            Err(_) => {
-                log::info!("link: {} held the link too long; it may still be carried out", kind);
-                l.cut_off();
-                Err(OpError::Unconfirmed)
+    l.earlier = None;
+    let r = {
+        let run = async {
+            match how {
+                How::KeptFirst => l.op_kept_first(kind, &body, shape).await,
+                How::Read | How::Change => l.op(kind, &body, shape, change).await,
             }
-        },
-        () = stop => {
-            log::info!("link: {} stopped for a reset; it may still be carried out", kind);
-            l.cut_off();
-            Err(OpError::Unconfirmed)
+        };
+        tokio::select! {
+            r = tokio::time::timeout(OP_HOLD_MAX, run) => r.map_err(|_| "held the link too long"),
+            () = stop => Err("stopped for a reset"),
         }
     };
+    let r = match r {
+        Ok(r) => r,
+        Err(why) => {
+            log::info!("link: {} {}; it may still be carried out", kind, why);
+            Err(l.cut_off(&body))
+        }
+    };
+    let earlier = l.earlier.take();
     if overtaken() {
-        return match r {
+        let r = match r {
             Ok(v) if change => Ok(v),
             Ok(_) => Err(OpError::NoSession),
             e => e,
         };
+        return (r, earlier);
     }
     publish(l.snapshot(Utc::now()));
-    r
+    (r, earlier)
 }
 
 #[cfg(test)]

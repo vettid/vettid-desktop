@@ -119,7 +119,6 @@ pub fn run() {
             vault::list_feed,
             vault::query_audit,
             vault::list_connection_audit,
-            vault::list_messages,
             vault::list_secrets_catalog,
             vault::list_proposals,
             vault::list_personal_data,

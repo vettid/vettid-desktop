@@ -1,5 +1,5 @@
-//! The shape of what the vault answers for the connection views
-//! (VAULT-MESSAGING 0.94.1 §10.4, §10.8), checked before it reaches the
+//! The shape of what the vault answers for the connection and conversation
+//! views (VAULT-MESSAGING 0.94.1 §10.4, §10.5, §10.8), checked before it reaches the
 //! window: known members only (others are ignored, §10.1), of their types,
 //! within their bounds. An incoming request's profile comes from someone
 //! the member hasn't accepted yet: nothing of it is passed on unchecked.
@@ -244,6 +244,65 @@ pub fn request_list(v: &Value) -> R<Value> {
         out.insert(k.into(), Value::Array(a.iter().filter_map(|r| f(r).ok().or_else(|| unreadable(r, id))).collect()));
     }
     Ok(Value::Object(out))
+}
+
+/// The most messages `message.list` answers with (its `limit`, §10.5).
+pub const MESSAGES_MAX: usize = 500;
+
+/// `message.list`'s answer for `connection_id` (§10.5, §10.5.2):
+/// `{messages, next_before?, unreadable}`, oldest first. Each message is
+/// checked as `message.new` is ([`inbound::message`]); one that doesn't
+/// check out is left out and counted in `unreadable`, so it doesn't blank
+/// the conversation. An attachment is the desktop's view of it, without
+/// `thumb` or `name` (§10.5.1 "Desktops").
+///
+/// SECURITY: the text is plaintext. It is passed on to the window only;
+/// nothing here logs it.
+///
+/// [`inbound::message`]: super::inbound::message
+pub fn message_list(v: &Value, connection_id: &str) -> R<Value> {
+    let o = obj(v)?;
+    let a = o.get("messages").and_then(Value::as_array).ok_or(BadShape)?;
+    if a.len() > MESSAGES_MAX {
+        return Err(BadShape);
+    }
+    let ok: Vec<Value> = a
+        .iter()
+        .filter_map(|m| super::inbound::message(m, Some(connection_id)).ok())
+        .filter_map(|m| serde_json::to_value(&m).ok())
+        .collect();
+    let mut out = Map::new();
+    match o.get("next_before") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(t)) if !t.is_empty() && t.len() <= super::inbound::MAX_ID_LEN => {
+            out.insert("next_before".into(), Value::String(t.clone()));
+        }
+        _ => return Err(BadShape),
+    }
+    out.insert("unreadable".into(), Value::from(a.len() - ok.len()));
+    out.insert("messages".into(), Value::Array(ok));
+    Ok(Value::Object(out))
+}
+
+/// `message.send`'s answer (§10.5): `{message_id, sent_at}`. A desktop
+/// sends no attachment, so an `att_id` isn't passed on.
+pub fn message_sent(v: &Value) -> R<Value> {
+    let o = obj(v)?;
+    let mut out = Map::new();
+    s(o, &mut out, "message_id", super::inbound::MAX_ID_LEN)?;
+    s(o, &mut out, "sent_at", super::inbound::MAX_FIELD_LEN)?;
+    let ok = |k: &str| out.get(k).and_then(Value::as_str).map(str::to_string).unwrap_or_default();
+    if ok("message_id").is_empty() || chrono::DateTime::parse_from_rfc3339(&ok("sent_at")).is_err() {
+        return Err(BadShape);
+    }
+    Ok(Value::Object(out))
+}
+
+/// An answer whose body is `{}` (`message.read`): an object, and nothing
+/// of it is passed on.
+pub fn empty(v: &Value) -> R<Value> {
+    obj(v)?;
+    Ok(Value::Object(Map::new()))
 }
 
 #[cfg(test)]

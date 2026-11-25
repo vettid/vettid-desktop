@@ -5,11 +5,14 @@ use tauri::State;
 // available" error: see `unavailable`. The connection operations go over the
 // link (DESKTOP-REWORK-PLAN Phase 5, 5.2; `link::ops`).
 use crate::commands::unavailable as operations;
-use crate::link::ops::{link_op_with, OpError};
+use crate::link::inbound::{MAX_ID_LEN, MAX_TEXT_LEN};
+use crate::link::ops::{link_run_with, Earlier, How, OpError};
 use crate::link::shape::{self, BadShape};
 use crate::state::AppState;
 
-#[derive(Debug, Serialize)]
+/// `Debug` leaves `data` out: it can carry message plaintext and personal
+/// data (names, profiles).
+#[derive(Serialize)]
 pub struct VaultOpResponse {
     pub success: bool,
     pub data: Option<serde_json::Value>,
@@ -19,6 +22,17 @@ pub struct VaultOpResponse {
     /// desktop stopped waiting, and the phone may still carry it out.
     pub error_code: Option<&'static str>,
     pub pending_approval: bool,
+}
+
+impl std::fmt::Debug for VaultOpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultOpResponse")
+            .field("success", &self.success)
+            .field("data", &self.data.is_some())
+            .field("error_code", &self.error_code)
+            .field("pending_approval", &self.pending_approval)
+            .finish_non_exhaustive()
+    }
 }
 
 impl VaultOpResponse {
@@ -59,8 +73,9 @@ impl VaultOpResponse {
 
 /// Run `kind` with `body` over the link ([`link_op_with`]): only while
 /// the screen shows a live session and no End session, lock or log-out is
-/// under way; its answer checked by `shape`. Every caller here is a read
-/// (`change: false`); the kept-change path is for messaging (5.3).
+/// under way; its answer checked by `shape`. The connection commands are
+/// reads; `send_message` is a change, sent after the kept one
+/// ([`How::KeptFirst`]).
 async fn link_op(
     state: &AppState,
     kind: &str,
@@ -68,13 +83,25 @@ async fn link_op(
     shape: fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>,
     change: bool,
 ) -> VaultOpResponse {
+    let how = if change { How::Change } else { How::Read };
+    VaultOpResponse::from_link(link_run(state, kind, body, shape, how).await.0)
+}
+
+/// [`link_op`]'s run, with the [`Earlier`] of [`How::KeptFirst`].
+async fn link_run(
+    state: &AppState,
+    kind: &str,
+    body: serde_json::Value,
+    shape: impl Fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>,
+    how: How,
+) -> (Result<serde_json::Value, OpError>, Option<Earlier>) {
     // Registered before the reset mark is read, so a reset that starts any
     // time after it wakes the operation.
     let stop = state.reset_notify.notified();
     tokio::pin!(stop);
     stop.as_mut().enable();
     let mark = crate::commands::auth::reset_mark(state);
-    let r = link_op_with(
+    link_run_with(
         &state.link,
         || state.snapshot().active_at(chrono::Utc::now()),
         || crate::commands::auth::overtaken_by_reset(state, mark),
@@ -83,10 +110,9 @@ async fn link_op(
         kind,
         body,
         shape,
-        change,
+        how,
     )
-    .await;
-    VaultOpResponse::from_link(r)
+    .await
 }
 
 /// List connections (`connection.list`, VAULT-MESSAGING §10.4): read-only.
@@ -151,13 +177,6 @@ pub async fn list_connection_audit(
         params["limit"] = serde_json::json!(l);
     }
     let result = operations::execute(&state, "connection.audit.list", params).await;
-    Ok(VaultOpResponse::from_op(result))
-}
-
-/// List messages.
-#[tauri::command]
-pub async fn list_messages(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(&state, "message.list", serde_json::json!({})).await;
     Ok(VaultOpResponse::from_op(result))
 }
 
@@ -424,46 +443,96 @@ pub async fn revoke_connection(
     Ok(VaultOpResponse::from_op(result))
 }
 
-/// Send a read receipt for a single message (independent — no phone needed).
+/// Mark an incoming message read (`message.read`, §10.5): the vault sends
+/// the read receipt. Answers `{}`.
+///
+/// Sent as a read (`change: false`), not as a change: marking twice is
+/// harmless (the vault answers `{}` again), so it needs no retry under its
+/// id, and the link keeps one change at a time, which belongs to an
+/// unconfirmed `send_message`. As a change, a mark that went unanswered
+/// would take a kept send's place. The view marks again the next time the
+/// message is seen. `not_found` (an unknown or outgoing message) is
+/// passed on as such.
 #[tauri::command]
-pub async fn mark_message_read(
-    state: State<'_, AppState>,
-    connection_id: String,
-    message_id: String,
-) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(
-        &state,
-        "message.read-receipt",
-        serde_json::json!({
-            "connection_id": connection_id,
-            "message_id": message_id,
-        }),
-    )
-    .await;
-    Ok(VaultOpResponse::from_op(result))
+pub async fn mark_message_read(state: State<'_, AppState>, connection_id: String, message_id: String) -> Result<VaultOpResponse, String> {
+    match read_body(&connection_id, &message_id) {
+        Ok(body) => Ok(link_op(&state, "message.read", body, shape::empty, false).await),
+        Err(e) => Ok(VaultOpResponse::from_link(Err(e))),
+    }
 }
 
-/// Send a message. `content_type` defaults to "text"; pass
-/// "btc_payment_decline" (with a JSON `{request_id, reason}` body) for
-/// Decline-on-payment-request, or any structured content type the peer
-/// app understands.
+/// Send a text message (`message.send`, §10.5): `text` of 1 B to 16 KiB
+/// of UTF-8. Answers `{message_id, sent_at}`, all the view needs besides
+/// what it sent, since the vault sends no `message.new` back to the
+/// desktop that sent it; and `earlier` when a send left unconfirmed was
+/// retried first (see [`sent_response`]).
+///
+/// A change: one left unanswered is kept and retried under its id, with
+/// its first `exp`, when the same text is sent again, so the vault sends
+/// it once (§8.2). Another message while one is kept retries the kept one
+/// first ([`How::KeptFirst`]); while that stays unconfirmed, the new one
+/// isn't sent (`earlier_unconfirmed`).
+///
+/// A service connection takes no messages: the vault answers `forbidden`,
+/// passed on as such (the view shows no conversation for one).
 #[tauri::command]
-pub async fn send_message(
-    state: State<'_, AppState>,
-    peer_connection_id: String,
-    content: String,
-    content_type: Option<String>,
-) -> Result<VaultOpResponse, String> {
-    let result = operations::execute(
-        &state,
-        "message.send",
-        serde_json::json!({
-            "connection_id": peer_connection_id,
-            "content": content,
-            "content_type": content_type.unwrap_or_else(|| "text".to_string()),
-        }),
-    ).await;
-    Ok(VaultOpResponse::from_op(result))
+pub async fn send_message(state: State<'_, AppState>, connection_id: String, text: String) -> Result<VaultOpResponse, String> {
+    // SECURITY: plaintext; this copy is wiped. The JSON body's copies are
+    // freed without wiping (as inbound's), and none is logged.
+    let text = zeroize::Zeroizing::new(text);
+    let body = match send_body(&connection_id, &text) {
+        Ok(b) => b,
+        Err(e) => return Ok(VaultOpResponse::from_link(Err(e))),
+    };
+    let (r, earlier) = link_run(&state, "message.send", body, shape::message_sent, How::KeptFirst).await;
+    Ok(sent_response(r, earlier))
+}
+
+/// `message.send`'s body, once its arguments check out: a connection id,
+/// and text of 1 B to [`MAX_TEXT_LEN`] bytes of UTF-8 (§10.5). Otherwise
+/// nothing is sent.
+fn send_body(connection_id: &str, text: &str) -> Result<serde_json::Value, OpError> {
+    if connection_id.is_empty() || connection_id.len() > MAX_ID_LEN || text.is_empty() || text.len() > MAX_TEXT_LEN {
+        return Err(OpError::BadArgument);
+    }
+    Ok(serde_json::json!({ "connection_id": connection_id, "text": text }))
+}
+
+/// `message.read`'s body, once its ids check out.
+fn read_body(connection_id: &str, message_id: &str) -> Result<serde_json::Value, OpError> {
+    if [connection_id, message_id].iter().any(|i| i.is_empty() || i.len() > MAX_ID_LEN) {
+        return Err(OpError::BadArgument);
+    }
+    Ok(serde_json::json!({ "connection_id": connection_id, "message_id": message_id }))
+}
+
+/// What `send_message` answers: this send's answer and, when a kept send
+/// was retried first, `data.earlier` (also on an error):
+/// `{connection_id, success, data?: {message_id, sent_at}, error?,
+/// error_code?}`. Only one send is kept at a time, so it is the one the
+/// view still shows unconfirmed for that connection. `error_code`
+/// `unconfirmed`: still not confirmed (or past its `exp`: only the next
+/// `get_conversation` tells whether it was sent).
+fn sent_response(r: Result<serde_json::Value, OpError>, earlier: Option<Earlier>) -> VaultOpResponse {
+    let mut resp = VaultOpResponse::from_link(r);
+    if let Some(e) = earlier {
+        // Only the id is read out of the kept body; its text is skipped.
+        #[derive(serde::Deserialize)]
+        struct Named {
+            connection_id: String,
+        }
+        let named = serde_json::from_str::<Named>(&e.body).map(|n| n.connection_id).ok();
+        let mut o = serde_json::json!({ "connection_id": named, "success": e.result.is_ok() });
+        match &e.result {
+            Ok(v) => o["data"] = v.clone(),
+            Err(err) => {
+                o["error"] = err.notice().into();
+                o["error_code"] = err.code().into();
+            }
+        }
+        resp.data.get_or_insert_with(|| serde_json::json!({}))["earlier"] = o;
+    }
+    resp
 }
 
 /// Send a chat message to an agent connection.
@@ -494,27 +563,50 @@ pub async fn send_agent_message(
     Ok(VaultOpResponse::from_op(result))
 }
 
-/// Get conversation messages for a connection. Vault returns the latest
-/// `limit` messages (default 50, max 100); `before` pages backwards
-/// using a message_id from the oldest currently-visible row.
+/// A page of a conversation (`message.list`, §10.5, §10.5.2), a read:
+/// without `before` the newest page, with it the page before that
+/// message. `limit` 1 to 500 (the vault's default is 100). Answers
+/// `{messages, next_before?, unreadable}` ([`shape::message_list`]),
+/// oldest first; `next_before` is there only when older messages remain.
+/// Volatile at the vault and kept in memory only here.
+///
+/// A `before` the vault no longer holds is `page_gone`: the view starts
+/// again from the newest page.
 #[tauri::command]
-pub async fn get_conversation(
-    state: State<'_, AppState>,
-    peer_connection_id: String,
-    limit: Option<i32>,
-    before: Option<String>,
-) -> Result<VaultOpResponse, String> {
-    let mut params = serde_json::json!({ "connection_id": peer_connection_id });
+pub async fn get_conversation(state: State<'_, AppState>, connection_id: String, before: Option<String>, limit: Option<u32>) -> Result<VaultOpResponse, String> {
+    let body = match conversation_body(&connection_id, before.as_deref(), limit) {
+        Ok(b) => b,
+        Err(e) => return Ok(VaultOpResponse::from_link(Err(e))),
+    };
+    let paged = body.get("before").is_some();
+    let (r, _) = link_run(&state, "message.list", body, |v| shape::message_list(v, &connection_id), How::Read).await;
+    Ok(VaultOpResponse::from_link(page_gone(r, paged)))
+}
+
+/// `message.list`'s body, once its arguments check out. An empty `before`
+/// is no `before` (the newest page).
+fn conversation_body(connection_id: &str, before: Option<&str>, limit: Option<u32>) -> Result<serde_json::Value, OpError> {
+    let before = before.filter(|b| !b.is_empty());
+    if connection_id.is_empty() || connection_id.len() > MAX_ID_LEN || before.is_some_and(|b| b.len() > MAX_ID_LEN) || limit.is_some_and(|l| l == 0 || l as usize > shape::MESSAGES_MAX) {
+        return Err(OpError::BadArgument);
+    }
+    let mut body = serde_json::json!({ "connection_id": connection_id });
     if let Some(l) = limit {
-        params["limit"] = serde_json::json!(l);
+        body["limit"] = l.into();
     }
     if let Some(b) = before {
-        if !b.is_empty() {
-            params["before"] = serde_json::json!(b);
-        }
+        body["before"] = b.into();
     }
-    let result = operations::execute(&state, "message.list", params).await;
-    Ok(VaultOpResponse::from_op(result))
+    Ok(body)
+}
+
+/// `not_found` to a page asked for with `before`: that message is gone
+/// (§10.5.2), said as [`OpError::PageGone`].
+fn page_gone(r: Result<serde_json::Value, OpError>, paged: bool) -> Result<serde_json::Value, OpError> {
+    match r {
+        Err(OpError::Vault(c)) if paged && c == "not_found" => Err(OpError::PageGone),
+        r => r,
+    }
 }
 
 /// List call history (independent).
@@ -934,6 +1026,193 @@ pub async fn presence_override_set(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The conversation commands as they run: their arguments, then the link
+    // (against the fake vault), then what the window gets.
+    use crate::link::fake::FakeVault;
+    use crate::link::ops::OP_FORBIDDEN_NOTICE;
+    use crate::link::Link;
+    use chrono::{TimeDelta, Utc};
+    use serde_json::json;
+    use tokio::sync::Mutex;
+    use vettid_device::pairing::SystemClock;
+
+    type Slot = Mutex<Option<Link<FakeVault, SystemClock>>>;
+
+    async fn live(dir: &std::path::Path) -> (FakeVault, Slot) {
+        let (vault, mut link) = FakeVault::paired(dir);
+        vault.set_session(Some(("s-1", Utc::now() + TimeDelta::hours(1))));
+        link.read_status().await.unwrap();
+        (vault, Mutex::new(Some(link)))
+    }
+
+    async fn run(s: &Slot, kind: &str, body: serde_json::Value, shape: impl Fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>, how: How) -> (Result<serde_json::Value, OpError>, Option<Earlier>) {
+        link_run_with(s, || true, || false, |_| {}, std::future::pending(), kind, body, shape, how).await
+    }
+
+    /// get_conversation as the command runs it.
+    async fn conversation(s: &Slot, id: &str, before: Option<&str>, limit: Option<u32>) -> VaultOpResponse {
+        let body = match conversation_body(id, before, limit) {
+            Ok(b) => b,
+            Err(e) => return VaultOpResponse::from_link(Err(e)),
+        };
+        let paged = body.get("before").is_some();
+        let (r, _) = run(s, "message.list", body, |v| shape::message_list(v, id), How::Read).await;
+        VaultOpResponse::from_link(page_gone(r, paged))
+    }
+
+    async fn send(s: &Slot, id: &str, text: &str) -> VaultOpResponse {
+        match send_body(id, text) {
+            Ok(b) => {
+                let (r, e) = run(s, "message.send", b, shape::message_sent, How::KeptFirst).await;
+                sent_response(r, e)
+            }
+            Err(e) => VaultOpResponse::from_link(Err(e)),
+        }
+    }
+
+    /// The request ids the vault answered, each once, in order (a stored
+    /// request and its retries carry the same id).
+    fn distinct(vault: &FakeVault) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (i, _) in vault.asked_ids() {
+            if !out.contains(&i) {
+                out.push(i);
+            }
+        }
+        out
+    }
+
+    const PAGE: &str = r#"{"messages":[{"message_id":"m-1","direction":"out","text":"first","sent_at":"2026-11-25T10:00:00Z","delivered":true,"read":true},
+        {"message_id":"m-2","direction":"in","text":"second","sent_at":"2026-11-25T10:01:00Z","delivered":true,"read":false},
+        {"message_id":"m-3","direction":"up","text":"bad","sent_at":"2026-11-25T10:02:00Z","delivered":true,"read":false}],"next_before":"m-1"}"#;
+
+    #[tokio::test]
+    async fn a_conversation_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, s) = live(dir.path()).await;
+        vault.answer("message.list", Ok(PAGE));
+        let r = conversation(&s, "c-1", None, Some(20)).await;
+        assert!(r.success, "{r:?}");
+        let d = r.data.unwrap();
+        assert_eq!((d["messages"].as_array().unwrap().len(), d["unreadable"].as_u64(), d["next_before"].as_str()), (2, Some(1), Some("m-1")));
+        assert_eq!((d["messages"][0]["connection_id"].as_str(), d["messages"][1]["text"].as_str()), (Some("c-1"), Some("second")));
+        // A page the vault no longer has: page_gone, said with no new text.
+        vault.answer("message.list", Err("not_found"));
+        let r = conversation(&s, "c-1", Some("m-1"), None).await;
+        assert_eq!((r.success, r.error_code, r.error.as_deref()), (false, Some("page_gone"), Some(crate::link::ops::OP_NOT_FOUND_NOTICE)));
+        // Without before it stays not_found.
+        assert_eq!(conversation(&s, "c-1", None, None).await.error_code, Some("not_found"));
+        // An unknown connection is an empty page.
+        vault.answer("message.list", Ok(r#"{"messages":[]}"#));
+        assert_eq!(conversation(&s, "c-9", Some(""), None).await.data, Some(json!({"messages": [], "unreadable": 0})));
+    }
+
+    #[test]
+    fn conversation_arguments() {
+        assert_eq!(conversation_body("c-1", Some("m-1"), Some(500)), Ok(json!({"connection_id": "c-1", "before": "m-1", "limit": 500})));
+        assert_eq!(conversation_body("c-1", Some(""), None), Ok(json!({"connection_id": "c-1"})), "an empty before is the newest page");
+        for (id, before, limit) in [("", None, None), ("c-1", None, Some(0)), ("c-1", None, Some(501))] {
+            assert_eq!(conversation_body(id, before, limit), Err(OpError::BadArgument), "{id} {limit:?}");
+        }
+        let long = "m".repeat(MAX_ID_LEN + 1);
+        assert_eq!(conversation_body("c-1", Some(&long), None), Err(OpError::BadArgument));
+        assert_eq!(read_body("c-1", ""), Err(OpError::BadArgument));
+        assert_eq!(read_body("", "m-1"), Err(OpError::BadArgument));
+    }
+
+    /// 1 B to 16 KiB of UTF-8, counted in bytes; nothing is sent otherwise.
+    #[tokio::test]
+    async fn send_arguments_are_checked_before_anything_is_sent() {
+        assert!(send_body("c-1", &"x".repeat(MAX_TEXT_LEN)).is_ok());
+        assert!(send_body("c-1", "x").is_ok());
+        for (id, text) in [("", "hi".to_string()), ("c-1", String::new()), ("c-1", "x".repeat(MAX_TEXT_LEN + 1)), ("c-1", "é".repeat(MAX_TEXT_LEN / 2 + 1)), (&"c".repeat(MAX_ID_LEN + 1), "hi".to_string())] {
+            assert_eq!(send_body(id, &text), Err(OpError::BadArgument), "{} {}", id.len(), text.len());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, s) = live(dir.path()).await;
+        vault.answer("message.send", Ok(r#"{"message_id":"m-9","sent_at":"2026-11-25T10:00:00Z"}"#));
+        let r = send(&s, "c-1", "").await;
+        assert_eq!(r.error_code, Some("bad_argument"));
+        assert!(vault.deposited().iter().all(|k| k != "message.send"), "sent");
+    }
+
+    #[tokio::test]
+    async fn a_message_is_sent_and_read_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, s) = live(dir.path()).await;
+        vault.answer("message.send", Ok(r#"{"message_id":"m-9","sent_at":"2026-11-25T10:00:00Z"}"#));
+        let r = send(&s, "c-1", "hello").await;
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.data, Some(json!({"message_id": "m-9", "sent_at": "2026-11-25T10:00:00Z"})));
+        vault.answer("message.read", Ok("{}"));
+        let (r, _) = run(&s, "message.read", read_body("c-1", "m-2").unwrap(), shape::empty, How::Read).await;
+        assert_eq!(r, Ok(json!({})));
+        vault.answer("message.read", Err("not_found"));
+        let (r, _) = run(&s, "message.read", read_body("c-1", "m-9").unwrap(), shape::empty, How::Read).await;
+        assert_eq!(VaultOpResponse::from_link(r).error_code, Some("not_found"));
+    }
+
+    /// A service connection takes no messages: the vault's `forbidden`
+    /// reaches the view as `forbidden`, with the existing text.
+    #[tokio::test]
+    async fn forbidden_is_passed_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, s) = live(dir.path()).await;
+        vault.answer("message.send", Err("forbidden"));
+        let r = send(&s, "svc-1", "hello").await;
+        assert_eq!((r.success, r.error_code, r.error.as_deref()), (false, Some("forbidden"), Some(OP_FORBIDDEN_NOTICE)));
+        assert!(r.data.is_none());
+        vault.answer("message.send", Err("connection_unavailable"));
+        assert_eq!(send(&s, "c-1", "hello").await.error_code, Some("connection_unavailable"));
+    }
+
+    /// An unanswered send is kept: the same text again goes under its id;
+    /// another text first retries it, and the answer says what became of it.
+    #[tokio::test]
+    async fn an_unanswered_send_is_kept_and_retried_under_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, s) = live(dir.path()).await;
+        vault.answer("message.send", Ok(r#"{"message_id":"m-9","sent_at":"2026-11-25T10:00:00Z"}"#));
+        vault.offline(true);
+        let r = send(&s, "c-1", "first").await;
+        assert_eq!((r.success, r.error_code), (false, Some("unconfirmed")));
+        // Still out of reach: another message isn't sent behind it.
+        let r = send(&s, "c-2", "second").await;
+        assert_eq!(r.error_code, Some("earlier_unconfirmed"));
+        assert_eq!(r.data.as_ref().map(|d| d["earlier"].clone()), Some(json!({"connection_id": "c-1", "success": false, "error_code": "unconfirmed", "error": crate::link::ops::OP_UNCONFIRMED_NOTICE})));
+        vault.offline(false);
+        let r = send(&s, "c-1", "first").await;
+        assert!(r.success && r.data.as_ref().unwrap().get("earlier").is_none(), "{r:?}");
+        assert_eq!(distinct(&vault).len(), 1, "one send, under the kept id: {:?}", vault.asked_ids());
+        // Kept again, then another text: the kept one first, then the new one.
+        vault.offline(true);
+        send(&s, "c-1", "third").await;
+        vault.offline(false);
+        let r = send(&s, "c-1", "fourth").await;
+        assert!(r.success, "{r:?}");
+        let d = r.data.unwrap();
+        assert_eq!(d["earlier"], json!({"connection_id": "c-1", "success": true, "data": {"message_id": "m-9", "sent_at": "2026-11-25T10:00:00Z"}}));
+        assert_eq!(d["message_id"], "m-9");
+        assert_eq!(distinct(&vault).len(), 3, "the first, the kept third, the fourth");
+        assert!(!serde_json::to_string(&d).unwrap().contains("third"), "the kept text isn't echoed");
+    }
+
+    /// Plaintext never reaches Debug.
+    #[tokio::test]
+    async fn plaintext_isnt_in_debug() {
+        let r = VaultOpResponse::from_link(Ok(json!({"messages": [{"text": "meet at noon"}]})));
+        let d = format!("{r:?}");
+        assert!(!d.contains("noon"), "{d}");
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, s) = live(dir.path()).await;
+        vault.answer("message.send", Ok(r#"{"message_id":"m-9","sent_at":"2026-11-25T10:00:00Z"}"#));
+        vault.offline(true);
+        send(&s, "c-1", "meet at noon").await;
+        let g = s.lock().await;
+        let d = format!("{:?}", g.as_ref().unwrap());
+        assert!(!d.contains("noon"), "{d}");
+    }
 
     /// Every vault operation reaches the frontend as one plain error, with
     /// nothing claimed: no success, no data, no pending approval.
