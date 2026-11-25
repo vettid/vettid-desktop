@@ -59,7 +59,8 @@ impl VaultOpResponse {
 
 /// Run `kind` with `body` over the link ([`link_op_with`]): only while
 /// the screen shows a live session and no End session, lock or log-out is
-/// under way; its answer checked by `shape`.
+/// under way; its answer checked by `shape`. Every caller here is a read
+/// (`change: false`); the kept-change path is for messaging (5.3).
 async fn link_op(
     state: &AppState,
     kind: &str,
@@ -104,27 +105,11 @@ pub async fn get_connection(state: State<'_, AppState>, connection_id: String) -
 }
 
 /// The connection requests waiting (`connection.request.list`, §10.4):
-/// incoming and outgoing. A desktop sees them, may decline them, and never
-/// approves one (§3.1).
+/// incoming and outgoing. A desktop shows them read-only; they are answered
+/// on the phone (§3.1).
 #[tauri::command]
 pub async fn list_connection_requests(state: State<'_, AppState>) -> Result<VaultOpResponse, String> {
     Ok(link_op(&state, "connection.request.list", serde_json::json!({}), shape::request_list, false).await)
-}
-
-/// Decline a connection request (`connection.decline`, §10.4): an incoming
-/// one by `pending_id`, or an outgoing one by `connection_id`, exactly one.
-#[tauri::command]
-pub async fn decline_connection_request(
-    state: State<'_, AppState>,
-    pending_id: Option<String>,
-    connection_id: Option<String>,
-) -> Result<VaultOpResponse, String> {
-    let body = match (pending_id, connection_id) {
-        (Some(p), None) if !p.is_empty() => serde_json::json!({ "pending_id": p }),
-        (None, Some(c)) if !c.is_empty() => serde_json::json!({ "connection_id": c }),
-        _ => return Ok(VaultOpResponse::from_link(Err(OpError::BadArgument))),
-    };
-    Ok(link_op(&state, "connection.decline", body, shape::empty, true).await)
 }
 
 /// List paired agents with their Contract (scope / approval mode /

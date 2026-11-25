@@ -105,11 +105,17 @@ export function requestSecondary(r) {
 /** The title of a request the vault sent in a form this desktop can't read. */
 export const UNREADABLE_REQUEST = 'Unreadable request';
 
+// Owner-approved text
+/** Shown once under the requests heading when there is a request:
+ *  requests are answered on the phone, never on a desktop (§3.1). */
+export const ANSWERED_ON_PHONE = 'This is done on your phone.';
+
 /**
  * What a request row shows. A request marked `unreadable` (it didn't check
  * out, and only its id is kept) is titled "Unreadable request" and shows no
  * profile fields; any other is titled by `requestTitle`, with
- * `requestSecondary` under it. Either can be declined (`declineArgs`).
+ * `requestSecondary` under it. Either is shown read-only: requests are
+ * answered on the phone.
  * @param {{ unreadable?: unknown, name?: string, profile?: { first_name?: string, last_name?: string, name?: string } | null }} r
  * @returns {{ unreadable: boolean, title: string, secondary: string[] }}
  */
@@ -148,20 +154,6 @@ export function inSentence(title) {
  */
 export function relayHeldText(title) {
   return `Waiting to reach ${inSentence(title)} at their vault's new address.`;
-}
-
-/**
- * The arguments for `decline_connection_request`: an incoming request by its
- * `pending_id`, an outgoing one by its `connection_id`, never both. `null`
- * when the id is missing (nothing is sent).
- * @param {'incoming' | 'outgoing'} side
- * @param {{ pending_id?: string, connection_id?: string }} req
- * @returns {{ pendingId: string } | { connectionId: string } | null}
- */
-export function declineArgs(side, req) {
-  if (side === 'incoming') return req.pending_id ? { pendingId: req.pending_id } : null;
-  if (side === 'outgoing') return req.connection_id ? { connectionId: req.connection_id } : null;
-  return null;
 }
 
 /** The `sync.event` kinds after which the connection views read again. */

@@ -185,8 +185,8 @@ pub fn connection_list(v: &Value) -> R<Value> {
     Ok(Value::Object(out))
 }
 
-/// A request that doesn't check out, kept with its id (so it can still be
-/// declined) and marked `unreadable`; dropped if even its id doesn't.
+/// A request that doesn't check out, kept with its id (so it is still listed,
+/// read-only) and marked `unreadable`; dropped if even its id doesn't.
 fn unreadable(v: &Value, id_key: &str) -> Option<Value> {
     let o = v.as_object()?;
     let mut out = Map::new();
@@ -244,12 +244,6 @@ pub fn request_list(v: &Value) -> R<Value> {
         out.insert(k.into(), Value::Array(a.iter().filter_map(|r| f(r).ok().or_else(|| unreadable(r, id))).collect()));
     }
     Ok(Value::Object(out))
-}
-
-/// An empty answer (`connection.decline`): `{}`, whatever it carries.
-pub fn empty(v: &Value) -> R<Value> {
-    obj(v)?;
-    Ok(Value::Object(Map::new()))
 }
 
 #[cfg(test)]

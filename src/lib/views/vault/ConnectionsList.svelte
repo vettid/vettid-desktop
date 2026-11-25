@@ -1,7 +1,6 @@
 <script lang="ts">
     import { onMount } from 'svelte';
-    import { invoke } from '@tauri-apps/api/core';
-    import type { Connection, VaultOpResponse } from '../../connections';
+    import type { Connection } from '../../connections';
     import { selectedConnectionStore } from '../../stores/navigation';
     import {
         connectionsStore,
@@ -18,7 +17,7 @@
         connectionTitle,
         secondaryNames,
         requestRow,
-        declineArgs,
+        ANSWERED_ON_PHONE,
         UNREADABLE_CONNECTIONS,
         hasUnreadableConnections,
     } from '../../connectionView.js';
@@ -90,27 +89,8 @@
         return filtered;
     });
 
-    // Declining is the only request action a desktop has (§3.1, §6.4):
-    // approving is the phone's, so no approve control is shown.
-    let declining = $state<string | null>(null);
-    let declineErrors = $state<Record<string, string>>({});
-
-    async function decline(side: 'incoming' | 'outgoing', key: string, req: { pending_id?: string; connection_id?: string }) {
-        const args = declineArgs(side, req);
-        if (!args || declining) return;
-        declining = key;
-        declineErrors = { ...declineErrors, [key]: '' };
-        try {
-            const resp: VaultOpResponse<unknown> = await invoke('decline_connection_request', args);
-            if (!resp.success) declineErrors = { ...declineErrors, [key]: resp.error ?? '' };
-        } catch (e) {
-            declineErrors = { ...declineErrors, [key]: String(e) };
-        }
-        declining = null;
-        // Whatever the answer, read again: the requests shown are the vault's.
-        reloadConnectionViews();
-    }
-
+    // Requests are shown read-only: they are answered on the phone
+    // (§3.1, §6.4), so no request control is shown.
     let hasRequests = $derived((requests?.incoming.length ?? 0) + (requests?.outgoing.length ?? 0) > 0);
 
     onMount(() => { loadAll(); });
@@ -128,21 +108,17 @@
             {#if requestsError}
                 <div class="status error">{requestsError}</div>
             {:else if requests}
+                {#if hasRequests}<p class="req-note">{ANSWERED_ON_PHONE}</p>{/if}
                 {#if requests.incoming.length}
                     <h5>Incoming</h5>
                     <ul class="req-list">
                         {#each requests.incoming as req (req.pending_id)}
-                            {@const key = `in:${req.pending_id}`}
                             {@const row = requestRow(req)}
                             <li class="req" class:unreadable={row.unreadable}>
                                 <div class="req-text">
                                     <div class="name"><bdi>{row.title}</bdi></div>
                                     {#each row.secondary as s}<div class="row2"><bdi>{s}</bdi></div>{/each}
-                                    {#if declineErrors[key]}<div class="req-error">{declineErrors[key]}</div>{/if}
                                 </div>
-                                <button class="decline" disabled={declining !== null} onclick={() => decline('incoming', key, req)}>
-                                    {declining === key ? '…' : 'Decline'}
-                                </button>
                             </li>
                         {/each}
                     </ul>
@@ -151,17 +127,12 @@
                     <h5>Outgoing</h5>
                     <ul class="req-list">
                         {#each requests.outgoing as req (req.connection_id)}
-                            {@const key = `out:${req.connection_id}`}
                             {@const row = requestRow(req)}
                             <li class="req" class:unreadable={row.unreadable}>
                                 <div class="req-text">
                                     <div class="name"><bdi>{row.title}</bdi></div>
                                     {#each row.secondary as s}<div class="row2"><bdi>{s}</bdi></div>{/each}
-                                    {#if declineErrors[key]}<div class="req-error">{declineErrors[key]}</div>{/if}
                                 </div>
-                                <button class="decline" disabled={declining !== null} onclick={() => decline('outgoing', key, req)}>
-                                    {declining === key ? '…' : 'Decline'}
-                                </button>
                             </li>
                         {/each}
                     </ul>
@@ -372,18 +343,5 @@
     }
     .req-text { flex: 1; min-width: 0; }
     .req.unreadable .name { color: var(--text-muted); font-style: italic; }
-    .req-error { margin-top: 4px; font-size: 0.8rem; color: var(--error); }
-    .decline {
-        background: none;
-        border: 1px solid var(--border);
-        border-radius: 6px;
-        padding: 4px 10px;
-        cursor: pointer;
-        color: inherit;
-        font: inherit;
-        font-size: 0.85rem;
-        flex-shrink: 0;
-    }
-    .decline:hover:not(:disabled) { background: var(--bg-elevated); }
-    .decline:disabled { opacity: 0.6; cursor: default; }
+    .req-note { margin: 0 0 6px; font-size: 0.8rem; color: var(--text-muted); }
 </style>
