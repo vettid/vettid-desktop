@@ -467,9 +467,11 @@ pub async fn mark_message_read(state: State<'_, AppState>, connection_id: String
 /// desktop that sent it; and `earlier` when a send left unconfirmed was
 /// retried first (see [`sent_response`]).
 ///
-/// A change: one left unanswered is kept and retried under its id, with
-/// its first `exp`, when the same text is sent again, so the vault sends
-/// it once (§8.2). Another message while one is kept retries the kept one
+/// A change: one left unanswered is kept, in memory only (the text never
+/// reaches the store or `device.enc`), and retried under its id, with its
+/// first `exp`, when the same text is sent again, so the vault sends it
+/// once (§8.2). With the relay out of reach nothing waits to go later: it
+/// is `not_sent`, and stays the view's draft. Another message while one is kept retries the kept one
 /// first ([`How::KeptFirst`]); while that stays unconfirmed, the new one
 /// isn't sent (`earlier_unconfirmed`).
 ///
@@ -1071,18 +1073,6 @@ mod tests {
         }
     }
 
-    /// The request ids the vault answered, each once, in order (a stored
-    /// request and its retries carry the same id).
-    fn distinct(vault: &FakeVault) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for (i, _) in vault.asked_ids() {
-            if !out.contains(&i) {
-                out.push(i);
-            }
-        }
-        out
-    }
-
     const PAGE: &str = r#"{"messages":[{"message_id":"m-1","direction":"out","text":"first","sent_at":"2026-11-25T10:00:00Z","delivered":true,"read":true},
         {"message_id":"m-2","direction":"in","text":"second","sent_at":"2026-11-25T10:01:00Z","delivered":true,"read":false},
         {"message_id":"m-3","direction":"up","text":"bad","sent_at":"2026-11-25T10:02:00Z","delivered":true,"read":false}],"next_before":"m-1"}"#;
@@ -1167,48 +1157,65 @@ mod tests {
         assert_eq!(send(&s, "c-1", "hello").await.error_code, Some("connection_unavailable"));
     }
 
-    /// An unanswered send is kept: the same text again goes under its id;
-    /// another text first retries it, and the answer says what became of it.
+    const SENT: &str = r#"{"message_id":"m-9","sent_at":"2026-11-25T10:00:00Z"}"#;
+
+    /// A send the relay took but the vault didn't answer in time is kept in
+    /// memory (never in the stored outbox): the same text again goes under
+    /// its id, so the vault sees one message; another text first retries
+    /// it, and the answer says what became of it.
     #[tokio::test]
     async fn an_unanswered_send_is_kept_and_retried_under_its_id() {
         let dir = tempfile::tempdir().unwrap();
-        let (vault, s) = live(dir.path()).await;
-        vault.answer("message.send", Ok(r#"{"message_id":"m-9","sent_at":"2026-11-25T10:00:00Z"}"#));
-        vault.offline(true);
+        let (vault, s) = live(dir.path()).await; // message.send taken, not answered
         let r = send(&s, "c-1", "first").await;
         assert_eq!((r.success, r.error_code), (false, Some("unconfirmed")));
-        // Still out of reach: another message isn't sent behind it.
+        // Still unanswered: another message isn't sent behind it.
         let r = send(&s, "c-2", "second").await;
         assert_eq!(r.error_code, Some("earlier_unconfirmed"));
         assert_eq!(r.data.as_ref().map(|d| d["earlier"].clone()), Some(json!({"connection_id": "c-1", "success": false, "error_code": "unconfirmed", "error": crate::link::ops::OP_UNCONFIRMED_NOTICE})));
-        vault.offline(false);
+        vault.answer("message.send", Ok(SENT));
         let r = send(&s, "c-1", "first").await;
         assert!(r.success && r.data.as_ref().unwrap().get("earlier").is_none(), "{r:?}");
-        assert_eq!(distinct(&vault).len(), 1, "one send, under the kept id: {:?}", vault.asked_ids());
+        assert_eq!(vault.deposited_ids("message.send").len(), 1, "one message to the vault, under the kept id: {:?}", vault.deposited());
         // Kept again, then another text: the kept one first, then the new one.
-        vault.offline(true);
+        vault.unanswer("message.send");
         send(&s, "c-1", "third").await;
-        vault.offline(false);
+        vault.answer("message.send", Ok(SENT));
         let r = send(&s, "c-1", "fourth").await;
         assert!(r.success, "{r:?}");
         let d = r.data.unwrap();
         assert_eq!(d["earlier"], json!({"connection_id": "c-1", "success": true, "data": {"message_id": "m-9", "sent_at": "2026-11-25T10:00:00Z"}}));
         assert_eq!(d["message_id"], "m-9");
-        assert_eq!(distinct(&vault).len(), 3, "the first, the kept third, the fourth");
+        assert_eq!(vault.deposited_ids("message.send").len(), 3, "the first, the kept third, the fourth");
         assert!(!serde_json::to_string(&d).unwrap().contains("third"), "the kept text isn't echoed");
     }
 
-    /// Plaintext never reaches Debug.
+    /// With the relay out of reach a send isn't stored to go later: it is
+    /// `not_sent`, nothing is kept, and the vault never sees it. Sent again
+    /// once the relay is back, the vault sees one message.
+    #[tokio::test]
+    async fn a_send_the_relay_never_took_is_not_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, s) = live(dir.path()).await;
+        vault.answer("message.send", Ok(SENT));
+        vault.offline(true);
+        let r = send(&s, "c-1", "first").await;
+        assert_eq!((r.success, r.error_code), (false, Some("not_sent")));
+        vault.offline(false);
+        let r = send(&s, "c-1", "first").await;
+        assert!(r.success && r.data.as_ref().unwrap().get("earlier").is_none(), "{r:?}");
+        assert_eq!(vault.deposited_ids("message.send").len(), 1);
+    }
+
+    /// Plaintext never reaches Debug, with a send kept unconfirmed.
     #[tokio::test]
     async fn plaintext_isnt_in_debug() {
         let r = VaultOpResponse::from_link(Ok(json!({"messages": [{"text": "meet at noon"}]})));
         let d = format!("{r:?}");
         assert!(!d.contains("noon"), "{d}");
         let dir = tempfile::tempdir().unwrap();
-        let (vault, s) = live(dir.path()).await;
-        vault.answer("message.send", Ok(r#"{"message_id":"m-9","sent_at":"2026-11-25T10:00:00Z"}"#));
-        vault.offline(true);
-        send(&s, "c-1", "meet at noon").await;
+        let (_vault, s) = live(dir.path()).await; // taken, not answered: kept
+        assert_eq!(send(&s, "c-1", "meet at noon").await.error_code, Some("unconfirmed"));
         let g = s.lock().await;
         let d = format!("{:?}", g.as_ref().unwrap());
         assert!(!d.contains("noon"), "{d}");

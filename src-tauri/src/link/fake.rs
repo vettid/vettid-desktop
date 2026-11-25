@@ -92,6 +92,8 @@ struct State {
     deposits_fail: bool,
     /// The type of every message the relay took from the device.
     deposited: Vec<String>,
+    /// The inner id of each of those.
+    deposited_ids: Vec<String>,
     /// The last `ts` this vault put on a message.
     last_ts: DateTime<Utc>,
     /// What happens once the next `device.session.request` is answered.
@@ -278,6 +280,7 @@ impl FakeVault {
             offline: false,
             deposits_fail: false,
             deposited: Vec::new(),
+            deposited_ids: Vec::new(),
             last_ts: now - TimeDelta::minutes(1),
             after_request: None,
             request_window: None,
@@ -421,6 +424,25 @@ impl FakeVault {
         self.lock().answers.insert(kind.to_string(), a.map(str::to_string).map_err(str::to_string));
     }
 
+    /// Answer requests of `kind` no more: they are taken and left unanswered.
+    pub(crate) fn unanswer(&self, kind: &str) {
+        self.lock().answers.remove(kind);
+    }
+
+    /// The inner ids of the messages of `kind` the relay took, each once, in
+    /// order (a retry under the same id is the same message to the vault,
+    /// §8.2).
+    pub(crate) fn deposited_ids(&self, kind: &str) -> Vec<String> {
+        let s = self.lock();
+        let mut out: Vec<String> = Vec::new();
+        for (k, i) in s.deposited.iter().zip(&s.deposited_ids) {
+            if k == kind && !out.contains(i) {
+                out.push(i.clone());
+            }
+        }
+        out
+    }
+
     /// Make each deposit wait `d` first.
     pub(crate) fn stall_deposits(&self, d: Option<std::time::Duration>) {
         self.lock().deposit_stall = d;
@@ -480,6 +502,7 @@ impl Transport for FakeVault {
         let env = Envelope::parse(payload).expect("an envelope");
         let inner = s.epoch.open(&env).expect("under the session epoch");
         s.deposited.push(inner.kind.clone());
+        s.deposited_ids.push(inner.id.clone());
         s.n += 1;
         let taken = format!("d{}", s.n);
         if s.locked {

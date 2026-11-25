@@ -217,6 +217,11 @@ pub fn message(v: &serde_json::Value, listed: Option<&str>) -> Result<MessageNew
         None | Some(serde_json::Value::Null) => None,
         Some(a) => Some(parse_attachment(a)?),
     };
+    // `""` is an attachment without a caption (§10.5); a text message has
+    // at least 1 byte.
+    if text.is_empty() && attachment.is_none() {
+        return Err(Unreadable);
+    }
     Ok(MessageNew { connection_id, message_id, direction, text, sent_at, delivered: b("delivered")?, read: b("read")?, attachment })
 }
 

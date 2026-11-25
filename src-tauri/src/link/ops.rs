@@ -161,7 +161,11 @@ impl<T: Transport, C: Clock> Link<T, C> {
     ///   same change asked again is retried under its id (§8.6), so the
     ///   vault answers it from its cache instead of acting twice.
     /// - Once the request is stored, any failure is
-    ///   [`OpError::Unconfirmed`]: it goes with the next exchange.
+    ///   [`OpError::Unconfirmed`]: it goes with the next exchange. A
+    ///   `message.send` is never stored (its body is plaintext,
+    ///   `vettid_device::session::memory_only`): it is unconfirmed once the
+    ///   relay may have taken it, and then only this kept change retries it;
+    ///   one the relay certainly didn't take is [`OpError::NotSent`].
     /// - `owner_check_required` is learned as the hold (§3.6.3);
     ///   `session_required` takes the session as unconfirmed.
     /// - A read answered while the batch it came in also showed a lock,

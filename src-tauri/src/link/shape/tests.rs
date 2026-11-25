@@ -131,10 +131,12 @@ fn a_page_of_messages_drops_and_counts_a_bad_one() {
     unnamed.as_object_mut().unwrap().remove("connection_id");
     let mut extra = msg("m-6");
     extra["extra"] = json!("dropped");
-    let v = message_list(&json!({"messages": [msg("m-1"), bad, long, other, unnamed, extra], "next_before": "m-1"}), "c-1").unwrap();
+    let mut empty_text = msg("m-7");
+    empty_text["text"] = json!("");
+    let v = message_list(&json!({"messages": [msg("m-1"), bad, long, other, unnamed, extra, empty_text], "next_before": "m-1"}), "c-1").unwrap();
     let ids: Vec<&str> = v["messages"].as_array().unwrap().iter().map(|m| m["message_id"].as_str().unwrap()).collect();
-    assert_eq!(ids, ["m-1", "m-5", "m-6"], "the bad, the too long and another connection's are left out");
-    assert_eq!(v["unreadable"], 3);
+    assert_eq!(ids, ["m-1", "m-5", "m-6"], "the bad, the too long, another connection's and an empty one are left out");
+    assert_eq!(v["unreadable"], 4);
     assert_eq!(v["next_before"], "m-1");
     assert_eq!(v["messages"][1]["connection_id"], "c-1", "a listed message may leave its connection out");
     assert!(v["messages"][2].get("extra").is_none());

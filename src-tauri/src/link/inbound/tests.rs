@@ -46,6 +46,9 @@ fn a_bad_message_is_unreadable() {
         r#"{"connection_id":"c-1","message_id":"m-1","direction":"in","text":"x","sent_at":"yesterday","delivered":true,"read":false}"#,
         r#"{"connection_id":"c-1","message_id":"m-1","direction":"in","text":"x","sent_at":"2026-11-25T10:00:00Z","delivered":"yes","read":false}"#,
         r#"{"connection_id":"c-1","message_id":"m-1","direction":"in","text":"x","sent_at":"2026-11-25T10:00:00Z","delivered":true,"read":false,"attachment":{"att_id":"a"}}"#,
+        // Empty text is an attachment without a caption, never alone.
+        r#"{"connection_id":"c-1","message_id":"m-1","direction":"in","text":"","sent_at":"2026-11-25T10:00:00Z","delivered":true,"read":false}"#,
+        r#"{"connection_id":"c-1","message_id":"m-1","direction":"in","text":"","sent_at":"2026-11-25T10:00:00Z","delivered":true,"read":false,"attachment":null}"#,
     ] {
         assert_eq!(parse(&inner(TYPE_MESSAGE_NEW, body)), Some(Err(Unreadable)), "{body}");
     }
