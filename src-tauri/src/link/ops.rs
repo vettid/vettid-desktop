@@ -14,7 +14,7 @@ use vettid_device::access::{VaultState, OWNER_CHECK_REQUIRED};
 use vettid_device::pairing::Clock;
 use vettid_device::session::SessionError;
 use vettid_device::transport::Transport;
-use vettid_vms::envelope::Status;
+use vettid_vms::envelope::{Status, MAX_CLOCK_SKEW_FUTURE};
 use zeroize::Zeroizing;
 
 use super::shape::BadShape;
@@ -30,15 +30,33 @@ pub const OP_TIMEOUT: TimeDelta = TimeDelta::seconds(6);
 pub const OP_HOLD_MAX: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// How long a change stays valid at the vault (`exp`, §8.5): one not
-/// delivered by then is dropped, so "unconfirmed" means "within this".
+/// delivered by then is dropped, so "unconfirmed" means "within this",
+/// plus [`KEPT_MARGIN`].
 pub const CHANGE_TTL: TimeDelta = TimeDelta::minutes(2);
+
+/// How long past its `exp`, by this computer's clock, a kept change is
+/// still taken as able to arrive: the vault judges `exp` by its own clock,
+/// which may be behind this one. The clock skew a receiver allows (§8.4:
+/// a `ts` up to 5 minutes ahead, [`MAX_CLOCK_SKEW_FUTURE`]), as
+/// `Session::arm` keeps a request's id for its answer until `exp` plus
+/// the same, and as §8.6 has a device wait for a `vault.lock` until "its
+/// own `exp` plus a margin". Only past it is a kept change forgotten
+/// ([`OpError::UnconfirmedExpired`]).
+pub const KEPT_MARGIN: TimeDelta = MAX_CLOCK_SKEW_FUTURE;
 /// The same for a read: an answer this late is of no use.
 pub const READ_TTL: TimeDelta = TimeDelta::seconds(30);
 
 /// NEW TEXT (owner approval needed): a change sent, or stored to be sent,
 /// but not answered in time: it may still be carried out within
 /// [`CHANGE_TTL`].
-pub const OP_UNCONFIRMED_NOTICE: &str = "Your vault hasn't confirmed this yet. It may still happen in the next two minutes: refresh then to see.";
+pub const OP_UNCONFIRMED_NOTICE: &str = "Your vault hasn't confirmed this yet. It may still happen in the next few minutes: refresh then to see.";
+// NEW TEXT (owner approval needed): a kept change still unconfirmed, and
+// this desktop can't reach the vault now (not sent, the clock, no
+// session): [`OpError::UnconfirmedFor`].
+pub const OP_UNCONFIRMED_UNREACHABLE_NOTICE: &str = "Your vault hasn't confirmed this yet, and this desktop can't reach it now. It may still happen in the next few minutes.";
+// NEW TEXT (owner approval needed): said after the lock's or the hold's
+// own text, for a change still unconfirmed ([`OpError::UnconfirmedFor`]).
+pub const OP_UNCONFIRMED_AFTER_NOTICE: &str = "Your vault hasn't confirmed this yet; it may still happen in the next few minutes.";
 /// NEW TEXT (owner approval needed): it couldn't be sent at all.
 pub const OP_NOT_SENT_NOTICE: &str = "This desktop couldn't send this to your vault. Try again.";
 
@@ -122,7 +140,12 @@ impl OpError {
             OpError::NotSaved => NOT_SAVED_NOTICE.into(),
             OpError::NotSent => OP_NOT_SENT_NOTICE.into(),
             OpError::EarlierUnconfirmed => OP_EARLIER_UNCONFIRMED_NOTICE.into(),
-            OpError::UnconfirmedFor(e) => e.notice(),
+            // Never the cause's own "try again" or "couldn't send": it may
+            // still happen.
+            OpError::UnconfirmedFor(e) => match **e {
+                OpError::Locked | OpError::Held => format!("{} {}", e.notice(), OP_UNCONFIRMED_AFTER_NOTICE),
+                _ => OP_UNCONFIRMED_UNREACHABLE_NOTICE.into(),
+            },
             OpError::UnconfirmedExpired => OP_UNCONFIRMED_EXPIRED_NOTICE.into(),
             OpError::AnswerUnreadable => OP_ANSWER_UNREADABLE_NOTICE.into(),
             OpError::Refused => REFUSED_NOTICE.into(),
@@ -194,9 +217,9 @@ impl<T: Transport, C: Clock> Link<T, C> {
     ///   one of [`READ_TTL`]. A change not confirmed is remembered, and the
     ///   same change asked again is retried under its id (§8.6), so the
     ///   vault answers it from its cache instead of acting twice. At most
-    ///   [`MAX_RETRIES`] times: asked again after that, nothing is sent
-    ///   while its `exp` lasts ([`OpError::Unconfirmed`]); past its `exp`
-    ///   it is forgotten, said once as [`OpError::UnconfirmedExpired`] (the
+    ///   [`MAX_RETRIES`] times, and before its `exp`: asked again after
+    ///   that, nothing is sent until its `exp` plus [`KEPT_MARGIN`]
+    ///   ([`OpError::Unconfirmed`]); past that it is forgotten, said once as [`OpError::UnconfirmedExpired`] (the
     ///   view reads the conversation again), and only the next same call
     ///   is a new request.
     /// - A retry that gets no answer from the vault, for any reason (not
@@ -240,15 +263,16 @@ impl<T: Transport, C: Clock> Link<T, C> {
         // The kept change this one is the same as (kind and body).
         let same = self.unconfirmed.clone().filter(|p| change && p.kind == kind && *p.body == *body);
         if let (Some(p), false) = (&same, must_retry) {
-            if now >= p.exp {
-                // Past its exp: it was carried out by then or never will be;
-                // only a read tells which. Said once; the next is new.
+            if now >= p.exp + KEPT_MARGIN {
+                // Past its exp, and the margin for the vault's clock: it was
+                // carried out by then or never will be; only a read tells
+                // which. Said once; the next is new.
                 self.unconfirmed = None;
                 return Err(OpError::UnconfirmedExpired);
             }
-            if p.retries >= MAX_RETRIES {
-                // Retried as often as §8.6 allows: nothing more goes while
-                // it can still arrive.
+            if now >= p.exp || p.retries >= MAX_RETRIES {
+                // Past its exp (within the margin), or retried as often as
+                // §8.6 allows: nothing more goes while it can still arrive.
                 return Err(OpError::Unconfirmed);
             }
         }
@@ -426,8 +450,10 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// [`OpError::EarlierUnconfirmed`], or the error that would have
     /// stopped this one too. The kept one goes only under its id (never as
     /// a new request). Retried [`MAX_RETRIES`] times already and still
-    /// within its `exp`, it isn't retried, and this one waits
-    /// ([`OpError::EarlierUnconfirmed`]). Past its `exp` it is forgotten,
+    /// within its `exp` and [`KEPT_MARGIN`], it isn't retried, and this one
+    /// waits ([`OpError::EarlierUnconfirmed`]). Past its `exp` but within
+    /// the margin it is still retried under its id (the vault dedupes or
+    /// drops it). Past both it is forgotten,
     /// reported [`OpError::UnconfirmedExpired`] (only a read tells whether
     /// it happened), and this one goes.
     pub async fn op_kept_first(&mut self, kind: &str, body: &serde_json::Value, shape: impl Fn(&serde_json::Value) -> Result<serde_json::Value, BadShape>) -> Result<serde_json::Value, OpError> {
@@ -437,7 +463,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
         if let Some(p) = kept {
             // Unconfirmed until its answer is in (a cut-off leaves it so).
             self.earlier = Some(Earlier { id: p.id.clone(), body: p.body.clone(), result: Err(OpError::Unconfirmed) });
-            if Utc::now() >= p.exp {
+            if Utc::now() >= p.exp + KEPT_MARGIN {
                 self.unconfirmed = None;
                 self.earlier = Some(Earlier { id: p.id, body: p.body, result: Err(OpError::UnconfirmedExpired) });
             } else if p.retries >= MAX_RETRIES {

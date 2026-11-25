@@ -402,7 +402,7 @@ async fn a_kept_change_past_its_exp_isnt_retried() {
     vault.offline(true);
     assert_eq!(link.op_kept_first("test.change", &serde_json::json!({"n": "a"}), any).await, Err(OpError::Unconfirmed));
     let kept = link.unconfirmed.clone().unwrap();
-    link.unconfirmed.as_mut().unwrap().exp = Utc::now() - TimeDelta::seconds(1);
+    link.unconfirmed.as_mut().unwrap().exp = Utc::now() - KEPT_MARGIN - TimeDelta::seconds(1);
     vault.offline(false);
     link.op_kept_first("test.change", &serde_json::json!({"n": "b"}), any).await.unwrap();
     assert_eq!(sent(&vault, "test.change"), 2, "retried past its exp (only the stored copy and the new one)");
@@ -473,7 +473,16 @@ fn the_new_codes() {
     assert_eq!((OpError::UnconfirmedExpired.code(), OpError::UnconfirmedExpired.notice()), ("unconfirmed_expired", OP_UNCONFIRMED_EXPIRED_NOTICE.to_string()));
     assert_eq!((OpError::AnswerUnreadable.code(), OpError::AnswerUnreadable.notice()), ("answer_unreadable", OP_ANSWER_UNREADABLE_NOTICE.to_string()));
     let locked = OpError::UnconfirmedFor(Box::new(OpError::Locked));
-    assert_eq!((locked.code(), locked.notice(), locked.is_unconfirmed()), ("unconfirmed", VAULT_LOCKED_NOTICE.to_string(), true));
+    assert_eq!((locked.code(), locked.notice(), locked.is_unconfirmed()), ("unconfirmed", format!("{VAULT_LOCKED_NOTICE} {OP_UNCONFIRMED_AFTER_NOTICE}"), true));
+    // No "unconfirmed" answer says the opposite of "it may still happen".
+    for cause in [OpError::NotSent, OpError::NotSaved, OpError::Clock(Some(0)), OpError::Clock(None), OpError::NoSession, OpError::Unknown, OpError::Locked, OpError::Held] {
+        let e = OpError::UnconfirmedFor(Box::new(cause.clone()));
+        let n = e.notice();
+        assert_eq!(e.code(), "unconfirmed");
+        assert!(n.contains("may still happen") && !n.contains("Try again") && !n.contains("couldn't send"), "{cause:?}: {n}");
+    }
+    assert_eq!(OpError::UnconfirmedFor(Box::new(OpError::NotSent)).notice(), OP_UNCONFIRMED_UNREACHABLE_NOTICE);
+    assert_eq!(OpError::UnconfirmedFor(Box::new(OpError::Held)).notice(), format!("{VAULT_HELD_NOTICE} {OP_UNCONFIRMED_AFTER_NOTICE}"));
     assert_eq!(OpError::Vault("connection_unavailable".into()).code(), "connection_unavailable");
     assert_eq!(OpError::Vault("connection_unavailable".into()).notice(), OP_FAILED_NOTICE);
 }
@@ -509,7 +518,9 @@ async fn a_change_is_retried_under_its_id_at_most_twice() {
     assert_eq!((kept.id, kept.retries), (first.id.clone(), 2), "still kept");
 }
 
-/// Past its exp, the kept change is forgotten and said once as
+/// Just past its exp, within KEPT_MARGIN (the vault's clock may be
+/// behind), the kept change is still unconfirmed and nothing is sent.
+/// Past exp plus the margin it is forgotten and said once as
 /// unconfirmed_expired, with nothing sent; only the next same call is a
 /// new request.
 #[tokio::test]
@@ -519,8 +530,16 @@ async fn a_kept_change_past_its_exp_is_said_once_then_forgotten() {
     let body = serde_json::json!({"n": "p"});
     assert_eq!(link.op("test.change", &body, any, true).await, Err(OpError::Unconfirmed));
     let first = link.unconfirmed.clone().unwrap();
-    link.unconfirmed.as_mut().unwrap().exp = Utc::now() - TimeDelta::milliseconds(1);
     let before = vault.deposited().len();
+    // Within the margin, on both sides of exp.
+    for past in [TimeDelta::milliseconds(1), KEPT_MARGIN - TimeDelta::seconds(5)] {
+        link.unconfirmed.as_mut().unwrap().exp = Utc::now() - past;
+        assert_eq!(link.op("test.change", &body, any, true).await, Err(OpError::Unconfirmed), "{past:?} past exp");
+        assert_eq!(link.unconfirmed.as_ref().map(|p| (p.id.clone(), p.retries)), Some((first.id.clone(), 0)), "still kept, and not tried again");
+    }
+    assert_eq!(vault.deposited().len(), before, "sent within the margin");
+    // Past exp plus the margin.
+    link.unconfirmed.as_mut().unwrap().exp = Utc::now() - KEPT_MARGIN - TimeDelta::milliseconds(1);
     assert_eq!(link.op("test.change", &body, any, true).await, Err(OpError::UnconfirmedExpired));
     assert_eq!(vault.deposited().len(), before, "sent past its exp");
     assert!(link.unconfirmed.is_none());
@@ -574,6 +593,29 @@ async fn a_failed_retry_stays_unconfirmed() {
     let _ = link.read_status().await; // the lock is known before the retry
     let r = link.op("message.send", &body, any, true).await;
     assert_eq!(r, Err(OpError::UnconfirmedFor(Box::new(OpError::Locked))), "{r:?}");
+    let n = r.unwrap_err().notice();
+    assert!(n.contains("may still happen") && !n.contains("Try again") && !n.contains("couldn't send"), "{n}");
+}
+
+/// Through op_kept_first: a kept send just past its exp (within the
+/// margin) is retried under its id before another message, never dropped
+/// or sent anew; its answer settles it, and the other goes.
+#[tokio::test]
+async fn a_kept_send_just_past_its_exp_is_retried_first_under_its_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, mut link) = live(dir.path()).await; // message.send: taken, not answered
+    let a = serde_json::json!({"connection_id": "c-1", "text": "first"});
+    assert_eq!(link.op_kept_first("message.send", &a, any).await, Err(OpError::Unconfirmed));
+    link.unconfirmed.as_mut().unwrap().exp = Utc::now() - TimeDelta::seconds(1);
+    let kept = link.unconfirmed.clone().unwrap();
+    vault.answer("message.send", Ok(r#"{"ok":1}"#));
+    let b = serde_json::json!({"connection_id": "c-1", "text": "second"});
+    assert_eq!(link.op_kept_first("message.send", &b, any).await, Ok(serde_json::json!({"ok": 1})));
+    let asked = vault.asked_ids();
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert_eq!((asked[0].0.clone(), asked[0].1.map(|e| e.timestamp_millis())), (kept.id.clone(), Some(kept.exp.timestamp_millis())), "the kept one first, under its id and exp");
+    assert_ne!(asked[1].0, kept.id);
+    assert_eq!(link.earlier.take().map(|e| (e.id, e.result)), Some((kept.id, Ok(serde_json::json!({"ok": 1})))));
 }
 
 /// A change the vault answered ok, with an answer that doesn't check out:

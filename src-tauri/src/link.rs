@@ -702,6 +702,12 @@ impl<T: Transport, C: Clock> Link<T, C> {
     /// them: this link only polls while it waits for a grant, so they
     /// would otherwise pile up. Missed session events are recovered by
     /// `vault.status` anyway (§6.8).
+    ///
+    /// Known follow-up: a late response here whose `re` is the kept
+    /// change's id (`ops::Pending`) isn't matched yet, so it doesn't clear
+    /// the kept send early; [`Link::route`] drops responses. Until then the
+    /// kept send is settled by its retry, or forgotten past its `exp` plus
+    /// `ops::KEPT_MARGIN`.
     fn drain_held(&mut self) {
         for m in self.session.take_held() {
             let e = self.access.observe(&mut self.session, &mut self.store, &m);

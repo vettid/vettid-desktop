@@ -472,7 +472,8 @@ pub async fn mark_message_read(state: State<'_, AppState>, connection_id: String
 /// reaches the store or `device.enc`), and retried under its id, with its
 /// first `exp`, when the same text is sent again, so the vault sends it
 /// once (§8.2), at most twice (§8.6). After that, the same text gets
-/// `unconfirmed` again with nothing sent while its `exp` lasts, then
+/// `unconfirmed` again with nothing sent until its `exp` plus a margin
+/// for the vault's clock (`ops::KEPT_MARGIN`, 5 minutes), then
 /// `unconfirmed_expired` once: the view reads the conversation before it
 /// offers the text again (a new request). A retry that doesn't reach the
 /// vault stays `unconfirmed`. A first send with the relay out of reach
@@ -482,6 +483,14 @@ pub async fn mark_message_read(state: State<'_, AppState>, connection_id: String
 /// sent (`earlier_unconfirmed`). `answer_unreadable`: the vault did it,
 /// but its answer couldn't be read; the view reads the conversation
 /// before it offers another send.
+///
+/// The view's rule for a message that holds a `pending_id` (5.3b): it
+/// stays unconfirmed on every answer except success (it is sent),
+/// `unconfirmed_expired` and `answer_unreadable` (read the conversation
+/// again before offering it), or an `earlier` with its `pending_id` that
+/// settles it. In particular `no_session`, `locked`, `held`, `not_sent`,
+/// `clock` and `earlier_unconfirmed` never turn it back into a draft: it
+/// may still be carried out.
 ///
 /// A service connection takes no messages: the vault answers `forbidden`,
 /// passed on as such (the view shows no conversation for one).
@@ -1221,6 +1230,19 @@ mod tests {
         let r = send(&s, "c-1", "first").await;
         assert_eq!((r.success, r.error_code), (false, Some("unconfirmed")), "{r:?}");
         assert_eq!(r.data.as_ref().map(|d| d["pending_id"].clone()), first.data.as_ref().map(|d| d["pending_id"].clone()), "the same token");
+        // Locked, known before the retry: still unconfirmed.
+        vault.offline(false);
+        vault.lock_vault(None);
+        let _ = s.lock().await.as_mut().unwrap().read_status().await;
+        let locked = send(&s, "c-1", "first").await;
+        assert_eq!((locked.success, locked.error_code), (false, Some("unconfirmed")), "{locked:?}");
+        // No unconfirmed answer says the opposite.
+        for a in [&first, &r, &locked] {
+            let n = a.error.as_deref().unwrap_or("");
+            assert!(n.contains("may still happen") && !n.contains("Try again") && !n.contains("couldn't send"), "{n}");
+        }
+        assert_eq!(r.error.as_deref(), Some(crate::link::ops::OP_UNCONFIRMED_UNREACHABLE_NOTICE));
+        assert!(locked.error.as_deref().unwrap_or("").starts_with(crate::link::VAULT_LOCKED_NOTICE));
     }
 
     /// The vault answered ok, but its answer doesn't read: never a "try
