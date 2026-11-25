@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
-use crate::link::{Changed, Link, Notify, Shared, Snapshot};
+use crate::link::{Changed, Deliver, Link, Notify, Shared, Snapshot};
 use crate::session::delegation::DelegationManager;
 
 #[cfg(feature = "webrtc")]
@@ -33,6 +33,14 @@ pub struct AppState {
     /// Tells the frontend that what it shows of the vault, or whether a
     /// session is live, has changed (#77; set up in `lib.rs`).
     pub changed: Changed,
+
+    /// Hands the frontend what the vault sent for the connection and
+    /// message views (Phase 5, 5.1; set up in `lib.rs`).
+    pub deliver: Deliver,
+
+    /// The mailbox collector (`link::spawn_collect`), running alongside the
+    /// refresh and stopped with it.
+    pub collect_task: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
 
     /// Pending phone-approval tracker.
     pub delegation: Arc<Mutex<DelegationManager>>,
@@ -97,6 +105,8 @@ impl AppState {
             refresh_task: Arc::new(std::sync::Mutex::new(None)),
             notify: Arc::new(std::sync::RwLock::new(None)),
             changed: Arc::new(std::sync::RwLock::new(None)),
+            deliver: Arc::new(std::sync::RwLock::new(None)),
+            collect_task: Arc::default(),
             delegation: Arc::new(Mutex::new(DelegationManager::new())),
             is_registered: Arc::new(RwLock::new(false)),
             pairing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -118,6 +128,7 @@ impl AppState {
             is_registered: self.is_registered.clone(),
             notify: self.notify.clone(),
             changed: self.changed.clone(),
+            deliver: self.deliver.clone(),
         }
     }
 
@@ -135,6 +146,9 @@ impl AppState {
         if let Some(h) = self.refresh_task.lock().unwrap_or_else(|p| p.into_inner()).take() {
             h.abort();
         }
+        if let Some(h) = self.collect_task.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            h.abort();
+        }
     }
 
     /// (Re)start the background refresh: at once if `now`, else after
@@ -145,6 +159,10 @@ impl AppState {
         let first = first_wait(now, self.snapshot().refused);
         let h = crate::link::spawn_refresh(self.shared(), first);
         if let Some(old) = self.refresh_task.lock().unwrap_or_else(|p| p.into_inner()).replace(h) {
+            old.abort();
+        }
+        let c = crate::link::spawn_collect(self.shared());
+        if let Some(old) = self.collect_task.lock().unwrap_or_else(|p| p.into_inner()).replace(c) {
             old.abort();
         }
     }

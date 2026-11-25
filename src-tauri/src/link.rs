@@ -567,6 +567,10 @@ pub struct Link<T: Transport = Http, C: Clock = SystemClock> {
     /// When this link last sent a `vault.status` of its own (answered or
     /// not): what a focus read is throttled on ([`Link::focused`]).
     last_attempt: Option<DateTime<Utc>>,
+    /// What the vault sent for the connection and message views
+    /// (`message.new`, `sync.event`), until [`Link::take_inbound`]: in
+    /// memory only (Phase 5, 5.1).
+    inbound: inbound::Queue,
 }
 
 /// What the refresh loop records of its own rounds, by the wall clock.
@@ -637,6 +641,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
             marks: Arc::default(),
             resumes: 0,
             last_attempt: None,
+            inbound: inbound::Queue::default(),
         }
     }
 
@@ -691,7 +696,75 @@ impl<T: Transport, C: Clock> Link<T, C> {
         for m in self.session.take_held() {
             let e = self.access.observe(&mut self.session, &mut self.store, &m);
             self.noted(&e);
+            self.route(&m);
         }
+    }
+
+    /// Whether the views may get what the vault sends now: the session is
+    /// live as the screen shows it ([`Snapshot::active_at`]: confirmed,
+    /// not stale, the vault Open), and the device isn't refused.
+    fn views_live(&self, now: DateTime<Utc>) -> bool {
+        !self.refused() && self.snapshot(now).active_at(now)
+    }
+
+    /// Keep `m` for the views, if they may have it ([`Link::views_live`]);
+    /// nothing is queued while no session is live (Phase 5, 5.1).
+    fn route(&mut self, m: &vettid_vms::envelope::Inner) {
+        if self.views_live(Utc::now()) {
+            self.inbound.take(m);
+        } else if inbound::parse(m).is_some() {
+            // One of ours, dropped: the views read again once live.
+            self.inbound.lose();
+        }
+    }
+
+    /// While an access session is live, collect the mailbox (Phase 5, 5.1)
+    /// with no wait at the relay, so the link's lock is held only for the
+    /// exchange: session events go to [`Access::observe`], messages for the
+    /// views to the inbound queue. A sleep is looked for first, as the
+    /// refresh loop does; a collect doesn't count as the vault answering
+    /// (what waited during a sleep proves nothing about now). Not live,
+    /// before or after: nothing collected is kept, and the queue is emptied
+    /// (nothing read before is shown). `false` if there was no session to
+    /// collect for.
+    pub async fn collect(&mut self) -> Collected {
+        self.check_gap(Utc::now());
+        if !self.views_live(Utc::now()) {
+            self.inbound.clear();
+            return Collected::NoSession;
+        }
+        let out = match self.session.poll_now(&mut self.store).await {
+            Ok(msgs) => {
+                self.reachable = true;
+                for m in &msgs {
+                    let e = self.access.observe(&mut self.session, &mut self.store, m);
+                    self.noted(&e);
+                    self.route(m);
+                }
+                Collected::Ok
+            }
+            Err(e) => {
+                log::info!("link: collecting: {}", e);
+                Collected::Failed { retry_after: retry_after_of(&e) }
+            }
+        };
+        self.settle_inbound();
+        out
+    }
+
+    /// After a collect: if no session is live as the screen shows it now,
+    /// nothing collected is kept, and the views read again (whether or not
+    /// anything was queued).
+    fn settle_inbound(&mut self) {
+        if !self.views_live(Utc::now()) {
+            self.inbound.clear_changed();
+        }
+    }
+
+    /// What the vault sent for the views since the last call (see
+    /// [`Link::collect`]).
+    pub fn take_inbound(&mut self) -> inbound::InboundBatch {
+        self.inbound.drain()
     }
 
     /// What this link keeps of an observed message's outcome: a late `ok`
@@ -708,6 +781,18 @@ impl<T: Transport, C: Clock> Link<T, C> {
         if matches!(e, Ok(Some(AccessEvent::Locked | AccessEvent::Held | AccessEvent::ReadStatus))) {
             self.backoff = None;
             self.read_now = true;
+        }
+        // Held, locked, a lock notice to place, or the session ended,
+        // denied or replaced: nothing queued before is shown (§3.6.5; the
+        // views read again under the session that is live then).
+        // A message that didn't read is no proof of anything: the same
+        // (fail secure).
+        if matches!(
+            e,
+            Ok(Some(AccessEvent::Locked | AccessEvent::Held | AccessEvent::ReadStatus | AccessEvent::Ended | AccessEvent::Denied | AccessEvent::Granted(_)))
+                | Err(_)
+        ) {
+            self.inbound.clear_changed();
         }
     }
 
@@ -1170,6 +1255,7 @@ impl<T: Transport, C: Clock> Link<T, C> {
                     for m in &msgs {
                         let e = self.access.observe(&mut self.session, &mut self.store, m);
                         self.noted(&e);
+                        self.route(m);
                         match e {
                             Ok(Some(AccessEvent::Granted(_))) => granted = true,
                             // A denial from before this request's answer is
@@ -1270,6 +1356,15 @@ pub type Changed = Arc<RwLock<Option<Arc<dyn Fn() + Send + Sync>>>>;
 /// The Tauri event a [`Changed`] call emits (no payload).
 pub const CHANGED_EVENT: &str = "vault:changed";
 
+/// Hands what [`collect_loop`] took to the frontend, as
+/// [`inbound::INBOUND_EVENT`].
+/// `true` if the batch reached the window.
+pub type Deliver = Arc<RwLock<Option<Arc<dyn Fn(inbound::InboundBatch) -> bool + Send + Sync>>>>;
+
+/// How often the mailbox is collected while an access session runs
+/// (Phase 5, 5.1; chosen; not in the spec).
+pub const COLLECT_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What a change of which [`Shared::publish`] tells the UI at once:
 /// everything the screen shows of the vault at `now` (its state, Locked
 /// "as of" or not, the reason, the counts, the deadline, `idle_lock_at`,
@@ -1288,6 +1383,7 @@ pub struct Shared {
     pub is_registered: Arc<tokio::sync::RwLock<bool>>,
     pub notify: Notify,
     pub changed: Changed,
+    pub deliver: Deliver,
 }
 
 impl Shared {
@@ -1308,6 +1404,29 @@ impl Shared {
                 f();
             }
         }
+    }
+
+    /// [`Shared::publish`], but only if the published snapshot is still the
+    /// one numbered `seen` (nothing newer was published since it was read):
+    /// under one write lock. `false` if it wasn't published.
+    pub fn publish_if(&self, seen: u64, s: Snapshot) -> bool {
+        let now = Utc::now();
+        let (before, after) = {
+            let mut g = self.snapshot.write().unwrap_or_else(|p| p.into_inner());
+            if g.seq != seen {
+                return false;
+            }
+            let before = shown(&g, now);
+            let seq = g.seq + 1;
+            *g = Snapshot { seq, ..s };
+            (before, shown(&g, now))
+        };
+        if before != after {
+            if let Some(f) = self.changed.read().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                f();
+            }
+        }
+        true
     }
 
     pub fn read(&self) -> Snapshot {
@@ -1497,8 +1616,158 @@ pub fn spawn_refresh(shared: Shared, first: std::time::Duration) -> JoinHandle<(
     })
 }
 
+/// What a [`Link::collect`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collected {
+    /// No live session: nothing was collected.
+    NoSession,
+    /// The mailbox was collected.
+    Ok,
+    /// The collect failed; the relay may have said when to try again
+    /// (`retry_after`, seconds).
+    Failed { retry_after: Option<u64> },
+}
+
+/// The relay's `retry_after` in a failed collect (RELAY-PROTOCOL §7.2).
+fn retry_after_of(e: &SessionError) -> Option<u64> {
+    match e {
+        SessionError::Relay(vettid_relay::client::RelayError::Relay { retry_after, .. }) => *retry_after,
+        _ => None,
+    }
+}
+
+/// The longest wait the doubling reaches between failed collects.
+pub const COLLECT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The longest `retry_after` taken as given (chosen; a relay that asks for
+/// more is asked again after this).
+pub const COLLECT_RETRY_AFTER_MAX: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// The wait before the next collect: [`COLLECT_EVERY`] after one that
+/// worked or had no session; after a failure, the relay's `retry_after`
+/// as given if it gave one (at most [`COLLECT_RETRY_AFTER_MAX`]), else
+/// double the last wait, at most [`COLLECT_BACKOFF_MAX`] (RELAY-PROTOCOL
+/// §7.2).
+pub fn next_collect_wait(last: std::time::Duration, c: Collected) -> std::time::Duration {
+    match c {
+        Collected::Ok | Collected::NoSession => COLLECT_EVERY,
+        Collected::Failed { retry_after: Some(s) } => std::time::Duration::from_secs(s).clamp(COLLECT_EVERY, COLLECT_RETRY_AFTER_MAX),
+        Collected::Failed { retry_after: None } => (last * 2).clamp(COLLECT_EVERY, COLLECT_BACKOFF_MAX),
+    }
+}
+
+/// Collect the mailbox while an access session runs, and hand what came
+/// for the views to `deliver`, with the link's snapshot as the collect
+/// left it (Phase 5, 5.1). A round that finds the link busy (a command
+/// holds it) is skipped: that command's own polls fill the queue, which the
+/// next round delivers. Ends when the link is gone. Polls stop on their own
+/// while there is no session (held, locked, ended), and start again with
+/// the next. `deliver` gets every round's batch, empty or not, so it can
+/// publish a session that this round found ended.
+pub async fn collect_loop<T: Transport, C: Clock>(
+    link: &Mutex<Option<Link<T, C>>>,
+    every: std::time::Duration,
+    deliver: impl Fn(inbound::InboundBatch, Snapshot),
+) {
+    let mut wait = every;
+    loop {
+        tokio::time::sleep(wait).await;
+        let (batch, snap) = {
+            let Ok(mut slot) = link.try_lock() else { continue };
+            let Some(l) = slot.as_mut() else { return };
+            let c = l.collect().await;
+            wait = match c {
+                Collected::Ok | Collected::NoSession => every,
+                Collected::Failed { .. } => next_collect_wait(wait, c),
+            };
+            (l.take_inbound(), l.snapshot(Utc::now()))
+        };
+        deliver(batch, snap);
+    }
+}
+
+/// What a round of [`spawn_collect`] does with its batch, given whether the
+/// published snapshot (what the screen shows) and the link's own are live:
+/// the batch to hand on (`None`: nothing), and whether to publish the
+/// link's snapshot first. The screen learns at once that a collect found
+/// the session over (only that direction: the refresh loop publishes the
+/// rest), and the views never get messages while the screen isn't live:
+/// then only the resync goes.
+pub fn gate(b: inbound::InboundBatch, published_live: bool, link_live: bool) -> (Option<inbound::InboundBatch>, bool) {
+    let publish = published_live && !link_live;
+    let any = !b.messages.is_empty() || b.resync;
+    if publish || !published_live {
+        return (any.then(|| inbound::InboundBatch { messages: Vec::new(), resync: true }), publish);
+    }
+    (any.then_some(b), false)
+}
+
+/// One round of [`spawn_collect`]: through [`gate`] against the published
+/// `snapshot` (read at `now()`); the link's `snap` is published (`publish`,
+/// only over the snapshot read) if the collect found the session over;
+/// then the batch is handed to `deliver` while `snapshot` is held for
+/// reading, and only if it is still live then (read at `now()` again), so
+/// an End session or a lock published meanwhile comes after it, never
+/// before. `owed`: a batch didn't reach the window, so a resync is owed,
+/// sent with the next batch or on its own.
+pub fn hand_on(
+    snapshot: &RwLock<Snapshot>,
+    b: inbound::InboundBatch,
+    snap: Snapshot,
+    now: impl Fn() -> DateTime<Utc>,
+    publish: impl FnOnce(u64, Snapshot),
+    deliver: Option<&(dyn Fn(inbound::InboundBatch) -> bool + Send + Sync)>,
+    owed: &std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (published_live, seen) = {
+        let g = snapshot.read().unwrap_or_else(|p| p.into_inner());
+        (g.active_at(now()), g.seq)
+    };
+    let (b, publish_snap) = gate(b, published_live, snap.active_at(now()));
+    if publish_snap {
+        publish(seen, snap);
+    }
+    let b = match b {
+        Some(mut b) => {
+            b.resync |= owed.load(SeqCst);
+            b
+        }
+        None if owed.load(SeqCst) => inbound::InboundBatch { messages: Vec::new(), resync: true },
+        None => return,
+    };
+    let Some(d) = deliver else {
+        owed.store(true, SeqCst);
+        return;
+    };
+    let guard = snapshot.read().unwrap_or_else(|p| p.into_inner());
+    let b = if guard.active_at(now()) { b } else { inbound::InboundBatch { messages: Vec::new(), resync: true } };
+    owed.store(!d(b), SeqCst);
+    drop(guard);
+}
+
+/// [`collect_loop`] as a task over the shared link, each round through
+/// [`hand_on`].
+pub fn spawn_collect(shared: Shared) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let owed = std::sync::atomic::AtomicBool::new(false);
+        collect_loop(&shared.link, COLLECT_EVERY, |b, snap| {
+            let d = shared.deliver.read().unwrap_or_else(|p| p.into_inner()).clone();
+            hand_on(&shared.snapshot, b, snap, Utc::now, |seen, s| {
+                shared.publish_if(seen, s);
+            }, d.as_deref(), &owed);
+        })
+        .await;
+    })
+}
+
+pub mod inbound;
+
 #[cfg(test)]
 pub(crate) mod fake;
+
+#[cfg(test)]
+mod collect_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2743,6 +3012,7 @@ mod tests {
             is_registered: Arc::default(),
             notify: Arc::default(),
             changed,
+            deliver: Arc::default(),
         };
         let count = || calls.load(std::sync::atomic::Ordering::SeqCst);
         let now = Utc::now();

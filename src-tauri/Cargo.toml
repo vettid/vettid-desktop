@@ -50,6 +50,9 @@ zeroize = { version = "1", features = ["derive"] }
 # (VAULT-MESSAGING; crates/vettid-device). None of its development-only
 # features (dev-file-store, dev-relay) may be enabled here: CI checks.
 vettid-device = { path = "crates/vettid-device" }
+# The envelope types of what the vault sends (src/link/inbound.rs), and the
+# fake vault for the link's tests (src/link/fake.rs).
+vettid-vms = { path = "crates/vettid-vms" }
 # rustls's process default (vettid_relay::tls::install_default_provider), set in run().
 vettid-relay = { path = "crates/vettid-relay" }
 
@@ -147,8 +150,6 @@ dbus-secret-service = { version = "4.1", features = ["crypto-rust"] }
 tempfile = "3"
 # Paused time, for the link loop's tests.
 tokio = { version = "1", features = ["full", "test-util"] }
-# A fake vault for the link's tests (src/link/fake.rs).
-vettid-vms = { path = "crates/vettid-vms" }
 ed25519-dalek = "2"
 
 [features]

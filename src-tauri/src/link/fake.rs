@@ -64,6 +64,7 @@ struct State {
     on_request: Option<(String, DateTime<Utc>)>,
     deny: bool,
     collects: usize,
+    waits: Vec<u64>,
     n: u64,
     /// The `unlock_id` `vault.status` names (written as is, so a test can
     /// give a malformed one); `None`: no member (a vault before release L).
@@ -253,6 +254,7 @@ impl FakeVault {
             on_request: None,
             deny: false,
             collects: 0,
+            waits: Vec::new(),
             n: 0,
             unlock_id: Some(UNLOCK_1.into()),
             owner_check: Some(owner_check("ok", false, "")),
@@ -398,6 +400,11 @@ impl FakeVault {
         self.lock().collects
     }
 
+    /// The `wait` of every collect so far.
+    pub(crate) fn waits(&self) -> Vec<u64> {
+        self.lock().waits.clone()
+    }
+
     /// The type of every message the relay took from the device.
     pub(crate) fn deposited(&self) -> Vec<String> {
         self.lock().deposited.clone()
@@ -489,12 +496,13 @@ impl Transport for FakeVault {
         Ok(taken)
     }
 
-    async fn collect(&self, _base: &str, _wait_secs: u64, _max: u32) -> Result<Vec<Message>, RelayError> {
+    async fn collect(&self, _base: &str, wait_secs: u64, _max: u32) -> Result<Vec<Message>, RelayError> {
         let mut s = self.lock();
         if s.offline {
             return Err(RelayError::Connect);
         }
         s.collects += 1;
+        s.waits.push(wait_secs);
         Ok(std::mem::take(&mut s.mailbox))
     }
 

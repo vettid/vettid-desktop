@@ -75,6 +75,14 @@ pub fn run() {
                     let _ = handle.emit(link::CHANGED_EVENT, ());
                 });
                 *app.state::<AppState>().changed.write().unwrap_or_else(|p| p.into_inner()) = Some(changed);
+                // Phase 5, 5.1: what the vault sent for the connection and
+                // message views reaches the window as `vault:inbound`.
+                let handle = app.handle().clone();
+                // `false` if the batch didn't reach the window: a resync is
+                // then owed (link::hand_on).
+                let deliver: std::sync::Arc<dyn Fn(link::inbound::InboundBatch) -> bool + Send + Sync> =
+                    std::sync::Arc::new(move |b: link::inbound::InboundBatch| handle.emit_to("main", link::inbound::INBOUND_EVENT, b).is_ok());
+                *app.state::<AppState>().deliver.write().unwrap_or_else(|p| p.into_inner()) = Some(deliver);
             }
             // Compute the device fingerprint now, on a background
             // thread. Hashing the executable is slow on a debug build;
