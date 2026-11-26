@@ -6930,6 +6930,7 @@ dependencies = [
  "dirs 5.0.1",
  "ed25519-dalek",
  "env_logger",
+ "gtk",
  "hex",
  "hkdf 0.12.4",
  "hmac 0.12.1",

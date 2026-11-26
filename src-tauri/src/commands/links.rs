@@ -520,13 +520,13 @@ fn tell_window(window: WebviewWindow) -> Late {
     })
 }
 
-/// The prompt on macOS and Linux: not seen, not closed; a late Open is told.
-#[cfg(not(windows))]
+/// The prompt on macOS: not seen, not closed; a late Open is told.
+#[cfg(target_os = "macos")]
 struct UnseenScreen {
     late: Late,
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 impl Screen for UnseenScreen {
     fn seen(&self) -> bool {
         false
@@ -736,6 +736,79 @@ mod win {
     }
 }
 
+/// The prompt on Linux: rfd's blocking GTK dialog. It isn't seen (the wait
+/// counts from the request), but it is closed at the time-out; a late Open
+/// on one that didn't close is told.
+#[cfg(target_os = "linux")]
+struct GtkPromptWatch {
+    /// The prompt's window title: the app's name.
+    title: String,
+    late: Late,
+}
+
+#[cfg(target_os = "linux")]
+impl Screen for GtkPromptWatch {
+    fn seen(&self) -> bool {
+        false
+    }
+
+    fn close(&self) -> bool {
+        gtk_prompts::close(&self.title)
+    }
+
+    fn left_up(&self, rx: Receiver<MessageDialogResult>) {
+        (self.late)(rx);
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod gtk_prompts {
+    use gtk::glib;
+    use gtk::prelude::*;
+    use std::time::Duration;
+
+    /// How long the close waits for GTK's main thread to take it.
+    const TAKEN: Duration = Duration::from_secs(1);
+
+    /// Closes every link prompt on screen: each GTK message dialog with
+    /// the prompt's title. The app makes no other. Only one prompt is asked
+    /// at a time, so at its time-out any other one is an earlier prompt
+    /// that has timed out too, and its answer opens nothing. Each is given
+    /// the response GTK_RESPONSE_DELETE_EVENT, as its close box gives,
+    /// which rfd's blocking dialog answers as `Cancel`. That response is
+    /// given directly: a close request (`gtk_window_close`) to a dialog
+    /// under another one's grab is dropped. Whether one was closed; not if
+    /// GTK's main thread didn't take this within `TAKEN`.
+    pub fn close(title: &str) -> bool {
+        let title = title.to_owned();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        // rfd makes the dialog in an idle callback on GTK's default main
+        // context, and runs it in a nested loop that holds that context:
+        // this runs on the same thread, inside that loop.
+        glib::MainContext::default().invoke(move || {
+            let _ = tx.send(close_titled(&title));
+        });
+        matches!(rx.recv_timeout(TAKEN), Ok(n) if n > 0)
+    }
+
+    /// On GTK's main thread: closes the message dialogs titled `title`,
+    /// and says how many. None where GTK isn't set up on this thread.
+    fn close_titled(title: &str) -> usize {
+        if !gtk::is_initialized_main_thread() {
+            return 0;
+        }
+        let mut closed = 0;
+        for w in gtk::Window::list_toplevels() {
+            let Ok(dialog) = w.downcast::<gtk::MessageDialog>() else { continue };
+            if dialog.is_visible() && dialog.title().as_deref() == Some(title) {
+                dialog.response(gtk::ResponseType::DeleteEvent);
+                closed += 1;
+            }
+        }
+        closed
+    }
+}
+
 /// The native dialog (rfd), over the window that asked.
 struct NativePrompt {
     app: AppHandle,
@@ -758,8 +831,10 @@ impl Prompt for NativePrompt {
         let late = tell_window(self.window.clone());
         #[cfg(windows)]
         let screen = TaskDialogWatch::new(late);
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         let screen = UnseenScreen { late };
+        #[cfg(target_os = "linux")]
+        let screen = GtkPromptWatch { title: title.clone(), late };
         let asked = clock.now();
         let started = match path_for(OS) {
             DialogPath::Async => self
@@ -1581,8 +1656,10 @@ mod tests {
         let kept = std::rc::Rc::new(RefCell::new(None));
         #[cfg(windows)]
         let screen = TaskDialogWatch::new(keeping(&kept));
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         let screen = UnseenScreen { late: keeping(&kept) };
+        #[cfg(target_os = "linux")]
+        let screen = GtkPromptWatch { title: "VettID".to_owned(), late: keeping(&kept) };
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         screen.left_up(rx);
         let rx = kept.borrow_mut().take().expect("handed to its Late");
@@ -1861,6 +1938,16 @@ mod tests {
     fn no_task_dialog_is_seen_when_there_is_none() {
         assert!(win::dialogs().is_empty());
         let watch = TaskDialogWatch::new(Box::new(drop));
+        assert!(!watch.seen());
+        assert!(!watch.close());
+    }
+
+    /// GTK isn't set up in a test, so no prompt is closed, and nothing
+    /// panics: the time-out goes on to the late watch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_gtk_prompt_is_closed_where_gtk_is_not_set_up() {
+        let watch = GtkPromptWatch { title: "VettID".to_owned(), late: Box::new(drop) };
         assert!(!watch.seen());
         assert!(!watch.close());
     }
