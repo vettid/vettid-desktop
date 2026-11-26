@@ -49,6 +49,7 @@ import {
   LINK_LATE_OPEN_EVENT,
   linkOutcomeText,
   linkErrorText,
+  openLinkTexts,
   bubbleLines,
   bubbleContent,
   textBytes,
@@ -706,6 +707,23 @@ test('after an open_message_link error: nothing for busy, not opened for the res
     assert.equal(linkErrorText(c), LINK_NOT_OPENED, String(c));
   }
   assert.equal(LINK_LATE_OPEN_EVENT, 'message-link-late-open');
+});
+
+test("the view's lines after open_message_link come from its answer or its error code", async () => {
+  const ok = (/** @type {unknown} */ v) => () => Promise.resolve(v);
+  const fails = (/** @type {unknown} */ c) => () => Promise.reject(c);
+  assert.deepEqual(await openLinkTexts(ok('too_fast')), { note: LINK_TOO_FAST, error: '' });
+  assert.deepEqual(await openLinkTexts(ok('opened')), { note: '', error: '' });
+  assert.deepEqual(await openLinkTexts(ok('not_confirmed')), { note: '', error: '' });
+  assert.deepEqual(await openLinkTexts(fails('busy')), { note: '', error: '' });
+  for (const c of ['refused', 'no_prompt', 'not_opened', 'timed_out', undefined]) {
+    assert.deepEqual(await openLinkTexts(fails(c)), { note: '', error: LINK_NOT_OPENED }, String(c));
+  }
+  // A call that throws before it promises anything counts as failed.
+  const throws = () => {
+    throw 'busy';
+  };
+  assert.deepEqual(await openLinkTexts(/** @type {any} */ (throws)), { note: '', error: '' });
 });
 
 test('the link question names the host, isolated', () => {

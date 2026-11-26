@@ -1160,3 +1160,18 @@ export function linkOutcomeText(outcome) {
 export function linkErrorText(code) {
   return code === 'busy' ? '' : LINK_NOT_OPENED;
 }
+
+/**
+ * Runs `call` (the `open_message_link` invoke) and gives the view's two
+ * lines: `note` from its answer (linkOutcomeText), `error` from the code
+ * it failed with (linkErrorText).
+ * @param {() => Promise<unknown>} call
+ * @returns {Promise<{ note: string, error: string }>}
+ */
+export async function openLinkTexts(call) {
+  try {
+    return { note: linkOutcomeText(await call()), error: '' };
+  } catch (code) {
+    return { note: '', error: linkErrorText(code) };
+  }
+}

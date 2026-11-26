@@ -27,8 +27,7 @@
         LINE_ISOLATE,
         LINK_NOT_OPENED,
         LINK_LATE_OPEN_EVENT,
-        linkOutcomeText,
-        linkErrorText,
+        openLinkTexts,
         EDIT_NEEDS_EMPTY_BOX,
         returnedElsewhereText,
         knownOutgoing,
@@ -501,17 +500,13 @@
     async function openLink(p: { text: string }): Promise<void> {
         linkError = '';
         linkNote = '';
-        try {
-            // `too_fast` ("Open" too soon after the prompt showed,
-            // MIN_CONFIRM_MS in commands/links.rs) says to try again;
-            // `opened` and `not_confirmed` say nothing.
-            linkNote = linkOutcomeText(await invoke<string>('open_message_link', { text: p.text }));
-        } catch (code) {
-            // Busy (another link's prompt shown, or one cancelled just
-            // now) says nothing; refused, the prompt not shown, not opened
-            // or an Open after the prompt timed out say it wasn't opened.
-            linkError = linkErrorText(code);
-        }
+        // `too_fast` ("Open" too soon after the prompt showed,
+        // MIN_CONFIRM_MS in commands/links.rs) says to try again; `opened`,
+        // `not_confirmed` and the error `busy` say nothing; the other
+        // errors say it wasn't opened.
+        const t = await openLinkTexts(() => invoke<string>('open_message_link', { text: p.text }));
+        linkNote = t.note;
+        linkError = t.error;
     }
 
     // An Open on a prompt left up after its time-out opens nothing

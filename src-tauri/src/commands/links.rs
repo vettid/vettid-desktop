@@ -425,6 +425,7 @@ pub fn open_link(
     let quiet = Some(answered + Duration::from_millis(QUIET_MS));
     match reply {
         Reply::Failed => Err(LinkError::NoPrompt),
+        // No quiet time either: the prompt's five minutes were the wait.
         Reply::LateOpen => Err(LinkError::TimedOut),
         Reply::TimedOut | Reply::Answered { open: false, .. } => {
             held.quiet_until = quiet;
@@ -497,22 +498,25 @@ pub fn watch_late(rx: Receiver<MessageDialogResult>, told: impl FnOnce()) {
 pub const LATE_OPEN_EVENT: &str = "message-link-late-open";
 
 /// What takes the answer of a prompt left up after its time-out.
-type Late = Box<dyn Fn(Receiver<MessageDialogResult>)>;
+pub type Late =Box<dyn Fn(Receiver<MessageDialogResult>)>;
 
 /// Watches a prompt left up after its time-out, on its own thread, and
-/// tells `window` (LATE_OPEN_EVENT) if its answer is Open.
-fn tell_window(window: WebviewWindow) -> Late {
+/// calls `tell` if its answer is Open.
+pub fn tell_late(tell: impl Fn() + Clone + Send + 'static) -> Late {
     Box::new(move |rx| {
-        use tauri::Emitter;
-        let window = window.clone();
-        let spawned = std::thread::Builder::new().name("link-prompt-late".into()).spawn(move || {
-            watch_late(rx, || {
-                let _ = window.emit(LATE_OPEN_EVENT, ());
-            })
-        });
+        let tell = tell.clone();
+        let spawned = std::thread::Builder::new().name("link-prompt-late".into()).spawn(move || watch_late(rx, tell));
         if spawned.is_err() {
             log::warn!("message link: a late answer can't be watched");
         }
+    })
+}
+
+/// `tell_late`, telling `window` (LATE_OPEN_EVENT).
+fn tell_window(window: WebviewWindow) -> Late {
+    tell_late(move || {
+        use tauri::Emitter;
+        let _ = window.emit(LATE_OPEN_EVENT, ());
     })
 }
 
@@ -1377,6 +1381,10 @@ mod tests {
         assert_eq!(LinkError::TimedOut.code(), "timed_out");
         assert!(b.opened.borrow().is_empty());
         assert!(!gate.showing());
+        // No quiet time after it: the next click prompts at once.
+        let again = prompt(&c, true, MIN_CONFIRM_MS);
+        assert_eq!(open_link(RAW, &gate, &again, &b, &c), Ok(Outcome::Opened));
+        assert_eq!(again.asked.borrow().len(), 1);
     }
 
     #[test]
@@ -1501,6 +1509,85 @@ mod tests {
         let reply = wait_reply(rx, Instant::now(), waits(0, 5), &SystemClock, &Keeps { close: true, kept: &kept });
         assert_eq!(reply, Reply::TimedOut);
         assert!(kept.borrow().is_none());
+    }
+
+    /// Closed, and the dialog's sender gone in the grace (its thread
+    /// ended): timed out, and nothing handed on.
+    #[test]
+    fn a_prompt_gone_in_the_grace_is_not_handed_on() {
+        struct DropsOnClose<'a> {
+            tx: &'a RefCell<Option<std::sync::mpsc::SyncSender<MessageDialogResult>>>,
+            kept: &'a RefCell<Option<Receiver<MessageDialogResult>>>,
+        }
+        impl Screen for DropsOnClose<'_> {
+            fn seen(&self) -> bool {
+                true
+            }
+            fn close(&self) -> bool {
+                drop(self.tx.borrow_mut().take());
+                true
+            }
+            fn left_up(&self, rx: Receiver<MessageDialogResult>) {
+                *self.kept.borrow_mut() = Some(rx);
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let tx = RefCell::new(Some(tx));
+        let kept = RefCell::new(None);
+        let started = Instant::now();
+        let mut w = waits(20, 5);
+        w.grace = Duration::from_secs(5);
+        let reply = wait_reply(rx, started, w, &SystemClock, &DropsOnClose { tx: &tx, kept: &kept });
+        assert_eq!(reply, Reply::TimedOut);
+        assert!(kept.borrow().is_none(), "handed on");
+        assert!(tx.borrow().is_none(), "not closed");
+        // Gone at once, not after the whole grace.
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    /// The hand-off that tells the window: told from its own thread for an
+    /// Open, and not for anything else.
+    #[test]
+    fn tell_late_tells_only_for_an_open() {
+        let (told_tx, told_rx) = std::sync::mpsc::channel::<()>();
+        let late = tell_late(move || told_tx.send(()).expect("told"));
+        for (answer, told) in [
+            (Some(MessageDialogResult::Custom(OPEN_LABEL.to_owned())), true),
+            (Some(MessageDialogResult::Custom(CANCEL_LABEL.to_owned())), false),
+            (Some(MessageDialogResult::Cancel), false),
+            (None, false),
+        ] {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            // Handed on before the answer: the watch waits for it.
+            late(rx);
+            match answer.clone() {
+                Some(a) => tx.send(a).expect("send"),
+                None => drop(tx),
+            }
+            let heard = told_rx.recv_timeout(Duration::from_millis(if told { 5000 } else { 300 }));
+            assert_eq!(heard.is_ok(), told, "{answer:?}");
+        }
+    }
+
+    /// A `Late` that keeps what it is handed.
+    fn keeping(kept: &std::rc::Rc<RefCell<Option<Receiver<MessageDialogResult>>>>) -> Late {
+        let kept = kept.clone();
+        Box::new(move |rx| *kept.borrow_mut() = Some(rx))
+    }
+
+    /// The platform's screen hands a prompt left up to its `Late`.
+    #[test]
+    fn the_platform_screen_hands_a_prompt_left_up_to_its_late() {
+        let kept = std::rc::Rc::new(RefCell::new(None));
+        #[cfg(windows)]
+        let screen = TaskDialogWatch::new(keeping(&kept));
+        #[cfg(not(windows))]
+        let screen = UnseenScreen { late: keeping(&kept) };
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        screen.left_up(rx);
+        let rx = kept.borrow_mut().take().expect("handed to its Late");
+        tx.send(MessageDialogResult::Cancel).expect("still heard");
+        assert!(matches!(rx.recv(), Ok(MessageDialogResult::Cancel)));
     }
 
     /// The watch on a prompt left up: told only for Open, and only once.
