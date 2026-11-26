@@ -763,58 +763,7 @@ impl Screen for GtkPromptWatch {
 }
 
 #[cfg(target_os = "linux")]
-mod gtk_prompts {
-    use gtk::glib;
-    use gtk::prelude::*;
-    use std::time::{Duration, Instant};
-
-    /// How long the close waits for GTK's main thread to take it.
-    const TAKEN: Duration = Duration::from_secs(1);
-
-    /// Closes every link prompt on screen: each GTK message dialog with
-    /// the prompt's title. The app makes no other. Only one prompt is asked
-    /// at a time, so at its time-out any other one is an earlier prompt
-    /// that has timed out too, and its answer opens nothing. Each is given
-    /// the response GTK_RESPONSE_DELETE_EVENT, as its close box gives,
-    /// which rfd's blocking dialog answers as `Cancel`. That response is
-    /// given directly: a close request (`gtk_window_close`) to a dialog
-    /// under another one's grab is dropped. Whether one was closed; not if
-    /// GTK's main thread didn't take this within `TAKEN`, and then it
-    /// closes nothing later either (a new prompt may be up by then).
-    pub fn close(title: &str) -> bool {
-        let title = title.to_owned();
-        let deadline = Instant::now() + TAKEN;
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        // rfd makes the dialog in an idle callback on GTK's default main
-        // context, and runs it in a nested loop that holds that context:
-        // this runs on the same thread, inside that loop. Where rfd's own
-        // GTK thread ran the dialog instead, GTK isn't set up for gtk-rs
-        // there: nothing is closed, and the prompt goes to the late watch.
-        glib::MainContext::default().invoke(move || {
-            if Instant::now() < deadline {
-                let _ = tx.send(close_titled(&title));
-            }
-        });
-        matches!(rx.recv_timeout(TAKEN), Ok(n) if n > 0)
-    }
-
-    /// On GTK's main thread: closes the message dialogs titled `title`,
-    /// and says how many. None where GTK isn't set up on this thread.
-    fn close_titled(title: &str) -> usize {
-        if !gtk::is_initialized_main_thread() {
-            return 0;
-        }
-        let mut closed = 0;
-        for w in gtk::Window::list_toplevels() {
-            let Ok(dialog) = w.downcast::<gtk::MessageDialog>() else { continue };
-            if dialog.is_visible() && dialog.title().as_deref() == Some(title) {
-                dialog.response(gtk::ResponseType::DeleteEvent);
-                closed += 1;
-            }
-        }
-        closed
-    }
-}
+mod gtk_prompts;
 
 /// The native dialog (rfd), over the window that asked.
 struct NativePrompt {
@@ -1212,6 +1161,50 @@ mod tests {
             .collect();
         assert_eq!(shell.len(), 1);
         assert!(shell[0].contains("\n \"open\""), "tauri-plugin-shell opens through `open`");
+    }
+
+    /// The link's prompt is the app's only message dialog: on Linux, its
+    /// close at the time-out picks message dialogs by title alone. No
+    /// dialog plugin is in the tree, only the app itself uses rfd, and no
+    /// other source file makes a message dialog.
+    #[test]
+    fn the_link_prompt_is_the_only_message_dialog() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("Cargo.lock");
+        let blocks: Vec<&str> = lock.split("\n\n").collect();
+        assert!(
+            !blocks.iter().any(|b| b.starts_with("[[package]]\nname = \"tauri-plugin-dialog\"\n")),
+            "tauri-plugin-dialog is in the tree"
+        );
+        let users: Vec<&str> = blocks
+            .iter()
+            .filter(|b| b.contains("\n \"rfd\"") || b.contains("\n \"rfd "))
+            .filter_map(|b| b.lines().find_map(|l| l.strip_prefix("name = \"")).map(|n| n.trim_end_matches('"')))
+            .collect();
+        assert_eq!(users, vec!["vettid-desktop"], "only the app uses rfd");
+
+        let links = root.join("src").join("commands").join("links.rs");
+        let gtk = root.join("src").join("commands").join("links").join("gtk_prompts.rs");
+        let mut dirs = vec![root.join("src")];
+        let mut files = 0;
+        while let Some(dir) = dirs.pop() {
+            for e in std::fs::read_dir(&dir).expect("src") {
+                let p = e.expect("entry").path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    files += 1;
+                    if p == links || p == gtk {
+                        continue;
+                    }
+                    let text = std::fs::read_to_string(&p).expect("source");
+                    for word in ["rfd::", "MessageDialog", "message_dialog"] {
+                        assert!(!text.contains(word), "{} names {word}", p.display());
+                    }
+                }
+            }
+        }
+        assert!(files > 10, "the sources were read");
     }
 
     /// A clock the fake prompt moves on.
