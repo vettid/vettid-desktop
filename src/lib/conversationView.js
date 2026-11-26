@@ -935,11 +935,53 @@ function trimTrail(raw) {
   return raw.slice(0, end);
 }
 
+/** The longest link, in UTF-8 bytes (`MAX_LINK_LEN` in src-tauri/src/commands/links.rs). */
+export const MAX_LINK_BYTES = 2048;
+
+/** Control characters (Cc) and the bidi formatting characters (`is_bidi` in commands/links.rs). */
+const NOT_IN_LINK = /[\u0000-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
+
+/**
+ * The checks commands/links.rs makes on a link's text before it asks to
+ * open it, as far as they are cheap here, so that a link it would refuse
+ * isn't shown as one (Rust decides): at most MAX_LINK_BYTES, no control
+ * or bidi character, a host and no user or password before it. The
+ * parsed URL's checks are `parsedFits`.
+ * @param {string} raw text that starts with `https://` (any case)
+ */
+function linkable(raw) {
+  if (new TextEncoder().encode(raw).length > MAX_LINK_BYTES) return false;
+  if (NOT_IN_LINK.test(raw)) return false;
+  const authority = raw.slice(8).split(/[/?#\\]/)[0];
+  return authority !== '' && !authority.includes('@');
+}
+
+/** The longest host, in punycode, and label in it (`MAX_HOST_LEN`, `MAX_LABEL_LEN` in commands/links.rs). */
+export const MAX_HOST_BYTES = 253;
+const MAX_LABEL_BYTES = 63;
+
+/**
+ * The checks commands/links.rs makes on the parsed URL that `linkable`
+ * can't: its host (punycode, as the prompt shows it) an IP address, or a
+ * name of a-z, 0-9, dots and dashes of at most MAX_HOST_BYTES with labels
+ * of at most 63; and the URL as written out at most MAX_LINK_BYTES.
+ * @param {URL} url
+ */
+function parsedFits(url) {
+  if (new TextEncoder().encode(url.href).length > MAX_LINK_BYTES) return false;
+  const host = url.hostname;
+  if (host.startsWith('[')) return true;
+  if (!/^[a-z0-9.-]+$/.test(host)) return false;
+  return host.length <= MAX_HOST_BYTES && host.split('.').every((label) => label.length <= MAX_LABEL_BYTES);
+}
+
 /**
  * §10.5 "Links": only `https://` URLs are links; every other scheme is
  * text. A link's `host` is what the view shows before it asks to open it
  * (the URL's own parsing, so an internationalised host shows as punycode;
- * with its port when it has one).
+ * with its port when it has one). A URL with a user or password, or one
+ * `linkable` refuses, is text. The view hands a link's `text` to
+ * `open_message_link`, which checks it again, asks, and opens it.
  * @param {string} line
  * @returns {Piece[]}
  */
@@ -956,7 +998,7 @@ export function linkPieces(line) {
     } catch {
       url = null;
     }
-    if (!url || url.protocol !== 'https:' || !url.hostname) continue;
+    if (!url || url.protocol !== 'https:' || !url.hostname || url.username || url.password || !linkable(raw) || !parsedFits(url)) continue;
     if (start > last) out.push({ text: line.slice(last, start) });
     out.push({ text: raw, href: url.href, host: url.host });
     last = start + raw.length;
@@ -1055,7 +1097,8 @@ export function conversationAction(batch, live) {
 
 // NEW TEXT (owner approval needed)
 /**
- * Asked before a link is opened (§10.5: "show its host and ask").
+ * Asked before a link is opened (§10.5: "show its host and ask"). The
+ * native prompt asks it, word for word (`question` in commands/links.rs).
  * @param {string} host
  */
 export function openLinkQuestion(host) {
@@ -1087,5 +1130,48 @@ export function logoutWiped(result) {
 export const EDIT_NEEDS_EMPTY_BOX = 'Edit puts this text in the message box once the box is empty.';
 
 // NEW TEXT (owner approval needed)
-/** When the system wouldn't open a link (the app's shell scope refuses most hosts). */
+/** When a link wasn't opened: refused, its prompt not shown, Open after its prompt timed out, or the system didn't open it. */
 export const LINK_NOT_OPENED = "This desktop couldn't open this link.";
+
+/** The event for an Open on a link's prompt left up after its time-out (LATE_OPEN_EVENT in commands/links.rs). */
+export const LINK_LATE_OPEN_EVENT = 'message-link-late-open';
+
+// NEW TEXT (owner approval needed)
+/** When Open came too soon after the link's prompt showed (`too_fast`): nothing opened. */
+export const LINK_TOO_FAST = 'Click the link again, then choose Open.';
+
+/**
+ * What the view says after `open_message_link` answered: only for
+ * `too_fast`; nothing for `opened` or `not_confirmed` (cancelled, closed,
+ * or no answer in time). Its errors show LINK_NOT_OPENED.
+ * @param {unknown} outcome
+ */
+export function linkOutcomeText(outcome) {
+  return outcome === 'too_fast' ? LINK_TOO_FAST : '';
+}
+
+/**
+ * What the view says when `open_message_link` answered an error: nothing
+ * for `busy` (another link's prompt is up, or one was just cancelled:
+ * nothing failed); LINK_NOT_OPENED for the others (refused, `no_prompt`,
+ * `not_opened`, `timed_out`) and anything unknown.
+ * @param {unknown} code
+ */
+export function linkErrorText(code) {
+  return code === 'busy' ? '' : LINK_NOT_OPENED;
+}
+
+/**
+ * Runs `call` (the `open_message_link` invoke) and gives the view's two
+ * lines: `note` from its answer (linkOutcomeText), `error` from the code
+ * it failed with (linkErrorText).
+ * @param {() => Promise<unknown>} call
+ * @returns {Promise<{ note: string, error: string }>}
+ */
+export async function openLinkTexts(call) {
+  try {
+    return { note: linkOutcomeText(await call()), error: '' };
+  } catch (code) {
+    return { note: '', error: linkErrorText(code) };
+  }
+}

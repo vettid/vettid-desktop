@@ -65,10 +65,5 @@
         ]
       }
     }
-  },
-  "plugins": {
-    "shell": {
-      "open": "^https://(vettid\\.org|vett\\.id|www\\.vettid\\.org)(/(about|blog|security|legal|press|contact)(/[^\"<>]*)?)?(/)?$"
-    }
   }
 }

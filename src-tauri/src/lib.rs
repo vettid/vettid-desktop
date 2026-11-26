@@ -11,7 +11,7 @@ pub mod uninstall;
 #[cfg(feature = "webrtc")]
 pub mod webrtc;
 
-use commands::{auth, calls, vault, session as session_cmd};
+use commands::{auth, calls, links, vault, session as session_cmd};
 use state::AppState;
 use tauri::Manager;
 
@@ -185,6 +185,8 @@ pub fn run() {
             calls::send_ice_candidate,
             calls::apply_remote_answer,
             calls::apply_remote_ice,
+            // A link in a message, after the native prompt (§10.5)
+            links::open_message_link,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

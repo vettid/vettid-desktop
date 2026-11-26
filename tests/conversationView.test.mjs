@@ -2,6 +2,7 @@
 // pages and live messages, receipts, the send states, bubble text and links. Run with `npm test`.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   MAX_TEXT_BYTES,
   RECEIPT_HOLD_MS,
@@ -41,6 +42,14 @@ import {
   deliveryText,
   cleanBubble,
   linkPieces,
+  MAX_LINK_BYTES,
+  MAX_HOST_BYTES,
+  LINK_TOO_FAST,
+  LINK_NOT_OPENED,
+  LINK_LATE_OPEN_EVENT,
+  linkOutcomeText,
+  linkErrorText,
+  openLinkTexts,
   bubbleLines,
   bubbleContent,
   textBytes,
@@ -592,9 +601,52 @@ test('§10.5 links: only https:// is a link, with its host; other schemes are te
   for (const t of ['http://example.com', 'someapp://x', 'javascript:alert(1)', 'www.example.com', 'ftp://x']) {
     assert.deepEqual(linkPieces(t), [{ text: t }], t);
   }
-  // The host is the URL's own: user info is not the host, IDN shows as punycode.
-  assert.equal(/** @type {any} */ (linkPieces('https://good.com@evil.example/')[0]).host, 'evil.example');
+  // IDN shows as punycode.
   assert.equal(/** @type {any} */ (linkPieces('https://bücher.example/')[0]).host, 'xn--bcher-kva.example');
+});
+
+test('§10.5 links: what open_message_link would refuse is text, not a link', () => {
+  // A user or password before the host.
+  for (const t of ['https://good.com@evil.example/', 'https://user:pw@example.com/', 'https://:pw@example.com/', 'https://@example.com/']) {
+    assert.deepEqual(linkPieces(t), [{ text: t }], t);
+  }
+  // An @ after the host is the path's or the query's.
+  assert.equal(/** @type {any} */ (linkPieces('https://example.com/@user')[0]).host, 'example.com');
+  assert.equal(/** @type {any} */ (linkPieces('https://example.com?to=a@b')[0]).host, 'example.com');
+  // No host before the path.
+  assert.deepEqual(linkPieces('https:///example.com/'), [{ text: 'https:///example.com/' }]);
+  // A control or bidi character anywhere in it.
+  for (const c of ['\u0000', '\u0007', '\u001B', '\u007F', '\u0085', '\u009F', '\u061C', '\u200E', '\u200F', '\u202A', '\u202B', '\u202C', '\u202D', '\u202E', '\u2066', '\u2067', '\u2068', '\u2069']) {
+    const t = `https://example.com/a${c}b`;
+    assert.deepEqual(linkPieces(t), [{ text: t }], JSON.stringify(t));
+  }
+  // Up to MAX_LINK_BYTES UTF-8 bytes.
+  const base = 'https://example.com/';
+  const atCap = base + 'a'.repeat(MAX_LINK_BYTES - base.length);
+  assert.equal(/** @type {any} */ (linkPieces(atCap)[0]).text, atCap);
+  assert.deepEqual(linkPieces(atCap + 'a'), [{ text: atCap + 'a' }]);
+  const wide = base + '\u00E9'.repeat((MAX_LINK_BYTES - base.length) / 2 + 1);
+  assert.deepEqual(linkPieces(wide), [{ text: wide }]);
+  assert.equal(MAX_LINK_BYTES, 2048);
+  // Written out longer than MAX_LINK_BYTES (percent-encoding).
+  const grows = base + 'é'.repeat((MAX_LINK_BYTES - base.length) / 2);
+  assert.ok(new TextEncoder().encode(grows).length <= MAX_LINK_BYTES);
+  assert.deepEqual(linkPieces(grows), [{ text: grows }]);
+  // A host over MAX_HOST_BYTES, or a label over 63, in punycode.
+  const fits = 'a'.repeat(63) + '.' + 'a'.repeat(63) + '.' + 'a'.repeat(63) + '.' + 'a'.repeat(61);
+  assert.equal(fits.length, MAX_HOST_BYTES);
+  assert.equal(/** @type {any} */ (linkPieces(`https://${fits}/`)[0]).host, fits);
+  for (const host of [fits + 'a', 'a'.repeat(64) + '.example', 'a'.repeat(59) + 'ü.example', Array(40).fill('a'.repeat(49)).join('.')]) {
+    assert.deepEqual(linkPieces(`https://${host}/`), [{ text: `https://${host}/` }], host.slice(0, 20));
+  }
+  assert.equal(/** @type {any} */ (linkPieces('https://[2001:db8::1]:8443/')[0]).host, '[2001:db8::1]:8443');
+  // A host name of a-z, 0-9, dots and dashes only, once parsed.
+  for (const t of ['https://a_b.example/', 'https://a*b.example/', 'https://a~b.example/', 'https://a!b.example/']) {
+    assert.deepEqual(linkPieces(t), [{ text: t }], t);
+  }
+  for (const t of ['https://a-b.example-1.com/', 'https://EXAMPLE.com/', 'https://192.0.2.1:8443/']) {
+    assert.equal(/** @type {any} */ (linkPieces(t)[0]).text, t, t);
+  }
 });
 
 test('bubble lines and content: attachment placeholder, caption under it, never an empty bubble', () => {
@@ -643,8 +695,42 @@ test('inbound batches: dropped while not live, a resync reads the newest page', 
   assert.equal(conversationAction(null, true), 'drop');
 });
 
+test('after open_message_link: a line only for an Open too soon', () => {
+  assert.equal(linkOutcomeText('too_fast'), LINK_TOO_FAST);
+  assert.equal(LINK_TOO_FAST, 'Click the link again, then choose Open.');
+  for (const o of ['opened', 'not_confirmed', undefined, null, '', 'refused']) assert.equal(linkOutcomeText(o), '', String(o));
+});
+
+test('after an open_message_link error: nothing for busy, not opened for the rest', () => {
+  assert.equal(linkErrorText('busy'), '');
+  for (const c of ['refused', 'no_prompt', 'not_opened', 'timed_out', undefined, null, '', 'other', new Error('x')]) {
+    assert.equal(linkErrorText(c), LINK_NOT_OPENED, String(c));
+  }
+  assert.equal(LINK_LATE_OPEN_EVENT, 'message-link-late-open');
+});
+
+test("the view's lines after open_message_link come from its answer or its error code", async () => {
+  const ok = (/** @type {unknown} */ v) => () => Promise.resolve(v);
+  const fails = (/** @type {unknown} */ c) => () => Promise.reject(c);
+  assert.deepEqual(await openLinkTexts(ok('too_fast')), { note: LINK_TOO_FAST, error: '' });
+  assert.deepEqual(await openLinkTexts(ok('opened')), { note: '', error: '' });
+  assert.deepEqual(await openLinkTexts(ok('not_confirmed')), { note: '', error: '' });
+  assert.deepEqual(await openLinkTexts(fails('busy')), { note: '', error: '' });
+  for (const c of ['refused', 'no_prompt', 'not_opened', 'timed_out', undefined]) {
+    assert.deepEqual(await openLinkTexts(fails(c)), { note: '', error: LINK_NOT_OPENED }, String(c));
+  }
+  // A call that throws before it promises anything counts as failed.
+  const throws = () => {
+    throw 'busy';
+  };
+  assert.deepEqual(await openLinkTexts(/** @type {any} */ (throws)), { note: '', error: '' });
+});
+
 test('the link question names the host, isolated', () => {
   assert.equal(openLinkQuestion('example.com'), `Open this link in your browser? It goes to ${FSI}example.com${PDI}.`);
+  // The same text as the native prompt's (commands/links.rs checks this fixture too).
+  const fixture = JSON.parse(readFileSync(new URL('./fixtures/link-question.json', import.meta.url), 'utf8'));
+  assert.equal(openLinkQuestion(fixture.host), fixture.question);
 });
 
 test('L3: kept sends and drafts go only when the log-out wiped this desktop', () => {
