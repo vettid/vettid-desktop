@@ -112,10 +112,19 @@ fn photo(o: &Map<String, Value>, out: &mut Map<String, Value>) -> R<()> {
 pub fn profile(v: &Value) -> R<Value> {
     let o = obj(v)?;
     let mut out = Map::new();
-    n(o, &mut out, "version")?;
+    // The inviter's side holds only the request's `{first_name, last_name,
+    // name?}` until the first `profile.update` (§10.4 "`name` and
+    // `profile`"), so `version`, `ik` and `items` may be absent. A profile
+    // with only some of them is read as it is: what is present is checked,
+    // and the view needs only the names.
+    if !matches!(o.get("version"), None | Some(Value::Null)) {
+        n(o, &mut out, "version")?;
+    }
     s(o, &mut out, "first_name", NAME_MAX)?;
     s(o, &mut out, "last_name", NAME_MAX)?;
-    ik(o, &mut out, "ik")?;
+    if !matches!(o.get("ik"), None | Some(Value::Null)) {
+        ik(o, &mut out, "ik")?;
+    }
     s_opt(o, &mut out, "name", DISPLAY_MAX)?;
     photo(o, &mut out)?;
     match o.get("items") {
@@ -137,15 +146,33 @@ pub fn connection(v: &Value) -> R<Value> {
     s(o, &mut out, "id", ID_MAX)?;
     exact(o, &mut out, "kind", "connection")?;
     exact(o, &mut out, "state", "active")?;
-    s(o, &mut out, "name", TEXT_MAX)?;
+    // The vault leaves out what is empty or not known yet (vettid-vault
+    // `peerJSON`): `name` without a display name, `profile` before the
+    // first (§10.4), the times while unset, and `alias`, `note` and `tags`
+    // while empty ("" clears them, §10.4). Absent metadata reads as empty.
+    s_opt(o, &mut out, "name", TEXT_MAX)?;
     ik(o, &mut out, "ik")?;
-    out.insert("profile".into(), profile(o.get("profile").ok_or(BadShape)?)?);
-    s(o, &mut out, "created_at", TIME_MAX)?;
-    s(o, &mut out, "last_active_at", TIME_MAX)?;
+    match o.get("profile") {
+        None | Some(Value::Null) => {}
+        Some(p) => {
+            out.insert("profile".into(), profile(p)?);
+        }
+    }
+    s_opt(o, &mut out, "created_at", TIME_MAX)?;
+    s_opt(o, &mut out, "last_active_at", TIME_MAX)?;
     n(o, &mut out, "version")?;
-    s(o, &mut out, "alias", TEXT_MAX)?;
-    s(o, &mut out, "note", TEXT_MAX)?;
+    for k in ["alias", "note"] {
+        match o.get(k) {
+            None | Some(Value::Null) => {
+                out.insert(k.into(), Value::String(String::new()));
+            }
+            _ => s(o, &mut out, k, TEXT_MAX)?,
+        }
+    }
     match o.get("tags") {
+        None | Some(Value::Null) => {
+            out.insert("tags".into(), Value::Array(Vec::new()));
+        }
         Some(Value::Array(a)) if a.len() <= LIST_MAX && a.iter().all(|t| t.as_str().is_some_and(|t| t.len() <= TEXT_MAX)) => {
             out.insert("tags".into(), Value::Array(a.clone()));
         }
