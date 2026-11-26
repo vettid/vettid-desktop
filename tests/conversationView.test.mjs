@@ -45,7 +45,10 @@ import {
   MAX_LINK_BYTES,
   MAX_HOST_BYTES,
   LINK_TOO_FAST,
+  LINK_NOT_OPENED,
+  LINK_LATE_OPEN_EVENT,
   linkOutcomeText,
+  linkErrorText,
   bubbleLines,
   bubbleContent,
   textBytes,
@@ -695,6 +698,14 @@ test('after open_message_link: a line only for an Open too soon', () => {
   assert.equal(linkOutcomeText('too_fast'), LINK_TOO_FAST);
   assert.equal(LINK_TOO_FAST, 'Click the link again, then choose Open.');
   for (const o of ['opened', 'not_confirmed', undefined, null, '', 'refused']) assert.equal(linkOutcomeText(o), '', String(o));
+});
+
+test('after an open_message_link error: nothing for busy, not opened for the rest', () => {
+  assert.equal(linkErrorText('busy'), '');
+  for (const c of ['refused', 'no_prompt', 'not_opened', 'timed_out', undefined, null, '', 'other', new Error('x')]) {
+    assert.equal(linkErrorText(c), LINK_NOT_OPENED, String(c));
+  }
+  assert.equal(LINK_LATE_OPEN_EVENT, 'message-link-late-open');
 });
 
 test('the link question names the host, isolated', () => {

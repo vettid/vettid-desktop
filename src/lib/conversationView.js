@@ -1130,8 +1130,11 @@ export function logoutWiped(result) {
 export const EDIT_NEEDS_EMPTY_BOX = 'Edit puts this text in the message box once the box is empty.';
 
 // NEW TEXT (owner approval needed)
-/** When a link wasn't opened: refused, busy, its prompt not shown, or the system didn't open it. */
+/** When a link wasn't opened: refused, its prompt not shown, Open after its prompt timed out, or the system didn't open it. */
 export const LINK_NOT_OPENED = "This desktop couldn't open this link.";
+
+/** The event for an Open on a link's prompt left up after its time-out (LATE_OPEN_EVENT in commands/links.rs). */
+export const LINK_LATE_OPEN_EVENT = 'message-link-late-open';
 
 // NEW TEXT (owner approval needed)
 /** When Open came too soon after the link's prompt showed (`too_fast`): nothing opened. */
@@ -1145,4 +1148,15 @@ export const LINK_TOO_FAST = 'Click the link again, then choose Open.';
  */
 export function linkOutcomeText(outcome) {
   return outcome === 'too_fast' ? LINK_TOO_FAST : '';
+}
+
+/**
+ * What the view says when `open_message_link` answered an error: nothing
+ * for `busy` (another link's prompt is up, or one was just cancelled:
+ * nothing failed); LINK_NOT_OPENED for the others (refused, `no_prompt`,
+ * `not_opened`, `timed_out`) and anything unknown.
+ * @param {unknown} code
+ */
+export function linkErrorText(code) {
+  return code === 'busy' ? '' : LINK_NOT_OPENED;
 }

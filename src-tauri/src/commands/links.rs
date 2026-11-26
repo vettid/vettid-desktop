@@ -15,13 +15,12 @@
 //!   the parsed URL as `url` writes it, never the window's text.
 //! - The prompt shows the parsed host, with the port when it isn't 443.
 //! - One prompt at a time: another call while one is shown answers busy,
-//!   and so does one within `QUIET_MS` of a prompt that wasn't confirmed.
-//!   A prompt with no answer after `PROMPT_TIMEOUT_SECS` counts as not
-//!   confirmed, and a later answer is ignored.
+//!   and so does one within `QUIET_MS` of a prompt that was cancelled,
+//!   closed or not answered. A prompt with no answer after
+//!   `PROMPT_TIMEOUT_SECS` counts as not confirmed.
 //! - An "Open" sooner than `MIN_CONFIRM_MS` after the prompt was on screen
 //!   counts as not confirmed (a held key's repeats).
-//! - Where the dialog's first button is its default (Windows, macOS),
-//!   Cancel is first, so Return or Enter cancels.
+//! - Cancel is the first button, so Return, Enter or Space cancels.
 //!
 //! The URL is never logged: its path or query can hold anything.
 
@@ -55,29 +54,38 @@ pub const MAX_LABEL_LEN: usize = 63;
 ///
 /// When the prompt was on screen: rfd has no "shown" callback. On Windows
 /// the wait for the answer looks for the task dialog's window (a visible
-/// `#32770` window of this process with an owner) and counts from when it
-/// is first seen. Elsewhere, and on Windows when the answer comes before
-/// the window is seen, it counts from just before the dialog was asked for,
-/// so the time the dialog takes to appear counts toward it.
+/// `#32770` window of this process that wasn't there when the prompt was
+/// asked for) and counts from when it is first seen. Elsewhere, and on
+/// Windows when the answer comes before the window is seen, it counts from
+/// just before the dialog was asked for, so the time the dialog takes to
+/// appear counts toward it.
 ///
-/// On Linux it is 1000 ms: rfd's GTK dialog sets no default button and no
-/// way to set one, Cancel can't safely go first there (see
-/// `cancel_first_for`), and no "shown" signal is read, so this is the only
-/// guard against a held key.
+/// On Linux it is 1000 ms: rfd's GTK dialog sets no default button and
+/// gives no way to set one, and no "shown" signal is read there. Cancel is
+/// first there too (`cancel_first_for`); this is the backstop.
 #[cfg(not(target_os = "linux"))]
 pub const MIN_CONFIRM_MS: u64 = 500;
 #[cfg(target_os = "linux")]
 pub const MIN_CONFIRM_MS: u64 = 1000;
 
-/// After a prompt that wasn't confirmed (Cancel, closed, too fast, or no
-/// answer), another call answers busy for this long, so a script can't put
-/// the prompt straight back up.
+/// After a prompt that was cancelled, closed or not answered, another call
+/// answers busy for this long, so a script can't put the prompt straight
+/// back up. Not after a too-fast Open: the view asks the member to click
+/// the link again, and that click asks again at once.
 pub const QUIET_MS: u64 = 1000;
 
 /// A prompt with no answer after this long counts as not confirmed: the
-/// one-prompt flag is let go, so links don't stay busy until a restart, and
-/// a later answer from that prompt is ignored.
+/// one-prompt flag is let go, so links don't stay busy until a restart.
+/// On Windows the prompt is closed then, and an Open pressed as it closes
+/// is the error `timed_out` (the view says the link couldn't be opened).
+/// Elsewhere rfd gives no way to close it: it stays on screen, and an Open
+/// on it later opens nothing and sends `LATE_OPEN_EVENT`, so the view says
+/// the same. So does one on Windows, if the prompt didn't close.
 pub const PROMPT_TIMEOUT_SECS: u64 = 300;
+
+/// How long the wait goes on for the answer of a prompt it closed at the
+/// time-out (Windows): an Open pressed as it closed arrives within it.
+const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 /// How often the wait for an answer looks for the dialog on screen.
 const SHOWN_POLL: Duration = Duration::from_millis(15);
@@ -272,6 +280,8 @@ pub enum Reply {
     Answered { open: bool, shown: Instant },
     /// No answer within `PROMPT_TIMEOUT_SECS`.
     TimedOut,
+    /// An Open pressed as the timed-out prompt was being closed.
+    LateOpen,
     /// The prompt couldn't be shown, or gave no answer.
     Failed,
 }
@@ -317,6 +327,8 @@ pub enum LinkError {
     NoPrompt,
     /// Confirmed, but the system didn't open it.
     NotOpened,
+    /// Open pressed only after the prompt timed out: not opened.
+    TimedOut,
 }
 
 impl LinkError {
@@ -327,6 +339,7 @@ impl LinkError {
             LinkError::Busy => "busy",
             LinkError::NoPrompt => "no_prompt",
             LinkError::NotOpened => "not_opened",
+            LinkError::TimedOut => "timed_out",
         }
     }
 
@@ -337,6 +350,7 @@ impl LinkError {
             LinkError::Busy => "another link's prompt is shown, or was just declined",
             LinkError::NoPrompt => "the prompt couldn't be shown",
             LinkError::NotOpened => "the system didn't open it",
+            LinkError::TimedOut => "Open came after the prompt timed out",
         }
     }
 }
@@ -411,14 +425,15 @@ pub fn open_link(
     let quiet = Some(answered + Duration::from_millis(QUIET_MS));
     match reply {
         Reply::Failed => Err(LinkError::NoPrompt),
+        Reply::LateOpen => Err(LinkError::TimedOut),
         Reply::TimedOut | Reply::Answered { open: false, .. } => {
             held.quiet_until = quiet;
             Ok(Outcome::NotConfirmed)
         }
+        // No quiet time: the view asks for the link to be clicked again.
         Reply::Answered { open: true, shown }
             if answered.saturating_duration_since(shown) < Duration::from_millis(MIN_CONFIRM_MS) =>
         {
-            held.quiet_until = quiet;
             Ok(Outcome::TooFast)
         }
         Reply::Answered { open: true, .. } => {
@@ -428,29 +443,131 @@ pub fn open_link(
     }
 }
 
-/// Waits for the dialog's answer on `rx`: at most `timeout` from `asked`,
-/// looking every `poll` for the dialog on screen (`shown`). The time the
-/// dialog was first seen, or `asked` if it never was, goes with the answer.
-/// On a time-out `rx` is dropped with the reply, so a later answer goes
-/// nowhere.
+/// How long `wait_reply` waits, and how often it looks.
+#[derive(Debug, Clone, Copy)]
+pub struct Waits {
+    /// For the answer, from when the prompt was asked for.
+    pub timeout: Duration,
+    /// For the answer of a prompt closed at the time-out.
+    pub grace: Duration,
+    /// Between looks for the prompt on screen.
+    pub poll: Duration,
+}
+
+/// The prompt's window, where it can be seen.
+pub trait Screen {
+    /// Whether the prompt is on screen now.
+    fn seen(&self) -> bool;
+    /// Closes the prompt (at the time-out); whether that was asked of it.
+    fn close(&self) -> bool;
+    /// Takes the answer of a prompt still up after the time-out (and the
+    /// grace, where it was closed): an Open from it opens nothing, and
+    /// the view is told it wasn't opened. Here: the answer is dropped.
+    fn left_up(&self, rx: Receiver<MessageDialogResult>) {
+        drop(rx);
+    }
+}
+
+/// Where the prompt can't be seen or closed, and a late answer goes
+/// nowhere (tests).
+pub struct NoScreen;
+
+impl Screen for NoScreen {
+    fn seen(&self) -> bool {
+        false
+    }
+    fn close(&self) -> bool {
+        false
+    }
+}
+
+/// Waits on `rx` for a prompt left up after its time-out, for as long as
+/// it is up, and calls `told` once if its answer is Open. Nothing is
+/// opened from here.
+pub fn watch_late(rx: Receiver<MessageDialogResult>, told: impl FnOnce()) {
+    if let Ok(answer) = rx.recv() {
+        if confirmed(&answer) {
+            told();
+        }
+    }
+}
+
+/// The event the view hears when Open was pressed on a prompt left up
+/// after its time-out: nothing opened (it shows LINK_NOT_OPENED).
+pub const LATE_OPEN_EVENT: &str = "message-link-late-open";
+
+/// What takes the answer of a prompt left up after its time-out.
+type Late = Box<dyn Fn(Receiver<MessageDialogResult>)>;
+
+/// Watches a prompt left up after its time-out, on its own thread, and
+/// tells `window` (LATE_OPEN_EVENT) if its answer is Open.
+fn tell_window(window: WebviewWindow) -> Late {
+    Box::new(move |rx| {
+        use tauri::Emitter;
+        let window = window.clone();
+        let spawned = std::thread::Builder::new().name("link-prompt-late".into()).spawn(move || {
+            watch_late(rx, || {
+                let _ = window.emit(LATE_OPEN_EVENT, ());
+            })
+        });
+        if spawned.is_err() {
+            log::warn!("message link: a late answer can't be watched");
+        }
+    })
+}
+
+/// The prompt on macOS and Linux: not seen, not closed; a late Open is told.
+#[cfg(not(windows))]
+struct UnseenScreen {
+    late: Late,
+}
+
+#[cfg(not(windows))]
+impl Screen for UnseenScreen {
+    fn seen(&self) -> bool {
+        false
+    }
+    fn close(&self) -> bool {
+        false
+    }
+    fn left_up(&self, rx: Receiver<MessageDialogResult>) {
+        (self.late)(rx);
+    }
+}
+
+/// Waits for the dialog's answer on `rx`: at most `waits.timeout` from
+/// `asked`, looking every `waits.poll` for the prompt on `screen`. The time
+/// it was first seen, or `asked` if it never was, goes with the answer.
+///
+/// At the time-out the prompt is closed if `screen` can, and its answer
+/// waited for `waits.grace` more: an Open then is `LateOpen`. Otherwise it
+/// is `TimedOut`, and `rx` goes to `screen.left_up`: a later Open opens
+/// nothing either.
 pub fn wait_reply(
     rx: Receiver<MessageDialogResult>,
     asked: Instant,
-    timeout: Duration,
-    poll: Duration,
+    waits: Waits,
     clock: &dyn Clock,
-    shown: &dyn Fn() -> bool,
+    screen: &dyn Screen,
 ) -> Reply {
     let mut seen: Option<Instant> = None;
     loop {
-        if seen.is_none() && shown() {
+        if seen.is_none() && screen.seen() {
             seen = Some(clock.now());
         }
-        let left = timeout.saturating_sub(clock.now().saturating_duration_since(asked));
+        let left = waits.timeout.saturating_sub(clock.now().saturating_duration_since(asked));
         if left.is_zero() {
+            if screen.close() {
+                match rx.recv_timeout(waits.grace) {
+                    Ok(answer) if confirmed(&answer) => return Reply::LateOpen,
+                    Ok(_) | Err(RecvTimeoutError::Disconnected) => return Reply::TimedOut,
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+            }
+            screen.left_up(rx);
             return Reply::TimedOut;
         }
-        match rx.recv_timeout(left.min(poll)) {
+        match rx.recv_timeout(left.min(waits.poll)) {
             Ok(answer) => {
                 return Reply::Answered { open: confirmed(&answer), shown: seen.unwrap_or(asked) }
             }
@@ -500,16 +617,17 @@ pub fn path_for(os: Os) -> DialogPath {
     }
 }
 
-/// Whether Cancel goes first: where the dialog backend makes its first
-/// button the default (Return or Enter), as rfd's Windows task dialog
-/// (`nDefaultButton` 0) and macOS alert do. rfd's GTK dialog sets no
-/// default, and GTK's answer for a dismissed dialog isn't checked here, so
-/// on Linux "Open" keeps the affirmative place and Cancel the cancelling
-/// one.
+/// Whether Cancel goes first: on every platform. rfd's Windows task dialog
+/// (`nDefaultButton` 0) and macOS alert make the first button the default
+/// (Return or Enter); with rfd's blocking GTK dialog, Enter and Space
+/// answer the first button too. Every backend answers a button by its
+/// label, so only the Open button opens. In this order GTK's Open button
+/// carries GTK_RESPONSE_CANCEL; a dismissed GTK dialog answers
+/// GTK_RESPONSE_DELETE_EVENT, which rfd's blocking dialog answers as
+/// `Cancel`.
 pub fn cancel_first_for(os: Os) -> bool {
     match os {
-        Os::Windows | Os::MacOs => true,
-        Os::Linux => false,
+        Os::Windows | Os::MacOs | Os::Linux => true,
     }
 }
 
@@ -528,40 +646,75 @@ pub fn confirmed(answer: &MessageDialogResult) -> bool {
     matches!(answer, MessageDialogResult::Custom(label) if label == OPEN_LABEL)
 }
 
-/// Whether the prompt is on screen, where that can be seen.
-#[cfg(windows)]
-fn dialog_shown() -> bool {
-    win::task_dialog_shown()
+/// The first dialog window in `now` that wasn't in `before`: the prompt,
+/// not a dialog left from an earlier one.
+pub fn new_dialog(before: &[isize], now: &[isize]) -> Option<isize> {
+    now.iter().copied().find(|h| !before.contains(h))
 }
 
-#[cfg(not(windows))]
-fn dialog_shown() -> bool {
-    false
+/// The prompt's task dialog on Windows: the dialog windows there before it
+/// was asked for are noted, and only a new one counts.
+#[cfg(windows)]
+struct TaskDialogWatch {
+    before: Vec<isize>,
+    found: std::cell::Cell<Option<isize>>,
+    late: Late,
+}
+
+#[cfg(windows)]
+impl TaskDialogWatch {
+    /// Notes the dialog windows on screen now: call before asking.
+    fn new(late: Late) -> Self {
+        TaskDialogWatch { before: win::dialogs(), found: std::cell::Cell::new(None), late }
+    }
+}
+
+#[cfg(windows)]
+impl Screen for TaskDialogWatch {
+    fn seen(&self) -> bool {
+        if self.found.get().is_none() {
+            self.found.set(new_dialog(&self.before, &win::dialogs()));
+        }
+        self.found.get().is_some()
+    }
+
+    fn close(&self) -> bool {
+        self.found.get().is_some_and(win::close)
+    }
+
+    fn left_up(&self, rx: Receiver<MessageDialogResult>) {
+        (self.late)(rx);
+    }
 }
 
 #[cfg(windows)]
 mod win {
     use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetClassNameW, GetWindowThreadProcessId, IsWindowVisible,
+        EnumWindows, GetClassNameW, GetWindowThreadProcessId, IsWindowVisible, PostMessageW,
+        WM_CLOSE,
     };
 
     /// The dialog class a task dialog's window has.
     const DIALOG_CLASS: [u16; 6] = [b'#' as u16, b'3' as u16, b'2' as u16, b'7' as u16, b'7' as u16, b'0' as u16];
 
-    /// Whether a task dialog of this process is on screen.
-    pub fn task_dialog_shown() -> bool {
-        find_task_dialog().is_some()
+    /// The visible top-level windows of this process of class `#32770`
+    /// (dialogs), as handles. No owner is checked: the app makes no dialog
+    /// other than the link's prompt, and only a new one counts.
+    pub fn dialogs() -> Vec<isize> {
+        let mut found: Vec<isize> = Vec::new();
+        // SAFETY: `each` only pushes through the pointer to `found`, which
+        // outlives the call; EnumWindows calls it on this thread.
+        unsafe { EnumWindows(Some(each), &mut found as *mut Vec<isize> as LPARAM) };
+        found
     }
 
-    /// A visible top-level window of this process of class `#32770` (a
-    /// dialog; the app makes no other than the link's prompt).
-    pub fn find_task_dialog() -> Option<HWND> {
-        let mut found: HWND = std::ptr::null_mut();
-        // SAFETY: `each` only writes through the pointer to `found`, which
-        // outlives the call; EnumWindows calls it on this thread.
-        unsafe { EnumWindows(Some(each), &mut found as *mut HWND as LPARAM) };
-        (!found.is_null()).then_some(found)
+    /// Asks the dialog to close (WM_CLOSE): rfd's task dialog then answers
+    /// `Cancel`.
+    pub fn close(hwnd: isize) -> bool {
+        // SAFETY: posting a message to a window handle is safe whatever the
+        // handle; a stale one fails.
+        unsafe { PostMessageW(hwnd as HWND, WM_CLOSE, 0, 0) != 0 }
     }
 
     unsafe extern "system" fn each(hwnd: HWND, data: LPARAM) -> BOOL {
@@ -573,8 +726,7 @@ mod win {
         let mut class = [0u16; 16];
         let n = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
         if n > 0 && class[..n as usize] == DIALOG_CLASS {
-            *(data as *mut HWND) = hwnd;
-            return 0;
+            (*(data as *mut Vec<isize>)).push(hwnd as isize);
         }
         1
     }
@@ -598,6 +750,12 @@ impl Prompt for NativePrompt {
         let question = question.to_owned();
         let window = self.window.clone();
         let buttons = buttons_for(cancel_first_for(OS));
+        // Before asking: the dialogs already on screen don't count.
+        let late = tell_window(self.window.clone());
+        #[cfg(windows)]
+        let screen = TaskDialogWatch::new(late);
+        #[cfg(not(windows))]
+        let screen = UnseenScreen { late };
         let asked = clock.now();
         let started = match path_for(OS) {
             DialogPath::Async => self
@@ -614,6 +772,8 @@ impl Prompt for NativePrompt {
                     });
                 })
                 .is_ok(),
+            // rfd's GTK dialog ignores `set_parent`: it is made with no
+            // parent window.
             DialogPath::Blocking => std::thread::Builder::new()
                 .name("link-prompt".into())
                 .spawn(move || {
@@ -630,7 +790,12 @@ impl Prompt for NativePrompt {
         if !started {
             return Reply::Failed;
         }
-        wait_reply(rx, asked, Duration::from_secs(PROMPT_TIMEOUT_SECS), SHOWN_POLL, clock, &dialog_shown)
+        let waits = Waits {
+            timeout: Duration::from_secs(PROMPT_TIMEOUT_SECS),
+            grace: CLOSE_GRACE,
+            poll: SHOWN_POLL,
+        };
+        wait_reply(rx, asked, waits, clock, &screen)
     }
 }
 
@@ -668,7 +833,7 @@ static GATE: Gate = Gate::new();
 /// Opens a link in a message, after the member's "Open" in a native prompt
 /// showing its host. `text` is the link as the message shows it. Answers
 /// `opened`, `not_confirmed` or `too_fast`; or the error `refused`, `busy`,
-/// `no_prompt` or `not_opened`.
+/// `no_prompt`, `not_opened` or `timed_out`.
 #[tauri::command]
 pub async fn open_message_link(
     app: AppHandle,
@@ -1156,10 +1321,9 @@ mod tests {
 
     #[test]
     fn busy_for_a_second_after_a_prompt_that_wasnt_confirmed() {
-        // Cancelled (after 2 s), too fast (at once), or no answer in time.
+        // Cancelled or closed (after 2 s), or no answer in time.
         for (yes, timed_out, after, first) in [
             (false, false, 2000, Outcome::NotConfirmed),
-            (true, false, 0, Outcome::TooFast),
             (true, true, 2000, Outcome::NotConfirmed),
         ] {
             let c = clock();
@@ -1183,6 +1347,38 @@ mod tests {
         }
     }
 
+    /// After a too-fast Open the view asks for the link to be clicked
+    /// again: that click asks again at once, not busy.
+    #[test]
+    fn a_too_fast_open_leaves_no_quiet_time() {
+        let c = clock();
+        let gate = Gate::new();
+        let b = FakeBrowser::default();
+        let p = prompt(&c, true, 0);
+        assert_eq!(open_link(RAW, &gate, &p, &b, &c), Ok(Outcome::TooFast));
+        let again = prompt(&c, true, MIN_CONFIRM_MS);
+        assert_eq!(open_link(RAW, &gate, &again, &b, &c), Ok(Outcome::Opened));
+        assert_eq!(again.asked.borrow().len(), 1);
+        assert_eq!(*b.opened.borrow(), vec![OPENS.to_owned()]);
+    }
+
+    #[test]
+    fn an_open_after_the_time_out_is_an_error_and_opens_nothing() {
+        struct Late;
+        impl Prompt for Late {
+            fn confirm(&self, _: &str, _: &dyn Clock) -> Reply {
+                Reply::LateOpen
+            }
+        }
+        let c = clock();
+        let gate = Gate::new();
+        let b = FakeBrowser::default();
+        assert_eq!(open_link(RAW, &gate, &Late, &b, &c), Err(LinkError::TimedOut));
+        assert_eq!(LinkError::TimedOut.code(), "timed_out");
+        assert!(b.opened.borrow().is_empty());
+        assert!(!gate.showing());
+    }
+
     #[test]
     fn a_prompt_with_no_answer_opens_nothing_and_lets_go() {
         let c = clock();
@@ -1195,17 +1391,150 @@ mod tests {
         assert!(!gate.showing());
     }
 
-    /// The wait itself: no answer within the time-out is `TimedOut`, and
-    /// the answer coming later goes nowhere.
+    fn waits(timeout_ms: u64, poll_ms: u64) -> Waits {
+        Waits {
+            timeout: Duration::from_millis(timeout_ms),
+            grace: Duration::from_millis(200),
+            poll: Duration::from_millis(poll_ms),
+        }
+    }
+
+    /// A screen from closures: `seen` is asked at each look, `close` at
+    /// the time-out.
+    struct FnScreen<'a> {
+        seen: &'a dyn Fn() -> bool,
+        close: &'a dyn Fn() -> bool,
+    }
+
+    impl Screen for FnScreen<'_> {
+        fn seen(&self) -> bool {
+            (self.seen)()
+        }
+        fn close(&self) -> bool {
+            (self.close)()
+        }
+    }
+
+    /// The wait itself: no answer within the time-out is `TimedOut` where
+    /// the prompt can't be closed, and the answer coming later goes nowhere.
     #[test]
     fn the_wait_times_out_and_ignores_a_late_answer() {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let asked = Instant::now();
-        let reply = wait_reply(rx, asked, Duration::from_millis(60), Duration::from_millis(5), &SystemClock, &|| false);
+        let reply = wait_reply(rx, asked, waits(60, 5), &SystemClock, &NoScreen);
         assert_eq!(reply, Reply::TimedOut);
         assert!(asked.elapsed() >= Duration::from_millis(60));
         // The receiver is gone with the reply: a late Open is refused.
         assert!(tx.send(MessageDialogResult::Custom(OPEN_LABEL.to_owned())).is_err());
+    }
+
+    /// Where the prompt can be closed (Windows): closed at the time-out;
+    /// an Open pressed as it closes is `LateOpen`, its Cancel `TimedOut`.
+    #[test]
+    fn the_wait_closes_the_prompt_at_the_time_out() {
+        for (answer, want) in [
+            (Some(MessageDialogResult::Custom(OPEN_LABEL.to_owned())), Reply::LateOpen),
+            (Some(MessageDialogResult::Cancel), Reply::TimedOut),
+            (Some(MessageDialogResult::Custom(CANCEL_LABEL.to_owned())), Reply::TimedOut),
+            (None, Reply::TimedOut),
+        ] {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let closed = Cell::new(0);
+            let close = || {
+                closed.set(closed.get() + 1);
+                if let Some(a) = answer.clone() {
+                    tx.send(a).expect("send");
+                }
+                true
+            };
+            let screen = FnScreen { seen: &|| true, close: &close };
+            let reply = wait_reply(rx, Instant::now(), waits(40, 5), &SystemClock, &screen);
+            assert_eq!(reply, want, "{answer:?}");
+            assert_eq!(closed.get(), 1, "{answer:?}");
+        }
+        // Not closed (it can't be): an answer already waiting isn't read.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let close = || {
+            tx.send(MessageDialogResult::Custom(OPEN_LABEL.to_owned())).expect("send");
+            false
+        };
+        let screen = FnScreen { seen: &|| false, close: &close };
+        assert_eq!(wait_reply(rx, Instant::now(), waits(40, 5), &SystemClock, &screen), Reply::TimedOut);
+    }
+
+    /// A screen that keeps what `left_up` is handed.
+    struct Keeps<'a> {
+        close: bool,
+        kept: &'a RefCell<Option<Receiver<MessageDialogResult>>>,
+    }
+
+    impl Screen for Keeps<'_> {
+        fn seen(&self) -> bool {
+            true
+        }
+        fn close(&self) -> bool {
+            self.close
+        }
+        fn left_up(&self, rx: Receiver<MessageDialogResult>) {
+            *self.kept.borrow_mut() = Some(rx);
+        }
+    }
+
+    /// A prompt still up after the time-out (not closable, or closed with
+    /// no answer in the grace) hands its answer to `left_up`; one that
+    /// answered in the grace doesn't.
+    #[test]
+    fn a_prompt_left_up_hands_its_answer_on() {
+        for close in [false, true] {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let kept = RefCell::new(None);
+            let reply = wait_reply(rx, Instant::now(), waits(40, 5), &SystemClock, &Keeps { close, kept: &kept });
+            assert_eq!(reply, Reply::TimedOut, "close {close}");
+            let rx = kept.borrow_mut().take().expect("handed on");
+            tx.send(MessageDialogResult::Custom(OPEN_LABEL.to_owned())).expect("still heard");
+            assert!(confirmed(&rx.recv().expect("answer")));
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(MessageDialogResult::Cancel).expect("send");
+        let kept = RefCell::new(None);
+        // Closed, and its Cancel came in the grace: not handed on.
+        let reply = wait_reply(rx, Instant::now(), waits(0, 5), &SystemClock, &Keeps { close: true, kept: &kept });
+        assert_eq!(reply, Reply::TimedOut);
+        assert!(kept.borrow().is_none());
+    }
+
+    /// The watch on a prompt left up: told only for Open, and only once.
+    #[test]
+    fn a_late_open_is_told_and_nothing_else_is() {
+        for (answer, told) in [
+            (Some(MessageDialogResult::Custom(OPEN_LABEL.to_owned())), 1),
+            (Some(MessageDialogResult::Custom(CANCEL_LABEL.to_owned())), 0),
+            (Some(MessageDialogResult::Cancel), 0),
+            (Some(MessageDialogResult::Ok), 0),
+            (None, 0),
+        ] {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            match answer.clone() {
+                Some(a) => tx.send(a).expect("send"),
+                None => drop(tx),
+            }
+            let n = Cell::new(0);
+            watch_late(rx, || n.set(n.get() + 1));
+            assert_eq!(n.get(), told, "{answer:?}");
+        }
+        assert_eq!(LATE_OPEN_EVENT, "message-link-late-open");
+    }
+
+    /// Only a dialog window that wasn't there before the prompt was asked
+    /// for counts as the prompt.
+    #[test]
+    fn only_a_new_dialog_window_is_the_prompt() {
+        assert_eq!(new_dialog(&[], &[]), None);
+        assert_eq!(new_dialog(&[], &[7]), Some(7));
+        assert_eq!(new_dialog(&[7], &[7]), None, "a stale dialog counted");
+        assert_eq!(new_dialog(&[7], &[7, 9]), Some(9));
+        assert_eq!(new_dialog(&[7, 9], &[9, 11, 7]), Some(11));
+        assert_eq!(new_dialog(&[7], &[]), None);
     }
 
     #[test]
@@ -1221,7 +1550,7 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             tx.send(answer.clone()).expect("send");
             let asked = Instant::now();
-            let reply = wait_reply(rx, asked, Duration::from_secs(5), Duration::from_millis(5), &SystemClock, &|| false);
+            let reply = wait_reply(rx, asked, waits(5000, 5), &SystemClock, &NoScreen);
             assert_eq!(reply, Reply::Answered { open, shown: asked }, "{answer:?}");
         }
         // Seen on screen on the third look: counted from then.
@@ -1239,12 +1568,13 @@ mod tests {
                 false
             }
         };
-        let reply = wait_reply(rx, asked, Duration::from_secs(5), Duration::from_millis(1), &c, &shown);
+        let screen = FnScreen { seen: &shown, close: &|| false };
+        let reply = wait_reply(rx, asked, waits(5000, 1), &c, &screen);
         assert_eq!(reply, Reply::Answered { open: true, shown: asked + Duration::from_millis(30) });
         // The dialog's thread gone with no answer: failed.
         let (tx, rx) = std::sync::mpsc::sync_channel::<MessageDialogResult>(1);
         drop(tx);
-        assert_eq!(wait_reply(rx, Instant::now(), Duration::from_secs(5), Duration::from_millis(5), &SystemClock, &|| false), Reply::Failed);
+        assert_eq!(wait_reply(rx, Instant::now(), waits(5000, 5), &SystemClock, &NoScreen), Reply::Failed);
     }
 
     #[test]
@@ -1374,8 +1704,8 @@ mod tests {
         assert_eq!(backend_of(Os::Linux), Backend::GtkBlocking);
     }
 
-    /// Cancel is the first (default) button on Windows and macOS, not on
-    /// Linux; and this build runs its own platform's choice.
+    /// Cancel is the first (default) button on every platform; and this
+    /// build runs its own platform's choice.
     #[test]
     fn cancel_is_first_where_the_first_button_is_the_default() {
         let first = |os| match buttons_for(cancel_first_for(os)) {
@@ -1384,7 +1714,7 @@ mod tests {
         };
         assert_eq!(first(Os::Windows), CANCEL_LABEL);
         assert_eq!(first(Os::MacOs), CANCEL_LABEL);
-        assert_eq!(first(Os::Linux), OPEN_LABEL);
+        assert_eq!(first(Os::Linux), CANCEL_LABEL);
         #[cfg(windows)]
         assert_eq!(OS, Os::Windows);
         #[cfg(target_os = "macos")]
@@ -1437,11 +1767,15 @@ mod tests {
         }
     }
 
-    /// No task dialog of this process is on screen in a test.
+    /// No dialog of this process is on screen in a test, so none is seen
+    /// and none can be closed.
     #[cfg(windows)]
     #[test]
     fn no_task_dialog_is_seen_when_there_is_none() {
-        assert!(!dialog_shown());
+        assert!(win::dialogs().is_empty());
+        let watch = TaskDialogWatch::new(Box::new(drop));
+        assert!(!watch.seen());
+        assert!(!watch.close());
     }
 
     /// The window can't open a URL itself: no capability grants it any of

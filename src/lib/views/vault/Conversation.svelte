@@ -26,7 +26,9 @@
         EMPTY_MESSAGE,
         LINE_ISOLATE,
         LINK_NOT_OPENED,
+        LINK_LATE_OPEN_EVENT,
         linkOutcomeText,
+        linkErrorText,
         EDIT_NEEDS_EMPTY_BOX,
         returnedElsewhereText,
         knownOutgoing,
@@ -504,12 +506,25 @@
             // MIN_CONFIRM_MS in commands/links.rs) says to try again;
             // `opened` and `not_confirmed` say nothing.
             linkNote = linkOutcomeText(await invoke<string>('open_message_link', { text: p.text }));
-        } catch {
-            // Refused, busy (another link's prompt shown, or one declined
-            // just now), the prompt not shown, or not opened.
-            linkError = LINK_NOT_OPENED;
+        } catch (code) {
+            // Busy (another link's prompt shown, or one cancelled just
+            // now) says nothing; refused, the prompt not shown, not opened
+            // or an Open after the prompt timed out say it wasn't opened.
+            linkError = linkErrorText(code);
         }
     }
+
+    // An Open on a prompt left up after its time-out opens nothing
+    // (LATE_OPEN_EVENT in commands/links.rs): say so.
+    $effect(() => {
+        const un = listen(LINK_LATE_OPEN_EVENT, () => {
+            linkNote = '';
+            linkError = LINK_NOT_OPENED;
+        });
+        return () => {
+            void un.then((f) => f());
+        };
+    });
 
     function when(iso: string): string {
         if (!iso) return '';
