@@ -76,15 +76,15 @@ pub const QUIET_MS: u64 = 1000;
 
 /// A prompt with no answer after this long counts as not confirmed: the
 /// one-prompt flag is let go, so links don't stay busy until a restart.
-/// On Windows the prompt is closed then, and an Open pressed as it closes
-/// is the error `timed_out` (the view says the link couldn't be opened).
-/// Elsewhere rfd gives no way to close it: it stays on screen, and an Open
-/// on it later opens nothing and sends `LATE_OPEN_EVENT`, so the view says
-/// the same. So does one on Windows, if the prompt didn't close.
+/// On Windows and Linux the prompt is closed then, and an Open pressed as
+/// it closes is the error `timed_out` (the view says the link couldn't be
+/// opened). On macOS rfd gives no way to close it: it stays on screen, and
+/// an Open on it later opens nothing and sends `LATE_OPEN_EVENT`, so the
+/// view says the same. So does one on Windows or Linux that didn't close.
 pub const PROMPT_TIMEOUT_SECS: u64 = 300;
 
 /// How long the wait goes on for the answer of a prompt it closed at the
-/// time-out (Windows): an Open pressed as it closed arrives within it.
+/// time-out (Windows, Linux): an Open pressed as it closed arrives within it.
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 /// How often the wait for an answer looks for the dialog on screen.
@@ -520,13 +520,14 @@ fn tell_window(window: WebviewWindow) -> Late {
     })
 }
 
-/// The prompt on macOS: not seen, not closed; a late Open is told.
-#[cfg(target_os = "macos")]
+/// The prompt on macOS (and any platform other than Windows and Linux):
+/// not seen, not closed; a late Open is told.
+#[cfg(not(any(windows, target_os = "linux")))]
 struct UnseenScreen {
     late: Late,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(not(any(windows, target_os = "linux")))]
 impl Screen for UnseenScreen {
     fn seen(&self) -> bool {
         false
@@ -765,7 +766,7 @@ impl Screen for GtkPromptWatch {
 mod gtk_prompts {
     use gtk::glib;
     use gtk::prelude::*;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// How long the close waits for GTK's main thread to take it.
     const TAKEN: Duration = Duration::from_secs(1);
@@ -778,15 +779,21 @@ mod gtk_prompts {
     /// which rfd's blocking dialog answers as `Cancel`. That response is
     /// given directly: a close request (`gtk_window_close`) to a dialog
     /// under another one's grab is dropped. Whether one was closed; not if
-    /// GTK's main thread didn't take this within `TAKEN`.
+    /// GTK's main thread didn't take this within `TAKEN`, and then it
+    /// closes nothing later either (a new prompt may be up by then).
     pub fn close(title: &str) -> bool {
         let title = title.to_owned();
+        let deadline = Instant::now() + TAKEN;
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         // rfd makes the dialog in an idle callback on GTK's default main
         // context, and runs it in a nested loop that holds that context:
-        // this runs on the same thread, inside that loop.
+        // this runs on the same thread, inside that loop. Where rfd's own
+        // GTK thread ran the dialog instead, GTK isn't set up for gtk-rs
+        // there: nothing is closed, and the prompt goes to the late watch.
         glib::MainContext::default().invoke(move || {
-            let _ = tx.send(close_titled(&title));
+            if Instant::now() < deadline {
+                let _ = tx.send(close_titled(&title));
+            }
         });
         matches!(rx.recv_timeout(TAKEN), Ok(n) if n > 0)
     }
@@ -831,7 +838,7 @@ impl Prompt for NativePrompt {
         let late = tell_window(self.window.clone());
         #[cfg(windows)]
         let screen = TaskDialogWatch::new(late);
-        #[cfg(target_os = "macos")]
+        #[cfg(not(any(windows, target_os = "linux")))]
         let screen = UnseenScreen { late };
         #[cfg(target_os = "linux")]
         let screen = GtkPromptWatch { title: title.clone(), late };
@@ -1656,7 +1663,7 @@ mod tests {
         let kept = std::rc::Rc::new(RefCell::new(None));
         #[cfg(windows)]
         let screen = TaskDialogWatch::new(keeping(&kept));
-        #[cfg(target_os = "macos")]
+        #[cfg(not(any(windows, target_os = "linux")))]
         let screen = UnseenScreen { late: keeping(&kept) };
         #[cfg(target_os = "linux")]
         let screen = GtkPromptWatch { title: "VettID".to_owned(), late: keeping(&kept) };
