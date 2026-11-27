@@ -76,15 +76,15 @@ pub const QUIET_MS: u64 = 1000;
 
 /// A prompt with no answer after this long counts as not confirmed: the
 /// one-prompt flag is let go, so links don't stay busy until a restart.
-/// On Windows the prompt is closed then, and an Open pressed as it closes
-/// is the error `timed_out` (the view says the link couldn't be opened).
-/// Elsewhere rfd gives no way to close it: it stays on screen, and an Open
-/// on it later opens nothing and sends `LATE_OPEN_EVENT`, so the view says
-/// the same. So does one on Windows, if the prompt didn't close.
+/// On Windows and Linux the prompt is closed then, and an Open pressed as
+/// it closes is the error `timed_out` (the view says the link couldn't be
+/// opened). On macOS rfd gives no way to close it: it stays on screen, and
+/// an Open on it later opens nothing and sends `LATE_OPEN_EVENT`, so the
+/// view says the same. So does one on Windows or Linux that didn't close.
 pub const PROMPT_TIMEOUT_SECS: u64 = 300;
 
 /// How long the wait goes on for the answer of a prompt it closed at the
-/// time-out (Windows): an Open pressed as it closed arrives within it.
+/// time-out (Windows, Linux): an Open pressed as it closed arrives within it.
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 /// How often the wait for an answer looks for the dialog on screen.
@@ -520,13 +520,14 @@ fn tell_window(window: WebviewWindow) -> Late {
     })
 }
 
-/// The prompt on macOS and Linux: not seen, not closed; a late Open is told.
-#[cfg(not(windows))]
+/// The prompt on macOS (and any platform other than Windows and Linux):
+/// not seen, not closed; a late Open is told.
+#[cfg(not(any(windows, target_os = "linux")))]
 struct UnseenScreen {
     late: Late,
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 impl Screen for UnseenScreen {
     fn seen(&self) -> bool {
         false
@@ -736,6 +737,34 @@ mod win {
     }
 }
 
+/// The prompt on Linux: rfd's blocking GTK dialog. It isn't seen (the wait
+/// counts from the request), but it is closed at the time-out; a late Open
+/// on one that didn't close is told.
+#[cfg(target_os = "linux")]
+struct GtkPromptWatch {
+    /// The prompt's window title: the app's name.
+    title: String,
+    late: Late,
+}
+
+#[cfg(target_os = "linux")]
+impl Screen for GtkPromptWatch {
+    fn seen(&self) -> bool {
+        false
+    }
+
+    fn close(&self) -> bool {
+        gtk_prompts::close(&self.title)
+    }
+
+    fn left_up(&self, rx: Receiver<MessageDialogResult>) {
+        (self.late)(rx);
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod gtk_prompts;
+
 /// The native dialog (rfd), over the window that asked.
 struct NativePrompt {
     app: AppHandle,
@@ -758,8 +787,10 @@ impl Prompt for NativePrompt {
         let late = tell_window(self.window.clone());
         #[cfg(windows)]
         let screen = TaskDialogWatch::new(late);
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         let screen = UnseenScreen { late };
+        #[cfg(target_os = "linux")]
+        let screen = GtkPromptWatch { title: title.clone(), late };
         let asked = clock.now();
         let started = match path_for(OS) {
             DialogPath::Async => self
@@ -1130,6 +1161,50 @@ mod tests {
             .collect();
         assert_eq!(shell.len(), 1);
         assert!(shell[0].contains("\n \"open\""), "tauri-plugin-shell opens through `open`");
+    }
+
+    /// The link's prompt is the app's only message dialog: on Linux, its
+    /// close at the time-out picks message dialogs by title alone. No
+    /// dialog plugin is in the tree, only the app itself uses rfd, and no
+    /// other source file makes a message dialog.
+    #[test]
+    fn the_link_prompt_is_the_only_message_dialog() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("Cargo.lock");
+        let blocks: Vec<&str> = lock.split("\n\n").collect();
+        assert!(
+            !blocks.iter().any(|b| b.starts_with("[[package]]\nname = \"tauri-plugin-dialog\"\n")),
+            "tauri-plugin-dialog is in the tree"
+        );
+        let users: Vec<&str> = blocks
+            .iter()
+            .filter(|b| b.contains("\n \"rfd\"") || b.contains("\n \"rfd "))
+            .filter_map(|b| b.lines().find_map(|l| l.strip_prefix("name = \"")).map(|n| n.trim_end_matches('"')))
+            .collect();
+        assert_eq!(users, vec!["vettid-desktop"], "only the app uses rfd");
+
+        let links = root.join("src").join("commands").join("links.rs");
+        let gtk = root.join("src").join("commands").join("links").join("gtk_prompts.rs");
+        let mut dirs = vec![root.join("src")];
+        let mut files = 0;
+        while let Some(dir) = dirs.pop() {
+            for e in std::fs::read_dir(&dir).expect("src") {
+                let p = e.expect("entry").path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    files += 1;
+                    if p == links || p == gtk {
+                        continue;
+                    }
+                    let text = std::fs::read_to_string(&p).expect("source");
+                    for word in ["rfd::", "MessageDialog", "message_dialog"] {
+                        assert!(!text.contains(word), "{} names {word}", p.display());
+                    }
+                }
+            }
+        }
+        assert!(files > 10, "the sources were read");
     }
 
     /// A clock the fake prompt moves on.
@@ -1581,8 +1656,10 @@ mod tests {
         let kept = std::rc::Rc::new(RefCell::new(None));
         #[cfg(windows)]
         let screen = TaskDialogWatch::new(keeping(&kept));
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         let screen = UnseenScreen { late: keeping(&kept) };
+        #[cfg(target_os = "linux")]
+        let screen = GtkPromptWatch { title: "VettID".to_owned(), late: keeping(&kept) };
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         screen.left_up(rx);
         let rx = kept.borrow_mut().take().expect("handed to its Late");
@@ -1861,6 +1938,16 @@ mod tests {
     fn no_task_dialog_is_seen_when_there_is_none() {
         assert!(win::dialogs().is_empty());
         let watch = TaskDialogWatch::new(Box::new(drop));
+        assert!(!watch.seen());
+        assert!(!watch.close());
+    }
+
+    /// GTK isn't set up in a test, so no prompt is closed, and nothing
+    /// panics: the time-out goes on to the late watch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_gtk_prompt_is_closed_where_gtk_is_not_set_up() {
+        let watch = GtkPromptWatch { title: "VettID".to_owned(), late: Box::new(drop) };
         assert!(!watch.seen());
         assert!(!watch.close());
     }

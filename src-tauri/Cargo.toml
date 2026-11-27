@@ -150,10 +150,13 @@ keyring = { version = "3", default-features = false, features = ["apple-native"]
 #   D-Bus session encrypted (`crypto-rust`); dbus, for checking that a
 #   session bus and `org.freedesktop.secrets` are there before using it.
 #   Both were already in the tree, through `keyring`.
+# - gtk: closing a link's prompt still up at its time-out
+#   (commands/links.rs). The version tauri's tao and wry already use.
 [target.'cfg(target_os = "linux")'.dependencies]
 tss-esapi = "7.7"
 dbus = "0.9"
 dbus-secret-service = { version = "4.1", features = ["crypto-rust"] }
+gtk = "=0.18.2"
 
 [dev-dependencies]
 tempfile = "3"
